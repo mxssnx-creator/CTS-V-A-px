@@ -117,6 +117,18 @@ export function ActiveConnectionCard({
   globalEngineRunning,
 }: ActiveConnectionCardProps) {
   const [progression, setProgression] = useState<ProgressionData | null>(null)
+  // Lightweight Real-stage averages + stage eval percentages, fetched on the
+  // same poll cadence as progression (no extra timer).
+  const [realAverages, setRealAverages] = useState<{
+    activeSets: number
+    posPerSet: number
+    posOpen: number
+  } | null>(null)
+  const [stageEvalPercent, setStageEvalPercent] = useState<{
+    base: number
+    main: number
+    real: number
+  } | null>(null)
   const [infoDialogOpen, setInfoDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [logsDialogOpen, setLogsDialogOpen] = useState(false)
@@ -359,6 +371,34 @@ export function ActiveConnectionCard({
         const data = await res.json()
         if (data.success && data.progression) {
           setProgression(data.progression)
+        }
+      }
+    } catch {
+      // Non-critical polling — swallow silently
+    }
+    // Real-stage averaged counts + stage eval %. Folded into the same poll so
+    // we don't spin up a second interval. Failures are non-fatal.
+    try {
+      const tRes = await fetch(`/api/connections/progression/${connection.connectionId}/tracking/strategies`, {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache, no-store, must-revalidate" },
+      })
+      if (tRes.ok) {
+        const tData = await tRes.json()
+        const tracking = tData?.tracking ?? tData
+        if (tracking?.real?.averages) {
+          setRealAverages({
+            activeSets: Number(tracking.real.averages.activeSets) || 0,
+            posPerSet: Number(tracking.real.averages.posPerSet) || 0,
+            posOpen: Number(tracking.real.averages.posOpen) || 0,
+          })
+        }
+        if (tracking?.stageEvalPercent) {
+          setStageEvalPercent({
+            base: Number(tracking.stageEvalPercent.base) || 0,
+            main: Number(tracking.stageEvalPercent.main) || 0,
+            real: Number(tracking.stageEvalPercent.real) || 0,
+          })
         }
       }
     } catch {
@@ -1182,6 +1222,50 @@ export function ActiveConnectionCard({
                             : `$${prehistoricStats.liveVolumeUsd.toFixed(0)}`}
                       </span>
                     </div>
+                  </div>
+                )}
+
+                {/* ── Real-stage averaged counts + stage eval % ──────────
+                    Averaged running counts at the Real stage (smoothed over
+                    an internal calculation interval — only the averages are
+                    shown) plus the Base/Main/Real stage pass-through
+                    percentages. Mirrors the detailed Strategy Pipeline card
+                    in a compact status-bar form. */}
+                {(realAverages || stageEvalPercent) && (
+                  <div className="mt-2 flex items-center gap-3 flex-wrap text-[10px]">
+                    {realAverages && (
+                      <>
+                        <div className="flex items-center gap-1" title="Average number of Real Sets running.">
+                          <span className="text-muted-foreground">Avg Sets</span>
+                          <span className="font-semibold text-emerald-700 dark:text-emerald-400 tabular-nums">
+                            {realAverages.activeSets.toFixed(1)}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1" title="Average positions (entries) held per running Real Set.">
+                          <span className="text-muted-foreground">Avg Pos/Set</span>
+                          <span className="font-semibold text-emerald-700 dark:text-emerald-400 tabular-nums">
+                            {realAverages.posPerSet.toFixed(1)}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1" title="Average total open positions across running Real Sets.">
+                          <span className="text-muted-foreground">Avg Open</span>
+                          <span className="font-semibold text-emerald-700 dark:text-emerald-400 tabular-nums">
+                            {realAverages.posOpen.toFixed(1)}
+                          </span>
+                        </div>
+                      </>
+                    )}
+                    {stageEvalPercent && (
+                      <div
+                        className="flex items-center gap-1"
+                        title="Stage pass-through: Base is the 100% entry point; Main = survived Base→Main; Real = survived Main→Real."
+                      >
+                        <span className="text-muted-foreground">Evals B/M/R</span>
+                        <span className="font-semibold text-sky-700 dark:text-sky-400 tabular-nums">
+                          {stageEvalPercent.base.toFixed(0)}% / {stageEvalPercent.main.toFixed(0)}% / {stageEvalPercent.real.toFixed(0)}%
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )}
 
