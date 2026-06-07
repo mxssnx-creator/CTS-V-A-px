@@ -686,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ����� operator-tunable
+      minProfitFactor: 1.0,   // spec default ������� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -725,7 +725,27 @@ export class StrategyCoordinator {
     this._pfThresholdsLoadedAt = now
     try {
       const { getAppSettings } = await import("@/lib/redis-db")
-      const s = (await getAppSettings()) || {}
+      const globalS = (await getAppSettings()) || {}
+      // ── Per-connection override of global app settings (CRITICAL wiring) ──
+      // PF thresholds, per-stage DDT, and stage min-position-counts are saved
+      // per-connection by the settings dialog and mirrored (flattened +
+      // unit-converted) into `connection_settings:{id}` by the PATCH route.
+      // Resolution order per the approved plan: connection hash wins, else
+      // fall back to the global app setting, else the built-in default below.
+      // We overlay the connection hash on top of global settings so any field
+      // the operator did NOT set per-connection transparently inherits global.
+      let connS: Record<string, string> = {}
+      try {
+        connS = ((await getRedisClient().hgetall(`connection_settings:${this.connectionId}`)) ||
+          {}) as Record<string, string>
+      } catch {
+        connS = {}
+      }
+      const s: Record<string, unknown> = { ...(globalS as Record<string, unknown>) }
+      // Only let non-empty connection-hash scalars override.
+      for (const [k, v] of Object.entries(connS)) {
+        if (v !== undefined && v !== null && v !== "") s[k] = v
+      }
       const clamp = (raw: unknown, fallback: number): number => {
         const n = Number(raw)
         if (!Number.isFinite(n) || n < 0) return fallback
@@ -783,34 +803,16 @@ export class StrategyCoordinator {
       // settings dialog saves these AND the PATCH route mirrors them into the
       // `connection_settings:{id}` hash, but until now NOTHING read them back —
       // the coordinator used its constructor defaults (15 / 10) forever, so
-      // operator changes silently never took effect. Resolution order per the
-      // approved plan: per-connection `connection_settings:{id}` hash → global
-      // `app_settings` → built-in default. Clamp [1, 200]. Read on the same
-      // PF-threshold TTL cadence so a save is picked up within one refresh
-      // window without per-cycle HGETALL overhead.
-      const evalCount = (raw: unknown, fallback: number): number | null => {
+      // operator changes silently never took effect. `s` already overlays the
+      // per-connection hash on top of global app_settings (see top of this
+      // method), so connection wins → global → built-in default. Clamp [1,200].
+      const evalCount = (raw: unknown): number | null => {
         const n = Number(raw)
         if (!Number.isFinite(n) || n < 1) return null
         return Math.min(200, Math.max(1, Math.floor(n)))
       }
-      try {
-        const client = getRedisClient()
-        const cs = ((await client.hgetall(`connection_settings:${this.connectionId}`)) ||
-          {}) as Record<string, string>
-        // connection hash wins, then global app_settings, then default.
-        const mainEval =
-          evalCount(cs?.mainEvalPosCount, 0) ??
-          evalCount((s as any).mainEvalPosCount, 0) ??
-          15
-        const realEval =
-          evalCount(cs?.realEvalPosCount, 0) ??
-          evalCount((s as any).realEvalPosCount, 0) ??
-          10
-        this._coordinationSettings.mainEvalPosCount = mainEval
-        this._coordinationSettings.realEvalPosCount = realEval
-      } catch {
-        /* keep last-known / default eval counts on read miss */
-      }
+      this._coordinationSettings.mainEvalPosCount = evalCount((s as any).mainEvalPosCount) ?? 15
+      this._coordinationSettings.realEvalPosCount = evalCount((s as any).realEvalPosCount) ?? 10
     } catch (err) {
       // Don't fail the whole flow on a settings read miss — the
       // already-loaded values (either the defaults or the last
@@ -2748,7 +2750,7 @@ export class StrategyCoordinator {
         )
       }
 
-      // ── POSITION-COUNT AXIS ACCUMULATION (Real stage) ──────────────
+      // ── POSITION-COUNT AXIS ACCUMULATION (Real stage) ───────────��──
       // Per spec: "Do the Additional Sets / Position Counts Accumulation
       // in Strategies Real instead of in Main". The axis windows are
       // tagged at Main creation time but the cumulative accumulation

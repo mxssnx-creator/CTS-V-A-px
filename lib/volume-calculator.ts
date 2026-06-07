@@ -388,7 +388,24 @@ export class VolumeCalculator {
       // Previously this read `system_settings`, which is a different
       // bundle (cleanup schedule, backup toggles) — so the operator's
       // saved leverage/cost never reached volume calculations.
-      const settings = (await getAppSettings()) || {}
+      //
+      // Per-connection override: the connection settings dialog can save
+      // `leveragePercentage` / `useMaximalLeverage` / `exchangePositionCost`
+      // per-connection, mirrored into the `connection_settings:{id}` hash.
+      // Overlay any non-empty connection-hash scalar on top of the global
+      // app settings so per-connection sizing wins, else inherits global.
+      const globalSettings = (await getAppSettings()) || {}
+      let connSettings: Record<string, string> = {}
+      try {
+        connSettings = ((await client.hgetall(`connection_settings:${connectionId}`)) ||
+          {}) as Record<string, string>
+      } catch {
+        connSettings = {}
+      }
+      const settings: Record<string, unknown> = { ...(globalSettings as Record<string, unknown>) }
+      for (const [k, v] of Object.entries(connSettings)) {
+        if (v !== undefined && v !== null && v !== "") settings[k] = v
+      }
       // Default position cost: 0.02% of balance per position (ultra-minimal).
       // With the new spec (Base capped at 1 long + 1 short), position budget
       // is intentionally kept at the absolute floor. On a $10K balance:

@@ -121,6 +121,12 @@ export async function PATCH(
     const updated = {
       ...connection,
       connection_settings: merged,
+      // Position mode & margin are first-class connection fields that the
+      // engine applies to the exchange connector at startup. Mirror them
+      // onto the connection object when the dialog sends them so the next
+      // (re)start uses the operator's choice.
+      ...(typeof settings.position_mode === "string" ? { position_mode: settings.position_mode } : {}),
+      ...(typeof settings.margin_mode === "string" ? { margin_type: settings.margin_mode } : {}),
       updated_at: new Date().toISOString(),
     }
 
@@ -148,6 +154,68 @@ export async function PATCH(
         const v = (merged as Record<string, unknown>)[k]
         if (typeof v === "number" && Number.isFinite(v)) flatKnobs[k] = String(v)
       }
+
+      // ── Per-connection leverage mirror ──────────────────────────────────
+      // VolumeCalculator overlays the `connection_settings:{id}` hash on top
+      // of global app_settings, reading `leveragePercentage` (1–100) and
+      // `useMaximalLeverage` ("true"/"false"). Mirror them so per-connection
+      // leverage sizing actually takes effect.
+      {
+        const lev = Number((merged as Record<string, unknown>).leveragePercentage)
+        if (Number.isFinite(lev) && lev > 0) {
+          flatKnobs.leveragePercentage = String(Math.max(1, Math.min(100, lev)))
+        }
+        const useMax = (merged as Record<string, unknown>).useMaximalLeverage
+        if (typeof useMax === "boolean") flatKnobs.useMaximalLeverage = useMax ? "true" : "false"
+      }
+
+      // ── Per-channel PF / DDT / max-positions flattening (CRITICAL) ──────
+      // The dialog stores per-channel strategy tuning nested under
+      // `strategies.main.{base,main,real}` as:
+      //   min_profit_factor  (× multiplier)
+      //   max_drawdown_time  (MINUTES, slider 1–1440)
+      //   max_positions      (count)
+      // But the coordinator's `loadAppPFThresholds()` reads FLAT, differently
+      // named fields and expects DDT in HOURS:
+      //   baseProfitFactor / mainProfitFactor / realProfitFactor / liveProfitFactor
+      //   maxDrawdownTimeMainHours / ...RealHours / ...LiveHours
+      //   stageMinPosCountBase / ...Main / ...Real
+      // Until now nothing bridged the two, so per-channel edits silently never
+      // reached the engine (it used global app_settings / defaults forever).
+      // Flatten + unit-convert here so the coordinator's per-connection
+      // resolution (connection hash → global → default) picks them up.
+      const strat = (merged as Record<string, unknown>).strategies as
+        | Record<string, Record<string, { min_profit_factor?: number; max_drawdown_time?: number; max_positions?: number }>>
+        | undefined
+      const chan = strat?.main // the live/realtime profile drives the engine
+      if (chan) {
+        const pf = (raw: unknown): string | null => {
+          const n = Number(raw)
+          return Number.isFinite(n) && n > 0 ? String(Math.max(0, Math.min(5, n))) : null
+        }
+        const ddtMinToHr = (raw: unknown): string | null => {
+          const n = Number(raw)
+          if (!Number.isFinite(n) || n <= 0) return null
+          // minutes → hours, clamp to the coordinator's [1,72]h gate window
+          return String(Math.max(1, Math.min(72, n / 60)))
+        }
+        const posCount = (raw: unknown): string | null => {
+          const n = Number(raw)
+          return Number.isFinite(n) && n > 0 ? String(Math.floor(n)) : null
+        }
+        const pairs: Array<[string, string | null]> = [
+          ["baseProfitFactor", pf(chan.base?.min_profit_factor)],
+          ["mainProfitFactor", pf(chan.main?.min_profit_factor)],
+          ["realProfitFactor", pf(chan.real?.min_profit_factor)],
+          ["maxDrawdownTimeMainHours", ddtMinToHr(chan.main?.max_drawdown_time)],
+          ["maxDrawdownTimeRealHours", ddtMinToHr(chan.real?.max_drawdown_time)],
+          ["stageMinPosCountBase", posCount(chan.base?.max_positions)],
+          ["stageMinPosCountMain", posCount(chan.main?.max_positions)],
+          ["stageMinPosCountReal", posCount(chan.real?.max_positions)],
+        ]
+        for (const [k, v] of pairs) if (v !== null) flatKnobs[k] = v
+      }
+
       if (Object.keys(flatKnobs).length > 0) {
         await getRedisClient().hset(`connection_settings:${id}`, flatKnobs)
       }

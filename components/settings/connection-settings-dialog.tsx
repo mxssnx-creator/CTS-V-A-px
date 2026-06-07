@@ -99,6 +99,9 @@ interface OverviewSettings {
   volumeFactorPreset: number
   marginMode:  "cross" | "isolated"
   volumeType:  "usdt" | "contract" | "spot"
+  positionMode: "one_way" | "hedge"
+  leveragePercentage: number
+  useMaximalLeverage: boolean
   /**
    * When true: do NOT place exchange-side reduce-only SL/TP control
    * orders for live positions on this connection. The engine instead
@@ -152,6 +155,9 @@ export function ConnectionSettingsDialog({
     volumeFactorPreset: 1.0,
     marginMode: "cross",
     volumeType: "usdt",
+    positionMode: "one_way",
+    leveragePercentage: 100,
+    useMaximalLeverage: false,
     useSystemCloseOnly: false,
   })
 
@@ -174,7 +180,7 @@ export function ConnectionSettingsDialog({
 
   // ─────────────────────────────────────────────────────────────────
   // LOAD
-  // ──────────────────────────────────────���──────────────────────────
+  // ──────────────────────────────────────�����──────────────────────────
 
   const loadAll = useCallback(async () => {
     setLoading(true)
@@ -198,6 +204,9 @@ export function ConnectionSettingsDialog({
           volumeFactorPreset: Number(settings.volume_factor_preset) || 1.0,
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
+          positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
+          leveragePercentage: Number(settings.leveragePercentage) || 100,
+          useMaximalLeverage: settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true",
           useSystemCloseOnly: settings.use_system_close_only === true || settings.useSystemCloseOnly === true,
         })
         setSymbolsCfg(prev => ({
@@ -357,6 +366,9 @@ export function ConnectionSettingsDialog({
         volume_factor_preset: overview.volumeFactorPreset,
         margin_mode: overview.marginMode,
         volume_type: overview.volumeType,
+        position_mode: overview.positionMode,
+        leveragePercentage: overview.leveragePercentage,
+        useMaximalLeverage: overview.useMaximalLeverage,
         use_system_close_only: overview.useSystemCloseOnly,
         useSystemCloseOnly:    overview.useSystemCloseOnly, // backwards-compat alias
         // Symbols
@@ -552,6 +564,47 @@ export function ConnectionSettingsDialog({
                         </SelectContent>
                       </Select>
                     </div>
+
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">Position Mode</Label>
+                      <Select
+                        value={overview.positionMode}
+                        onValueChange={(v) => setOverview(p => ({ ...p, positionMode: v as "one_way" | "hedge" }))}
+                      >
+                        <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="one_way">One-Way</SelectItem>
+                          <SelectItem value="hedge">Hedge</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">Leverage</Label>
+                      <NumberField
+                        label=""
+                        suffix="%"
+                        min={1}
+                        max={100}
+                        step={1}
+                        value={overview.leveragePercentage}
+                        onChange={(v) => setOverview(p => ({ ...p, leveragePercentage: v }))}
+                        disabled={overview.useMaximalLeverage}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between rounded-md border border-border p-3 mt-3">
+                    <div className="space-y-0.5">
+                      <Label className="text-xs font-medium">Use Maximal Leverage</Label>
+                      <p className="text-[11px] text-muted-foreground">
+                        {"Size positions at the exchange's maximum leverage (overrides the leverage %)."}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={overview.useMaximalLeverage}
+                      onCheckedChange={(checked) => setOverview(p => ({ ...p, useMaximalLeverage: checked }))}
+                    />
                   </div>
 
                   <Separator className="my-4" />
