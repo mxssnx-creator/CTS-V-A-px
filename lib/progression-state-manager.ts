@@ -470,9 +470,15 @@ return {
    */
   static async completePrehistoricPhase(connectionId: string, symbolTotal?: number): Promise<void> {
     try {
-      const client = getRedisClient()
+      // Ensure Redis is initialised BEFORE using the client.
+      // getRedisClient() returns null on cold-boot; binding `client` first then
+      // calling initRedis() left the local null, causing every completion call
+      // to crash on `client.hset` with "Cannot read properties of null".
+      // Re-fetch after init so we always hold a live instance.
+      let client = getRedisClient()
       if (!client) {
         await initRedis()
+        client = getRedisClient()!
       }
       const key = `progression:${connectionId}`
 
