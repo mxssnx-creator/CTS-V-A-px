@@ -40,7 +40,7 @@
     },
     {
       "path": "/api/cron/generate-indications",
-      "schedule": "*/5 * * * *"
+      "schedule": "*/2 * * * *"
     }
   ],
   "headers": [
