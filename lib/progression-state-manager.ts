@@ -415,11 +415,14 @@ return {
    */
   static async incrementPrehistoricCycle(connectionId: string, symbol: string): Promise<void> {
     try {
-      const client = getRedisClient()
-      if (!client) {
+      if (!getRedisClient()) {
         await initRedis()
       }
-      const actualClient = getRedisClient()
+      const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not available for incrementPrehistoricCycle`)
+        return
+      }
       const key = `progression:${connectionId}`
 
       // PERFORMANCE: The previous implementation called `getProgressionState`
@@ -631,11 +634,14 @@ return {
    */
   static async resetProgressionState(connectionId: string): Promise<void> {
     try {
-      const client = getRedisClient()
-      if (!client) {
+      if (!getRedisClient()) {
         await initRedis()
       }
-      const actualClient = getRedisClient()
+      const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not available for resetProgressionState`)
+        return
+      }
       const key = `progression:${connectionId}`
       await client.del(key)
       console.log(`[v0] [Progression] State reset for ${connectionId}`)
@@ -660,11 +666,14 @@ return {
    */
   static async endProgression(connectionId: string, epoch = 0): Promise<void> {
     try {
-      const client = getRedisClient()
-      if (!client) {
+      if (!getRedisClient()) {
         await initRedis()
       }
-      const actualClient = getRedisClient()
+      const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not available for endProgression`)
+        return
+      }
       const key = `progression:${connectionId}`
       const now = Date.now()
 

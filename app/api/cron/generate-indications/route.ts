@@ -20,6 +20,7 @@
 import { NextResponse } from "next/server"
 import { isTruthyFlag, isConnectionInActivePanel } from "@/lib/connection-state-utils"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
+import { fetchTopSymbols } from "@/lib/top-symbols"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -32,22 +33,18 @@ const FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 const volatileSymbolCache = new Map<string, { symbol: string; ts: number }>()
 const CACHE_TTL = 60_000
 
+// CRITICAL: Never HTTP-self-fetch from a route handler — it deadlocks the dev server
+// and hangs on Vercel when the request context is unavailable. Call the shared lib fn
+// directly so resolution happens in-process with zero network overhead.
 async function getMostVolatileSymbol(exchange: string): Promise<string> {
   const cached = volatileSymbolCache.get(exchange)
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.symbol
 
   try {
-    const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || `http://localhost:${process.env.PORT || "3002"}`
-    const res = await fetch(
-      `${baseUrl}/api/exchange/${exchange}/top-symbols?t=${Date.now()}`,
-      { signal: AbortSignal.timeout(4000), cache: "no-store" }
-    )
-    if (res.ok) {
-      const data = await res.json()
-      if (data.symbol) {
-        volatileSymbolCache.set(exchange, { symbol: data.symbol, ts: Date.now() })
-        return data.symbol
-      }
+    const result = await fetchTopSymbols(exchange, 1, "volatility")
+    if (result?.symbol) {
+      volatileSymbolCache.set(exchange, { symbol: result.symbol, ts: Date.now() })
+      return result.symbol
     }
   } catch {
     // fall through to fallback
@@ -525,18 +522,17 @@ export async function GET() {
 
       let primarySymbol = symbolsRaw[0]
       if (!primarySymbol) {
-        try {
-          const marketDataKeys = await client.keys("market_data:*")
-          const flatSymbolKeys = (marketDataKeys || []).filter(
-            (k: string) => !k.includes(":1m") && !k.includes(":5m") && !k.includes(":15m")
-          )
-          if (flatSymbolKeys.length > 0) {
-            const symbolFromRedis = flatSymbolKeys[0].replace("market_data:", "")
-            if (symbolFromRedis && symbolFromRedis.length > 3) {
-              primarySymbol = symbolFromRedis
+        // Avoid O(N) client.keys scan — probe well-known symbols in-order via cheap HGET
+        // (each is one O(1) round-trip bounded by the number of candidates, not keyspace size).
+        for (const sym of ["BTCUSDT", "ETHUSDT", "SOLUSDT"]) {
+          try {
+            const close = await client.hget(`market_data:${sym}`, "close").catch(() => null)
+            if (close && parseFloat(close) > 0) {
+              primarySymbol = sym
+              break
             }
-          }
-        } catch {  }
+          } catch { /* keep probing */ }
+        }
       }
 
       if (!primarySymbol) {
@@ -624,26 +620,6 @@ export async function GET() {
         await client.set(`prehistoric:${conn}:firstpass:done`, "1").catch(() => {})
         await client.expire(`prehistoric:${conn}:done`, 86400 * 7).catch(() => {})
         await client.expire(`prehistoric:${conn}:firstpass:done`, 86400 * 7).catch(() => {})
-
-        // Keep a minimal live position so the Positions tile never shows 0 after cold start
-        const liveOpenKey = `live:positions:${conn}`
-        const liveOpenListKey = `live:positions:${conn}:open`
-        const now = Date.now()
-        const posId = `live:${conn}:cronlive:1`
-        const livePos: Record<string, string> = {
-          id: posId, connectionId: conn, symbol: "BTCUSDT", direction: "long", side: "long",
-          entryPrice: "65000", averageExecutionPrice: "65000", executedQuantity: "0.015",
-          remainingQuantity: "0.015", leverage: "10", marginType: "cross", status: "open",
-          statusReason: "prod_cron_realtime", unrealized_pnl: "87.5", unrealized_pnl_percent: "1.35",
-          markPrice: "65500", createdAt: String(now - 1000 * 60 * 45), updatedAt: String(now),
-          fills: JSON.stringify([{ price: 65000, quantity: 0.015, timestamp: now - 1000 * 60 * 45 }]),
-        }
-        await client.hset(`live:position:${conn}:${posId}`, livePos).catch(() => {})
-        await client.sadd(`live:positions:${conn}:open`, posId).catch(() => {})
-        await client.lpush(liveOpenKey, posId).catch(() => {})
-        await client.lpush(liveOpenListKey, posId).catch(() => {})
-        await client.hincrby(`progression:${conn}`, "live_positions_created_count", 1).catch(() => {})
-        await client.hincrby(`progression:${conn}`, "live_positions_cycle_count", 1).catch(() => {})
 
         // Logistics marker
         await client.hset("system:logistics", {

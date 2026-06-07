@@ -794,11 +794,18 @@ export async function GET(
       liveAggTotalVolumeUsd     += p.volumeUsd || 0
       if ((p.unrealizedPnl || 0) > 0) liveAggInProfit++
       else if ((p.unrealizedPnl || 0) < 0) liveAggInLoss++
+      // Both long (liq below mark → positive distance) and short (liq above mark
+      // → negative distance) are "near liquidation" when their absolute distance
+      // is ≤ 5%. The previous `<= 5` without Math.abs was correct for longs but
+      // silently missed short positions (where liquidationDistancePct is negative
+      // and would be < 5, so they WERE counted — but a short at -3% is 3% away,
+      // which IS within the 5% alert band; only shorts safely past -5% are fine).
+      // Use Math.abs to make the intent explicit and guard against sign drift.
       if (
         p.liquidationPrice > 0 &&
         p.markPrice > 0 &&
         p.liquidationDistancePct !== 0 &&
-        p.liquidationDistancePct <= 5
+        Math.abs(p.liquidationDistancePct) <= 5
       ) {
         liveAggNearLiquidation++
       }
