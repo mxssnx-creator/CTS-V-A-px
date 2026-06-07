@@ -4,6 +4,7 @@ import { updateConnection, initRedis, getConnection, getRedisClient, setSettings
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 import { getTradeEngine } from "@/lib/trade-engine"
+import { fetchTopSymbols } from "@/lib/top-symbols"
 
 export async function GET(
   request: NextRequest,
@@ -262,29 +263,25 @@ export async function PATCH(
           // Operator-curated list wins verbatim (still capped at count).
           resolved = manualList.slice(0, count)
         } else {
-          // Auto-resolve top-N by the chosen order from the public ticker API.
+          // Auto-resolve top-N by the chosen order. Call the shared resolver
+          // DIRECTLY (no HTTP self-fetch — that fails on loopback/origin inside
+          // a route handler, which is why the first cut resolved 0 symbols).
           const exchange = String((connection as Record<string, unknown>).exchange || "bingx").toLowerCase()
           const sort = order.startsWith("volatil") ? "volatility" : "volume"
-          const origin = new URL(request.url).origin
           try {
-            const ctrl = new AbortController()
-            const t = setTimeout(() => ctrl.abort(), 8000)
-            const topRes = await fetch(
-              `${origin}/api/exchange/${exchange}/top-symbols?limit=${count}&sort=${sort}&t=${Date.now()}`,
-              { signal: ctrl.signal, cache: "no-store" },
-            ).finally(() => clearTimeout(t))
-            if (topRes.ok) {
-              const topData = await topRes.json()
-              const list: string[] = Array.isArray(topData.symbolList)
-                ? topData.symbolList.filter((s: unknown): s is string => typeof s === "string" && s.length > 0)
-                : []
-              resolved = list.slice(0, count)
-            }
+            const { symbols: topSymbols } = await fetchTopSymbols(exchange, count, sort)
+            resolved = topSymbols
+              .map((s) => s.symbol)
+              .filter((s): s is string => typeof s === "string" && s.length > 0)
+              .slice(0, count)
           } catch (fetchErr) {
-            console.warn("[v0] [Settings] top-symbols auto-resolve failed:", fetchErr instanceof Error ? fetchErr.message : fetchErr)
+            console.warn(
+              "[v0] [Settings] top-symbols auto-resolve failed:",
+              fetchErr instanceof Error ? fetchErr.message : fetchErr,
+            )
           }
-          // If auto-resolve produced nothing (sandbox/outage), fall back to any
-          // manual list the operator had, so we never wipe the engine's symbols.
+          // If auto-resolve produced nothing, fall back to any manual list the
+          // operator had, so we never wipe the engine's symbols.
           if (resolved.length === 0 && manualList.length > 0) resolved = manualList.slice(0, count)
         }
 

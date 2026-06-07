@@ -3399,7 +3399,14 @@ export class TradeEngineManager {
         ])
 
         if (connState && typeof connState === "object") {
-          const connSymbols = (connState as any).symbols || (connState as any).active_symbols
+          let connSymbols = (connState as any).symbols || (connState as any).active_symbols
+          // The settings PATCH route and updateEngineState write this field as a
+          // JSON.stringify'd array (the emulator stores hash values as strings).
+          // Parse it so this primary branch isn't silently skipped — otherwise we
+          // fall through to the connection-object fallback for no reason.
+          if (typeof connSymbols === "string") {
+            try { connSymbols = JSON.parse(connSymbols) } catch { /* ignore */ }
+          }
           if (Array.isArray(connSymbols) && connSymbols.length > 0) return connSymbols
         }
 
