@@ -1275,8 +1275,21 @@ async function updateProtectionOrders(
         result.changed = true
       }
     } else if (
+      // Re-arm (place fresh / cancel-replace) the SL leg when a stop is
+      // desired AND there is no live protection at the right level. The
+      // liveness-verification block above has already cleared
+      // `stopLossOrderId` if the recorded order is gone from the venue, so
+      // by here `!pos.stopLossOrderId` reliably means "nothing armed".
+      // Placing also fires when the trigger price or the position quantity
+      // has drifted past tolerance (cancel-then-replace at the new level).
+      //
+      // NOTE: the previous one-liner folded the "order still alive on
+      // venue" check into the SAME `||` group as `!pos.stopLossOrderId`,
+      // which (because `||` binds tighter than `?:`) made the whole
+      // expression evaluate to `false` whenever NO order existed — so a
+      // position with no stop-loss order was never armed at all.
       desiredSl > 0 &&
-      (!pos.stopLossOrderId || (liveOrderIds && pos.stopLossOrderId && liveOrderIds.has(String(pos.stopLossOrderId))) ? false : (priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted))
+      (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted)
     ) {
       // Cancel-then-replace race: if a cancel fails we must NOT place
       // a new SL — the old one is still armed on the exchange, and
@@ -1331,8 +1344,12 @@ async function updateProtectionOrders(
         result.changed = true
       }
     } else if (
+      // Mirror of the SL leg: arm a take-profit when one is desired and
+      // nothing live covers it (or the level/qty drifted). Same precedence
+      // fix — the old `||`-grouped ternary collapsed to `false` when no TP
+      // order existed, leaving positions without a take-profit entirely.
       desiredTp > 0 &&
-      (!pos.takeProfitOrderId || (liveOrderIds && pos.takeProfitOrderId && liveOrderIds.has(String(pos.takeProfitOrderId))) ? false : (priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted))
+      (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted)
     ) {
       let oldGone = true
       if (pos.takeProfitOrderId) {
@@ -3437,8 +3454,10 @@ async function checkAndForceCloseOnSltpCross(
         : fillPrice * (1 - tpPct)
       : 0
 
+  // Nothing to evaluate if neither protection band is configured.
+  if (desiredSl <= 0 && desiredTp <= 0) return null
+
   let crossReason: "sl_hit" | "tp_hit" | null = null
-  if (!crossReason) return null
   if (pos.direction === "long") {
     if (desiredSl > 0 && markPrice <= desiredSl) crossReason = "sl_hit"
     else if (desiredTp > 0 && markPrice >= desiredTp) crossReason = "tp_hit"
@@ -3751,7 +3770,7 @@ export async function reconcileLivePositions(
       exchangeMap.set(`${sym}|${direction}`, ep)
     }
 
-    // ── Once-per-tick venue open-orders snapshot ───────────────────────
+    // ── Once-per-tick venue open-orders snapshot ────���──────────────────
     // Used by `updateProtectionOrders` to detect silently-gone SL/TP
     // (filled, externally cancelled, expired, sweep). One `getOpenOrders`
     // call amortized across every position in the reconcile sweep, vs.
@@ -4787,7 +4806,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           continue // closeLivePosition persisted terminal state — skip per-position setex
         }
 
-        // ── Delayed-fill SL/TP arming ────��────────────────────���───────
+        // ── Delayed-fill SL/TP arming ────���────────────────────���───────
         // If the entry order was still pending when `executeLivePosition`
         // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
         // and the position ended up `placed` with no protection orders.
