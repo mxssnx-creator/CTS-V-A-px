@@ -135,6 +135,7 @@ export async function GET(
       axisWindowsHashRaw,
       ordersBySymbolRaw,
       hedgePosAccHashRaw,
+      strategyDetailBaseHashRaw,
       strategyDetailMainHashRaw,
       strategyDetailRealHashRaw,
     ] = await Promise.all([
@@ -160,6 +161,11 @@ export async function GET(
       // in the Real stage tuner loop. Fields: `{parentSetKey}:{long|short|sets_long|sets_short|ts}`
       // Consumed to surface long/short hedge breakdown per base Set in strategyDetail.real.
       client.hgetall(`hedge_pos_acc:${connectionId}`).catch(() => null),
+      // Per-symbol strategy detail for the Base stage (performance tier source).
+      // Previously this hash was never fetched — buildSpecPerformance for "base"
+      // was incorrectly reading from the Main hash, causing the dashboard's Base
+      // performance tile to display Main-stage data instead of Base-stage data.
+      client.hgetall(`strategy_detail:${connectionId}:base`).catch(() => null),
       // Per-symbol strategy detail for the Main stage (performance tier source).
       // Fields: `s:{symbol}:{created|entries|running|progressing|passed|evaluated|
       //   apf|addt|apps|aper|ts}` — one bundle per symbol × cycle.
@@ -174,6 +180,7 @@ export async function GET(
     const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
     const ordersBySymbolHash: Record<string, string> = ordersBySymbolRaw || {}
     const hedgePosAccHash: Record<string, string> = (hedgePosAccHashRaw as Record<string, string>) || {}
+    const strategyDetailBaseHash: Record<string, string> = (strategyDetailBaseHashRaw as Record<string, string>) || {}
     const strategyDetailMainHash: Record<string, string> = (strategyDetailMainHashRaw as Record<string, string>) || {}
     const strategyDetailRealHash: Record<string, string> = (strategyDetailRealHashRaw as Record<string, string>) || {}
 
@@ -1053,7 +1060,7 @@ export async function GET(
     //
     // We surface these alongside the stage-level detail so the dashboard can
     // show "Avg PF / Avg DDT per variant" over the lifetime of the run.
-    // ── PAUSE VARIANT ────────────────────────────────────────────────
+    // ���─ PAUSE VARIANT ────────────────────────────────────────────────
     // The Real stage and StrategyCoordinator both write a 5th variant
     // bucket — `pause` — for entries placed under the global pause-axis
     // ratio config. The previous `variantKeys` list dropped this row so
@@ -1424,6 +1431,29 @@ export async function GET(
       )
     }
 
+    // ── SINGLE closed-archive fetch shared by stratDetail.live and
+    //    closedPositionsForHistory (below) ────────────────────────────────
+    // Previously the archive was fetched TWICE:
+    //   1. lrange(0, 199) for stratDetail.live PF/hold/ROI numbers.
+    //   2. lrange(0, 499) for closedPositionsForHistory rows + perf tiers.
+    // Both fetches scanned the SAME key and parsed the SAME JSON.
+    // Now we do one 0–499 lrange here (outer scope), share the parsed
+    // array across both consumers, and slice as needed. This removes one
+    // full round-trip + 200–500 GET fan-outs from every /stats call.
+    const sharedClosedParsed: Array<Record<string, any>> = []
+    try {
+      const closedIds = ((await client
+        .lrange(`live:positions:${connectionId}:closed`, 0, 499)
+        .catch(() => [])) || []) as string[]
+      const rawList = await Promise.all(
+        closedIds.map((id) => client.get(`live:position:${id}`).catch(() => null)),
+      )
+      for (const raw of rawList) {
+        if (!raw) continue
+        try { sharedClosedParsed.push(JSON.parse(raw as string)) } catch { /* skip malformed */ }
+      }
+    } catch { /* archive empty */ }
+
     // ── LIVE STAGE DETAIL (4th tier — mirrors Real but from real exchange) ───
     // Sourced entirely from local Redis — the progression hash (counters) and
     // the closed-position archive written by the live-stage pipeline. No
@@ -1436,53 +1466,30 @@ export async function GET(
       const liveWins      = n(progHash.live_wins_count)
       const liveVolumeUsd = n(progHash.live_volume_usd_total)
 
-      // Sample the closed archive (already bounded to the 5000 most recent
-      // ids by live-stage) to derive PF, hold time, realised PnL, etc.
+      // Derive stratDetail.live metrics from the shared parsed array
+      // (first 200 entries mirror the old lrange(0, 199) behaviour).
       let sumPnl = 0
       let sumGrossProfit = 0
       let sumGrossLoss = 0
       let sumHoldMs = 0
       let sumRoi = 0
       let countSampled = 0
-
-      try {
-        const closedIds = ((await client
-          .lrange(`live:positions:${connectionId}:closed`, 0, 199)
-          .catch(() => [])) || []) as string[]
-
-        // Fan-out the per-id GETs in parallel. Previously this was a
-        // sequential N round-trip loop on the /stats hot path — at 200
-        // ids that's 200 sequential awaits, which dominated /stats
-        // latency once the closed archive filled up. Parallel GET is
-        // safe: each id is independent, and the reads are followed by
-        // pure-CPU JSON parsing.
-        const rawList = await Promise.all(
-          closedIds.map((id) =>
-            client.get(`live:position:${id}`).catch(() => null),
-          ),
-        )
-        for (const raw of rawList) {
-          if (!raw) continue
-          try {
-            const pos = JSON.parse(raw as string)
-            const pnl = Number(pos.realizedPnL) || 0
-            sumPnl += pnl
-            if (pnl > 0) sumGrossProfit += pnl
-            if (pnl < 0) sumGrossLoss += Math.abs(pnl)
-
-            const created = Number(pos.createdAt) || 0
-            const closedAt = Number(pos.closedAt) || Number(pos.updatedAt) || 0
-            if (created > 0 && closedAt > created) sumHoldMs += closedAt - created
-
-            const qty  = Number(pos.executedQuantity || pos.quantity) || 0
-            const avgP = Number(pos.averageExecutionPrice || pos.entryPrice) || 0
-            const notional = qty * avgP
-            if (notional > 0) sumRoi += pnl / notional
-
-            countSampled++
-          } catch { /* skip malformed */ }
-        }
-      } catch { /* archive empty */ }
+      for (const pos of sharedClosedParsed.slice(0, 200)) {
+        try {
+          const pnl = Number(pos.realizedPnL) || 0
+          sumPnl += pnl
+          if (pnl > 0) sumGrossProfit += pnl
+          if (pnl < 0) sumGrossLoss += Math.abs(pnl)
+          const created  = Number(pos.createdAt) || 0
+          const closedAt = Number(pos.closedAt) || Number(pos.updatedAt) || 0
+          if (created > 0 && closedAt > created) sumHoldMs += closedAt - created
+          const qty  = Number(pos.executedQuantity || pos.quantity) || 0
+          const avgP = Number(pos.averageExecutionPrice || pos.entryPrice) || 0
+          const notional = qty * avgP
+          if (notional > 0) sumRoi += pnl / notional
+          countSampled++
+        } catch { /* skip malformed */ }
+      }
 
       const avgHoldMin  = countSampled > 0 ? (sumHoldMs / countSampled) / 60_000 : 0
       const avgPnl      = countSampled > 0 ? sumPnl / countSampled : 0
@@ -1581,8 +1588,12 @@ export async function GET(
         detail: detail.slice(0, 200), // cap at 200 rows for response size
       }
     }
-    const baseSpecPerf  = buildSpecPerformance(strategyDetailMainHash, "base")
-    const mainSpecPerf  = buildSpecPerformance(strategyDetailRealHash, "main")
+    // Each stage reads from its OWN strategy_detail hash — previously
+    // base used the Main hash and main used the Real hash, so the
+    // dashboard's Base performance tile showed Main-stage data and
+    // Main showed Real-stage data. Now every stage reads the correct source.
+    const baseSpecPerf  = buildSpecPerformance(strategyDetailBaseHash, "base")
+    const mainSpecPerf  = buildSpecPerformance(strategyDetailMainHash, "main")
     const realSpecPerf  = buildSpecPerformance(strategyDetailRealHash, "real")
 
     // ── LIVE CLOSED POSITION AGGREGATES (drive tradeHistory + perfTiers live) ──
@@ -1615,18 +1626,12 @@ export async function GET(
     }> = []
 
     try {
-      const closedIds = ((await client
-        .lrange(`live:positions:${connectionId}:closed`, 0, 499)
-        .catch(() => [])) || []) as string[]
-
-      const rawList = await Promise.all(
-        closedIds.map((id) => client.get(`live:position:${id}`).catch(() => null)),
-      )
-      const closedParsed: Array<Record<string, any>> = []
-      for (const raw of rawList) {
-        if (!raw) continue
-        try { closedParsed.push(JSON.parse(raw as string)) } catch { /* skip malformed */ }
-      }
+      // Reuse the closed-archive array already fetched and parsed above.
+      // The old code fetched lrange(0,499) here independently — that was
+      // a duplicate of the lrange(0,199) done for stratDetail.live, doubling
+      // the number of GET calls on this hot path. `sharedClosedParsed`
+      // already holds all 500 entries (fetched once above).
+      const closedParsed = sharedClosedParsed
       liveClosedCount = closedParsed.length
       liveClosedCountForPf = closedParsed.length
       const closedEval = evaluateClosedBatch(closedParsed)
@@ -1636,7 +1641,7 @@ export async function GET(
       liveClosedSumHoldMs      = closedEval.sumHoldMs
       liveClosedRoeAcc         = closedEval.sumRoe
       liveClosedHoldMinutes    = closedEval.sumHoldMs / 60_000
-      liveClosedWins           = closedParsed.filter((p) => (Number(p.realizedPnL ?? 0) || 0) > 0).length
+      liveClosedWins           = closedParsed.filter((p: Record<string, any>) => (Number(p.realizedPnL ?? 0) || 0) > 0).length
 
       // Build per-position history rows (cap at 500 for response payload)
       for (const pos of closedParsed) {
@@ -2286,9 +2291,14 @@ export async function GET(
       //     `live.positions[].mirroredSets` array carries those
       //     equivalent Sets so the UI can render "N Sets → 1 Order".
       openPositions: (() => {
-        const pseudoOpen = Math.max(0, n(progHash.pseudo_positions_created_count))
-        const mainOpen = Math.max(0, n(progHash.main_positions_created_count))
-        const realOpen = Math.max(0, n(progHash.real_positions_created_count))
+        // IMPORTANT: use the scan-derived outer variables (from the actual
+        // smembers/lrange scans above), NOT progHash counters. The progHash
+        // fields `pseudo_positions_created_count` and `real_positions_created_count`
+        // are NOT written anywhere in the canonical schema — they always resolve
+        // to 0, which caused openPositions.pseudo.open and openPositions.real.open
+        // to always show 0 even when there were genuine open positions.
+        // `pseudoOpen` and `realOpen` already hold the correct scan-derived counts.
+        const mainOpen = 0  // Main has no independent open-position store (uses pseudo ledger)
         const liveOpen = Math.max(
           0,
           n(progHash.live_positions_created_count) -

@@ -492,14 +492,25 @@ export async function getStrategyTracking(
   // base = 100% entry point; main = Main output / Main input (Base→Main
   // survival); real = Real output / Real input (Main→Real survival).
   // Each clamped to [0,100].
-  const mainOutput    = Number(prog.strategies_main_total || "0")
+  const baseOutput    = Number(prog.strategies_base_total    || "0")
+  const mainOutput    = Number(prog.strategies_main_total    || "0")
   const mainInput     = Number(prog.strategies_main_evaluated || "0")
-  const realOutput    = Number(prog.strategies_real_total || "0")
+  const realOutput    = Number(prog.strategies_real_total    || "0")
   const realInput     = Number(prog.strategies_real_evaluated || "0")
   const pct = (num: number, den: number): number =>
     den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
+  // Base is the pipeline entry point — it has no upstream filter so its
+  // eval% is always 100 as long as the engine has produced any base sets.
+  // The previous condition `mainInput > 0 || mainOutput > 0` correctly
+  // returned 0 before any Main sets existed, but that made Base show 0%
+  // on a fresh run even when base sets were already being processed.
+  // Using `strategies_base_total` (the Base output counter) as the guard
+  // makes Base show 100% as soon as the first base set is produced —
+  // which is the semantically correct behaviour (Base always passes 100%
+  // of its own sets, by definition). Falls back to the Main guard so
+  // old connections without a `strategies_base_total` counter still work.
   const stageEvalPercent = {
-    base: mainInput > 0 || mainOutput > 0 ? 100 : 0,
+    base: baseOutput > 0 || mainInput > 0 || mainOutput > 0 ? 100 : 0,
     main: pct(mainOutput, mainInput),
     real: pct(realOutput, realInput),
   }
