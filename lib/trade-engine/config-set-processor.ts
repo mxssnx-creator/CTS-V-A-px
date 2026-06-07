@@ -237,19 +237,38 @@ export class ConfigSetProcessor {
         if (candles.length === 0) {
           console.log(`[v0] [ConfigSetProcessor] ⚠ no candles for ${symbol} — skipping`)
           symbolsWithoutData++
-          // CRITICAL ("0/N stuck" fix): a symbol with no prehistoric candles
-          // must STILL count toward the processed total, otherwise
-          // `symbols_processed` can never reach `symbols_total` and the
-          // dashboard sticks at "X/N" forever. Add it to the canonical SET
-          // (single atomic source of truth) and mirror the distinct count
-          // into the hash. SADD is idempotent so a replay can't double-count.
+          // CRITICAL ("0/N stuck" + stalled progress-bar fix): a symbol with
+          // no prehistoric candles must STILL count toward the processed
+          // total, otherwise `symbols_processed` can never reach
+          // `symbols_total` (dashboard sticks at "X/N") AND the percent bar
+          // — computed from the local `symbolsProcessed` below — can never
+          // reach 95%. Increment the local counter, add to the canonical SET
+          // (single atomic source of truth), and mirror BOTH the distinct
+          // count and the legacy `prehistoric_symbols_processed_count` field.
+          // SADD is idempotent so a replay can't double-count.
+          symbolsProcessed++
           try {
             await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
             await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
+            await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
             const distinctSkipProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
             await client.hset(`prehistoric:${this.connectionId}`, {
               symbols_processed: String(distinctSkipProcessed),
             })
+            // Advance the dashboard percent bar even for data-less symbols,
+            // using the SAME `engine_progression` schema the main path writes.
+            const totalSyms = Math.max(1, symbols.length)
+            const skipPct = Math.min(95, 15 + Math.round((symbolsProcessed / totalSyms) * 80))
+            void setSettings(`engine_progression:${this.connectionId}`, {
+              phase: "prehistoric_data",
+              progress: skipPct,
+              detail: `Prehistoric calc filling sets — ${symbolsProcessed}/${totalSyms} symbols processed (no data: ${symbol})`,
+              sub_current: symbolsProcessed,
+              sub_total: totalSyms,
+              sub_item: symbol,
+              connection_id: this.connectionId,
+              updated_at: new Date().toISOString(),
+            }).catch(() => { /* non-critical */ })
           } catch { /* non-critical */ }
           await logProgressionEvent(this.connectionId, "config_set_symbol_skipped", "warning", `No prehistoric candles for ${symbol}`, {
             symbol,

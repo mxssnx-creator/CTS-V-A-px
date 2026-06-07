@@ -317,8 +317,37 @@ export async function getStrategyTracking(
     const h = !Number.isFinite(n) || n <= 0 ? fallbackHours : Math.max(1, Math.min(72, n))
     return h * 60
   }
-  const mainDdtCeilingMin = ddtHoursToMin((appSettings as any).maxDrawdownTimeMainHours, 4)
-  const realDdtCeilingMin = ddtHoursToMin((appSettings as any).maxDrawdownTimeRealHours, 4)
+  // Per-connection overlay: the engine gate now resolves DDT as
+  // connection hash → global app setting → default, so the display must do
+  // the same to stay identical to what's enforced.
+  const resolveDdtMin = (key: string, fallbackHours: number): number => {
+    const raw =
+      (settings as Record<string, string>)[key] ??
+      (appSettings as Record<string, unknown>)[key]
+    return ddtHoursToMin(raw, fallbackHours)
+  }
+  const mainDdtCeilingMin = resolveDdtMin("maxDrawdownTimeMainHours", 4)
+  const realDdtCeilingMin = resolveDdtMin("maxDrawdownTimeRealHours", 4)
+
+  // Canonical per-stage min Profit-Factor thresholds — read from the SAME
+  // source + key names + defaults the engine gate uses in
+  // `strategy-coordinator.loadAppPFThresholds` (`mainProfitFactor` /
+  // `realProfitFactor`, connection hash overlaid on global app settings,
+  // clamp [0,5], defaults main 1.0 / real 1.0). The old display read
+  // `settings.minProfitFactorMain` / `minProfitFactorReal` (defaults
+  // 1.2 / 1.4) which are NEVER written anywhere — so the dashboard PF
+  // ceiling permanently diverged from the gate the engine enforced.
+  const resolvePF = (key: string, fallback: number): number => {
+    // connection hash wins, else global app setting, else default.
+    const raw =
+      (settings as Record<string, string>)[key] ??
+      (appSettings as Record<string, unknown>)[key]
+    const n = Number(raw)
+    if (!Number.isFinite(n) || n < 0) return fallback
+    return Math.max(0, Math.min(5, n))
+  }
+  const mainPFThreshold = resolvePF("mainProfitFactor", 1.0)
+  const realPFThreshold = resolvePF("realProfitFactor", 1.0)
 
   // Variant breakdowns
   const mainVariants = await readVariantBreakdown(client, connectionId, "main")
@@ -405,7 +434,7 @@ export async function getStrategyTracking(
       setsProgressing: Number(main.sets_progressing || main.created_sets || "0"),
       avgProfitFactor: Number(main.avg_profit_factor || "0"),
       avgDrawdownTime: Number(main.avg_drawdown_time || "0"),
-      minProfitFactor: Number(settings.minProfitFactorMain || "1.2"),
+      minProfitFactor: mainPFThreshold,
       maxDrawdownTime: mainDdtCeilingMin,
       variants: mainVariants,
     },
@@ -419,7 +448,7 @@ export async function getStrategyTracking(
       avgProfitFactor: Number(real.avg_profit_factor || "0"),
       avgDrawdownTime: Number(real.avg_drawdown_time || "0"),
       avgPosPerSet: Number(real.avg_pos_per_set || "0"),
-      minProfitFactor: Number(settings.minProfitFactorReal || "1.4"),
+      minProfitFactor: realPFThreshold,
       maxDrawdownTime: realDdtCeilingMin,
       axisAccumulation,
       variantsAccumulated: realVariants,
