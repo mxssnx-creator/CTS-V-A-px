@@ -1257,7 +1257,7 @@ const migrations: Migration[] = [
       // getAllConnections() calls initRedis() internally. Since we are already
       // INSIDE initRedis() running migrations, that creates a circular wait that
       // deadlocks the entire server (event loop blocked, all routes timeout).
-      // Use client.keys() directly — exactly as migrations 020-024 do.
+      // Use client.keys() directly ��� exactly as migrations 020-024 do.
       const idSet025 = new Set<string>()
       try {
         const connKeys025 = (await client.keys("connection:*")) || []
@@ -1379,6 +1379,104 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "24")
+    },
+  },
+  {
+    name: "026-per-connection-pf-ddt-leverage-defaults",
+    version: 26,
+    up: async (client: any) => {
+      await client.set("_schema_version", "26")
+
+      // ── Backfill per-connection PF/DDT/stage-min-pos/leverage defaults ───────
+      //
+      // The strategy coordinator reads per-connection overrides from
+      // `connection_settings:{id}` (written by the settings PATCH route).
+      // On a cold boot / fresh install these hashes don't exist yet, so the
+      // coordinator falls back to global app_settings → built-in defaults.
+      // This migration seeds the canonical defaults into every connection's
+      // hash so:
+      //   1. The coordinator's resolution chain (connection > global > default)
+      //      finds the values on first load without waiting for the operator
+      //      to visit Settings → Strategy and save.
+      //   2. The Settings PATCH route's idempotent "set-if-absent" logic
+      //      (which never clobbers operator-tuned values) is satisfied.
+      //
+      // Defaults per spec:
+      //   baseProfitFactor=0.9   — admission floor for Base stage
+      //   main/real/liveProfitFactor=1.0
+      //   maxDrawdownTimeMainHours=4  maxDrawdownTimeRealHours=4  maxDrawdownTimeLiveHours=4
+      //   stageMinPosCountBase=1  stageMinPosCountMain=1  stageMinPosCountReal=1
+      //   leveragePercentage=100  useMaximalLeverage=false
+      //
+      // IDEMPOTENT: hgetall + set-only-if-absent so re-running on a DB with
+      // operator-tuned values never overwrites the operator's choices.
+      //
+      // DEADLOCK-SAFE: uses raw client.keys() — never calls getAllConnections()
+      // (which calls initRedis() internally and would deadlock since we are
+      // already inside initRedis() running migrations).
+
+      const idSet026 = new Set<string>()
+      try {
+        const connKeys026 = (await client.keys("connection:*")) || []
+        for (const k of connKeys026) {
+          if (typeof k !== "string") continue
+          if (k.startsWith("connection_settings:")) continue
+          const id = k.slice("connection:".length)
+          if (id) idSet026.add(id)
+        }
+      } catch { /* keys() unavailable */ }
+      for (const setName026 of ["connections", "connections:main:enabled"]) {
+        try {
+          const ids = (await client.smembers(setName026)) || []
+          for (const id of ids) if (typeof id === "string" && id) idSet026.add(id)
+        } catch { /* missing set */ }
+      }
+
+      const DEFAULTS_026: Record<string, string> = {
+        baseProfitFactor:             "0.9",
+        mainProfitFactor:             "1.0",
+        realProfitFactor:             "1.0",
+        liveProfitFactor:             "1.0",
+        maxDrawdownTimeMainHours:     "4",
+        maxDrawdownTimeRealHours:     "4",
+        maxDrawdownTimeLiveHours:     "4",
+        stageMinPosCountBase:         "1",
+        stageMinPosCountMain:         "1",
+        stageMinPosCountReal:         "1",
+        leveragePercentage:           "100",
+        useMaximalLeverage:           "false",
+      }
+
+      let seeded = 0
+      for (const connId026 of idSet026) {
+        const key = `connection_settings:${connId026}`
+        // Read existing hash — emulator has no hsetnx so we simulate
+        // it with hgetall + conditional hset.
+        const existing = (await client.hgetall(key).catch(() => null)) as
+          | Record<string, string>
+          | null
+        const have = existing || {}
+
+        const toWrite: Record<string, string> = {}
+        for (const [field, val] of Object.entries(DEFAULTS_026)) {
+          // Only set when the field is absent or blank — never overwrite
+          // operator-tuned values.
+          if (have[field] === undefined || have[field] === null || have[field] === "") {
+            toWrite[field] = val
+          }
+        }
+        if (Object.keys(toWrite).length > 0) {
+          await client.hset(key, toWrite)
+          seeded += Object.keys(toWrite).length
+        }
+      }
+
+      console.log(
+        `[v0] Migration 026: seeded per-connection PF/DDT/leverage defaults for ${idSet026.size} connections (${seeded} fields written)`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "25")
     },
   },
 ]

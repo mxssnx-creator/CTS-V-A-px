@@ -1007,10 +1007,15 @@ export async function GET(
                           : 0
         // Prefer cross-symbol activeStratEvaluated (from strategies_active hash
         // `:evaluated` suffix fields) so the denominator matches stratCounts[type]
-        // scope. Fall back to the last-symbol-wins standalone key only when the
-        // active hash hasn't been written yet (cold start / old engine version).
+        // scope. Do NOT fall back to the standalone `strategies:{id}:{type}:evaluated`
+        // key: that key is a lifetime cumulative `incrby` counter (grows across every
+        // cron cycle × symbol) while `stratCounts[type]` is the current-cycle live
+        // snapshot — comparing them triggers false-positive STATS-VALIDATION warnings
+        // (e.g. baseEvaluated 1577 > base 4) and floods the error log. When the
+        // active hash hasn't been written yet (cold start / old engine) return 0 so
+        // the dashboard shows "no data yet" rather than an inflated lifetime number.
         const fromActiveEval = activeStratEvaluated[type] ?? 0
-        stratEvaluated[type] = fromActiveEval > 0 ? fromActiveEval : n(evalFromKeyRaw)
+        stratEvaluated[type] = fromActiveEval > 0 ? fromActiveEval : 0
       })
     )
     // ── Pipeline-aware "total strategies" ────────────────────────────────

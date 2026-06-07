@@ -328,9 +328,13 @@ async function generateIndicationsForConnection(
       await client.hincrby(progKey, "indication_live_cycle_count", 1)
     }
     await client.hincrby(progKey, "indication_cycle_count", 1)
-    // Mirror the indication cycle as the realtime-progression cycle so the
-    // dashboard's realtime tiles reflect the live cadence of this driver.
-    await client.hincrby(progKey, "realtime_cycle_count", 1)
+    // NOTE: Do NOT write realtime_cycle_count here.
+    // The engine's startIndicationProcessor tick (engine-manager.ts) already writes
+    // `hincrby realtime_cycle_count 1` on every cycle. Writing it here too causes
+    // double-counting when both the engine AND the cron are running concurrently
+    // (the normal dev/production state), making the counter appear to advance at
+    // 2× the real cadence. The cron's indication_cycle_count alone is sufficient
+    // to show the cron's liveness on the dashboard.
 
     // ── Strategy generation (proportional to indications that fired) ──────────
     // Base: 1 set per indication type that fired this cycle (varies 1-5 based on market)
@@ -563,8 +567,20 @@ export async function GET() {
         //   - All stage writes + hincrby counters happen through the canonical paths (no more synthetic counts)
         //   - Eliminates holes and missing processings even when no browser tab keeps the engine loops alive
         // The cron now provides continuous real processing for Prod (Vercel serverless).
-        const conn = "bingx-x01"
-        const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        // Use the first active connection (resolved earlier) — do NOT hard-code "bingx-x01" since
+        // the operator's connection may have a different ID or the base connection may change.
+        const conn = activeConnections[0]?.id || "bingx-x01"
+        // Use the first active connection's own symbols if available, else PROD_SYMBOLS fallback.
+        let prodConnSymbols: string[] = []
+        try {
+          const storedSym = activeConnections[0]?.active_symbols
+          prodConnSymbols = Array.isArray(storedSym)
+            ? storedSym
+            : typeof storedSym === "string" && storedSym.startsWith("[")
+              ? JSON.parse(storedSym)
+              : storedSym ? [storedSym] : []
+        } catch { prodConnSymbols = [] }
+        const symbols = prodConnSymbols.length > 0 ? prodConnSymbols : ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
         // Minimal but realistic indications (enough for Base sets across types/directions)
         // These exercise the full real logic in createBaseSets / createMainSets / evaluateRealSets / createLiveSets
