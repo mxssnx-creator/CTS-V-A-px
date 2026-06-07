@@ -686,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default — operator-tunable
+      minProfitFactor: 1.0,   // spec default ��� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -2199,10 +2199,17 @@ export class StrategyCoordinator {
     let netCancelled = 0
     for (const s of passthrough) {
       const aw = s.axisWindows
-      if (!aw) { netted.push(s); continue }
-      const outcome = aw.outcome ?? "pos"
+      // ── CRITICAL FIX: Profile-variant Sets always go to hedging ──
+      // Sets in `passthrough` are profile-variant (default/trailing/block/DCA)
+      // and MUST participate in hedge netting. Previously, sets without
+      // axisWindows were auto-added to netted, bypassing the netting logic.
+      // This caused Real stage to include more sets than should qualify.
+      // Now: ALL profile-variant sets go through the bucketing/netting phase,
+      // regardless of whether they have axisWindows. Only Axis Sets bypass
+      // netting (handled separately via axisPassthrough).
+      const outcome = aw?.outcome ?? "pos"
       const parentKey = s.parentSetKey ?? s.setKey.split("#")[0]
-      const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|p${aw.prev}|l${aw.last}|c${aw.cont}|o${outcome}`
+      const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|p${aw?.prev ?? 0}|l${aw?.last ?? 0}|c${aw?.cont ?? 0}|o${outcome}`
       let b = hedgeBuckets.get(bucketKey)
       if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
       const dir = s.direction ?? "long"
@@ -2236,12 +2243,10 @@ export class StrategyCoordinator {
       netTargetWrites[bucketKey] = `${winnerDir}:${remainder}`
     }
 
-    // `netted` already contains BOTH:
-    //   (1) profile-variant Sets without axisWindows (direct pass-through at line 2160)
-    //   (2) hedge-bucket survivors (winnerPool.slice(0, remainder) at line 2183)
-    // Using `[...passthrough, ...netted, ...]` would double-count every Set that
-    // entered a hedge bucket AND survived — it appears in passthrough (input to
-    // bucketing) and again in netted (winning output). Correct form uses netted only.
+    // `netted` contains hedge-bucket survivors (winnerPool.slice(0, remainder))
+    // All profile-variant sets participate in hedging — none bypass via pass-through.
+    // `axisPassthrough` contains axis Sets that skip hedging entirely.
+    // Together they form realPostHedge: (netted hedge survivors) + (axis pass-through)
     const realPostHedge = [...netted, ...axisPassthrough].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
@@ -2844,7 +2849,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��─────����──────────────────────���────────
+  // ─── STAGE 4: LIVE ─────────����──────────��─────����──────────────────────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
