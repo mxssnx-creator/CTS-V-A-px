@@ -2348,7 +2348,7 @@ export class StrategyCoordinator {
     // Use Math.min to hard-enforce the ceiling even when the operator has set
     // maxRealSets explicitly — Infinity default no longer bypasses this guard.
     const realSetsCap = Math.min(
-      Number.isFinite(this.config.maxRealSets) ? this.config.maxRealSets : REAL_SETS_SAFETY_CEILING,
+      Number.isFinite(this.config.maxRealSets ?? NaN) ? (this.config.maxRealSets as number) : REAL_SETS_SAFETY_CEILING,
       REAL_SETS_SAFETY_CEILING
     )
     const realSets = realPostHedge.slice(0, realSetsCap)
