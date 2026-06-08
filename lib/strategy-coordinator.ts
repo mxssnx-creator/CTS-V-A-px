@@ -686,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ����������� operator-tunable
+      minProfitFactor: 1.0,   // spec default ������������� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -2724,9 +2724,9 @@ export class StrategyCoordinator {
         const sampleKey = `real_samples:${this.connectionId}`
         const sample = JSON.stringify({
           t: Date.now(),
-          sets: realRunningNow,
+          sets: realSets.length,          // all Real Sets passing gates this cycle
           pps: Number(realPosPerRunningSet.toFixed(3)),
-          open: realOpenPositions,
+          open: realOpenPositions,        // running (pseudo-open) positions
         })
         writes.push(
           client.lpush(sampleKey, sample),
