@@ -54,13 +54,15 @@ function generateMockIndications(connectionId: string): Indication[] {
 /**
  * Read real indications from the canonical engine keyspace.
  *
- * The engine stores indications as JSON arrays in:
- *   indication_set:{connId}:{symbol}:{type}:{...config}
+ * The engine stores indications via IndicationConfigManager:
+ *   Config key:   indication:{connId}:config:{configId}       — JSON: { id, type, enabled, ... }
+ *   Results key:  indication:{connId}:config:{configId}:results — list of pipe-delimited strings:
+ *                 "timestamp|symbol|value|signal" (signal = buy|sell|neutral)
  *
- * Each entry has: { id, timestamp, type, direction, profitFactor, confidence, config, metadata }
- *
- * We scan up to 500 keys (bounded), read each array, and surface the most
- * recent entry per key as a displayable Indication record.
+ * We read all config keys (bounded to 500), fetch the most-recent result per
+ * config, and surface each as a displayable Indication record.  We use
+ * client.keys() here because this is an internal-only route and the key count
+ * is bounded by the number of indication configs (~50–200 per connection).
  */
 async function getRealIndications(connectionId: string): Promise<Indication[]> {
   try {
@@ -68,57 +70,82 @@ async function getRealIndications(connectionId: string): Promise<Indication[]> {
     const client = getRedisClient()
     if (!client) return []
 
-    // Bounded scan of indication_set keys for this connection
-    const prefix = `indication_set:${connectionId}:`
-    const allKeys: string[] = await client.keys(`${prefix}*`).catch(() => [] as string[])
-    if (!allKeys || allKeys.length === 0) return []
+    // Fetch all config keys for this connection (excludes :results suffix)
+    const configPattern = `indication:${connectionId}:config:*`
+    const allKeys: string[] = await (client.keys(configPattern) as Promise<string[]>).catch(() => [] as string[])
 
-    // Limit to 500 keys to keep reads bounded
-    const keys = allKeys.slice(0, 500)
+    // Filter to only bare config keys (not the :results sub-keys)
+    const configKeys = allKeys
+      .filter((k) => !k.endsWith(":results"))
+      .slice(0, 500)
+
+    if (configKeys.length === 0) return []
+
+    // Fetch config JSON and most-recent result entry in parallel
+    const [configs, latestResults] = await Promise.all([
+      Promise.all(configKeys.map((k) => client.get(k).catch(() => null))),
+      Promise.all(
+        configKeys.map((k) =>
+          client.lindex(`${k}:results`, 0).catch(() => null)
+        )
+      ),
+    ])
 
     const indications: Indication[] = []
 
-    // Read each key's JSON array and extract the most recent (last) entry
-    const values = await Promise.all(keys.map((k) => client.get(k).catch(() => null)))
-
-    for (let i = 0; i < keys.length; i++) {
-      const raw = values[i]
-      if (!raw) continue
-      let entries: any[]
+    for (let i = 0; i < configKeys.length; i++) {
+      // Parse config
+      let config: any = null
       try {
-        entries = JSON.parse(raw as string)
+        const raw = configs[i]
+        config = raw ? JSON.parse(typeof raw === "string" ? raw : JSON.stringify(raw)) : null
       } catch {
         continue
       }
-      if (!Array.isArray(entries) || entries.length === 0) continue
+      if (!config) continue
 
-      // Parse key to extract symbol and type
-      // Key format: indication_set:{connId}:{symbol}:{type}:{...rest}
-      const keyWithoutPrefix = keys[i].slice(prefix.length) // e.g. "BTCUSDT:direction:r10:..."
-      const parts = keyWithoutPrefix.split(":")
-      const symbol = parts[0] ?? "UNKNOWN"
-      const indType = parts[1] ?? "unknown"
+      const configId = config.id || configKeys[i].split(":").pop() || `config-${i}`
+      const indType: string = config.type || "Unknown"
+      const enabled: boolean = config.enabled !== false
 
-      // Most recent entry is last (entries are push()'d newest-at-last)
-      const entry = entries[entries.length - 1]
+      // Parse most-recent result (pipe-delimited: timestamp|symbol|value|signal)
+      const resultRaw = latestResults[i]
+      let symbol = "UNKNOWN"
+      let signal: string = "neutral"
+      let timestamp = new Date().toISOString()
 
-      const direction =
-        entry.direction === "short" ? "DOWN" : entry.direction === "long" ? "UP" : "NEUTRAL"
+      if (resultRaw && typeof resultRaw === "string") {
+        const parts = resultRaw.split("|")
+        timestamp = parts[0] || timestamp
+        symbol = parts[1] || symbol
+        // parts[2] = value (numeric, unused for display)
+        signal = parts[3] || "neutral"
+      } else {
+        // Config exists but no results yet — still show the config so the UI
+        // can display enabled/disabled state for each indicator type.
+        // Skip configs with no result rows to avoid cluttering the list.
+        continue
+      }
+
+      const direction: "UP" | "DOWN" | "NEUTRAL" =
+        signal === "buy" ? "UP" : signal === "sell" ? "DOWN" : "NEUTRAL"
+
+      // Derive a confidence proxy: use the stored value field scaled to 0–100.
+      // For most indicator types the value is an oscillator (RSI 0-100) or a
+      // small delta; we normalise to a 0-100 display range.
+      const rawValue = parseFloat(resultRaw.split("|")[2] || "0") || 0
+      const normalizedConf = Math.min(100, Math.max(0, Math.abs(rawValue) > 1 ? rawValue : rawValue * 100))
 
       indications.push({
-        id: entry.id || `${symbol}-${indType}-${i}`,
+        id: `${connectionId}-${configId}`,
         symbol,
         indicationType: indType.charAt(0).toUpperCase() + indType.slice(1),
-        direction: direction as "UP" | "DOWN" | "NEUTRAL",
-        confidence: Math.min(100, Math.max(0, Number(entry.confidence) || 50)),
-        strength: Math.min(100, Math.max(0, Number(entry.profitFactor ?? entry.confidence) * 10 || 50)),
-        timestamp: entry.timestamp || new Date().toISOString(),
-        enabled: true,
-        metadata: {
-          rsiValue: entry.metadata?.rsi ? Number(entry.metadata.rsi) : undefined,
-          macdValue: entry.metadata?.macd ? Number(entry.metadata.macd) : undefined,
-          volatility: entry.metadata?.volatility ? Number(entry.metadata.volatility) : undefined,
-        },
+        direction,
+        confidence: normalizedConf,
+        strength: normalizedConf,
+        timestamp,
+        enabled,
+        metadata: {},
       })
     }
 
