@@ -1,14 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSession } from "@/lib/auth"
 import { getSettings, setSettings } from "@/lib/redis-db"
 
 export async function GET(request: NextRequest) {
   try {
-    const user = await getSession()
-    if (!user) {
-      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
-    }
-
     const strategies = await getSettings("strategies")
 
     return NextResponse.json({

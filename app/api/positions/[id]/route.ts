@@ -10,15 +10,9 @@ export const dynamic = "force-dynamic"
  */
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    // Allow development/testing access without auth
-    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
-    if (!user) {
-      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
-    }
-
     const { id: positionId } = await params
     const { searchParams } = new URL(request.url)
-    const connectionId = searchParams.get("connection_id")
+    const connectionId = searchParams.get("connection_id") || searchParams.get("connectionId")
 
     if (!connectionId) {
       return NextResponse.json({ success: false, error: "connection_id required" }, { status: 400 })
@@ -64,12 +58,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
  */
 export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    // Allow development/testing access without auth
-    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
-    if (!user) {
-      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
-    }
-
     const { id: positionId } = await params
     const body = await request.json()
     const { connection_id, current_price, stop_loss, take_profit } = body
