@@ -1771,8 +1771,44 @@ export async function executeLivePosition(
     // `processSimulatedPositions` sweep walking Redis market_data
     // and force-closing on SL/TP cross or max-hold-time expiry.
     if (!isLiveTradeEnabled) {
-      const simEntryPrice = livePosition.entryPrice || realPosition.entryPrice || 0
-      const simQty = realPosition.quantity || 0
+      // Fetch the current market price so simulated positions open at a
+      // real price (not 0). This mirrors the live path's Step 2 but runs
+      // here before the simulation early-return so SL/TP cross-checks and
+      // PnL display are meaningful.
+      let simEntryPrice = livePosition.entryPrice || realPosition.entryPrice || 0
+      if (!simEntryPrice || simEntryPrice <= 0) {
+        simEntryPrice = (await fetchCurrentPrice(realPosition.symbol).catch(() => 0)) || 0
+      }
+      livePosition.entryPrice = simEntryPrice
+
+      // Compute a realistic volume using the VolumeCalculator (same as Step 3
+      // on the live path). Falls back to realPosition.quantity if the
+      // calculator fails (e.g. no balance data in sandbox).
+      let simQty = realPosition.quantity || 1
+      try {
+        const { VolumeCalculator } = await import("@/lib/volume-calculator")
+        const simVolResult = await VolumeCalculator.calculateVolumeForConnection(
+          connectionId,
+          realPosition.symbol,
+          simEntryPrice,
+        )
+        const vol = simVolResult?.finalVolume ?? simVolResult?.calculatedVolume ?? simVolResult?.volume ?? 0
+        if (vol > 0) {
+          simQty = vol
+          livePosition.leverage = simVolResult.leverage || livePosition.leverage
+        }
+      } catch { /* fallback to realPosition.quantity */ }
+
+      // Set averageExecutionPrice before calling computeDesiredProtectionPrices
+      // because that function uses it as the fill price for SL/TP calculation.
+      livePosition.averageExecutionPrice = simEntryPrice
+      // Compute SL/TP prices for the simulated position so reconcile and
+      // checkAndForceCloseOnSltpCross have valid price targets.
+      if (simEntryPrice > 0) {
+        const simProtection = computeDesiredProtectionPrices(livePosition)
+        if (simProtection.desiredSl > 0) livePosition.assignedStopLoss  = simProtection.desiredSl
+        if (simProtection.desiredTp > 0) livePosition.assignedTakeProfit = simProtection.desiredTp
+      }
       livePosition.executedQuantity = simQty
       livePosition.remainingQuantity = 0
       livePosition.averageExecutionPrice = simEntryPrice
