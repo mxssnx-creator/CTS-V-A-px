@@ -204,15 +204,27 @@ async function findOpenLivePositionByDir(connId: string, symbol: string, side: s
   return null
 }
 async function fetchCurrentPrice(symbol: string, connId?: string): Promise<number> {
-  const { getMarketData } = await import("@/lib/redis-db")
+  const { getMarketData, getRedisClient } = await import("@/lib/redis-db")
   try {
+    // Primary: OHLCV candle-series key written by historic loader / live feed.
     const data = await getMarketData(symbol, "1m")
-    if (!data) return 0
-    // data.latest is expected format; fallback to first candle close
-    const latest = data.latest || (Array.isArray(data) ? data[data.length - 1] : null)
-    if (!latest) return 0
-    const price = parseFloat(String(latest.close ?? latest[4] ?? latest.price ?? 0)) || 0
-    return price
+    if (data) {
+      const latest = data.latest || (Array.isArray(data) ? data[data.length - 1] : null)
+      if (latest) {
+        const price = parseFloat(String(latest.close ?? latest[4] ?? latest.price ?? 0)) || 0
+        if (price > 0) return price
+      }
+    }
+    // Fallback: the synthetic price generator and the cron write the current
+    // close into the flat hash `market_data:{symbol}` (field "close").
+    // This key is available in the sandbox even when the candle-series key is absent.
+    const client = getRedisClient()
+    if (client) {
+      const closeRaw = await client.hget(`market_data:${symbol}`, "close").catch(() => null)
+      const price = parseFloat(String(closeRaw ?? 0)) || 0
+      if (price > 0) return price
+    }
+    return 0
   } catch {
     return 0
   }

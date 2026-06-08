@@ -40,7 +40,7 @@ export default function LiveTradingPage() {
   const [filterSide, setFilterSide] = useState<"all" | "long" | "short">("all")
   // Keep a stable ref to the fetch function so the polling interval can call
   // it without adding it as a dependency (avoids interval recreation churn).
-  const loadPositionsRef = useRef<() => Promise<void>>()
+  const loadPositionsRef = useRef<(() => Promise<void>) | undefined>(undefined)
 
   const loadPositions = useCallback(async () => {
     try {
