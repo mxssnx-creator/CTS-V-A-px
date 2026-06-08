@@ -686,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ������������� operator-tunable
+      minProfitFactor: 1.0,   // spec default ��������������� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -1383,9 +1383,15 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:base:count`, 86400),
         client.expire(`strategies:${this.connectionId}:base:evaluated`, 86400),
       ]
+      // Total candidates entering Base = variants × indication buckets.
+      // This is the denominator for Base eval% (how many raw combos were
+      // attempted vs how many produced a passing Set).
+      const baseTotalCandidates = variantPasses.length * setMap.size
       if (baseSets.length > 0) {
         writes.push(client.hincrby(redisKey, "strategies_base_total", baseSets.length))
-        writes.push(client.hincrby(redisKey, "strategies_base_evaluated", baseSets.length))
+      }
+      if (baseTotalCandidates > 0) {
+        writes.push(client.hincrby(redisKey, "strategies_base_evaluated", baseTotalCandidates))
       }
 
       // ── ACTIVE-NOW snapshot per (symbol, stage) ───────────────────────
@@ -4048,7 +4054,7 @@ export class StrategyCoordinator {
         ],
       },
       {
-        // ── Pause variant — 1..8 last-position validation windows (step 1) ──
+        // ── Pause variant — 1..8 last-position validation windows (step 1) ─���
         // Spec: *"add Pause 1-8 Pos step 1 to Main additional Sets creation
         // after Pos prev,Last,cont .. add the 1-8 Last for counting Pause of
         // validating."* Each sub-config encodes one validation lookback N
