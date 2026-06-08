@@ -78,21 +78,12 @@ function validateOrder(order: any): { valid: boolean; error?: string } {
 
 export async function GET(request: NextRequest) {
   try {
-    const user = await getSession()
-    if (!user) {
-      throw new ApiError("Not authenticated", {
-        statusCode: 401,
-        code: "UNAUTHORIZED",
-        context: { operation: "get_orders" },
-      })
-    }
-
     const { searchParams } = new URL(request.url)
     const status = searchParams.get("status")
     const limit = Math.min(Number.parseInt(searchParams.get("limit") || "50"), 500)
 
     const allOrders = (await getSettings("orders")) || []
-    let filtered = allOrders.filter((o: any) => o.user_id === user.id)
+    let filtered = allOrders
 
     if (status) {
       if (!["pending", "filled", "partially_filled", "cancelled", "rejected"].includes(status)) {
@@ -130,16 +121,8 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const user = await getSession()
-    if (!user) {
-      return NextResponse.json(
-        { success: false, error: "Not authenticated", category: API_CATEGORY },
-        { status: 401 }
-      )
-    }
-
     // Rate limit check
-    const isAllowed = checkOrderRateLimit(String(user.id))
+    const isAllowed = checkOrderRateLimit("system")
     if (!isAllowed) {
       return NextResponse.json(
         {

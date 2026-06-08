@@ -1,6 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
-import { getSession } from "@/lib/auth"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 
 export const dynamic = "force-dynamic"
@@ -12,13 +11,6 @@ export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   const startTime = Date.now()
   try {
-    let user = null
-    try {
-      user = await getSession()
-    } catch {
-      // Auth may not be configured yet - continue with empty stats
-    }
-
     await initRedis()
     const client = getRedisClient()
     

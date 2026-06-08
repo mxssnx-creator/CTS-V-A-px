@@ -1,5 +1,4 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSession } from "@/lib/auth"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 
@@ -12,12 +11,6 @@ export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   const startTime = Date.now()
   try {
-    // Allow development/testing access without auth
-    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
-    if (!user) {
-      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
-    }
-
     await initRedis()
     const { searchParams } = new URL(request.url)
     const connectionId = searchParams.get("connection_id")
@@ -112,12 +105,6 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const startTime = Date.now()
   try {
-    // Allow development/testing access without auth
-    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
-    if (!user) {
-      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
-    }
-
     await initRedis()
     const body = await request.json()
     
