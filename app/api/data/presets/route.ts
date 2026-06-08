@@ -1,7 +1,4 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSession } from "@/lib/auth"
-import { query } from "@/lib/db"
-import { getActiveStrategies } from "@/lib/db-helpers"
 
 interface PresetTemplate {
   id: string

@@ -1,7 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
-import { getSession } from "@/lib/auth"
 
 export const dynamic = "force-dynamic"
 
