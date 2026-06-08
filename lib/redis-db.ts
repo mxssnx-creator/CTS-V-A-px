@@ -47,6 +47,10 @@ const globalForRedis = globalThis as unknown as {
   // builds the instance early would otherwise make the loader think the
   // snapshot was already applied and skip it, booting with an empty store.
   __redis_snapshot_loaded?: boolean
+  // Global equivalent of the module-scoped `isConnected` flag. Allows fresh
+  // Next.js dev route modules (which re-evaluate and get isConnected=false) to
+  // see the real connected state without re-running initRedis/migrations.
+  __redis_fully_connected?: boolean
 }
 
 export class InlineLocalRedis {
@@ -1261,6 +1265,7 @@ export async function initRedis(): Promise<void> {
 
     connectionsInitialized = true
     isConnected = true
+    globalForRedis.__redis_fully_connected = true
   })()
 
   try {
@@ -1308,7 +1313,11 @@ export async function ensureRedisInitialized(): Promise<void> {
 }
 
 export function isRedisConnected(): boolean {
-  return isConnected
+  // The module-scoped `isConnected` is false in freshly-evaluated Next.js dev
+  // route modules that never called initRedis() in their own scope. Fall back
+  // to the globalThis flag which is set by the engine's full init path and
+  // survives across module re-evaluations.
+  return isConnected || !!globalForRedis.__redis_fully_connected
 }
 
 // ========== Helpers ==========
@@ -2090,6 +2099,7 @@ export function buildBaseConnectionEnableUpdate(connection: any): any {
 
 export async function closeRedis(): Promise<void> {
   isConnected = false
+  globalForRedis.__redis_fully_connected = false
 }
 
 export function getRedisRequestsPerSecond(): number {
