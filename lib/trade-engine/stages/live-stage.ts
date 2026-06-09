@@ -1737,7 +1737,7 @@ export async function executeLivePosition(
   }
 
   try {
-    // ── Step 1: Pre-flight validation ──────────────�����──────────────────────
+    // ── Step 1: Pre-flight validation ──────────────������──────────────────────
     if (!realPosition.direction || !realPosition.symbol) {
       livePosition.status = "rejected"
       livePosition.statusReason = `Invalid inputs: symbol=${realPosition.symbol}, direction=${realPosition.direction}`
@@ -2043,39 +2043,31 @@ export async function executeLivePosition(
 
     // ── Operator policy: ALWAYS use venue max leverage ─────────────────
     // realPosition.leverage carries the per-variant coordination signal
-    // (1, 2, 3, 5x as derived in expandSizeLeverageVariants). That
-    // signal is for INTERNAL strategy ranking only — when actually
-    // placing the order on the venue we override to the connection's
-    // maximum supported leverage. Two safety nets remain armed
-    // downstream:
-    //   1. setLeverage(symbol, max) — venue clamps to per-symbol bracket
-    //   2. VolumeCalculator's balance-based cap — small-balance
-    //      accounts get a lower effective leverage automatically
-    //   3. 101204 "Insufficient margin" auto-halve retry below
-    // The override happens BEFORE the volume call so margin-based
-    // sizing (volumeUsd / leverage) reflects the max we'll actually use.
-    try {
+    // (1, 2, 3, 5x from expandSizeLeverageVariants). That is an INTERNAL
+    // ranking signal only — at order time we unconditionally override to
+    // the connection's maximum supported leverage.
+    //
+    // The previous guard `if (venueMax > livePosition.leverage)` caused
+    // silent failures: when getMaxLeverageForExchange returned the
+    // SAFE_DEFAULT (10) — which is > any coordination signal (1–5x) —
+    // the position was placed at 10x rather than 150x (BingX max).
+    // Fix: always assign, no comparison.
+    //
+    // Downstream safety nets remain armed:
+    //   1. setLeverage(symbol, venueMax) — exchange clamps to per-symbol
+    //      bracket (e.g. BTC 125x, SOL 75x)
+    //   2. 101204 "Insufficient margin" auto-halve + lev=1 retry below
+    {
+      const previous = livePosition.leverage
       const { getConnection: _getConnLev } = await import("@/lib/redis-db")
-      const connRecord = await _getConnLev(connectionId)
+      const connRecord = await _getConnLev(connectionId).catch(() => null)
       const venueMax = getMaxLeverageForExchange(connRecord?.exchange)
-      if (venueMax > livePosition.leverage) {
-        const previous = livePosition.leverage
-        livePosition.leverage = venueMax
-        pushStep(
-          livePosition,
-          "leverage_override",
-          true,
-          `coordination=${previous}x → venue_max=${venueMax}x (operator policy)`,
-        )
-      }
-    } catch (err) {
-      // Non-critical: fall through with realPosition.leverage and let
-      // the existing 101204 auto-halve fallback handle margin issues.
+      livePosition.leverage = venueMax
       pushStep(
         livePosition,
         "leverage_override",
         true,
-        `skipped — connection lookup failed (${String(err).slice(0, 60)})`,
+        `coordination=${previous}x → venue_max=${venueMax}x (operator policy)`,
       )
     }
 
@@ -3299,7 +3291,7 @@ export async function closeLivePosition(
 
           lastErrorMsg = (r && typeof r === "object" && r.error) ? String(r.error) : "invalid_response"
 
-          // ── Already-closed reconciliation ─────────────────────────────
+          // ── Already-closed reconciliation ───���─────────────────────────
           // If the venue says the position is gone, we treat the close as
           // successful and stop retrying. The DB-side terminal-state
           // pipeline below still runs (PnL is computed from `closePrice`,
@@ -5604,7 +5596,7 @@ export async function syncLiveFromPseudo(
     let slPct = Number.isFinite(rawSL) ? (Math.abs(rawSL) < 1 ? rawSL * 100 : rawSL) : undefined
     const tpPct = Number.isFinite(rawTP) ? (Math.abs(rawTP) < 1 ? rawTP * 100 : rawTP) : undefined
 
-    // ── Trailing-aware SL pull-through ──────────────────────────────
+    // ── Trailing-aware SL pull-through ���─────────────────────────────
     // When the pseudo's trailing-stop machine is ARMED (multi-step
     // `trailing_active=1` or legacy `trailing_stop_price>0`), the
     // effective stop level is no longer `stoploss_ratio × fillPrice`

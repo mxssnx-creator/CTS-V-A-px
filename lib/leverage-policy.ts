@@ -48,7 +48,12 @@ import {
   type ConnectionPredefinition,
 } from "./connection-predefinitions"
 
-const SAFE_DEFAULT_MAX_LEVERAGE = 10
+// Raised from 10 → 125. The old 10x safe default meant any missed exchange
+// lookup silently capped leverage at 10x — lower than the SAFE_DEFAULT is
+// intended to represent (a "conservative but reasonable" fallback, not a
+// penalty). 125x matches Binance/Bybit perpetuals; BingX resolves to 150x
+// via the predefinition lookup so this fallback only fires for unknown exchanges.
+const SAFE_DEFAULT_MAX_LEVERAGE = 125
 
 /** Lookup table built once on module load (predefinitions are static). */
 const PREDEF_BY_EXCHANGE: ReadonlyMap<string, ConnectionPredefinition> =
