@@ -132,6 +132,7 @@ export async function GET(
       engineState,
       engineProgression,
       prehistoricSymbolCount,
+      prehistoricDoneMarker,
       axisWindowsHashRaw,
       ordersBySymbolRaw,
       hedgePosAccHashRaw,
@@ -145,6 +146,10 @@ export async function GET(
       getSettings(`trade_engine_state:${connectionId}`).catch(() => ({})),
       getSettings(`engine_progression:${connectionId}`).catch(() => ({})),
       client.scard(`prehistoric:${connectionId}:symbols`).catch(() => 0),
+      // `:done` marker written by completePrehistoricPhase — a plain SET
+      // key separate from the hash so a hot-reload that loses the in-memory
+      // completion callback can still flip the progress bar to 100 %.
+      client.get(`prehistoric:${connectionId}:done`).catch(() => null),
       // Per-axis-window cumulative counters written by createMainSets in
       // strategy-coordinator.ts. Hash fields are `${axis}_${N}_sets` /
       // `${axis}_${N}_pos` for axis ∈ {prev, last, cont, pause} and the
@@ -246,13 +251,23 @@ export async function GET(
     )
     const historicIsComplete =
       prehistoricHash.is_complete === "1" ||
-      progHash.prehistoric_phase_active === "false" && historicSymbolsProcessed > 0 ||
+      // `:done` plain-key marker written by completePrehistoricPhase —
+      // survives hot-reloads where the in-memory callback may not fire.
+      String(prehistoricDoneMarker) === "1" ||
+      (progHash.prehistoric_phase_active === "false" && historicSymbolsProcessed > 0) ||
       es.prehistoric_data_loaded === true ||
-      es.prehistoric_data_loaded === "1"
+      es.prehistoric_data_loaded === "1" ||
+      // All symbols processed — even if is_complete was never written
+      // (e.g. the processor crashed after the last symbol but before the
+      // completion pin), treat the run as done so the bar reaches 100 %.
+      (historicSymbolsTotal > 0 && historicSymbolsProcessed >= historicSymbolsTotal)
     const historicProgressPercent = historicIsComplete
       ? 100
+      // No Math.min(99) cap — progress tracks real completion. The bar
+      // should reach 100 % when all symbols are processed, not be stuck
+      // one step below waiting for an is_complete flag that may never arrive.
       : historicSymbolsTotal > 0
-        ? Math.min(99, Math.round((historicSymbolsProcessed / historicSymbolsTotal) * 100))
+        ? Math.round((historicSymbolsProcessed / historicSymbolsTotal) * 100)
         : 0
 
     // ── REALTIME section ─────────────────────────────────────────────────────
@@ -607,7 +622,7 @@ export async function GET(
       updatedAt: number
       syncedAt: number                // last exchange reconciliation (staleness check)
       realPositionId?: string
-      // ── Coordination (mirroring fan-in) ──────────────────────────────
+      // ── Coordination (mirroring fan-in) ──────────────────────────���───
       // Equivalent upstream Sets mirrored into this ONE exchange order.
       // Count = how many pseudo eval positions that Set is currently
       // holding. No per-Set USD (eval-stage notionals are NOT real
@@ -1050,7 +1065,7 @@ export async function GET(
     // pipeline-aware semantic by the engine & cron) if Real is zero.
     const stratTotal = stratCounts.real || strategiesTotal
 
-    // ── STRATEGY VARIANT breakdown ───────────────────────────────────────────
+    // ── STRATEGY VARIANT breakdown ───────────────────────────────────────��───
     // The Main stage expands each promoted Base Set into position-variant
     // entries (default / trailing / block / dca). StrategyCoordinator writes
     // per-variant aggregates to `strategy_variant:{connId}:{variant}` hash
@@ -2095,7 +2110,7 @@ export async function GET(
           total:          { sets: activeSetsIndTotal,                       trackings: indTotal,                       positions: activeIndTotal },
         },
         strategies: (() => {
-          // ── Actively-running per stage (operator spec) ─────────────
+          // ─��� Actively-running per stage (operator spec) ─────────────
           // Source of truth: `strategy_detail:{conn}:{stage}.sets_running_now`,
           // written by strategy-coordinator each cycle using parent-base
           // active_config_keys membership. Fallback only to the per-symbol

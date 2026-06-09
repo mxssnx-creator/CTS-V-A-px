@@ -309,7 +309,7 @@ export async function POST(request: Request) {
         const FETCH_TIMEOUT = setTimeout(() => timeoutCtrl.abort(), FETCH_MS)
         const topRes = await Promise.race([
           fetch(
-            `${baseUrl}/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&t=${Date.now()}`,
+            `${baseUrl}/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&sort=volatility&t=${Date.now()}`,
             { signal: timeoutCtrl.signal, cache: "no-store" },
           ),
           new Promise<never>((_, reject) =>

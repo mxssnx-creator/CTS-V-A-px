@@ -205,7 +205,12 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // Get detailed prehistoric progress tracking
     let prehistoricProgress = {
       symbolsProcessed: 0,
-      symbolsTotal: 3, // BTC, ETH, SOL
+      // Default to 1 until the Redis hash is read below — this prevents the
+      // progress denominator from showing "0/3" on fresh quickstarts where
+      // the operator may have chosen a single symbol. The hash field
+      // `symbols_total` (written by quickstart + engine start) overrides
+      // this as soon as it exists.
+      symbolsTotal: 1,
       candlesLoaded: 0,
       candlesTotal: 0,
       indicatorsCalculated: 0,

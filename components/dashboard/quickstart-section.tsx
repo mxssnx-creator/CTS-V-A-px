@@ -615,7 +615,7 @@ export function QuickstartSection() {
       }
 
       const ex = (conn.exchange || "bingx").toLowerCase()
-      const symRes = await fetch(`/api/exchange/${ex}/top-symbols?t=` + Date.now(), { cache: "no-store" })
+      const symRes = await fetch(`/api/exchange/${ex}/top-symbols?sort=volatility&t=` + Date.now(), { cache: "no-store" })
       if (!symRes.ok) throw new Error("no symbols")
       const sym = await symRes.json()
       setVolatileSymbol({ symbol: sym.symbol || "BTCUSDT", exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
@@ -632,7 +632,7 @@ export function QuickstartSection() {
     return () => clearInterval(symbolInterval)
   }, [loadSymbol])
 
-  // ── auto-scroll logs ───────────────────────────────────────────────────────
+  // ── auto-scroll logs ────────────────────────────────────────��──────────────
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
@@ -966,7 +966,7 @@ export function QuickstartSection() {
 
       {/* ── options strip ─────────────────────────────────────────────
           Per-connection knobs the operator changes mid-run:
-            • Control Orders   — toggle live exchange order emission
+            ��� Control Orders   — toggle live exchange order emission
             • Profit Factor Mins (Base/Main/Real/Live) — stage gates
             • Volume Factor    — live volume multiplier
             • Strategies Pos. Counts — Block + DCA on/off
