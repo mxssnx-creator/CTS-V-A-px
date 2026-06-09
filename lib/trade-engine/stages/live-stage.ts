@@ -107,6 +107,9 @@ interface LivePosition {
   current_price?: number
   quantity: number
   axisWindows?: { prev: number; last: number; cont: number; pause: number }
+  // Variant size multiplier mirrored from RealPosition (block=1.5-2.0,
+  // dca=0.5, others=1.0). Stored so accumulation can match original sizing.
+  sizeMultiplier?: number
   parentSetKey?: string
   setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
   accumulatedSetKeys?: string[]
@@ -269,11 +272,13 @@ async function accumulateIntoLivePosition(connId: string, existing: LivePosition
     const exchangeSide: "buy" | "sell" = direction === "long" ? "buy" : "sell"
 
     // ── Size the accumulation order the same way a fresh entry is sized ──
+    // Pass the existing position's sizeMultiplier so Block/DCA accumulation
+    // steps scale consistently with the original entry's variant intent.
     const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
       connId,
       symbol,
       price,
-      { tradeMode: "main" },
+      { tradeMode: "main", sizeMultiplier: existing.sizeMultiplier },
     ).catch(() => null)
     let addQty = volumeResult?.finalVolume || volumeResult?.volume || 0
     if (!Number.isFinite(addQty) || addQty <= 0) {
@@ -1573,10 +1578,11 @@ export async function executeLivePosition(
       progression: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      setKey: realPosition.setKey,
-      parentSetKey: realPosition.parentSetKey,
-      setVariant: realPosition.setVariant,
-      axisWindows: realPosition.axisWindows,
+      setKey:         realPosition.setKey,
+      parentSetKey:   realPosition.parentSetKey,
+      setVariant:     realPosition.setVariant,
+      axisWindows:    realPosition.axisWindows,
+      sizeMultiplier: realPosition.sizeMultiplier,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
     }
     pushStep(cbSkipped, "preflight", false, cbSkipped.statusReason!)
@@ -1628,10 +1634,11 @@ export async function executeLivePosition(
       progression: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      setKey: realPosition.setKey,
-      parentSetKey: realPosition.parentSetKey,
-      setVariant: realPosition.setVariant,
-      axisWindows: realPosition.axisWindows,
+      setKey:         realPosition.setKey,
+      parentSetKey:   realPosition.parentSetKey,
+      setVariant:     realPosition.setVariant,
+      axisWindows:    realPosition.axisWindows,
+      sizeMultiplier: realPosition.sizeMultiplier,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
     }
     pushStep(skipped, "preflight", false, skipped.statusReason!)
@@ -1680,10 +1687,11 @@ export async function executeLivePosition(
     // `accumulatedSetKeys` is seeded with the originating setKey so
     // accumulation merges later append onto a non-empty list (rather
     // than having to special-case the first entry).
-    setKey:        realPosition.setKey,
-    parentSetKey:  realPosition.parentSetKey,
-    setVariant:    realPosition.setVariant,
-    axisWindows:   realPosition.axisWindows,
+    setKey:         realPosition.setKey,
+    parentSetKey:   realPosition.parentSetKey,
+    setVariant:     realPosition.setVariant,
+    axisWindows:    realPosition.axisWindows,
+    sizeMultiplier: realPosition.sizeMultiplier,
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
   }
 
@@ -2061,7 +2069,12 @@ export async function executeLivePosition(
       connectionId,
       realPosition.symbol,
       currentPrice,
-      { tradeMode: liveTradeMode },
+      {
+        tradeMode: liveTradeMode,
+        // Forward the Block/DCA variant multiplier so notional is correctly
+        // scaled before the exchange order is placed (absent → 1.0 identity).
+        sizeMultiplier: realPosition.sizeMultiplier,
+      },
     ).catch(err => {
       console.error(`${LOG_PREFIX} volume calc error:`, err)
       return null
@@ -5460,7 +5473,7 @@ export async function syncLiveFromPseudo(
       })()
     const trailingStopPrice = parseFloat(String(pseudoPos?.trailing_stop_price || "0"))
 
-    // ── Set-scoped match (BUG 6) ──────────────────────────────────────
+    // ── Set-scoped match (BUG 6) ───────────���──────────────────────────
     // Identify the Real Set that owns THIS pseudo position. Several pseudo
     // positions (distinct Sets) can target the same symbol+side slot; the
     // dedup lock collapses them onto ONE live position. Matching by

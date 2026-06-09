@@ -3419,6 +3419,11 @@ export class StrategyCoordinator {
                     parentSetKey: set.parentSetKey,
                     setVariant:   set.variant,
                     axisWindows:  set.axisWindows,
+                    // Forward the variant size multiplier so VolumeCalculator
+                    // can apply Block (1.5–2.0×) or DCA (0.5×) notional scaling
+                    // before placing the exchange order. Falls back to set-level
+                    // sizeMultiplier then 1.0 if the entry doesn't carry one.
+                    sizeMultiplier: bestEntry.sizeMultiplier ?? (set as any).sizeMultiplier ?? 1,
                   },
                   connector
                 )

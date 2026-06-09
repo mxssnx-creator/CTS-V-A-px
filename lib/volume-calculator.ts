@@ -44,6 +44,11 @@ interface VolumeCalculationParams {
   // setting can never blow out a live order to 100× the intended size.
   mainVolumeFactor?: number
   presetVolumeFactor?: number
+  // Adjust-type variant multiplier: block=1.5-2.0, dca=0.5, others=1.0.
+  // Applied after liveEngineFactor; absent/undefined → 1.0 (no scaling).
+  // Clamped to [0.1, 5] — narrower than engine factor's [0.1, 10] since
+  // this comes from automated variantProfiles, not operator overrides.
+  sizeMultiplier?: number
 }
 
 interface VolumeCalculationResult {
@@ -152,6 +157,7 @@ export class VolumeCalculator {
       tradeMode,
       mainVolumeFactor,
       presetVolumeFactor,
+      sizeMultiplier,
     } = params
 
     // ── Resolve the engine-specific volume factor (Live-only) ──────
@@ -235,22 +241,37 @@ export class VolumeCalculator {
       // — which is exactly the spec: pseudo positions are ratio-only,
       // live positions calculate "indeed volume" (real notional) using
       // the per-engine ratio.
+      // ── Adjust-type variant multiplier (Block / DCA) ──────────────────
+      // Clamped to [0.1, 5]; absent/invalid → 1.0 (identity).
+      // Applied after liveEngineFactor so both multipliers compose:
+      //   notional = balance × positionCost × liveEngineFactor × variantMult / posAvg
+      const clampVariant = (raw: number | undefined): number => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n <= 0) return 1
+        return Math.max(0.1, Math.min(5, n))
+      }
+      const variantMult = clampVariant(sizeMultiplier)
+
       const posAvg = positionsAverage && positionsAverage > 0 ? positionsAverage : 1
-      const positionSizeUsd = (accountBalance * positionCost * liveEngineFactor) / posAvg
+      const positionSizeUsd = (accountBalance * positionCost * liveEngineFactor * variantMult) / posAvg
       const calculatedVolume = positionSizeUsd / currentPrice
       const { final, adjusted, reason } = clampUp(calculatedVolume)
 
-      // Surface engine-factor provenance in the adjustment reason ONLY
-      // when it actually changed sizing (≠ 1.0). A 1.0 factor is the
-      // norm for Strategy callers and default Live config, and we don't
-      // want to spam the volume-history log with no-op entries.
+      // Surface multiplier provenance in the adjustment reason only when
+      // the factor actually changed sizing (≠ 1.0) to avoid log spam.
       const factorReason =
         liveEngineFactor !== 1 && tradeMode
           ? `${tradeMode}-engine volume factor ${liveEngineFactor.toFixed(2)}x applied`
           : undefined
-      const composedReason = adjusted && reason
-        ? (factorReason ? `${reason} | ${factorReason}` : reason)
-        : factorReason
+      const variantReason =
+        variantMult !== 1
+          ? `variant size multiplier ${variantMult.toFixed(2)}x applied (Block/DCA adjust-type)`
+          : undefined
+      const composedReason = [
+        adjusted ? reason : undefined,
+        factorReason,
+        variantReason,
+      ].filter(Boolean).join(" | ") || undefined
 
       return {
         calculatedVolume,
@@ -258,7 +279,7 @@ export class VolumeCalculator {
         volume: final,
         volumeUsd: final * currentPrice,
         leverage,
-        volumeAdjusted: adjusted || liveEngineFactor !== 1,
+        volumeAdjusted: adjusted || liveEngineFactor !== 1 || variantMult !== 1,
         adjustmentReason: composedReason,
       }
     }
@@ -376,7 +397,12 @@ export class VolumeCalculator {
     connectionId: string,
     symbol: string,
     currentPrice: number,
-    options: { tradeMode?: "main" | "preset" } = {},
+    options: {
+      tradeMode?: "main" | "preset"
+      // Block/DCA variant multiplier from RealPosition.sizeMultiplier.
+      // Absent / undefined → treated as 1.0 (no Block/DCA scaling).
+      sizeMultiplier?: number
+    } = {},
   ): Promise<VolumeCalculationResult> {
     try {
       await initRedis()
@@ -507,6 +533,8 @@ export class VolumeCalculator {
         tradeMode: resolvedMode,
         mainVolumeFactor,
         presetVolumeFactor,
+        // Variant multiplier forwarded from the callsite (Block/DCA sizing).
+        sizeMultiplier: options.sizeMultiplier,
       })
 
       return result
