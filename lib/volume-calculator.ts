@@ -127,10 +127,10 @@ export class VolumeCalculator {
       // Non-critical — fall back to the $10k default so volume is calculated.
     }
 
-    // Leverage safety cap: keep margin per position above exchange floor.
-    //   ≤$50  → 10x  |  ≤$200 → 20x  |  ≤$500 → 50x  |  >$500 → 125x
-    const cap = balance <= 50 ? 10 : balance <= 200 ? 20 : balance <= 500 ? 50 : 125
-    return { accountBalance: balance, maxLeverage: Math.min(rawLeverage, cap) }
+    // No balance-based leverage cap — operator policy is always-max-leverage.
+    // The exchange setLeverage call clamps to the per-symbol bracket and the
+    // 101204 auto-halve retry handles any remaining margin rejections.
+    return { accountBalance: balance, maxLeverage: rawLeverage }
   }
 
   /**
