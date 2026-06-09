@@ -632,7 +632,7 @@ export function QuickstartSection() {
     return () => clearInterval(symbolInterval)
   }, [loadSymbol])
 
-  // ── auto-scroll logs ────────────────────────────────────────��──────────────
+  // ── auto-scroll logs ───────────────────────────────────���────��──────────────
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
@@ -714,13 +714,17 @@ export function QuickstartSection() {
       const clampedCount = Math.max(1, Math.min(10, symbolCount))
       addLog(
         clampedCount === 1
-          ? "Fetching most volatile symbol (1h)..."
-          : `Fetching top ${clampedCount} volatile symbols (1h)...`,
+          ? "Fetching most volatile symbol (24h)..."
+          : `Fetching top ${clampedCount} volatile symbols (24h)...`,
         "info",
       )
       const ex = (conn.exchange || "bingx").toLowerCase()
+      // sort=volatility is required — without it the API defaults to volume
+      // sort and the engine would start on large-cap low-movers (ETHUSDT,
+      // SOLUSDT) instead of the highest-momentum symbols the QuickStart is
+      // designed to target.
       const symRes = await fetch(
-        `/api/exchange/${ex}/top-symbols?limit=${clampedCount}&t=${Date.now()}`,
+        `/api/exchange/${ex}/top-symbols?sort=volatility&limit=${clampedCount}&t=${Date.now()}`,
         { cache: "no-store" },
       )
       let chosen: string[] = ["BTCUSDT"]
@@ -735,7 +739,7 @@ export function QuickstartSection() {
               : (sym.symbol ? [sym.symbol] : [])
         if (list.length > 0) chosen = list
         const top = chosen[0]
-        addLog(`Selected: ${chosen.join(", ")} (top: ${sym.priceChangePercent?.toFixed(2) ?? "—"}% 1h)`, "success")
+        addLog(`Selected: ${chosen.join(", ")} (top: ${sym.priceChangePercent?.toFixed(2) ?? "—"}% 24h volatile)`, "success")
         setVolatileSymbol({ symbol: top, exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
       }
 
@@ -998,7 +1002,10 @@ export function QuickstartSection() {
             <>
               <span className="font-semibold text-foreground font-mono">{volatileSymbol.symbol}</span>
               {volatileSymbol.pct !== null && (
-                <span className={`text-[10px] tabular-nums ${volatileSymbol.pct >= 0 ? "text-green-600" : "text-red-500"}`}>
+                <span
+                  className={`text-[10px] tabular-nums ${volatileSymbol.pct >= 0 ? "text-green-600" : "text-red-500"}`}
+                  title="24h price change %"
+                >
                   {volatileSymbol.pct >= 0 ? "+" : ""}{volatileSymbol.pct.toFixed(2)}%
                 </span>
               )}
