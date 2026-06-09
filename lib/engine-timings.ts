@@ -182,7 +182,7 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
   prehistoricCyclePauseMs:   { min: 10,          max: 500                 },
   realtimeIntervalMs:        { min: 200,         max: 60_000              },
   realtimeCyclePauseMs:      { min: 10,          max: 500                 },
-  livePositionsCyclePauseMs:  { min: 10,          max: 200                 },
+  livePositionsCyclePauseMs:  { min: 10,          max: 500                 },
 // ── Hedge Accumulation bounds ─────────────────────────────────────────────
    neutralizeEnabled:           { min: 0,           max: 1  /* boolean */    },
    neutralizeThresholdPct:      { min: 0,           max: 50                  },

@@ -3830,7 +3830,7 @@ export async function reconcileLivePositions(
     // `null` means "skip verification this tick"; the next tick retries.
     const liveOrderIds = await fetchLiveOrderIdSet(exchangeConnector)
 
-    // ── Per-position worker (parallelisable) ─────────────────────────
+    // ── Per-position worker (parallelisable) ─────────��───────────────
     // Each iteration is independent at the venue + Redis layer:
     //   • Redis writes are scoped to `live:positions:{conn}:{id}` and
     //     the per-symbol-direction lock key — no two positions share
@@ -5007,10 +5007,10 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // network issue, illiquid gap, operator manual cancel), the
         // position will not be held indefinitely.
         //
-  // Default: 4 hours. Live override via /settings → System →
-  // Engine Timings → max_position_hold_ms (or deploy-time
-  // MAX_POSITION_HOLD_MS env var). 0 = disabled.
-  const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
+        // Default: 4 hours. Live override via /settings → System →
+        // Engine Timings → max_position_hold_ms (or deploy-time
+        // MAX_POSITION_HOLD_MS env var). 0 = disabled.
+        const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
         const openedAt = position.createdAt || position.updatedAt || 0
         const heldMs = Date.now() - openedAt
         if (

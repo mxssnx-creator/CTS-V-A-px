@@ -365,6 +365,11 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         indicationCycleCount,
         strategyCycleCount,
         realtimeCycleCount: toNumber(engineState?.realtime_cycle_count),
+        // LivePositions loop (Loop C) telemetry — written by engine-manager
+        // `tickLivePositions` every 200 ms into `progression:{id}`.
+        livePositionsCycleCount: parseInt(progHash.live_positions_cycle_count || "0", 10),
+        livePositionsLastCycleAt: toNumber(progHash.live_positions_last_cycle_at),
+        livePositionsLastCycleMs: toNumber(progHash.live_positions_last_cycle_ms),
         cycleTimeMs: toNumber(engineState?.last_cycle_duration),
         totalStrategiesEvaluated: toNumber(engineState?.total_strategies_evaluated),
         totalIndicationsEvaluated: toNumber(engineState?.total_indications_evaluated),
