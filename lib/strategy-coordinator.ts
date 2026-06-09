@@ -242,6 +242,14 @@ export interface PositionContext {
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
+  /**
+   * Per-symbol, per-direction open position count.
+   * Key: symbol, value: { long: n, short: n }.
+   * Used by expandAxisSets so each direction's axis entryCount reflects
+   * only the positions actually open in that direction — keeps long and
+   * short coordinations fully independent.
+   */
+  perSymbolOpenByDir: Record<string, { long: number; short: number }>
 }
 
 // ── Position-Count Cartesian Axis Windows (operator spec) ────────────────────
@@ -1764,8 +1772,12 @@ export class StrategyCoordinator {
       // instead of static projections. Per-symbol is correct because
       // axis Sets and their hedge bucketing are scoped to one symbol.
       const liveCont = symbolCtx?.continuousCount ?? 0
+      // Direction-specific open counts for this symbol — gives expandAxisSets
+      // independent liveCont per direction so long and short axis Sets get
+      // different entryCount values when one direction is more accumulated.
+      const liveContByDir = ctx.perSymbolOpenByDir?.[symbol] ?? { long: 0, short: 0 }
       for (const defaultSet of defaultByBaseKey.values()) {
-        const expanded = this.expandAxisSets(defaultSet, minPF, liveCont)
+        const expanded = this.expandAxisSets(defaultSet, minPF, liveCont, liveContByDir)
         for (const axisSet of expanded) {
           mainSets.push(axisSet)
           axisSetsAdded++
@@ -3666,6 +3678,7 @@ export class StrategyCoordinator {
       lastLosses: 0,
       prevLosses: 0,
       perSymbolOpen: {},
+      perSymbolOpenByDir: {},
     }
   }
 
@@ -3690,10 +3703,17 @@ export class StrategyCoordinator {
       // positions). No extra Redis reads — getActivePositions already pulls
       // the full hashes behind a 1s internal cache.
       const perSymbolOpen: Record<string, number> = {}
+      // Direction-split variant: tracks long and short independently per
+      // symbol so expandAxisSets can give each direction its own liveCont.
+      const perSymbolOpenByDir: Record<string, { long: number; short: number }> = {}
       for (const p of active) {
         const sym = String(p.symbol || "")
         if (!sym) continue
         perSymbolOpen[sym] = (perSymbolOpen[sym] ?? 0) + 1
+        if (!perSymbolOpenByDir[sym]) perSymbolOpenByDir[sym] = { long: 0, short: 0 }
+        const dir = String(p.direction || p.side || "long").toLowerCase()
+        if (dir === "short") perSymbolOpenByDir[sym].short += 1
+        else                 perSymbolOpenByDir[sym].long  += 1
       }
 
       // ── P-CTX-1: Read from dedicated closed-positions index ──────────
@@ -3778,6 +3798,7 @@ export class StrategyCoordinator {
         lastLosses:      lastN.filter((r) => r.pnl < 0).length,
         prevLosses,
         perSymbolOpen,
+        perSymbolOpenByDir,
       }
 
       this.positionContextCache = { ctx, ts: now }
@@ -3962,6 +3983,7 @@ export class StrategyCoordinator {
     baseDefault: StrategySet,
     minPF: number,
     liveCont = 0,
+    liveContByDir?: { long: number; short: number },
   ): StrategySet[] {
     const axisSets: StrategySet[] = []
     const baseEC = baseDefault.entryCount || 0
@@ -4019,11 +4041,15 @@ export class StrategyCoordinator {
               // The `cont` axis dimension represents "actual + next N-1
               // positions to accumulate". Per spec we only credit
               // positions that ACTUALLY exist live this cycle. Cap by
-              // `liveCont` so axis Sets reflect the rolling continuous
-              // count, not a static projection that would over-count
-              // empty slots. Worst case (liveCont = 0) collapses to
-              // `entryCount = baseEC`, growing as positions accrue.
-              const credited = Math.min(cont, Math.max(0, liveCont))
+              // the DIRECTION-SPECIFIC open count so long and short axis
+              // Sets reflect independently accumulated position counts —
+              // not a shared total that would always mirror both sides.
+              // Falls back to the aggregate `liveCont` when the caller
+              // does not provide per-direction data (e.g. prehistoric).
+              const dirLiveCont = liveContByDir
+                ? (dir === "short" ? liveContByDir.short : liveContByDir.long)
+                : liveCont
+              const credited = Math.min(cont, Math.max(0, dirLiveCont))
               const ec = baseEC + credited
 
               // ── Synthetic representative entry ─────────────────────
