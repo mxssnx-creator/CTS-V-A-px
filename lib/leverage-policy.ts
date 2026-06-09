@@ -28,11 +28,9 @@
  *     1.  Helper returns predefinition.maxLeverage (e.g. BingX → 150).
  *     2.  setLeverage(symbol, X) on the connector — venue clamps to
  *         the per-symbol bracket if X exceeds it.
- *     3.  Volume calculator's balance-based cap clamps the per-order
- *         leverage further when the account is small (≤$50 → 10x,
- *         ≤$200 → 20x, ≤$500 → 50x, otherwise 125x).
- *     4.  101204 ("Insufficient margin") fallback halves leverage
- *         and retries once (live-stage already implements this).
+ *     3.  101204 ("Insufficient margin") fallback halves leverage
+ *         and retries; final fallback tries lev=1 with min-notional.
+ *         Both retry paths are implemented in live-stage.
  *
  *  Net effect: callers get "max leverage" semantics without having to
  *  implement balance/symbol clamps themselves; safety nets stay armed.
@@ -40,9 +38,9 @@
  *  Safe default (`SAFE_DEFAULT_MAX_LEVERAGE = 10`):
  *    Used when the connection cannot be resolved (e.g. no DB row
  *    matching `connectionId`, predefinition lookup miss, or ID is a
- *    test stub like "test-conn"). 10x is the floor of the
- *    balance-based cap chain above, so the resulting margin
- *    requirement is always satisfiable on accounts ≥$50.
+ *    test stub like "test-conn"). 10x is a conservative fallback for
+ *    unknown exchanges; real connections always resolve via the
+ *    predefinition (BingX → 150, Binance → 125, etc.).
  */
 
 import {
