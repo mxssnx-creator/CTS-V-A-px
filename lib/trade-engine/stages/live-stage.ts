@@ -983,24 +983,49 @@ async function placeProtectionOrder(
     // is 0.0001 BTC."; the same class of rejection exists on Bybit
     // (110007) and Binance (-1013).
     //
-    // The protection layer is the LAST line of defense before the venue,
-    // so we floor up to the minimum rather than rejecting locally. The
-    // alternative — silently failing to arm SL/TP on micro-positions
-    // from partial fills — is far more dangerous than over-sizing the
-    // protection order by a fraction of a base unit. We log a warning
-    // whenever the floor actually kicks in so operators can spot the
-    // edge case if it becomes a pattern.
+    // CRITICAL: only floor UP when the position qty already exceeds venueMin.
+    // If the position is smaller than venueMin (e.g. 0.77 SOL when min=1),
+    // flooring up to 1 produces code=110424 "order size must be less than the
+    // available amount of 0.77 SOL". In that case we use the original quantity
+    // — the protection order covers exactly what the position holds. The venue
+    // will accept a qty equal to the position size even if it's below the
+    // general minimum (reduce-only orders close existing exposure, so many
+    // exchanges relax the minimum when the order is strictly reduce-only and
+    // qty matches the position).
     const venueMin = getVenueMinQty(symbol)
     let effectiveQty = quantity
-    if (effectiveQty < venueMin) {
-      console.warn(
-        `${tag} QTY FLOORED: requested=${quantity} bumped to venueMin=${venueMin} (preventing code=110422)`,
-      )
-      effectiveQty = venueMin
+    if (quantity < venueMin) {
+      if (quantity * 2 >= venueMin) {
+        // Position is between 50% and 100% of venueMin — safe to floor up
+        // because the excess is small and reduce-only semantics on BingX
+        // allow the SL/TP qty to exceed the held quantity by a small margin
+        // without rejection (the exchange closes the whole position anyway).
+        console.warn(
+          `${tag} QTY FLOORED: requested=${quantity} bumped to venueMin=${venueMin} (preventing code=110422)`,
+        )
+        effectiveQty = venueMin
+      } else {
+        // Position qty is well below venueMin. Do NOT floor up: that would
+        // produce code=110424 (qty > available amount). Use exact position qty
+        // so the reduce-only order covers precisely what we hold.
+        console.warn(
+          `${tag} QTY BELOW VENUE MIN: position=${quantity} venueMin=${venueMin} — using position qty to avoid 110424`,
+        )
+        effectiveQty = quantity
+      }
     }
 
     const kind: "stop_loss" | "take_profit" =
       orderLabel === "StopLoss" ? "stop_loss" : "take_profit"
+
+    // ── Helper: extract numeric "available amount" from a 110424 message ──
+    // Error text: "The order size must be less than the available amount of 0.77 SOL"
+    const extract110424Available = (errMsg: string): number | null => {
+      const m = /available amount of ([\d.]+)/i.exec(errMsg)
+      if (!m) return null
+      const n = parseFloat(m[1])
+      return Number.isFinite(n) && n > 0 ? n : null
+    }
 
     // NOTE: We do NOT pass `hedgeMode` here. The BingX connector defaults to
     // hedgeMode=true (sends `positionSide`) and includes a built-in one-way
@@ -1015,21 +1040,45 @@ async function placeProtectionOrder(
     // timeout we return null; the next sync tick will retry, and meanwhile
     // `checkAndForceCloseOnSltpCross` provides the safety net (it triggers
     // on price independent of whether the protection order is armed).
-    const result = await withTimeout(
-      connector.placeStopOrder(
-        symbol,
-        closeSide,
-        effectiveQty,
-        triggerPrice,
-        kind,
-        {
-          reduceOnly: true,
-          positionSide: positionDirection === "long" ? "LONG" : "SHORT",
-        },
-      ) as Promise<any>,
-      EXCHANGE_TIMEOUT_PLACE_STOP_MS,
-      `placeStopOrder(${orderLabel} ${symbol})`,
-    )
+    const placeStop = (qty: number) =>
+      withTimeout(
+        connector.placeStopOrder(
+          symbol,
+          closeSide,
+          qty,
+          triggerPrice,
+          kind,
+          {
+            reduceOnly: true,
+            positionSide: positionDirection === "long" ? "LONG" : "SHORT",
+          },
+        ) as Promise<any>,
+        EXCHANGE_TIMEOUT_PLACE_STOP_MS,
+        `placeStopOrder(${orderLabel} ${symbol})`,
+      )
+
+    let result = await placeStop(effectiveQty)
+
+    // ── code=110424: "order size must be less than available amount" ───
+    // Triggered when the protection qty exceeds the position's remaining
+    // available quantity (e.g. partial fills reduced the held qty after we
+    // computed `effectiveQty`). Parse the available amount from the error
+    // message and retry once with that exact quantity.
+    if (!result?.success) {
+      const errMsg = String(result?.error || "")
+      if (errMsg.includes("110424") || /available amount/i.test(errMsg)) {
+        const availableQty = extract110424Available(errMsg)
+        if (availableQty !== null && availableQty < effectiveQty) {
+          console.warn(
+            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} — retrying with exact available qty`,
+          )
+          result = await placeStop(availableQty)
+          if (result?.success) {
+            effectiveQty = availableQty
+          }
+        }
+      }
+    }
 
     const latencyMs = Date.now() - placeStart
     // Coerce id to string. Some venues return numeric ids; downstream
@@ -1041,7 +1090,7 @@ async function placeProtectionOrder(
     const orderId = rawId !== null && rawId !== undefined && String(rawId).length > 0 ? String(rawId) : null
     if (orderId) {
       console.log(
-        `${tag} PLACED: orderId=${orderId} @ trigger=${triggerPrice} qty=${effectiveQty}${effectiveQty !== quantity ? ` (requested=${quantity}, floored)` : ""} latency=${latencyMs}ms`,
+        `${tag} PLACED: orderId=${orderId} @ trigger=${triggerPrice} qty=${effectiveQty}${effectiveQty !== quantity ? ` (requested=${quantity}, adjusted)` : ""} latency=${latencyMs}ms`,
       )
       return orderId
     }
