@@ -15,6 +15,15 @@ const ORDER_LIMITS = {
   MAX_ORDERS_PER_MINUTE: 500, // Maximum rate limit - no practical limit
 }
 
+// Settings hashes flatten arrays into index-keyed fields ("0","1",...), so
+// a stored order list round-trips back as an OBJECT, not an array. Coerce
+// either shape into a real array so .filter/.slice/.push never crash.
+function toOrderArray(raw: unknown): any[] {
+  if (Array.isArray(raw)) return raw
+  if (raw && typeof raw === "object") return Object.values(raw)
+  return []
+}
+
 // Simple per-user rate limiter for order creation
 const orderTimestamps = new Map<string, number[]>()
 
@@ -81,7 +90,7 @@ export async function GET(request: NextRequest) {
     const status = searchParams.get("status")
     const limit = Math.min(Number.parseInt(searchParams.get("limit") || "50"), 500)
 
-    const allOrders = (await getSettings("orders")) || []
+    const allOrders = toOrderArray(await getSettings("orders"))
     let filtered = allOrders
 
     if (status) {
@@ -176,7 +185,7 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const existing = (await getSettings("orders")) || []
+    const existing = toOrderArray(await getSettings("orders"))
     const newOrder = {
       id: `order:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`,
       user_id: "system",

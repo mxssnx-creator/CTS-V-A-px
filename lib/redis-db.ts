@@ -1393,7 +1393,12 @@ function parseHashValue(value: unknown): unknown {
 }
 
 function parseHash(hash: Record<string, string> | null): Record<string, any> | null {
-  if (!hash) return null
+  // Empty hash → null. Real Redis hGetAll returns {} for missing keys (the
+  // emulator now matches that), but getSettings' contract is `any | null`
+  // and every caller relies on `getSettings(...) || fallback` to detect
+  // "no value". A truthy {} here broke those fallbacks (e.g. /api/orders
+  // crashed calling .slice on {} instead of the [] default).
+  if (!hash || Object.keys(hash).length === 0) return null
   const result: Record<string, any> = {}
   for (const [key, value] of Object.entries(hash)) {
     result[key] = parseHashValue(value)
@@ -1510,7 +1515,22 @@ export async function getSettings(key: string): Promise<any | null> {
   await initRedis()
   const client = getClient()
   const hash = await client.hgetall(`settings:${key}`)
-  return parseHash(hash)
+  const parsed = parseHash(hash)
+  // ARRAY ROUND-TRIP: setSettings(key, someArray) flattens the array into
+  // index-keyed hash fields ("0","1","2",...). Without this reconstruction
+  // the caller gets back an OBJECT {0:..,1:..} where it stored an array —
+  // every `getSettings("orders") || []` site then crashed on .filter/.slice.
+  // Detect the all-numeric-keys shape and rebuild the original array.
+  if (parsed && typeof parsed === "object") {
+    const keys = Object.keys(parsed)
+    if (keys.length > 0 && keys.every((k) => /^\d+$/.test(k))) {
+      return keys
+        .map(Number)
+        .sort((a, b) => a - b)
+        .map((i) => (parsed as Record<string, any>)[String(i)])
+    }
+  }
+  return parsed
 }
 
 export async function setSettings(key: string, value: any): Promise<void> {
