@@ -226,8 +226,14 @@ import {
  *
  * If a future operator runs hundreds of symbols and the cap becomes the
  * bottleneck, expose this as a setting — but don't remove the cap.
+ *
+ * MEMORY: lowered 32 → 6. Each symbol's strategy pass builds a large in-memory
+ * Set graph (Base→Main→Real, up to thousands of axis Sets + pseudo-position
+ * objects). At 32 the peak LIVE memory was ~32× a single symbol's graph, which
+ * blew past the V8 heap ceiling and OOM-killed the process. 6 keeps strong
+ * parallelism for typical watchlists while bounding simultaneous Set graphs.
  */
-const SYMBOL_CONCURRENCY = 32
+const SYMBOL_CONCURRENCY = 6
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -2463,7 +2469,7 @@ export class TradeEngineManager {
       try { clearTimeout(this.realtimeTimer); unregisterEngineTimer(this.realtimeTimer) } catch { /* stale handle */ }
       this.realtimeTimer = undefined
     }
-    // ── ARCHITECTURAL CHANGE (three-progression refactor) ────────────────
+    // ── ARCHITECTURAL CHANGE (three-progression refactor) ─────────────���──
     // This method NO LONGER runs per-position mark-to-market / TP / SL
     // (that work is now Phase 2 of the shared ind+strat pipeline, fired
     // from inside the Realtime Progression via `startIndicationProcessor`).
@@ -3005,7 +3011,7 @@ export class TradeEngineManager {
         // work each symbol can do in one cycle, so a cold start with a
         // 50-hour range (180 000 candles) doesn't monopolize the event
         // loop. The remaining candles replay on subsequent cycles.
-        const MAX_REPLAY_STEPS_PER_SYMBOL = 500
+        const MAX_REPLAY_STEPS_PER_SYMBOL = 60
         const client = getRedisClient()
 
         const replayOneSymbol = async (
@@ -3124,8 +3130,17 @@ export class TradeEngineManager {
         const timeoutMinutes = Math.max(5, Math.min(25, Number.isFinite(rawTimeoutMinutes) ? rawTimeoutMinutes : 10))
         const timeoutMs = Math.round(timeoutMinutes * 60_000)
 
+        // OOM-protection: replay runs the FULL Base→Main→Real pipeline per
+        // candle step (each step can materialise thousands of axis Sets +
+        // pseudo-position writes). At SYMBOL_CONCURRENCY (32) every symbol
+        // replayed its whole step batch simultaneously in a tight synchronous
+        // loop where GC never got a turn — peak live memory spiked ~2.7GB in a
+        // single window and OOM-killed the process right as live trading
+        // began. Replay with LOW concurrency (2) so at most two symbols build
+        // their Set graphs at once; the rest stream through across cycles.
+        const REPLAY_CONCURRENCY = 2
         const results = await withCycleDeadline(
-          mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, replayOneSymbol),
+          mapWithConcurrency(symbols, REPLAY_CONCURRENCY, replayOneSymbol),
           `Engine ${connId} prehistoric-progression`,
           timeoutMs,
         )

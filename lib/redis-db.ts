@@ -377,27 +377,39 @@ export class InlineLocalRedis {
   
   private startTTLCleanup(): void {
     // TTL-based cleanup + LRU eviction when heap memory exceeds threshold.
-    // In dev mode, module reloads accumulate data; in prod, this prevents
-    // unbounded growth of position history and candle buffers.
+    // In dev mode the InlineLocalRedis emulator holds the ENTIRE dataset on
+    // the Node heap (in prod this lives in real Redis, off-heap). During live
+    // trading the per-cycle pipeline writes thousands of `pseudo_position:*`
+    // and `config_set:*` hashes plus a growing `pseudo_positions:{conn}` set
+    // every second; left unchecked this drove heapUsed past the 4GB V8 ceiling
+    // and OOM-killed next-server seconds after live trading began (verified:
+    // RSS climbing 1.5GB→7.3GB within a single ~60s window, GC unable to
+    // reduce — i.e. genuinely retained, not transient churn).
     const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
     if (globalCleanup.__redis_cleanup_started) return
     globalCleanup.__redis_cleanup_started = true
-    
-    const CLEANUP_INTERVAL_MS = 60_000 // Every 60s
-    const MEMORY_LIMIT_BYTES = 1_000_000_000 // 1GB soft limit
-    
+
+    // Fire FREQUENTLY: the old 60s cadence could not keep up with the burst,
+    // which exceeded the ceiling well inside one interval. 8s catches it.
+    const CLEANUP_INTERVAL_MS = 8_000
+    // Trigger eviction well below the 4GB V8 ceiling so there is headroom to
+    // actually reclaim before allocation failure (the old 1GB constant was
+    // fine but the eviction it triggered was too narrow to matter).
+    const HEAP_PRESSURE_MB = 1800
+
     const ttlCleanupTimer = setInterval(() => {
       try {
         // First, clean up expired keys
-        const cleaned = this.cleanupExpiredKeys()
-        
-        // Check memory pressure: if heap > threshold, evict old position/candle records
+        this.cleanupExpiredKeys()
+
+        // Check memory pressure: if heap > threshold, evict accumulators.
         const heapUsedMB = (process.memoryUsage?.().heapUsed || 0) / 1024 / 1024
-        const heapLimitMB = 1000 // 1GB
-        
-        if (heapUsedMB > heapLimitMB) {
+        if (heapUsedMB > HEAP_PRESSURE_MB) {
           console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
           this.evictOldRecords()
+          // Nudge GC if exposed (dev runs with --expose-gc sometimes); the
+          // emulator frees Map references above, this returns them to the OS.
+          ;(globalThis as any).gc?.()
         }
       } catch (err) {
         // Swallow errors so the cleanup timer doesn't die
@@ -423,30 +435,89 @@ export class InlineLocalRedis {
   }
   
   private evictOldRecords(): number {
-    // LRU eviction: delete oldest position/candle records when heap pressure high.
-    // Target keys that accumulate unboundedly: `strategy:*:positions`, `market_data:*:candles`.
-    // We measure "age" by parsing timestamps in the key structure or falling back to FIFO order.
+    // LRU/FIFO eviction of the key families that accumulate unboundedly on the
+    // Node heap in the dev emulator. In production these live in real Redis
+    // (off-heap) so this is a dev-only safety net, but it is essential: during
+    // live trading the pipeline creates thousands of these per minute.
     let evicted = 0
-    const targetPatterns = [
-      (k: string) => k.startsWith("strategy:") && k.includes(":positions"),
-      (k: string) => k.startsWith("market_data:") && k.endsWith(":candles"),
+
+    // 1) Hash families that grow per-cycle. Keep only the newest CAP entries
+    //    of each family (FIFO — Map preserves insertion order, so the first
+    //    entries are the oldest). config_set/pseudo_position carry a trailing
+    //    `-<nowMs>` or timestamp component, so insertion order ≈ chronological.
+    const hashFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
+      { match: (k) => k.startsWith("pseudo_position:"), cap: 4000 },
+      { match: (k) => k.startsWith("config_set:") || k.includes(":config_set:"), cap: 6000 },
+      { match: (k) => k.startsWith("strategy:") && k.includes(":positions"), cap: 2000 },
     ]
-    
-    const keysToEvict: string[] = []
-    for (const [key] of this.data.hashes.entries()) {
-      if (targetPatterns.some(p => p(key))) {
-        keysToEvict.push(key)
+    for (const { match, cap } of hashFamilyCaps) {
+      const matching: string[] = []
+      for (const [key] of this.data.hashes.entries()) {
+        if (match(key)) matching.push(key)
+      }
+      if (matching.length > cap) {
+        // Drop the oldest (front of insertion order) down to the cap.
+        const dropCount = matching.length - cap
+        for (let i = 0; i < dropCount; i++) {
+          this.deleteKey(matching[i])
+          evicted++
+        }
       }
     }
-    
-    // Evict oldest 20% of matching keys to recover memory
-    const evictCount = Math.max(1, Math.floor(keysToEvict.length * 0.2))
-    for (let i = 0; i < evictCount && i < keysToEvict.length; i++) {
-      const key = keysToEvict[i]
-      this.deleteKey(key)
-      evicted++
+
+    // 2) String families (setSettings can store flat JSON as strings too).
+    const stringFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
+      { match: (k) => k.startsWith("pseudo_position:"), cap: 4000 },
+      { match: (k) => k.includes(":exists:") || k.includes(":dedup:"), cap: 6000 },
+    ]
+    for (const { match, cap } of stringFamilyCaps) {
+      const matching: string[] = []
+      for (const [key] of this.data.strings.entries()) {
+        if (match(key)) matching.push(key)
+      }
+      if (matching.length > cap) {
+        const dropCount = matching.length - cap
+        for (let i = 0; i < dropCount; i++) {
+          this.deleteKey(matching[i])
+          evicted++
+        }
+      }
     }
-    
+
+    // 3) Candle blobs — large (~10MB each); keep a small number around.
+    {
+      const candleKeys: string[] = []
+      for (const [key] of this.data.strings.entries()) {
+        if (key.startsWith("market_data:") && key.endsWith(":candles")) candleKeys.push(key)
+      }
+      // Candles are static per session; never need more than the active symbol
+      // set. 20 is generous and prevents stale reload duplicates lingering.
+      const CANDLE_CAP = 20
+      if (candleKeys.length > CANDLE_CAP) {
+        const dropCount = candleKeys.length - CANDLE_CAP
+        for (let i = 0; i < dropCount; i++) {
+          this.deleteKey(candleKeys[i])
+          evicted++
+        }
+      }
+    }
+
+    // 4) Prune oversized membership sets so smembers() can't materialise huge
+    //    arrays. These hold pseudo-position ids; trim to the newest entries.
+    const SET_MEMBER_CAP = 8000
+    for (const [key, members] of this.data.sets.entries()) {
+      if (
+        (key.startsWith("pseudo_positions:") || key.startsWith("real_pseudo_positions:")) &&
+        members.size > SET_MEMBER_CAP
+      ) {
+        const arr = Array.from(members)
+        // Sets also preserve insertion order; keep the newest SET_MEMBER_CAP.
+        const keep = new Set(arr.slice(arr.length - SET_MEMBER_CAP))
+        this.data.sets.set(key, keep)
+        evicted += arr.length - keep.size
+      }
+    }
+
     if (evicted > 0) {
       console.log(`[v0] [Redis Memory] Evicted ${evicted} old records to reduce memory pressure`)
     }
