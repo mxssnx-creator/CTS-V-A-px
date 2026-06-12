@@ -255,18 +255,27 @@ export async function GET(
       // have clearly been processed (Frames and Indicators are non-zero).
       historicSymbolsProcessed
     )
+    // DATA INTEGRITY: every completion signal is gated on REAL recorded work
+    // (symbolsProcessed > 0). The genuine completion path
+    // (completePrehistoricPhase) always stamps symbols_processed=max(scard,total)
+    // alongside is_complete and the `:done` marker — so a flag without work is
+    // by definition a stale/fake stamp (legacy fake-data writers stamped
+    // prehistoric_done=1, the 7-day-TTL `:done` key, and data_loaded
+    // unconditionally). Without this gate a never-run system shows a false
+    // "100 % complete" with symbolsProcessed=0.
     const historicIsComplete =
-      prehistoricHash.is_complete === "1" ||
-      // `:done` plain-key marker written by completePrehistoricPhase —
-      // survives hot-reloads where the in-memory callback may not fire.
-      String(prehistoricDoneMarker) === "1" ||
-      (progHash.prehistoric_phase_active === "false" && historicSymbolsProcessed > 0) ||
-      es.prehistoric_data_loaded === true ||
-      es.prehistoric_data_loaded === "1" ||
-      // All symbols processed — even if is_complete was never written
-      // (e.g. the processor crashed after the last symbol but before the
-      // completion pin), treat the run as done so the bar reaches 100 %.
-      (historicSymbolsTotal > 0 && historicSymbolsProcessed >= historicSymbolsTotal)
+      historicSymbolsProcessed > 0 &&
+      (prehistoricHash.is_complete === "1" ||
+        // `:done` plain-key marker written by completePrehistoricPhase —
+        // survives hot-reloads where the in-memory callback may not fire.
+        String(prehistoricDoneMarker) === "1" ||
+        progHash.prehistoric_phase_active === "false" ||
+        es.prehistoric_data_loaded === true ||
+        es.prehistoric_data_loaded === "1" ||
+        // All symbols processed — even if is_complete was never written
+        // (e.g. the processor crashed after the last symbol but before the
+        // completion pin), treat the run as done so the bar reaches 100 %.
+        (historicSymbolsTotal > 0 && historicSymbolsProcessed >= historicSymbolsTotal))
     const historicProgressPercent = historicIsComplete
       ? 100
       // No Math.min(99) cap — progress tracks real completion. The bar
@@ -464,7 +473,7 @@ export async function GET(
       .sort((a, b) => b.count - a.count)
       .slice(0, 5)
 
-    // ── Real-stage open positions ────────────────────────────────────
+    // ── Real-stage open positions ────────────���───────────────────────
     //
     // Real positions are Main→Real promotions awaiting mirror into
     // exchange orders. Count only — USD volume is NOT tracked here
@@ -1481,7 +1490,7 @@ export async function GET(
       }
     } catch { /* archive empty */ }
 
-    // ── LIVE STAGE DETAIL (4th tier — mirrors Real but from real exchange) ───
+    // ── LIVE STAGE DETAIL (4th tier — mirrors Real but from real exchange) ��──
     // Sourced entirely from local Redis — the progression hash (counters) and
     // the closed-position archive written by the live-stage pipeline. No
     // exchange history calls required.

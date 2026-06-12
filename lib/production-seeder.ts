@@ -120,48 +120,51 @@ async function seedPredefinedConnections(): Promise<void> {
   try {
     const client = getRedisClient()
     const connectionsKey = "all_connections"
-    
-    // In production always ensure complete state (no early skip)
-    const { isProductionEnvironment } = await import("@/lib/redis-db")
-    if (!isProductionEnvironment()) {
-      const existingConnections = await client.get(connectionsKey)
-      if (existingConnections) {
-        console.log("[v0] [ProductionSeeder] Connections already exist, skipping...")
-        return
-      }
+
+    // ALWAYS skip when connections already exist — in EVERY environment.
+    // AUTO-START DISABLED: this function previously re-ran unconditionally in
+    // production ("no early skip") and force-wrote is_enabled_dashboard=1 /
+    // is_active=1 / is_live_trade=1 onto bingx-x01 on EVERY call. Because
+    // /api/system/initialize is invoked from EngineAutoInitializer on every
+    // dashboard mount, that re-enabled (and auto-started) the connection
+    // after every operator disable. Seeding is now strictly first-boot-only.
+    const existingConnections = await client.get(connectionsKey)
+    if (existingConnections) {
+      console.log("[v0] [ProductionSeeder] Connections already exist, skipping (never overwrite)")
+      return
     }
-    
+
     // Get predefined connections
     const predefinedConnections = getPredefinedAsExchangeConnections()
-    
-    // Enable BingX X01 for immediate trading (it has real credentials)
-    // Quick-start requires non-predefined connections, so we set is_predefined: false
-    // and mark it as enabled/active/live_trade for production use
-    const enabledConnections = predefinedConnections.map((conn, idx) => ({
+
+    // AUTO-START DISABLED: seed ALL connections fully disabled. The operator
+    // must explicitly enable a connection via the dashboard toggle before
+    // anything runs. `is_enabled` stays "1" (connection is usable/selectable)
+    // but no dashboard/active/live flags are pre-set.
+    const seededConnections = predefinedConnections.map((conn) => ({
       ...conn,
-      // First connection (bingx-x01) gets enabled for immediate trading
       is_enabled: "1",
-      is_active: idx === 0 ? "1" : "0",
-      is_live_trade: idx === 0 ? "1" : "0",
-      is_assigned: idx === 0 ? "1" : "0",
-      is_dashboard_inserted: idx === 0 ? "1" : "0",
-      is_enabled_dashboard: idx === 0 ? "1" : "0",
-      is_inserted: idx === 0 ? "1" : "0",
+      is_active: "0",
+      is_live_trade: "0",
+      is_assigned: "0",
+      is_dashboard_inserted: "0",
+      is_enabled_dashboard: "0",
+      is_inserted: "0",
       // Mark as NOT predefined so quick-start can find it (string "false" for Redis consistency)
       is_predefined: "false",
-      active_symbols: idx === 0 ? JSON.stringify([]) : "[]",
-      live_volume_factor: idx === 0 ? "0.1" : "1",
+      active_symbols: "[]",
+      live_volume_factor: "1",
     }))
-    
+
     // Save individual connections to Redis (connection:{id} hashes)
-    for (const conn of enabledConnections) {
+    for (const conn of seededConnections) {
       await saveConnection(conn)
     }
-    
+
     // Store the connection list for quick lookup
-    await client.set(connectionsKey, JSON.stringify(enabledConnections))
-    
-    console.log(`[v0] [ProductionSeeder] ✅ Seeded ${enabledConnections.length} connections, bingx-x01 enabled for trading`)
+    await client.set(connectionsKey, JSON.stringify(seededConnections))
+
+    console.log(`[v0] [ProductionSeeder] ✅ Seeded ${seededConnections.length} connections (all disabled — operator must enable explicitly)`)
   } catch (error) {
     console.error("[v0] [ProductionSeeder] ❌ Failed to seed connections:", error)
     throw error
@@ -203,39 +206,38 @@ async function seedProgressionState(): Promise<void> {
     console.log("[v0] [ProductionSeeder] Seeding progression state...")
     
     const client = getRedisClient()
-    
-    // In production we never skip — we always run the full coverage repair
-    // so that progression counters are guaranteed correct after redeploy.
-    const { isProductionEnvironment } = await import("@/lib/redis-db")
-    if (!isProductionEnvironment()) {
-      const progressionKeys = await client.keys("progression:*")
-      if (progressionKeys.length > 0) {
-        console.log("[v0] [ProductionSeeder] Progression state already exists, skipping...")
-        return
-      }
-    }
-    
+
     // Get all connections to create progression states for
     const connections = await client.get("all_connections")
     if (!connections) {
       console.log("[v0] [ProductionSeeder] No connections found, skipping progression seeding")
       return
     }
-    
+
     const connectionsArray = JSON.parse(connections)
-    
-    // Create initial progression state for each connection
-    // is_enabled and is_active are stored as "1"/"0" strings in Redis
+
+    // DATA INTEGRITY FIX: never archive/restart an existing progression here.
+    // This function previously ran UNCONDITIONALLY in production (no skip) and
+    // called archiveAndStartNewProgression for every enabled connection —
+    // i.e. every /api/system/initialize call (fired on each dashboard mount)
+    // archived the LIVE progression and reset all counters to zero. Now a
+    // progression is created only when NONE exists for that connection.
+    let created = 0
     for (const conn of connectionsArray) {
       if (conn.is_enabled === "1" && conn.is_active === "1") {
+        const existing = await client.hgetall(`progression:${conn.id}`).catch(() => null)
+        if (existing && Object.keys(existing).length > 0) {
+          continue // live progression present — never touch it
+        }
         await ProgressionStateManager.archiveAndStartNewProgression(
           conn.id,
           Date.now()
         )
+        created++
       }
     }
-    
-    console.log("[v0] [ProductionSeeder] ✅ Progression state seeded")
+
+    console.log(`[v0] [ProductionSeeder] ✅ Progression state seeded (${created} created, existing untouched)`)
   } catch (error) {
     console.error("[v0] [ProductionSeeder] ❌ Failed to seed progression state:", error)
     throw error
@@ -283,12 +285,11 @@ export async function forceReseedProductionData(): Promise<void> {
   }
 }
 
-/**
- * Auto-seed on module load if in production mode
- */
-if (process.env.NODE_ENV === "production") {
-  seedProductionData().catch(console.error)
-}
+// Module-load auto-seed REMOVED.
+// Previously `seedProductionData()` fired as an import side effect whenever
+// NODE_ENV === "production", re-running the seeder on every cold start and
+// module re-import. Seeding now happens only via the explicit
+// /api/system/initialize endpoint (which itself is first-boot-only).
 
 export default {
   seedProductionData,
