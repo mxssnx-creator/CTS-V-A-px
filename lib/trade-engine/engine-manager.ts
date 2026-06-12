@@ -710,12 +710,13 @@ export class TradeEngineManager {
           ])
           const symbolsForCheck = await this.getSymbols()
           const hasSymbols = symbolsForCheck.length > 0
-          // PRODUCTION FIX: production fast-path sets done/firstpass flags without historic PF data.
-          // Skip pfSample check in production mode to avoid defeating the fast-path.
-          const { isProductionEnvironment } = await import("@/lib/redis-db")
-          const isProd = isProductionEnvironment()
+          // STRICT verification in ALL environments: the production bypass of
+          // the PF-sample check existed only to protect the (now removed)
+          // fake fast-path that stamped flags without data. A cache marker
+          // with no historic PF sample means the real fill never completed —
+          // force the full reload so realtime never runs on empty Sets.
           const dataLooksComplete =
-            doneFlag === "1" && firstPass === "1" && isComplete === "1" && (isProd || pfSample != null || !hasSymbols)
+            doneFlag === "1" && firstPass === "1" && isComplete === "1" && (pfSample != null || !hasSymbols)
           if (!dataLooksComplete) {
             console.warn(
               `[v0] [Engine ${this.connectionId}] Stale prehistoric cache marker (done/firstpass/complete/PF missing or empty) — FORCING full prehistoric reload. This fixes production "stuck prehistoric / low keys / no activity" after deploys/migrations.`,
@@ -733,6 +734,18 @@ export class TradeEngineManager {
               redisClient.del(`prehistoric:${this.connectionId}:done`),
               redisClient.del(`prehistoric:${this.connectionId}:firstpass:done`),
             ])
+            // Also clear the completion fields that the cache-hit path
+            // re-stamped above BEFORE this verification ran — otherwise the
+            // stats route would show a fake "complete N/N" while the forced
+            // full reload is still processing.
+            await redisClient
+              .hset(`prehistoric:${this.connectionId}`, {
+                is_complete: "0",
+                symbols_processed: "0",
+                updated_at: new Date().toISOString(),
+                data_source: "forced-reload",
+              })
+              .catch(() => {})
             cacheHit = false
             prehistoricCached = null
           }
@@ -746,96 +759,23 @@ export class TradeEngineManager {
       }
 
       if (!cacheHit) {
-        // ── PRODUCTION FAST-PATH FOR LIVE TRADING ─────────────────────────
-        // In production (Vercel serverless / cold starts / limited function lifetime)
-        // the full prehistoric load can never complete inside one invocation.
-        // This left stats stalling at "prehistoric_data" and prevented any
-        // new live positions from opening even when is_live_trade=1 and
-        // quickstart had enabled the connection.
+        // PRODUCTION FAST-PATH REMOVED (data-integrity directive).
+        // The previous code force-stamped `prehistoric:{id}:done`,
+        // `firstpass:done` and `is_complete=1` WITHOUT any real prehistoric
+        // processing whenever isProd && is_live_trade=1, then armed all live
+        // processors against EMPTY sets. That violated the architectural
+        // contract ("first finish prehistoric progress, then start realtime
+        // progress") and the no-fake-data directive: realtime evaluated
+        // empty Sets, dashboards showed fake 100 % completion, and the real
+        // historic fill never produced the Sets/PF baselines realtime needs.
         //
-        // Fix: when running in production *and* the connection has live trade
-        // enabled, immediately mark prehistoric done (so the self-gating ticks
-        // become productive) and arm all processors. Historic set filling
-        // continues in the background via crons + the continuous prehistoric
-        // path. Live position adoption, mark sync, SL/TP healing, and any
-        // realtime signals that can fire will work immediately.
-        // This makes prod behavior match the user's expectation from dev/quickstart.
-        const { isProductionEnvironment } = await import("@/lib/redis-db")
-        const isProd = isProductionEnvironment()
-        let liveTradeOn = false
-        try {
-          const connData = await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({} as any))
-          liveTradeOn = connData && (
-            connData.is_live_trade === "1" || connData.is_live_trade === true ||
-            connData.live_trade_enabled === "1" || connData.live_trade_enabled === true
-          )
-        } catch { /* non-fatal */ }
-
-        if (isProd && liveTradeOn) {
-          console.log(
-            `[v0] [Engine ${this.connectionId}] PRODUCTION + live_trade=1 → forcing prehistoric done + arming processors immediately. ` +
-            `Historic enrichment will backfill via crons. This fixes "stalling stats / no live positions" in prod.`
-          )
-          try {
-            await redisClient.set(`prehistoric:${this.connectionId}:done`, "1")
-            await redisClient.set(`prehistoric:${this.connectionId}:firstpass:done`, "1")
-            await redisClient.hset(`prehistoric:${this.connectionId}`, {
-              is_complete: "1",
-              data_source: "production-fast-path",
-              updated_at: new Date().toISOString(),
-            })
-            await redisClient.set(prehistoricCacheKey, "1", { EX: 86400 }).catch(() => {})
-          } catch (forceErr) {
-            console.warn(`[v0] [Engine] Failed to force prehistoric done in prod fast-path:`, forceErr)
-          }
-          // Arm processors right now (they will self-gate on the flags we just set)
-          this.startIndicationProcessor(config.indicationInterval)
-          this.startStrategyProcessor(config.strategyInterval)
-          this.startRealtimeProcessor(config.realtimeInterval)
-          cacheHit = true // treat as hit for the rest of startup
-          // Advance phase so dashboard doesn't appear stuck in prehistoric in prod
-          try {
-            const symCount = (await this.getSymbols()).length
-            await this.updateProgressionPhase(
-              "live_trading",
-              100,
-              `Live trading ACTIVE (prod fast-path) — ${symCount} symbols`
-            )
-            await setSettings(`trade_engine_state:${this.connectionId}`, {
-              all_phases_started: true,
-              live_trading_started: true,
-              engine_ready: true,
-              updated_at: new Date().toISOString(),
-            })
-
-            // === COMPREHENSIVE PSEUDO POSITION RECONCILIATION (fixes "millions of open at 8k Sets") ===
-            // In prod (restarts, serverless, migrations) the open pseudo index can bloat
-            // because closes are lost or axis expansion creates variants faster than closes.
-            // This pass removes any open pseudo whose config no longer has a live Set,
-            // repairs indexes, and ensures correct logistics (history, Base counters, progression).
-            try {
-              const { PseudoPositionManager } = await import("./pseudo-position-manager")
-              const posMgr = new PseudoPositionManager(this.connectionId)
-              // Best-effort: use whatever is currently tracked as active by the pseudo manager itself
-              // (this will conservatively close true orphans while the next strategy cycles recreate valid ones).
-              const currentActive = new Set<string>()
-              // (A full implementation would union keys from current Main/Real sets; empty set here forces
-              // cleanup of anything not provably needed right now — safe and effective for bloat.)
-              const cleaned = await posMgr.reconcileStaleOpenPositions(currentActive).catch(() => 0)
-              if (cleaned > 0) {
-                console.log(`[v0] [Engine ${this.connectionId}] Prod reconciliation closed ${cleaned} stale pseudo positions — correct progress and DB state restored.`)
-              }
-            } catch (recErr) {
-              console.warn(`[v0] [Engine] Prod pseudo reconciliation warning:`, recErr)
-            }
-          } catch (phaseErr) {
-            console.warn(`[v0] [Engine] Prod fast-path phase advance warning:`, phaseErr)
-          }
-        } else {
-          // Non-blocking prehistoric loading (fresh or forced after stale cache) — dev / non-live paths
-          await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
-          this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
-        }
+        // Production now follows the SAME correct path as dev: the
+        // non-blocking background load runs the real prehistoric calculator
+        // (with per-symbol checkpoints, so interrupted runs resume instead
+        // of restarting), and `armLiveProgressions` (via onFirstPassComplete)
+        // arms the realtime loops the moment the first REAL pass completes.
+        await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
+        this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
       }
 
       // Mark engine as running BEFORE starting the self-scheduling processor
