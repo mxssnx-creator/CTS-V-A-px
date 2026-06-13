@@ -196,19 +196,25 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
     await initRedis()
     const client = getClient()
 
-    // Default symbols if none provided
+    // Default symbols if none provided — matches the 15-symbol production set
+    // seeded by migration 031+032 (ordered by 1h volatility per standing directive).
     const targetSymbols = symbols.length > 0 ? symbols : [
-      "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
-      "DOGEUSDT", "LINKUSDT", "LITUSDT", "THETAUSDT", "AVAXUSDT",
-      "MATICUSDT", "SOLUSDT", "UNIUSDT", "APTUSDT", "ARBUSDT"
+      "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
+      "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+      "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
     ]
 
-    // Base prices for fallback synthetic data
+    // Base prices for fallback synthetic data. Used when the live exchange
+    // fetch fails (no API key / rate limit). Prices are approximate Jun-2026
+    // values; the synthetic generator applies ±0.5 % random walk so they
+    // drift realistically over the 86,400-candle window.
     const basePrices: Record<string, number> = {
-      BTCUSDT: 45000, ETHUSDT: 2500, BNBUSDT: 600, XRPUSDT: 0.5,
-      ADAUSDT: 0.8, DOGEUSDT: 0.12, LINKUSDT: 25, LITUSDT: 120,
-      THETAUSDT: 2.5, AVAXUSDT: 35, MATICUSDT: 1.2, SOLUSDT: 140,
-      UNIUSDT: 15, APTUSDT: 10, ARBUSDT: 1.8,
+      BTCUSDT:  65000, ETHUSDT:  3500,  SOLUSDT:  165,  BNBUSDT:   620,
+      XRPUSDT:  0.55,  DOGEUSDT: 0.18,  ADAUSDT:  0.90, AVAXUSDT:  40,
+      LINKUSDT: 18,    DOTUSDT:  9.5,   ATOMUSDT: 11,   LTCUSDT:   95,
+      UNIUSDT:  12,    NEARUSDT: 7.5,   MATICUSDT:1.1,
+      // Legacy symbols kept for backward-compat with any cached keys.
+      LITUSDT: 120, THETAUSDT: 2.5, APTUSDT: 10, ARBUSDT: 1.8,
     }
 
     let loaded = 0

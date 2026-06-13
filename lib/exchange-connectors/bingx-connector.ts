@@ -554,6 +554,24 @@ export class BingXConnector extends BaseExchangeConnector {
           const retryData = await this.safeJson(retryResponse)
           if (!retryResponse.ok || !this.isBingXSuccess(retryData.code)) {
             const retryErrMsg = retryData.msg || retryData.error || `HTTP ${retryResponse.status}`
+            // Return a structured failure instead of throwing so callers (e.g.
+            // VolumeCalculator.resolveBalanceAndLeverage) can distinguish between
+            // "API unavailable — use fallback balance" and hard coding errors.
+            // Throwing here caused an uncaught error that prevented the balance
+            // fallback from being written to the cache, resulting in every subsequent
+            // live dispatch also calling getBalance() and hitting the same 100421.
+            if (
+              retryData.code === 100421 ||
+              String(retryData.code) === "100421"
+            ) {
+              // Throttle the log: only emit once per 30 s across all connector instances.
+              const now = Date.now()
+              if (now - BingXConnector.lastSyncFailLogTs > 30_000) {
+                BingXConnector.lastSyncFailLogTs = now
+                this.logError(`API Error after resync (code ${retryData.code}): ${retryErrMsg} — returning balance=0 (caller uses fallback)`)
+              }
+              return { success: false, error: retryErrMsg, balance: 0, capabilities: this.getCapabilities(), logs: this.logs }
+            }
             this.logError(`API Error after resync (code ${retryData.code}): ${retryErrMsg}`)
             throw new Error(retryErrMsg)
           }
@@ -639,6 +657,23 @@ export class BingXConnector extends BaseExchangeConnector {
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
+      // 100421 "Null timestamp or timestamp mismatch" is an intermittent
+      // exchange-side timestamp error already handled above with a resync+retry.
+      // If it still bubbles here the retry also failed; log once per 30 s to avoid
+      // flooding stderr at ~800ms cadence across 15 symbols × 2 directions.
+      const is100421 =
+        errorMsg.includes("100421") ||
+        errorMsg.toLowerCase().includes("null timestamp") ||
+        errorMsg.toLowerCase().includes("timestamp mismatch")
+      if (is100421) {
+        const now = Date.now()
+        if (now - BingXConnector.lastSyncFailLogTs > 30_000) {
+          BingXConnector.lastSyncFailLogTs = now
+          this.logError(`✗ Connection error: ${errorMsg} (100421 — throttled, next log in 30 s)`)
+        }
+        // Return a non-throwing failure so VolumeCalculator can write the cache.
+        return { success: false, error: errorMsg, balance: 0, capabilities: this.getCapabilities(), logs: this.logs }
+      }
       this.logError(`✗ Connection error: ${errorMsg}`)
       throw error
     }
@@ -656,7 +691,7 @@ export class BingXConnector extends BaseExchangeConnector {
       // Sync server time before any signed request to prevent timestamp errors
       await this.syncServerTime()
 
-      // ��─ Quantity sanity & formatting ─────────────────────────────────────
+      // ���─ Quantity sanity & formatting ─────────────────────────────────────
       // BingX rejects quantities that fall below the symbol step size, and in
       // many cases responds with its generic "this api is not exist" error
       // instead of a precise reason. Normalise the quantity to a reasonable

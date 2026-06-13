@@ -94,7 +94,7 @@ export class VolumeCalculator {
     let balance = 10000
     try {
       const cachedBalance = await getSettings(`connection_balance:${connectionId}`)
-      if (cachedBalance?.balance) {
+      if (cachedBalance?.balance && parseFloat(String(cachedBalance.balance)) > 0) {
         balance = parseFloat(String(cachedBalance.balance))
       } else {
         const connection = await getConnection(connectionId)
@@ -113,15 +113,33 @@ export class VolumeCalculator {
             isTestnet:
               connection.is_testnet === true || connection.is_testnet === "true",
           })
-          const result = await connector.getBalance()
-          if (result?.balance) {
-            balance = result.balance
-            await setSettings(`connection_balance:${connectionId}`, {
-              balance,
-              updated_at: new Date().toISOString(),
-            })
+          try {
+            const result = await connector.getBalance()
+            if (result?.success && result?.balance && result.balance > 0) {
+              balance = result.balance
+            }
+          } catch {
+            // getBalance threw (e.g. 100421 timestamp error) — use the $10k default.
+            // Fall through to cache write below so subsequent calls skip the live fetch.
           }
         }
+        // Cache the resolved balance (real or fallback) so every subsequent live
+        // dispatch in this cycle skips the getBalance() round-trip entirely.
+        // TTL: 90 s — short enough that a real balance change is picked up within
+        // two minutes, long enough to cover a full 15-symbol cycle at 1 Hz.
+        await setSettings(`connection_balance:${connectionId}`, {
+          balance,
+          updated_at: new Date().toISOString(),
+          is_fallback: balance === 10000,
+        })
+        // Optionally refresh the cache in the background after 90 s to avoid
+        // every worker racing for the balance on the same expiry boundary.
+        setTimeout(async () => {
+          try {
+            const { getRedisClient: _rc } = await import("@/lib/redis-db")
+            await _rc().del(`settings:connection_balance:${connectionId}`)
+          } catch { /* best-effort TTL reset */ }
+        }, 90_000)
       }
     } catch {
       // Non-critical — fall back to the $10k default so volume is calculated.
@@ -506,7 +524,7 @@ export class VolumeCalculator {
       //   - an explicit "main" / "preset" (forces that engine), OR
       //   - leave it unset entirely (treated as Strategy → identity).
       // To opt into AUTO-RESOLUTION from connection flags, the
-      // live-stage caller passes `tradeMode: "auto"` — handled by the
+      // live-stage caller passes `tradeMode: "auto"` ��� handled by the
       // type widening below.
       let resolvedMode: "main" | "preset" | undefined = options.tradeMode
       let mainVolumeFactor = 1
