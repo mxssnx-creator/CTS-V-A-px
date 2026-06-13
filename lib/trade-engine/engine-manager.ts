@@ -1279,7 +1279,14 @@ export class TradeEngineManager {
         // needs to run — only the prev-set enrichment depends on
         // prehistoric output, and that's a soft dependency.
         try {
-          await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 })
+          // Write BOTH gate flags. startPrehistoricProgression watches
+          // `:firstpass:done` to arm realtime via onFirstPassComplete; if
+          // only `:done` is written the replay loop spins forever without
+          // ever calling the callback, leaving realtime permanently disabled.
+          await Promise.all([
+            redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 }),
+            redisClient.set(`prehistoric:${this.connectionId}:firstpass:done`, "1", { EX: 86400 }),
+          ])
           await this.updateProgressionPhase(
             "live_trading",
             100,
@@ -1419,10 +1426,17 @@ export class TradeEngineManager {
 
       const totalPrehistoricDurationMs = Date.now() - calcStartTs
 
-      // Mark prehistoric hash as complete
+      // Mark prehistoric hash as complete.
+      // AUTHORITATIVE symbols_processed: re-read the SCARD of the idempotent
+      // SET that ConfigSetProcessor owned during the run. The local
+      // `processingResult.symbolsProcessed` counter raced under parallelism and
+      // can be lower than reality; SCARD is always the monotonic ground truth.
+      const finalScard = await redisClient
+        .scard(`prehistoric:${this.connectionId}:symbols`)
+        .catch(() => processingResult.symbolsProcessed)
       await redisClient.hset(`prehistoric:${this.connectionId}`, {
         is_complete: "1",
-        symbols_processed: String(processingResult.symbolsProcessed),
+        symbols_processed: String(finalScard),
         candles_loaded: String(processingResult.candlesProcessed),
         indicators_calculated: String(processingResult.indicationResults),
         total_duration_ms: String(totalPrehistoricDurationMs),
@@ -1449,12 +1463,12 @@ export class TradeEngineManager {
           this.connectionId,
           "prehistoric_complete",
           processingResult.errors > 0 ? "warning" : "info",
-          `Prehistoric calc done — ${processingResult.symbolsProcessed}/${processingResult.symbolsTotal} symbols, ` +
+          `Prehistoric calc done — ${finalScard}/${processingResult.symbolsTotal} symbols, ` +
           `${processingResult.candlesProcessed} candles, ${processingResult.indicationResults} indications, ` +
           `${processingResult.strategyPositions} positions in ${totalPrehistoricDurationMs}ms`,
           {
             symbolsTotal: processingResult.symbolsTotal,
-            symbolsProcessed: processingResult.symbolsProcessed,
+            symbolsProcessed: finalScard,
             candlesProcessed: processingResult.candlesProcessed,
             indicationResults: processingResult.indicationResults,
             strategyPositions: processingResult.strategyPositions,
@@ -1466,7 +1480,7 @@ export class TradeEngineManager {
 
       console.log(
         `[v0] [Prehistoric] ✓ complete in ${totalPrehistoricDurationMs}ms | ` +
-        `symbols=${processingResult.symbolsProcessed}/${processingResult.symbolsTotal} | ` +
+        `symbols=${finalScard}/${processingResult.symbolsTotal} | ` +
         `candles=${processingResult.candlesProcessed} | ` +
         `indications=${processingResult.indicationResults} | ` +
         `strategies=${processingResult.strategyPositions} | ` +
@@ -1487,7 +1501,7 @@ export class TradeEngineManager {
         config_set_indication_results: processingResult.indicationResults,
         config_set_strategy_positions: processingResult.strategyPositions,
         config_set_symbols_total: processingResult.symbolsTotal,
-        config_set_symbols_processed: processingResult.symbolsProcessed,
+        config_set_symbols_processed: finalScard,
         config_set_candles_processed: processingResult.candlesProcessed,
         config_set_errors: processingResult.errors,
         config_set_duration_ms: processingResult.duration,
@@ -3148,10 +3162,21 @@ export class TradeEngineManager {
         cycleCount++
         const duration = Date.now() - cycleStart
 
-        // First-pass done: flip both flags so the gated realtime loop
-        // can become productive. Subsequent cycles re-fill the Sets
-        // continuously as new market data arrives.
-        if (!firstPassDone) {
+        // Hoist step/indication/strategy totals so the first-pass guard below can
+        // read stepsTotal before the telemetry block that originally declared it.
+        const stepsTotal = results.reduce(
+          (acc: number, r: any) => acc + (Number(r?.stepsReplayed) || 0),
+          0,
+        )
+        _ppLastSteps = stepsTotal
+
+        // First-pass done: flip both flags so the gated realtime loop can become
+        // productive. Only fire when this cycle did REAL work (at least one symbol
+        // replayed ≥1 candle step). If all symbols produced zero steps on the first
+        // tick (cold candle cache, market data not yet loaded) we would arm realtime
+        // against completely empty Sets — exactly the state the gate is designed to
+        // prevent. Stay in the "not done" state and let the next cycle retry.
+        if (!firstPassDone && stepsTotal > 0) {
           firstPassDone = true
           try {
             const client = getRedisClient()
@@ -3183,14 +3208,8 @@ export class TradeEngineManager {
         }
 
         // Cycle telemetry — surfaces the loop's heartbeat to the dashboard.
-        // Now reports replay-step totals so operators can see real per-cycle
-        // work (e.g. "1 200 steps replayed across 12 symbols, 340 indications,
-        // 18 strategies") instead of an opaque cycle count.
-        const stepsTotal = results.reduce(
-          (acc: number, r: any) => acc + (Number(r?.stepsReplayed) || 0),
-          0,
-        )
-        _ppLastSteps = stepsTotal
+        // stepsTotal/_ppLastSteps are already computed and set above the
+        // first-pass guard so they can influence the firstPassDone check.
         const indTotal = results.reduce(
           (acc: number, r: any) => acc + (Number(r?.indications) || 0),
           0,
@@ -3204,11 +3223,18 @@ export class TradeEngineManager {
           const telemetryClient = getRedisClient()
           const progKey = `progression:${connId}`
           const nowMs = Date.now()
+          // NOTE: prehistoric_indications_total and prehistoric_strategies_total are
+          // owned EXCLUSIVELY by ConfigSetProcessor (loadPrehistoricData path). They
+          // are written once via hincrby per symbol during the one-time historic calc.
+          // The ongoing replay loop here MUST NOT also hincrby those same fields —
+          // doing so double-counts every cycle after historic completes and inflates the
+          // dashboard numbers indefinitely. The replay loop writes to distinct
+          // *_replay_* keys so the two paths stay isolated and the totals remain correct.
           await Promise.all([
             telemetryClient.hincrby(progKey, "prehistoric_progression_cycles", 1),
             telemetryClient.hincrby(progKey, "prehistoric_replay_steps_total", stepsTotal),
-            telemetryClient.hincrby(progKey, "prehistoric_indications_total", indTotal),
-            telemetryClient.hincrby(progKey, "prehistoric_strategies_total", stratTotal),
+            telemetryClient.hincrby(progKey, "prehistoric_replay_indications_total", indTotal),
+            telemetryClient.hincrby(progKey, "prehistoric_replay_strategies_total", stratTotal),
             telemetryClient.hset(progKey, {
               prehistoric_progression_last_cycle_at: String(nowMs),
               prehistoric_progression_last_cycle_ms: String(duration),
