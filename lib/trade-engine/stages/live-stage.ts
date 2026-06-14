@@ -96,6 +96,19 @@ interface LivePosition {
   assignedStopLoss?: number
   assignedTakeProfit?: number
   protectionArmedQuantity?: number
+  // ── Trailing stop state ────────────────────────────────────────────────
+  // Written by syncLiveFromPseudo when the pseudo position's trailing machine
+  // is armed. These fields make the ratcheted absolute stop price available to
+  // computeDesiredProtectionPrices and checkAndForceCloseOnSltpCross so that
+  // the trailing level — not the original static percentage — is used for both
+  // exchange order placement and proactive force-close detection.
+  //
+  // trailingActive: true when the pseudo's trailing machine is armed.
+  // trailingStopPrice: the latest ratcheted absolute stop price. Updated every
+  //   time syncLiveFromPseudo writes a new trailing level; cleared (undefined)
+  //   when trailing becomes inactive so the static stopLoss % takes over again.
+  trailingActive?: boolean
+  trailingStopPrice?: number
   status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
   statusReason?: string
   closeReason?: string
@@ -1190,15 +1203,25 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   const fillPrice = pos.averageExecutionPrice || pos.entryPrice
   if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
 
-  const slPct = Math.max(0, pos.stopLoss || 0) / 100
-  const tpPct = Math.max(0, pos.takeProfit || 0) / 100
+  // ── Trailing stop: use the ratcheted absolute price directly ────────────
+  // When trailing is active syncLiveFromPseudo stamps pos.trailingStopPrice
+  // with the latest ratcheted absolute stop level. Using that absolute price
+  // directly avoids the percentage-anchored re-derivation below which would
+  // always revert to the static origin level, fighting the ratchet every tick.
+  let desiredSl: number
+  if (pos.trailingActive && pos.trailingStopPrice && pos.trailingStopPrice > 0) {
+    desiredSl = pos.trailingStopPrice
+  } else {
+    const slPct = Math.max(0, pos.stopLoss || 0) / 100
+    desiredSl =
+      slPct > 0
+        ? pos.direction === "long"
+          ? fillPrice * (1 - slPct)
+          : fillPrice * (1 + slPct)
+        : 0
+  }
 
-  const desiredSl =
-    slPct > 0
-      ? pos.direction === "long"
-        ? fillPrice * (1 - slPct)
-        : fillPrice * (1 + slPct)
-      : 0
+  const tpPct = Math.max(0, pos.takeProfit || 0) / 100
   const desiredTp =
     tpPct > 0
       ? pos.direction === "long"
@@ -1251,14 +1274,21 @@ function priceDrifted(current: number | undefined, desired: number): boolean {
 // driven by *price or qty drift* (not missing-order re-arms — those always fire
 // immediately because arming a missing order is never a no-op).
 //
-// 30 s is chosen to be:
-//   • long enough to absorb a normal oscillation window (BTC 0.5% range
-//     typically resolves within ~5–15 s on a 1-min candle)
-//   • short enough that a genuine operator override or large fill-size change
-//     is reflected on the exchange within one operator-perceptible minute.
+// MIN_REARM_MS (30 s) — for static SL/TP price drift: long enough to absorb
+//   a normal oscillation window (BTC 0.5% range typically resolves in ~5-15 s).
+//
+// TRAILING_REARM_MS (5 s) — for trailing ratchet advances: the trailing stop
+//   machine ratchets approximately every strategy cycle (~5 s). A 30 s cooldown
+//   here means the exchange order would lag the ratchet by up to 5 cycles, leaving
+//   the position underprotected while the trailing level was moving in our favour.
+//   5 s gives one-cycle latency: worst case the ratchet advances, we wait one
+//   cycle, then update. The shorter cooldown only applies when trailingActive=true
+//   and the absolute trailingStopPrice has actually moved — not on every tick.
+//
 // Missing-order re-arms (stopLossOrderId = undefined after liveness-verify)
-// bypass the cooldown entirely and always place immediately.
+// bypass all cooldowns and always place immediately.
 const MIN_REARM_MS = 30_000
+const TRAILING_REARM_MS = 5_000
 
 // ── System-close-only flag, micro-cached ─────────────────────────────
 //
@@ -1470,7 +1500,11 @@ async function updateProtectionOrders(
         !pos.stopLossOrderId
           ? true  // no order at all → arm immediately regardless of cooldown
           : (priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted) &&
-            Date.now() - (pos.stopLossLastArmedAt ?? 0) >= MIN_REARM_MS
+            // Trailing ratchets use a shorter cooldown so exchange orders track
+            // the ratcheted level within one strategy cycle (~5 s). Static price
+            // drift uses the full 30 s cooldown to absorb oscillation noise.
+            Date.now() - (pos.stopLossLastArmedAt ?? 0) >=
+              (pos.trailingActive ? TRAILING_REARM_MS : MIN_REARM_MS)
       )
     ) {
       // Cancel-then-replace race: if a cancel fails we must NOT place
@@ -1538,7 +1572,8 @@ async function updateProtectionOrders(
         !pos.takeProfitOrderId
           ? true  // no order at all → arm immediately
           : (priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted) &&
-            Date.now() - (pos.takeProfitLastArmedAt ?? 0) >= MIN_REARM_MS
+            Date.now() - (pos.takeProfitLastArmedAt ?? 0) >=
+              (pos.trailingActive ? TRAILING_REARM_MS : MIN_REARM_MS)
       )
     ) {
       let oldGone = true
@@ -2062,7 +2097,7 @@ export async function executeLivePosition(
       return livePosition
     }
 
-    // ── Step 2: Fetch current market price ──────���������──────────────────────────
+    // ── Step 2: Fetch current market price ──────�����������──────────────────────────
     let currentPrice = realPosition.entryPrice
     if (!currentPrice || currentPrice <= 0) {
       currentPrice = await fetchCurrentPrice(realPosition.symbol)
@@ -3788,14 +3823,29 @@ async function checkAndForceCloseOnSltpCross(
   // confirmed filled yet; skip until it is.
   if (!fillPrice || fillPrice <= 0) return null
 
-  const slPct = Math.max(0, pos.stopLoss || 0) / 100
+  // ── Trailing stop: honour the ratcheted absolute price ─────────────────
+  // When trailing is active syncLiveFromPseudo has stamped trailingStopPrice
+  // onto the position. Using that absolute price means the proactive force-close
+  // fires at the RATCHETED level — not the static origin level that the
+  // percentage anchor would compute. Without this fix a trailing stop that
+  // ratcheted from, say, 2% below entry to 0.5% below entry would NEVER
+  // trigger the proactive close (the static 2% level is never reached while
+  // in profit), letting the position blow through the ratcheted stop if the
+  // exchange order somehow failed to fire.
+  let desiredSl: number
+  if (pos.trailingActive && pos.trailingStopPrice && pos.trailingStopPrice > 0) {
+    desiredSl = pos.trailingStopPrice
+  } else {
+    const slPct = Math.max(0, pos.stopLoss || 0) / 100
+    desiredSl =
+      slPct > 0
+        ? pos.direction === "long"
+          ? fillPrice * (1 - slPct)
+          : fillPrice * (1 + slPct)
+        : 0
+  }
+
   const tpPct = Math.max(0, pos.takeProfit || 0) / 100
-  const desiredSl =
-    slPct > 0
-      ? pos.direction === "long"
-        ? fillPrice * (1 - slPct)
-        : fillPrice * (1 + slPct)
-      : 0
   const desiredTp =
     tpPct > 0
       ? pos.direction === "long"
@@ -5065,7 +5115,23 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // block protection-order updates for healthy positions.
     const stuckPositions: Array<{ position: LivePosition; placedAgeMs: number; STUCK_PLACED_MAX_MS: number }> = []
 
-    for (const position of openPositions) {
+    // ── Parallelised per-position sync (bounded concurrency) ────────────
+    // The original serial `for…of` loop processed every position
+    // sequentially, so an exchange call (getOrder, placeStopOrder, etc.)
+    // that took 200 ms on ONE position delayed ALL subsequent positions.
+    // With 10 open positions at 200 ms each the loop took 2 s+ per tick —
+    // far longer than the 200–300 ms target tick period. The same worker-pool
+    // pattern used in `reconcileLivePositions` fans out to SYNC_CONCURRENCY
+    // workers; each slot picks the next position atomically so no position is
+    // processed twice. SYNC_CONCURRENCY=6: high enough to parallelise the
+    // common case (≤6 positions all get serviced in one RTT window) while
+    // staying well below typical exchange rate-limit buckets (50–100 req/s).
+    const SYNC_CONCURRENCY = 6
+    // Per-position timeout: if one position's exchange calls hang, the pool
+    // slot is released after this interval rather than blocking indefinitely.
+    const SYNC_PER_POS_TIMEOUT_MS = 8_000
+
+    const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
         const mapKey = `${normSym(position.symbol)}|${position.direction}`
         const exchangePos = exchangeMap.get(mapKey)
@@ -5165,7 +5231,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               closeErr instanceof Error ? closeErr.message : String(closeErr),
             )
           }
-          continue // closeLivePosition persisted terminal state — skip per-position setex
+          return // closeLivePosition persisted terminal state — skip per-position setex
         }
 
         // ── Delayed-fill SL/TP arming ────���────────────────────���───────
@@ -5256,7 +5322,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           const placedAgeMs = Date.now() - (position.createdAt || position.updatedAt || Date.now())
           if (placedAgeMs > STUCK_PLACED_MAX_MS) {
             stuckPositions.push({ position, placedAgeMs, STUCK_PLACED_MAX_MS })
-            continue
+            return
           }
         }
 
@@ -5301,7 +5367,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             markPrice,
             exchangeConnector,
           )
-          if (crossed) continue
+          if (crossed) return
         }
 
         // ── Max-hold-time safety closer ────────────────────────────────
@@ -5336,7 +5402,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             { positionId: position.id, heldMs, maxHoldMs: MAX_HOLD_TIME_MS, exitPrice },
           )
           await closeLivePosition(connectionId, position.id, exitPrice, exchangeConnector, "max_hold_time_exceeded")
-          continue
+          return
         }
 
         const key = `live:position:${position.id}`
@@ -5345,6 +5411,35 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         console.warn(`${LOG_PREFIX} Error syncing ${position.id}:`, err)
       }
     }
+
+    // ── Bounded parallel pool for processOneSync ─────────────────────────
+    // Each worker picks the next unprocessed position by index; stops when
+    // all positions are claimed. allSettled ensures one slow/failing
+    // position never prevents the rest from completing.
+    {
+      let nextSyncIdx = 0
+      const syncWorker = async (): Promise<void> => {
+        while (true) {
+          const i = nextSyncIdx++
+          if (i >= openPositions.length) return
+          await withTimeout(
+            processOneSync(openPositions[i]),
+            SYNC_PER_POS_TIMEOUT_MS,
+            `syncWithExchange.processOneSync(${openPositions[i].symbol})`,
+          ).catch((err: unknown) => {
+            console.warn(
+              `${LOG_PREFIX} [sync-pool] position ${openPositions[i]?.id} timed out or errored:`,
+              err instanceof Error ? err.message : String(err),
+            )
+          })
+        }
+      }
+      const poolSize = Math.min(SYNC_CONCURRENCY, openPositions.length)
+      if (poolSize > 0) {
+        await Promise.allSettled(Array.from({ length: poolSize }, () => syncWorker()))
+      }
+    }
+
     // Sync completion heartbeat. Pairs with the `[sync-tick]` entry log
     // so the operator can see the loop ran to completion (not silently
     // aborted by an uncaught throw) and how long it took. If [sync-tick]
@@ -5746,6 +5841,28 @@ export async function syncLiveFromPseudo(
             }
           }
 
+          // ── Stamp trailing state onto the live position ───────────────────
+          // Write trailingActive + trailingStopPrice from the pseudo position
+          // so that computeDesiredProtectionPrices and checkAndForceCloseOnSltpCross
+          // can use the ratcheted absolute price instead of re-computing from
+          // the stale static percentage. This ensures both the exchange order
+          // placement path and the proactive force-close path reflect the latest
+          // trailing ratchet on every tick, not only on recalc ticks.
+          const prevTrailingActive = livePos.trailingActive
+          const prevTrailingStopPrice = livePos.trailingStopPrice
+          livePos.trailingActive = trailingActive
+          livePos.trailingStopPrice = (trailingActive && trailingStopPrice > 0) ? trailingStopPrice : undefined
+          // If the trailing state changed, persist it immediately so other
+          // callers (reconcile, syncWithExchange) always read the latest ratchet
+          // from Redis even if the no-op guard below skips recalculateAndApplySLTP.
+          const trailingStateChanged =
+            prevTrailingActive !== livePos.trailingActive ||
+            prevTrailingStopPrice !== livePos.trailingStopPrice
+          if (trailingStateChanged) {
+            // Best-effort async save — don't await on the hot path.
+            savePosition(livePos).catch(() => {})
+          }
+
           // ── Per-tick no-op guard ──────────────────────────────────────────
           // syncLiveFromPseudo fires on EVERY realtime cycle (200–300 ms) but
           // the trailing stop price only ratchets once per strategy cycle
@@ -5772,7 +5889,15 @@ export async function syncLiveFromPseudo(
           const tpDeltaPct = currentTpPct !== undefined && tpPct !== undefined
             ? Math.abs(tpPct - currentTpPct) / Math.max(currentTpPct, 0.001)
             : (tpPct !== undefined ? 1 : 0)  // tpPct newly defined → changed; both undefined → no change
-          const nothingChanged = !ordersMissing && slDeltaPct < 0.0025 && tpDeltaPct < 0.0025
+          // When trailing is active the ratchet can advance even when the
+          // derived slPct (from distPct calculation above) looks stable within
+          // 0.25%.  The absolute stop price advancing is always significant —
+          // skip the no-op guard if the trailing stop price itself changed.
+          const trailingPriceAdvanced =
+            trailingStateChanged ||
+            (trailingActive && trailingStopPrice > 0 && prevTrailingStopPrice !== trailingStopPrice)
+          const nothingChanged =
+            !ordersMissing && slDeltaPct < 0.0025 && tpDeltaPct < 0.0025 && !trailingPriceAdvanced
           if (nothingChanged) continue
 
           await recalculateAndApplySLTP(connectionId, livePos.id, exchangeConnector, {
