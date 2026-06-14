@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─���� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─����� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -2036,9 +2036,14 @@ export class StrategyCoordinator {
     // individual entries. Entries within a Set share the variant label.
     // Legacy entry-level classifier is kept as a fallback for any caller
     // that produces a Set without the variant field (back-compat safety).
+    // NOTE: `sizeMultiplier >= 1.5` was deliberately removed — Real-stage
+    // coord-record tuning can push a default/trailing entry above 1.5× after
+    // a good streak, which incorrectly labelled those entries as "block" and
+    // inflated block PF stats. Only `positionState === "add"` (the true
+    // semantic marker for block add-on entries) is retained as the fallback.
     const classifyVariant = (e: StrategySetEntry): "default" | "trailing" | "block" | "dca" => {
       if (e.positionState === "reduce" || e.positionState === "close") return "dca"
-      if (e.positionState === "add" || e.sizeMultiplier >= 1.5)        return "block"
+      if (e.positionState === "add")                                    return "block"
       if (e.positionState === "new"  && e.leverage       >= 3)         return "trailing"
       return "default"
     }
@@ -3627,15 +3632,43 @@ export class StrategyCoordinator {
             // will always be deferred on the same cycle.
             //
             // The qualifying array is already sorted by avgProfitFactor desc.
-            // Walk it once and keep only the first Set seen for each direction.
+            //
+            // Preselection rules:
+            //   • "new" variants (default, trailing, pause): at most 1 per
+            //     direction — first (highest-PF) wins.
+            //   • "block" variant: allowed through even when the direction
+            //     already has a "new" set selected. Block places an ADD-ON
+            //     order into an existing open position; the dedup-lock path
+            //     handles whether to accumulate or open a fresh add-on lot.
+            //     At most 1 block set per direction (the highest-PF one).
+            //   • "dca" variant: same as block — at most 1 per direction,
+            //     allowed alongside a "new" set.
+            //
+            // Without this rule, block/dca sets targeting e.g. long were
+            // always dropped because `sawLong=true` was already set by the
+            // default set, meaning block strategy NEVER dispatched.
             const dispatchSets: StrategySet[] = []
             {
-              let sawLong  = false
-              let sawShort = false
+              let sawNewLong  = false
+              let sawNewShort = false
+              let sawBlockLong  = false
+              let sawBlockShort = false
+              let sawDcaLong    = false
+              let sawDcaShort   = false
               for (const s of qualifying) {
-                if (s.direction === "long"  && !sawLong)  { dispatchSets.push(s); sawLong  = true }
-                if (s.direction === "short" && !sawShort) { dispatchSets.push(s); sawShort = true }
-                if (sawLong && sawShort) break
+                const isBlock = s.variant === "block"
+                const isDca   = s.variant === "dca"
+                const isNew   = !isBlock && !isDca // default / trailing / pause
+                if (s.direction === "long") {
+                  if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
+                  if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
+                  if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
+                } else {
+                  if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
+                  if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
+                  if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
+                }
+                if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
               }
             }
 

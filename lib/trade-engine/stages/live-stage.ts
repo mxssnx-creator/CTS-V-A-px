@@ -1816,6 +1816,10 @@ export async function executeLivePosition(
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
   }
 
+  // Hoisted before the try/catch so the catch block can release the
+  // correct variant-scoped dedup lock on unhandled errors.
+  const _lockDirSuffix = realPosition.setVariant === "block" ? ":block" : ""
+
   try {
     // ── Step 1: Pre-flight validation ──────────────�������──────────────────────
     if (!realPosition.direction || !realPosition.symbol) {
@@ -1843,6 +1847,10 @@ export async function executeLivePosition(
     const isLiveTradeEnabled =
       isTruthyFlag(connSettings.is_live_trade) ||
       isTruthyFlag(connSettings.live_trade_enabled)
+
+    // isBlockVariant and _lockDirSuffix are hoisted to function scope (before
+    // the try block) so the catch handler can also release the correct key.
+    const isBlockVariant = realPosition.setVariant === "block"
 
     pushStep(livePosition, "preflight", true, `live_trade=${isLiveTradeEnabled}`)
     await logProgressionEvent(
@@ -1885,20 +1893,38 @@ export async function executeLivePosition(
     // This is the only writer of `live:lock:{conn}:{sym}:{dir}` on the
     // critical path, so the race window is closed at its source.
     if (isLiveTradeEnabled) {
+      // ── Variant-specific lock key ────────────────────────────────────────
+      // Block add-on orders MUST be able to proceed even when the default/
+      // trailing position's lock is held (that lock means "default slot is
+      // occupied — don't open a second default", not "all orders blocked").
+      //
+      // We use a variant-scoped lock key for block sets:
+      //   default/trailing/pause/dca: live:lock:{conn}:{sym}:{dir}
+      //   block:                      live:lock:{conn}:{sym}:{dir}:block
+      //
+      // This allows at most 1 default + 1 block position per direction per
+      // symbol simultaneously. isBlockVariant + _lockDirSuffix are hoisted
+      // to function scope so every releaseLock / refreshLockTTL in this
+      // function's long body uses the correct scoped key automatically.
       const acquired = await tryAcquireLock(
         connectionId,
         realPosition.symbol,
-        realPosition.direction,
+        realPosition.direction + _lockDirSuffix,
       )
       if (!acquired) {
         // Slot is held — try to merge into the existing exchange
         // position. If we can't (in-flight entry from another tick),
         // defer this signal cleanly.
-        const existing = await findOpenLivePositionByDir(
-          connectionId,
-          realPosition.symbol,
-          realPosition.direction,
-        )
+        // For block variant: if the block lock is held, defer (another
+        // block add-on is in-flight). Block does NOT merge into the
+        // default position when its own lock is taken.
+        const existing = isBlockVariant
+          ? null // block defers; no merge-into-default on collision
+          : await findOpenLivePositionByDir(
+              connectionId,
+              realPosition.symbol,
+              realPosition.direction,
+            )
 
         if (!existing) {
           // Lock present, no position visible yet → another tick is
@@ -1907,7 +1933,7 @@ export async function executeLivePosition(
           // orders). Surface a deferral and let the next cycle retry.
           livePosition.status = "rejected"
           livePosition.statusReason =
-            `Dedup lock held — another entry in flight for ${realPosition.symbol} ${realPosition.direction}; will retry next cycle`
+            `Dedup lock held — another entry in flight for ${realPosition.symbol} ${realPosition.direction}${isBlockVariant ? " (block)" : ""}; will retry next cycle`
           pushStep(livePosition, "preflight", false, livePosition.statusReason)
           await savePosition(livePosition)
           await incrementMetric(connectionId, "live_orders_deferred_count")
@@ -1970,7 +1996,7 @@ export async function executeLivePosition(
         // by the 300 s window. Lock value remains the original entry's
         // timestamp (intentional — debuggers see the original entry's
         // wall-clock, not the accumulation's).
-        await refreshLockTTL(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+        await refreshLockTTL(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
         return merged
       }
       // acquired === true: we own the slot. Continue to fresh-entry
@@ -2093,7 +2119,7 @@ export async function executeLivePosition(
       // the next signal isn't blocked for the full 5-min TTL on a non-
       // recoverable connector failure (operator likely didn't configure a
       // connector — they need to be able to retry once they do).
-      await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
       return livePosition
     }
 
@@ -2115,7 +2141,7 @@ export async function executeLivePosition(
       // condition (typically a fresh symbol whose ticker hasn't streamed
       // yet). Without releasing, the next cycle's signal would defer for
       // 5 minutes even though the price arrives within seconds.
-      await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
       return livePosition
     }
     livePosition.entryPrice = currentPrice
@@ -2574,132 +2600,7 @@ export async function executeLivePosition(
         symbol: realPosition.symbol,
         error: orderResult?.error,
       })
-      await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
-      await logLiveOrderFinal(orderTrace, {
-        status: "circuit_breaker",
-        livePositionId: livePosition.id,
-        reason: livePosition.statusReason,
-        extra: { errorCode: orderResult?.errorCode ?? orderResult?.code, error: orderResult?.error },
-      })
-      return livePosition
-    }
-
-    // ─��� Exchange minimum order size enforcement (code=101400) ────────────
-    // BingX returns code=101400 when the order qty is below the pair's
-    // minimum. The error message includes the required minimum:
-    //   "The minimum order amount is 56.974 DRIFT."
-    //
-    // Strategy: parse + persist the minimum to Redis so every subsequent
-    // cycle produces the right qty from the volume calculator, then retry
-    // THIS order once with the corrected quantity so the signal fires now
-    // rather than waiting for the next cycle.
-    if (!orderResult?.success && isMinOrderSizeError(orderResult)) {
-      const requiredMin = extractMinOrderQty(orderResult)
-      if (requiredMin && requiredMin > 0) {
-        // Persist to `settings:trading_pair:{symbol}` hash via setSettings —
-        // this is the EXACT key that VolumeCalculator reads via
-        // `getSettings("trading_pair:{symbol}")`. The previous implementation
-        // wrote to a plain-string key `trading_pair:{symbol}` (via redis.set)
-        // which is a completely different Redis path from the settings hash.
-        try {
-          await setSettings(`trading_pair:${realPosition.symbol}`, {
-            min_order_size: String(requiredMin),
-            updated_at: String(Date.now()),
-            source: "101400_auto_correction",
-          })
-          console.log(
-            `${LOG_PREFIX} Stored min_order_size=${requiredMin} for ${realPosition.symbol} in settings hash`
-          )
-        } catch (storeErr) {
-          console.warn(`${LOG_PREFIX} Failed to persist min_order_size for ${realPosition.symbol}:`, storeErr)
-        }
-
-        // Retry once with the required minimum quantity.
-        const correctedQty = Math.max(requiredMin * 1.01, requiredMin) // +1% buffer for rounding
-        console.log(
-          `${LOG_PREFIX} Retrying ${realPosition.symbol} with corrected qty=${correctedQty.toFixed(6)} (exchange min=${requiredMin})`
-        )
-        const minRetry: any = await retry(
-          async () => {
-            placeAttempt += 1
-            const { raw } = await withLiveOrderLogging(
-              orderTrace,
-              {
-                quantity: correctedQty,
-                price: currentPrice,
-                leverage: livePosition.leverage,
-                marginType: livePosition.marginType ?? "unknown",
-                orderType: "market",
-                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
-                strategySetKey: livePosition.setKey,
-                realPositionId: realPosition.id,
-                attempt: placeAttempt,
-                label: `min-corrected(required=${requiredMin})`,
-              },
-              () => exchangeConnector.placeOrder(
-                realPosition.symbol,
-                exchangeSide,
-                correctedQty,
-                undefined,
-                "market",
-                { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
-              ),
-            )
-            return raw
-          },
-          (r: any) => !!r?.success && !!(r.orderId || r.id),
-          "placeOrder-minCorrection",
-          1
-        )
-        if (minRetry?.success && (minRetry.orderId || minRetry.id)) {
-          orderResult = minRetry
-          computedVolume = correctedQty // keep volume consistent for fill + SL/TP
-          console.log(
-            `${LOG_PREFIX} Min-size corrected order succeeded for ${realPosition.symbol}: orderId=${minRetry.orderId || minRetry.id}`
-          )
-        } else {
-          orderResult = minRetry ?? orderResult
-        }
-      }
-    }
-
-    if (!orderResult?.success || !(orderResult.orderId || orderResult.id)) {
-      livePosition.status = "error"
-      livePosition.statusReason = `Entry order failed: ${orderResult?.error || "unknown"}`
-      pushStep(livePosition, "place_order", false, livePosition.statusReason)
-      await savePosition(livePosition)
-      await incrementMetric(connectionId, "live_orders_failed_count")
-
-      // Per-connection progression log (for the UI Progression panel).
-      await logProgressionEvent(connectionId, "live_trading", "error", `Entry order failed for ${realPosition.symbol}`, {
-        error: orderResult?.error,
-        side: exchangeSide,
-        quantity: computedVolume,
-        price: currentPrice,
-        leverage: livePosition.leverage,
-      })
-
-      // Systemwide error log — makes this visible in the global error view
-      // alongside API errors so one place shows both UI + exchange failures.
-      // Wrapped in try/catch because we never block the main return on logging.
-      try {
-        await SystemLogger.logError(
-          new Error(
-            `Exchange entry order failed: ${orderResult?.error || "unknown"} [symbol=${realPosition.symbol}, side=${exchangeSide}, qty=${computedVolume}]`,
-          ),
-          connectionId,
-          "live-stage.placeOrder",
-        )
-      } catch {
-        /* logging must never throw */
-      }
-      // Release the dedup lock — the order failed (rejection / API error /
-      // margin shortfall), no exchange position will exist for this slot.
-      // Without releasing, a transient failure would block the next signal
-      // for the full 5-min TTL even though the entry never opened. The
-      // margin-cooldown gate above still prevents a stampede of retries
-      // when the failure is non-recoverable (insufficient balance).
-      await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
       await logLiveOrderFinal(orderTrace, {
         status: "rejected",
         livePositionId: livePosition.id,
@@ -2729,7 +2630,7 @@ export async function executeLivePosition(
     await refreshLockTTL(
       connectionId,
       realPosition.symbol,
-      realPosition.direction,
+      realPosition.direction + _lockDirSuffix,
     ).catch(() => {})
     await logProgressionEvent(connectionId, "live_trading", "info", `Entry order placed for ${realPosition.symbol}`, {
       orderId: livePosition.orderId,
@@ -3154,7 +3055,7 @@ export async function executeLivePosition(
     } catch {
       /* logging must never throw */
     }
-    await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+    await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
     return livePosition
   }
 }
@@ -4341,7 +4242,7 @@ export async function reconcileLivePositions(
             return delta
           }
 
-          // ── Ownership guard ──────────────────────────────────────────
+          // ── Ownership guard ────────────────────���─────────────────────
           // Only arm SL/TP and issue force-closes on positions that carry
           // a system orderId — proof WE placed the entry order.
           // If orderId is absent, the exchange position at this
