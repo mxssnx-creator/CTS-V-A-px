@@ -268,7 +268,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         
         // Update global engine state (stored as Redis HASH)
         const disableClient = getRedisClient()
-        const disableGlobalState = await disableClient.hgetall("trade_engine:global").catch(() => ({})) || {}
+        const disableGlobalState: Record<string, string> = await disableClient.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>)) || {}
         const allConnsForDisable = await getAllConnections()
         // Use clean helper function - exclude current connection
         const activeCount = allConnsForDisable.filter((c: any) => 
