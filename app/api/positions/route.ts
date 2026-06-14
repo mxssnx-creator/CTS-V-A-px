@@ -20,8 +20,18 @@ export async function GET(request: NextRequest) {
     const limit = Math.min(parseInt(searchParams.get("limit") || "100"), 1000)
     const offset = parseInt(searchParams.get("offset") || "0")
 
+    // When no connectionId is provided, return an empty positions list rather
+    // than a 400 — callers that poll the endpoint without context (e.g. generic
+    // dashboards or health checks) get a valid empty response instead of an error.
     if (!connectionId) {
-      return NextResponse.json({ success: false, error: "connection_id or connectionId required" }, { status: 400 })
+      return NextResponse.json({
+        success: true,
+        positions: [],
+        total: 0,
+        open: 0,
+        closed: 0,
+        note: "No connection_id supplied — pass connection_id or connectionId query param to filter",
+      })
     }
 
     const client = getRedisClient()
