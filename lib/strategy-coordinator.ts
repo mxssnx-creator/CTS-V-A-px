@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─����� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─������ Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -1820,7 +1820,13 @@ export class StrategyCoordinator {
       for (const profile of variantsForThisBase) {
         // Spawn async build task for this variant
         buildTasks.push((async () => {
-          const fingerprint = this.variantFingerprint(baseSet, profile.name, ctx)
+          // ── IMPORTANT: fingerprint must use symbolCtx (per-symbol continuousCount)
+          // not the global ctx — the block variant's configs were built from symbolCtx
+          // (which patches continuousCount to perSymbolOpen[symbol]).  Using global ctx
+          // here caused cross-symbol cache collisions: a symbol with 0 open positions
+          // would receive a cached block Set that was originally sized for a different
+          // symbol that had 2 open positions (wrong sizeMultiplier baked in).
+          const fingerprint = this.variantFingerprint(baseSet, profile.name, symbolCtx)
           let cachedSet: StrategySet | null = null
 
           // ── Fingerprint cache (fast path) ─────────────────────────────
@@ -2790,8 +2796,16 @@ export class StrategyCoordinator {
           for (const e of s.entries) {
             // Variant-specific tuning rules.
             if (s.variant === "block") {
-              // Block scales size — bias the existing multiplier directly.
-              e.sizeMultiplier = Math.max(0.5, Math.min(2.0, e.sizeMultiplier * combined))
+              // Block scales size via the combined bias, but the operator
+              // explicitly configured block aggression (1.5× / 2.0× base).
+              // The tuner should only attenuate on bad signals — it must not
+              // reduce block sizing below 50% of the operator's chosen base
+              // (i.e. floor at 0.5 × base, not the universal 0.5 absolute).
+              // Without this floor a combined=0.65 cycle would shrink a 2.0×
+              // block entry to 1.3×, losing most of the block strategy's
+              // purpose (accumulating into an existing position at higher size).
+              const blockFloor = Math.max(0.5, e.sizeMultiplier * 0.5)
+              e.sizeMultiplier = Math.max(blockFloor, Math.min(2.0, e.sizeMultiplier * combined))
             } else if (s.variant === "dca") {
               // DCA recovery — only ATTENUATE leverage when historic PF poor;
               // never amplify (recovery gambling is an anti-pattern).
@@ -2818,23 +2832,25 @@ export class StrategyCoordinator {
               s.entries.length
           }
 
-          // ── Write tuning delta onto the CoordRecord (single source of truth) ─
-          // CoordIndex consumers (createLiveSets) read tunedAvgPF from the
-          // coord record so they don't need to re-scan entries[]. Also stores
-          // the combined size bias so Live dispatch can apply it without
-          // touching Base entry objects.
+          // ── Write tuning onto the CoordRecord ────────────────────────────
+          // The Real-stage tuner already mutated s.entries[].sizeMultiplier
+          // in-place above.  createLiveSets picks bestEntry from those same
+          // in-memory entry objects, so bestEntry.sizeMultiplier is already
+          // the post-tuned value.  We must NOT store a non-zero sizeDelta on
+          // the CoordRecord — if we did, createLiveSets would apply the
+          // combined bias a second time (double-tuning), e.g. a block entry
+          // at 2.0× tuned down to 1.3× would then get multiplied by 1.3 again
+          // to reach 1.69× — wrong.  Only tunedAvgPF is written here (used for
+          // SL/TP derivation at dispatch); sizeDelta is left undefined so the
+          // dispatch path falls through to bestEntry.sizeMultiplier directly.
           if (coordIndex) {
             const coordRec = coordIndex.byCoordKey.get(s.setKey)
             if (coordRec) {
-              coordRec.tunedAvgPF  = s.avgProfitFactor   // post-tuner recomputed
-              // combined bias factor mirrors the calculation above
-              const sr      = Math.max(0, Math.min(1, pos.successRate))
-              const pfBias  = pos.profitFactor <= 0
-                ? 0.85
-                : Math.max(0.6, Math.min(1.4, 0.7 + 0.5 * Math.tanh(pos.profitFactor - 1.0)))
-              const sigBias = Math.max(0.7, Math.min(1.3, 0.7 + 1.2 * sr))
-              coordRec.sizeDelta = (pfBias + sigBias) / 2 - 1  // delta from 1.0
-              coordRec.status    = "valid_real"
+              coordRec.tunedAvgPF = s.avgProfitFactor  // post-tuner recomputed PF
+              // sizeDelta intentionally NOT set — entries already tuned in-place;
+              // setting it would cause a second application in createLiveSets.
+              coordRec.sizeDelta  = undefined
+              coordRec.status     = "valid_real"
             }
           }
         }
@@ -3912,13 +3928,17 @@ export class StrategyCoordinator {
           const creations = await Promise.all(
             qualifying.map(async (set) => {
               try {
-                // Axis Sets are pure-metadata projections (entries=[]).
-                // Hydrate from the parent Real Set when entries is empty so
-                // the pseudo creation path can still derive SL/TP from PF.
+                // Axis Sets carry one synthetic representative entry; for SL/TP
+                // derivation we need the full entries[] from the Base Set.
+                // Priority: set.entries (non-empty profile-variant sets) →
+                //   coordIndex.base.byKey O(1) lookup → O(N) realSets.find() fallback.
+                const _pseudoParentKey = set.parentSetKey || set.setKey.split("#")[0]
                 const effectiveEntries =
                   set.entries.length > 0
                     ? set.entries
-                    : (realSets.find((s) => s.setKey === set.parentSetKey)?.entries ?? [])
+                    : coordIndex
+                      ? (coordIndex.base.byKey.get(_pseudoParentKey)?.entries ?? [])
+                      : (realSets.find((s) => s.setKey === _pseudoParentKey)?.entries ?? [])
                 const bestEntry = effectiveEntries.reduce(
                   (best, e) => (e.profitFactor > best.profitFactor ? e : best),
                   effectiveEntries[0],
