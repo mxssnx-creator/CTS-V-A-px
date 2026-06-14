@@ -1841,6 +1841,24 @@ const migrations: Migration[] = [
     },
   },
 
+  {
+    // Version 032 was intentionally skipped — migration 033 superseded the
+    // in-progress v32 draft before it was ever shipped. This tombstone fills
+    // the version gap so:
+    //   a) The `migrations.filter(m => m.version > currentVersion)` loop never
+    //      skips v033 on a DB that somehow recorded _schema_version=32.
+    //   b) migration 033's `down` can safely decrement to "32" and land on
+    //      this no-op, then a second rollback step gets back to "31".
+    name: "032-tombstone-skipped-version",
+    version: 32,
+    up: async (client: any) => {
+      await client.set("_schema_version", "32")
+      console.log("[v0] Migration 032: tombstone — version 32 was intentionally skipped (033 superseded in-progress draft)")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "31")
+    },
+  },
   // Migration 033 — Expand bingx-x01 to 15 symbols + write force_symbols override
   // (supersedes v32 which lacked force_symbols; bumped so existing DBs re-run)
   {
@@ -1916,77 +1934,102 @@ const migrations: Migration[] = [
       }).catch(() => {})
     },
     down: async (client: any) => {
+      // Roll back to 032 (the tombstone), which is a no-op one step from 031.
       await client.set("_schema_version", "32")
     },
   },
   // ── Migration 034 — operator-spec defaults ──────────────────────────────────
-  // Seeds the operator-directed configuration defaults into bingx-x01 settings:
-  //   • volumeFactorLive = 2.2 (was 1.0)
-  //   • pf_base_min = 1.0, pf_main_min = 1.2, pf_real_min = 1.2
-  //   • symbol_order = volatility_1h, symbol_count = 15 (already correct via 033)
-  //   • variants: trailing=true, block=true, dca=false, control_orders=true
-  //   • minStep = 5 (default, range 3-30)
-  //   • max_positions: base/main = 5000, real = 2000
+  // Seeds the operator-directed configuration defaults for bingx-x01:
+  //   • live_volume_factor = 2.2  (written to BOTH connection:{id} and
+  //     connection_settings:{id} so all three priority tiers in
+  //     VolumeCalculator.resolveVolumeFactors() are satisfied; app_settings
+  //     also gets volume_factor_live=2.2 as the global fallback)
+  //   • baseProfitFactor=1.0, main/real/liveProfitFactor=1.2
+  //     → written to connection_settings:bingx-x01 using the camelCase keys
+  //       that StrategyCoordinator.loadProfitFactors() reads (NOT the
+  //       pf_base_min snake_case names used by the old settings UI)
+  //   • variantTrailingEnabled / variantBlockEnabled / variantDcaEnabled /
+  //     variantPauseEnabled → written to connection_settings:bingx-x01
+  //     using the camelCase keys that loadCoordinationSettings() reads
+  //   • minStep=5, mainEvalPosCount=15, realEvalPosCount=10 →
+  //     connection_settings:bingx-x01
+  //   • symbol_order=volatility_1h written to connection:bingx-x01 (where
+  //     getSymbols() resolves it)
   //
-  // These are idempotent — already-correct values are overwritten harmlessly.
-  // Does NOT touch live:position:* or active_symbols (migration 033 handles those).
+  // KEY INVARIANT: every field is written to the hash that the actual engine
+  // code reads.  Previous incarnation of this migration wrote to
+  // `settings:connection:bingx-x01` (a setSettings-prefixed key that only
+  // the legacy settings-storage module reads) and used wrong field names
+  // (snake_case variants that the coordinator never checks).  This version
+  // targets the correct hashes with the correct names.
+  //
+  // IDEMPOTENT: values are written unconditionally (safe — migrations run
+  // once per _schema_version level; operator overrides made after this
+  // migration via the Settings UI are never touched by migrations).
   {
     version: 34,
-    name: "operator_spec_defaults",
+    name: "034-operator-spec-defaults",
     up: async (client: any) => {
+      await client.set("_schema_version", "34")
+
       const CONN_ID = "bingx-x01"
       const now = new Date().toISOString()
 
-      // ── App-level PF thresholds (shared across all connections) ──────────────
+      // ── 1. app_settings — global volume factor fallback + PF thresholds ─────
+      // VolumeCalculator priority-3 fallback reads `volume_factor_live` from here.
+      // StrategyCoordinator reads baseProfitFactor/mainProfitFactor etc. from here
+      // as the global default (then connection_settings overrides per-connection).
       await client.hset("app_settings", {
-        pf_base_min:         "1.0",
-        pf_main_min:         "1.2",
-        pf_real_min:         "1.2",
-        pf_live_min:         "1.2",
-        updated_at:          now,
-      }).catch(() => {})
-
-      // ── Per-connection operator settings ────────────────────────────────────
-      const settingsKey = `settings:connection:${CONN_ID}`
-      await client.hset(settingsKey, {
-        volume_factor_live:   "2.2",
-        volume_factor_base:   "1.0",
-        volume_factor_preset: "1.0",
-        symbol_order:         "volatility_1h",
-        symbol_count:         "15",
-        // Strategy PF thresholds (per-connection override)
-        pf_base_min:          "1.0",
-        pf_main_min:          "1.2",
-        pf_real_min:          "1.2",
-        pf_live_min:          "1.2",
-        // Max positions per stage (increased for high-throughput)
-        max_positions_base:   "5000",
-        max_positions_main:   "5000",
-        max_positions_real:   "2000",
-        // Coordination variants per operator spec
-        variant_trailing:     "1",
-        variant_block:        "1",
-        variant_dca:          "0",
-        control_orders:       "1",
-        // Minimum position-creation step
-        min_step:             "5",
+        volume_factor_live:   "2.2",   // global fallback for VolumeCalculator
+        volume_factor_preset: "1.0",   // preset mode factor
+        baseProfitFactor:     "1.0",   // coordinator global default
+        mainProfitFactor:     "1.2",
+        realProfitFactor:     "1.2",
+        liveProfitFactor:     "1.2",
         updated_at:           now,
       }).catch(() => {})
 
-      // Also write into the trade_engine_state settings for the running engine
-      await client.hset(`settings:trade_engine_state:${CONN_ID}`, {
-        volume_factor:       "1.0",
-        volume_factor_live:  "2.2",
-        symbol_order:        "volatility_1h",
-        pf_base_min:         "1.0",
-        pf_main_min:         "1.2",
-        pf_real_min:         "1.2",
-        control_orders:      "1",
-        updated_at:          now,
+      // ── 2. connection:bingx-x01 — direct connection hash ────────────────────
+      // VolumeCalculator priority-1 reads `live_volume_factor` here.
+      // getSymbols() reads `symbol_order` from here.
+      await client.hset(`connection:${CONN_ID}`, {
+        live_volume_factor:   "2.2",   // priority-1 override in VolumeCalculator
+        preset_volume_factor: "1.0",
+        symbol_order:         "volatility",
+        updated_at:           now,
       }).catch(() => {})
 
-      await client.set("_schema_version", "34")
-      console.log("[v0] Migration 034: operator-spec defaults applied (pf=1.0/1.2/1.2, volumeFactor=2.2, symbolOrder=volatility_1h, max_positions=5000/5000/2000)")
+      // ── 3. connection_settings:bingx-x01 — coordinator + volume overlay ─────
+      // StrategyCoordinator.loadProfitFactors() and loadCoordinationSettings()
+      // both read exclusively from `connection_settings:{id}` (hgetall).
+      // VolumeCalculator priority-2 reads `live_volume_factor` here when the
+      // caller passes the merged settings object.
+      await client.hset(`connection_settings:${CONN_ID}`, {
+        // Volume factors (VolumeCalculator priority-2)
+        live_volume_factor:   "2.2",
+        preset_volume_factor: "1.0",
+        // PF thresholds — camelCase: what loadProfitFactors() reads
+        baseProfitFactor:     "1.0",
+        mainProfitFactor:     "1.2",
+        realProfitFactor:     "1.2",
+        liveProfitFactor:     "1.2",
+        // Coordination variant toggles — camelCase: what loadCoordinationSettings() reads
+        variantTrailingEnabled: "true",
+        variantBlockEnabled:    "true",
+        variantDcaEnabled:      "false",
+        variantPauseEnabled:    "true",
+        // Block knobs
+        blockVolumeRatio:     "1.0",
+        blockMaxStack:        "3",
+        // Eval thresholds
+        mainEvalPosCount:     "15",
+        realEvalPosCount:     "10",
+        // Entry step
+        minStep:              "5",
+        updated_at:           now,
+      }).catch(() => {})
+
+      console.log("[v0] Migration 034: operator-spec defaults applied (pf=1.0/1.2/1.2, live_volume_factor=2.2, variantBlock/Trailing=true, correct hashes)")
     },
     down: async (client: any) => {
       await client.set("_schema_version", "33")
@@ -2012,6 +2055,15 @@ const BASE_CONNECTION_CONFIG: Array<{
   { id: "bingx-x01", name: "BingX Base", exchange: "bingx", credentialId: "bingx-x01", autoActive: true },
   { id: "pionex-x01", name: "Pionex Base", exchange: "pionex", credentialId: "pionex-x01", autoActive: false },
   { id: "orangex-x01", name: "OrangeX Base", exchange: "orangex", credentialId: "orangex-x01", autoActive: false },
+]
+
+// Canonical 15-symbol test list used by migration 031, migration 033, and
+// ensureBaseConnections. Declared once here to avoid drift between the three
+// call-sites that previously each contained an inline copy of the array.
+const BASE_TEST_SYMBOLS = [
+  "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
+  "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+  "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
 ]
 
 async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: number; credentialsInjected: number }> {
@@ -2115,11 +2167,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
 
     if (!hasExisting) {
       // First-time seed. Apply full canonical defaults.
-      const TEST_SYMBOLS_031 = [
-        "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
-        "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
-        "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
-      ]
+      const TEST_SYMBOLS_031 = BASE_TEST_SYMBOLS
       const seedData: Record<string, string> = {
         id: cfg.id,
         name: cfg.name,
@@ -2210,11 +2258,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
       const symRaw = String(existing["active_symbols"] ?? "")
       const hasSymbols = symRaw.length > 0 && symRaw !== "[]"
       if (cfg.autoActive && cfg.exchange === "bingx" && (!hasLiveTrade || !hasSymbols)) {
-        const TEST_SYMBOLS_031 = [
-          "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
-          "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
-          "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
-        ]
+        const TEST_SYMBOLS_031 = BASE_TEST_SYMBOLS
         const patchData: Record<string,string> = {}
         if (!hasLiveTrade) patchData["is_live_trade"] = "1"
         if (!hasSymbols)   patchData["active_symbols"] = JSON.stringify(TEST_SYMBOLS_031)
@@ -2237,11 +2281,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
         // Also push to setSettings-prefixed keys so getSymbols() resolves
         // the 15 test symbols on the very first engine tick.
         if (!hasSymbols) {
-          const TEST_SYMBOLS_031 = [
-            "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
-            "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
-            "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
-          ]
+          const TEST_SYMBOLS_031 = BASE_TEST_SYMBOLS
           await client.hset(`settings:trade_engine_state:${cfg.id}`, {
             active_symbols: JSON.stringify(TEST_SYMBOLS_031),
             symbol_count: String(TEST_SYMBOLS_031.length),
