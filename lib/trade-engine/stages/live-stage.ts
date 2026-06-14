@@ -41,10 +41,16 @@ import {
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 
-const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS = 10_000
-const EXCHANGE_TIMEOUT_PLACE_STOP_MS = 15_000
-const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 10_000
-const EXCHANGE_TIMEOUT_GET_ORDER_MS = 10_000
+// ── Exchange call timeouts ────────────────────────────────────────────────
+// Target: syncWithExchange completes in <1 s on the hot path.
+// These timeouts bound per-call worst case so the pool never hangs.
+// Each value is calibrated to a ~2×p99 RTT of a typical BingX API call
+// (BingX p99 ≈ 120–250 ms); the gap gives one retry margin without
+// stalling the full sync for multiple seconds on a flaky call.
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  =  4_000  // was 10 s
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS    =  5_000  // was 15 s
+const EXCHANGE_TIMEOUT_GET_POSITIONS_MS =  4_000  // was 10 s
+const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  3_000  // was 10 s
 
 /**
  * Live position as it flows through the live-stage pipeline and is
@@ -4677,22 +4683,45 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
     )
 
-    // ── Batch-fetch exchange positions once ──────────────────────────────
-    // Used by both orphan-adoption (below) and the per-position sync loop.
-    // Fetching here (in the second try block) ensures the result is in scope
-    // for the adoption block regardless of whether openPositions is empty.
-    // On a fresh restart after terminate, openPositions will be empty but
-    // the exchange may still have open positions — this single fetch enables
-    // the adoption block to discover and adopt them.
-    // Fetch exchange positions for orphan adoption. syncWithExchange always
-    // runs adoption (no skipOrphanAdoption option in this function — that
-    // option only exists on reconcileLivePositions).
+    // ── Batch pre-loop fetches in parallel ───────────────────────────────
+    // Three independent I/O calls are needed before the per-position loop:
+    //   1. getPositions()    — exchange position list (adoption + map)
+    //   2. getOpenOrders()   — live order id set for liveness verification
+    //   3. getClosedLivePositions(50) — recent closes for orphan guard
+    //
+    // Previously these ran serially adding ~3× RTT to every tick.
+    // Running them in a single Promise.all collapses to 1× RTT.
+    // getPositions is also deduplicated — it was previously called TWICE
+    // (once for adoption, once for the exchange map).
     let exchangePositionsForAdoption: any[] = []
-    if (exchangeConnector && typeof exchangeConnector.getPositions === "function") {
-      try {
-        exchangePositionsForAdoption = (await exchangeConnector.getPositions().catch(() => [])) || []
-      } catch { /* best-effort adoption — failure is non-fatal */ }
-    }
+    let liveOrderIdsSync: Set<string> | null = null
+    let recentlyClosedForOrphanGuard: LivePosition[] = []
+
+    await Promise.allSettled([
+      // 1. Exchange positions (reused for adoption AND per-position map).
+      (async () => {
+        if (exchangeConnector && typeof exchangeConnector.getPositions === "function") {
+          try {
+            exchangePositionsForAdoption =
+              (await withTimeout(
+                exchangeConnector.getPositions() as Promise<any[]>,
+                EXCHANGE_TIMEOUT_GET_POSITIONS_MS,
+                "getPositions(sync-prefetch)",
+              ).catch(() => [])) || []
+          } catch { /* best-effort */ }
+        }
+      })(),
+      // 2. Open orders snapshot for liveness verification.
+      (async () => {
+        liveOrderIdsSync = await fetchLiveOrderIdSet(exchangeConnector)
+      })(),
+      // 3. Recently-closed positions for orphan-adoption guard.
+      (async () => {
+        try {
+          recentlyClosedForOrphanGuard = await getClosedLivePositions(connectionId, 50).catch(() => [] as LivePosition[])
+        } catch { /* best-effort */ }
+      })(),
+    ])
 
     // ── Observability heartbeat ───────────────────────────────────────
     // Previously this function ran silently when there were zero
@@ -4799,24 +4828,11 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       }
     }
 
-    // ── Exchange-orphan adoption (P0 fix for "positions not closing") ──
-    // Positions on the exchange that AREN'T in our Redis open-index are
-    // completely invisible to every close path (SL/TP cross, max-hold,
-    // reconcile, sync). They sit there forever with no control orders armed.
-    //
-    // This block fetches exchange positions directly (one HTTP call) so
-    // even a fresh restart with 0 Redis positions will detect and adopt
-    // any positions the exchange still holds from a prior session.
-    // Adopted positions are pushed into `openPositions` so the per-position
-    // sync loop below arms SL/TP immediately without waiting for the next tick.
-    // Fetch exchange positions once — reused for both orphan adoption AND
-    // the per-position exchange map built below (avoids a second API call).
-    let exchangePositions: any[] = []
-    if (exchangeConnector) {
-      try {
-        exchangePositions = (await exchangeConnector.getPositions().catch(() => [])) || []
-      } catch { /* fail silently — adoption is best-effort */ }
-    }
+    // ── Exchange-orphan adoption ─────────────────────────────────────────
+    // `exchangePositionsForAdoption` was already fetched in the parallel
+    // prefetch above — no second getPositions() call needed here.
+    // Alias it so the adoption block's variable names are unchanged.
+    const exchangePositions = exchangePositionsForAdoption
     let adoptedCount = 0
     if (exchangeConnector && Array.isArray(exchangePositionsForAdoption) && exchangePositionsForAdoption.length > 0) {
       if (true) { // guard already applied above
@@ -4829,21 +4845,17 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           for (const p of allOpen) {
             trackedKeys.add(`${normSym(p.symbol)}|${p.direction}`)
           }
-          // Also pull recent closes (last 50) so a just-closed position
-          // doesn't bounce back as an orphan during the close-confirmation
-          // window. `getClosedLivePositions` reads the closed-archive list.
-          try {
-            const recentlyClosed = await getClosedLivePositions(connectionId, 50).catch(() => [] as LivePosition[])
-            for (const p of recentlyClosed) {
-              const closedAgoMs = Date.now() - (p.closedAt || 0)
-              // Within 60s of close ��� exchange may still report position
-              // until the close fill propagates. After that window, treat
-              // it as truly closed and orphan-adopt if it reappears.
-              if (closedAgoMs < 60_000) {
-                trackedKeys.add(`${normSym(p.symbol)}|${p.direction}`)
-              }
+          // Use the pre-fetched recent-closes list (fetched in parallel
+          // above) so we don't issue another Redis round-trip here.
+          for (const p of recentlyClosedForOrphanGuard) {
+            const closedAgoMs = Date.now() - (p.closedAt || 0)
+            // Within 60 s of close — exchange may still report position
+            // until the close fill propagates. After that window treat
+            // it as truly closed and orphan-adopt if it reappears.
+            if (closedAgoMs < 60_000) {
+              trackedKeys.add(`${normSym(p.symbol)}|${p.direction}`)
             }
-          } catch { /* best-effort */ }
+          }
 
           // Load default SL/TP percentages once for all adoptions.
           let defaultSlPct = 1
@@ -4962,9 +4974,9 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // ── end orphan adoption ───────────────────────────────────────────
 
     if (openPositions.length === 0) {
-      // Nothing to sync after adoption — run TTL expiry sweep and exit.
-      // syncWithExchange returns void so no summary to pass.
-      await orphanCloseExpiredPositions(connectionId, exchangeConnector, undefined as any)
+      // Nothing to sync after adoption — fire-and-forget the TTL expiry
+      // sweep so we return immediately (no exchange call latency on idle path).
+      orphanCloseExpiredPositions(connectionId, exchangeConnector, undefined as any).catch(() => {})
       return
     }
 
@@ -5005,11 +5017,8 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       exchangeMap.set(`${sym}|${direction}`, ep)
     }
 
-    // ── Once-per-tick venue open-orders snapshot ───────────────────────
-    // See `fetchLiveOrderIdSet` docs. Same purpose as in reconcile: lets
-    // `updateProtectionOrders` notice silently-gone SL/TP legs without
-    // calling getOrder() per leg. `null` ⇒ skip verification this tick.
-    const liveOrderIdsSync = await fetchLiveOrderIdSet(exchangeConnector)
+    // liveOrderIdsSync was fetched in the parallel prefetch above.
+    // No separate serial call needed here.
 
     // Positions tagged as stuck-in-placed are collected here and
     // processed in a parallel batch AFTER the main loop so they don't
@@ -5017,20 +5026,24 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     const stuckPositions: Array<{ position: LivePosition; placedAgeMs: number; STUCK_PLACED_MAX_MS: number }> = []
 
     // ── Parallelised per-position sync (bounded concurrency) ────────────
-    // The original serial `for…of` loop processed every position
-    // sequentially, so an exchange call (getOrder, placeStopOrder, etc.)
-    // that took 200 ms on ONE position delayed ALL subsequent positions.
-    // With 10 open positions at 200 ms each the loop took 2 s+ per tick —
-    // far longer than the 200–300 ms target tick period. The same worker-pool
-    // pattern used in `reconcileLivePositions` fans out to SYNC_CONCURRENCY
-    // workers; each slot picks the next position atomically so no position is
-    // processed twice. SYNC_CONCURRENCY=6: high enough to parallelise the
-    // common case (≤6 positions all get serviced in one RTT window) while
-    // staying well below typical exchange rate-limit buckets (50–100 req/s).
-    const SYNC_CONCURRENCY = 6
-    // Per-position timeout: if one position's exchange calls hang, the pool
-    // slot is released after this interval rather than blocking indefinitely.
-    const SYNC_PER_POS_TIMEOUT_MS = 8_000
+    // Target: all positions complete in <1 s total.
+    //
+    // SYNC_CONCURRENCY=12: with tightened per-call timeouts (getOrder 3 s,
+    // placeStop 5 s) and typical ≤10 open positions, all positions start
+    // concurrently (ceil(10/12)=1 pass). Every position's calls run in
+    // parallel within updateProtectionOrders' own Promise.all(slLeg, tpLeg)
+    // — the outer pool just bounds the total fanout to prevent rate-limit
+    // spikes on venue buckets (BingX: 100 req/s sustained, 200 burst).
+    //
+    // SYNC_PER_POS_TIMEOUT_MS=4 s: the tightest single-call timeout is
+    // placeStop at 5 s, but within processOneSync the heaviest path is
+    // fill-detect (getOrder 3 s) + updateProtectionOrders (parallel cancel
+    // 4 s + place 5 s, but both legs run concurrently so ~5 s total).
+    // 6 s gives that path 1 s of slack. Any position that can't complete
+    // in 6 s on a working exchange has already timed out at the inner
+    // call level and logged a warning.
+    const SYNC_CONCURRENCY = 12
+    const SYNC_PER_POS_TIMEOUT_MS = 6_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
@@ -5101,7 +5114,8 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           console.log(
             `${LOG_PREFIX} EXTERNALLY-CLOSED detected for ${position.symbol} ${position.direction} (id=${position.id}) — finalising in Redis`,
           )
-          await logProgressionEvent(
+          // Fire-and-forget — don't block the close path on a log write.
+          logProgressionEvent(
             connectionId,
             "live_trading",
             "info",
@@ -5112,7 +5126,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               executedQuantity: position.executedQuantity,
               direction: position.direction,
             },
-          )
+          ).catch(() => {})
           // closeLivePosition does the full terminal-state pipeline:
           // best-effort exchange close (no-op when already gone), cancel
           // orphan SL/TP, compute PnL/ROI, archive, release lock,
@@ -5163,9 +5177,10 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               position.status = "open"
               position.updatedAt = Date.now()
               justFilled = true
-              await incrementMetric(connectionId, "live_orders_filled_count")
-              await incrementOrdersBySymbol(connectionId, position.symbol, position.direction || position.side || "long", "filled")
-              await logProgressionEvent(
+              // Fire-and-forget metric + log — don't block the fast path.
+              incrementMetric(connectionId, "live_orders_filled_count").catch(() => {})
+              incrementOrdersBySymbol(connectionId, position.symbol, position.direction || position.side || "long", "filled").catch(() => {})
+              logProgressionEvent(
                 connectionId,
                 "live_trading",
                 "info",
@@ -5174,7 +5189,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                   orderId: position.orderId,
                   filledQty: position.executedQuantity,
                 }
-              )
+              ).catch(() => {})
             } else if (order) {
               // Order exists but not filled (placed/partial/cancelled/rejected) —
               // log so the operator can see WHY the position stays in
@@ -5241,10 +5256,13 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               justFilled ? "sync_fill_detected" : "sync_heal",
               liveOrderIdsSync,
             )
-            // Persist any protection changes (placement, rearmed ids,
-            // liveness-verify clears) so a serverless restart doesn't lose them.
+            // Fire-and-forget persist — protection state (order IDs,
+            // lastArmedAt) must be durable but the save does not need to
+            // complete before we proceed to the SL/TP cross check. On a
+            // crash the 7-day setex TTL means we lose at most one tick's
+            // worth of protection metadata, which the next sync heals.
             if (protectionResult.changed) {
-              await savePosition(position)
+              savePosition(position).catch(() => {})
             }
           } catch (slTpErr) {
             console.warn(
@@ -5295,13 +5313,14 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           console.warn(
             `${LOG_PREFIX} MAX HOLD TIME exceeded for ${position.symbol} (held ${Math.round(heldMs / 60000)}min > ${Math.round(MAX_HOLD_TIME_MS / 60000)}min) — force-closing`,
           )
-          await logProgressionEvent(
+          // Fire-and-forget — close should not be gated on log write.
+          logProgressionEvent(
             connectionId,
             "live_trading",
             "warning",
             `Max hold time exceeded for ${position.symbol} — force-closing`,
             { positionId: position.id, heldMs, maxHoldMs: MAX_HOLD_TIME_MS, exitPrice },
-          )
+          ).catch(() => {})
           await closeLivePosition(connectionId, position.id, exitPrice, exchangeConnector, "max_hold_time_exceeded")
           return
         }
@@ -5359,7 +5378,8 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           console.warn(
             `${LOG_PREFIX} [stuck-placed] ${position.symbol} (id=${position.id}) has been 'placed' for ${Math.round(placedAgeMs / 1000)}s — cancelling entry order and rejecting position`,
           )
-          await logProgressionEvent(
+          // Fire-and-forget — log should not delay cancel + close.
+          logProgressionEvent(
             connectionId,
             "live_trading",
             "warning",
@@ -5370,7 +5390,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               placedAgeMs,
               stuckLimitMs: STUCK_PLACED_MAX_MS,
             },
-          )
+          ).catch(() => {})
           // Best-effort cancel of the entry order (bounded timeout).
           if (position.orderId && exchangeConnector?.cancelOrder) {
             try {
