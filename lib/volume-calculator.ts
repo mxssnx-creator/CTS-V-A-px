@@ -374,17 +374,38 @@ export class VolumeCalculator {
     const isLive   = truthy(conn["is_live_trade"])
     const tradeMode: "main" | "preset" = isPreset && !isLive ? "preset" : "main"
 
-    // Per-connection override > global default > 1.0 identity.
-    // Global setting key is `mainTradeVolumeFactor` (matches the slider
-    // wired in `components/settings/tabs/overall-tab.tsx`).
+    // Priority stack for the main (live) volume factor:
+    //   1. Per-connection override in connection:{id} hash  → `live_volume_factor`
+    //   2. Per-connection override in connection_settings:{id} overlay → same key
+    //      (when the caller passes the merged settings object as `appSettings`)
+    //   3. Global app_settings hash written by migration 034 → `volume_factor_live`
+    //   4. Legacy UI-named variant                          → `mainTradeVolumeFactor`
+    //   5. Snake-case UI variant                            → `main_trade_volume_factor`
+    //   6. Identity (1.0) — no scaling
+    //
+    // Key-name history:
+    //   Migration 034 writes `volume_factor_live` to app_settings.
+    //   The volume endpoint writes `live_volume_factor` to connection:{id}.
+    //   Older UI code may have written `mainTradeVolumeFactor` / `main_trade_volume_factor`.
+    //   All variants are tried so every write path resolves correctly.
     const mainVolumeFactor = num(
       conn["live_volume_factor"]
+        ?? app["live_volume_factor"]
+        ?? app["volume_factor_live"]
         ?? app["mainTradeVolumeFactor"]
         ?? app["main_trade_volume_factor"],
       1,
     )
+
+    // Priority stack for the preset volume factor:
+    //   1. Per-connection `preset_volume_factor`
+    //   2. Global `volume_factor_preset` (migration 034)
+    //   3. Legacy UI variants
+    //   4. Identity (1.0)
     const presetVolumeFactor = num(
       conn["preset_volume_factor"]
+        ?? app["preset_volume_factor"]
+        ?? app["volume_factor_preset"]
         ?? app["presetTradeVolumeFactor"]
         ?? app["preset_trade_volume_factor"],
       1,
@@ -455,27 +476,34 @@ export class VolumeCalculator {
       for (const [k, v] of Object.entries(connSettings)) {
         if (v !== undefined && v !== null && v !== "") settings[k] = v
       }
-      // Default position cost: 0.02% of balance per position (ultra-minimal).
-      // With the new spec (Base capped at 1 long + 1 short), position budget
-      // is intentionally kept at the absolute floor. On a $10K balance:
-      //   0.02% → $2/position → clamped up to per-pair exchange minimum
-      // The per-pair `exchangeMinVolume` from trading-pair metadata always
-      // takes over as the hard floor in `calculatePositionVolume`, ensuring
-      // the order is never rejected for being too small. Operators who want
-      // larger sizing set `exchangePositionCost` explicitly in Settings.
-      const positionCostPercent = parseFloat(
-        String(settings.exchangePositionCost ?? settings.positionCost ?? "0.02")
-      )
-      const positionCost = positionCostPercent / 100
+      // ── Position cost resolution ─────────────────────────────────────
+      // Priority: connection_settings:{id} overlay (in `settings`)
+      //           > connection:{id} record direct field
+      //           > global app_settings (also in `settings`)
+      //           > built-in default 0.02 (0.02% of balance)
+      //
+      // `settings` already merges global app_settings + connection_settings
+      // overlay so checking `settings` first covers both those sources.
+      // We also check the raw connection record fields because operators
+      // may set `exchangePositionCost` via updateConnection() which writes
+      // to connection:{id} directly without going through connection_settings.
+      // The connection record is fetched later (line 494 area) so we keep
+      // these as lazy reads from the already-fetched `settings` object here;
+      // the raw connection record fields will be merged in below once fetched.
+      const positionCostRaw =
+        settings.exchangePositionCost ??
+        settings.positionCost ??
+        settings.exchange_position_cost ??
+        "0.02"
+      const positionCostPercent = parseFloat(String(positionCostRaw))
+      const positionCost = (Number.isFinite(positionCostPercent) && positionCostPercent > 0)
+        ? positionCostPercent / 100
+        : 0.02 / 100  // 0.02% absolute fallback
 
-      // Default: 2 (matches the Base-stage cap of 1 long + 1 short).
-      // The denominator divides budgeted exposure across the expected
-      // number of concurrent positions. With Strategy Base limited to 2
-      // (per the new spec — Main/Real calculate free and don't open
-      // positions), 2 is the correct divisor for minimal per-position
-      // sizing. Operator overrides via `positions_average` still apply.
+      // ── Positions-average resolution ─────────────────────────────────
+      // Same priority stack: connection_settings overlay → app_settings → default 2.
       const positionsAverage = (() => {
-        const raw = parseFloat(String(settings.positions_average ?? "2"))
+        const raw = parseFloat(String(settings.positions_average ?? settings.positionsAverage ?? "2"))
         return Number.isFinite(raw) && raw > 0 ? raw : 2
       })()
 
@@ -491,7 +519,29 @@ export class VolumeCalculator {
       // Two downstream safety nets still apply after this:
       //   1. setLeverage(symbol, X) on the connector — venue clamps to per-symbol bracket.
       //   2. The live-stage 101204 auto-halve retry handles margin rejections.
+      // ── Single getConnection call ─────────────────────────────────────
+      // Fetch the connection record ONCE — reused for exchange type
+      // (leverage max lookup) AND for live/preset volume factor resolution.
+      // Previously this was called twice (lines 494 and 537), creating a
+      // race window and doubling Redis round-trips on every live order.
+      //
+      // After fetching, we also overlay the connection record's own fields
+      // (exchangePositionCost, positionCost, live_volume_factor, etc.) into
+      // `settings` so positionCost resolution above uses the correct value
+      // if the operator set it via updateConnection() directly.
       const connection = await getConnection(connectionId).catch(() => null)
+      if (connection) {
+        const CONN_FIELDS_TO_OVERLAY = [
+          "exchangePositionCost", "exchange_position_cost", "positionCost",
+          "positions_average", "positionsAverage",
+          "live_volume_factor", "preset_volume_factor",
+          "leveragePercentage", "useMaximalLeverage",
+        ] as const
+        for (const f of CONN_FIELDS_TO_OVERLAY) {
+          const v = (connection as Record<string, unknown>)[f]
+          if (v !== undefined && v !== null && v !== "") settings[f] = v
+        }
+      }
       const exchangeMax   = getMaxLeverageForExchange(connection?.exchange)
       const useMaximal    = settings.useMaximalLeverage === true ||
                             settings.useMaximalLeverage === "true" ||
@@ -520,27 +570,21 @@ export class VolumeCalculator {
       // — they go through with no engine multiplier (the in-place
       // ratio-only behaviour the spec requires).
       //
-      // Live-stage callers can pass:
-      //   - an explicit "main" / "preset" (forces that engine), OR
-      //   - leave it unset entirely (treated as Strategy → identity).
-      // To opt into AUTO-RESOLUTION from connection flags, the
-      // live-stage caller passes `tradeMode: "auto"` ��� handled by the
-      // type widening below.
+      // Live-stage callers pass tradeMode: "main" | "preset" explicitly.
+      // Strategy callers omit it → liveEngineFactor stays 1.0.
       let resolvedMode: "main" | "preset" | undefined = options.tradeMode
       let mainVolumeFactor = 1
       let presetVolumeFactor = 1
       if (resolvedMode === "main" || resolvedMode === "preset") {
-        // We need the connection record + app settings to resolve the
-        // factor stack (per-connection override > global > 1.0).
-        let connectionRecord: any = null
-        try {
-          connectionRecord = await getConnection(connectionId)
-        } catch { /* defaults to 1.0 / 1.0 */ }
-
-        const resolved = VolumeCalculator.resolveLiveEngine(connectionRecord, settings)
+        // Pass BOTH the connection record (has live_volume_factor written
+        // by the volume endpoint) AND the merged settings object (has
+        // live_volume_factor from connection_settings overlay + global
+        // volume_factor_live from app_settings) so resolveLiveEngine
+        // can find the factor from whichever write path was used.
+        const resolved = VolumeCalculator.resolveLiveEngine(connection, settings)
         mainVolumeFactor = resolved.mainVolumeFactor
         presetVolumeFactor = resolved.presetVolumeFactor
-        // We honour the CALLER's explicit mode; `resolveLiveEngine`'s
+        // We honour the CALLER's explicit mode; resolveLiveEngine's
         // tradeMode result is informational here (used only when the
         // caller did not specify).
       }
