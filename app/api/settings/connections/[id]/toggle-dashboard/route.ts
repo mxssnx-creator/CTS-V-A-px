@@ -278,7 +278,14 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           ...disableGlobalState,
           updated_at: new Date().toISOString(),
           active_connections: String(activeCount),
-          status: activeCount > 0 ? "running" : "idle",
+          // When stopping/disabling a connection, keep the global status as
+          // "stopped" unless other connections are enabled AND the engine was
+          // already running. Never promote to "running" from a disable action.
+          status: (() => {
+            if (activeCount === 0) return "stopped"
+            // Only keep "running" if the engine was running before this disable
+            return (disableGlobalState?.status === "running" && activeCount > 0) ? "running" : "stopped"
+          })(),
         })
         
         // DIRECTLY STOP THE ENGINE - don't rely on coordinator polling

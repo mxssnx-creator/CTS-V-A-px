@@ -38,8 +38,8 @@ export function GlobalTradeEngineControls() {
   useEffect(() => {
     // Load initial status immediately
     loadStatus()
-    // Optimized: Increased polling from 3s to 30s to reduce API load significantly
-    const interval = setInterval(loadStatus, 30000)
+    // Poll at 8s to keep status fresh without hammering the API
+    const interval = setInterval(loadStatus, 8000)
     
     // Listen for engine state change events (from quick-start button, etc)
     const handleEngineStateChange = () => {
@@ -257,12 +257,12 @@ export function GlobalTradeEngineControls() {
           </div>
         </div>
 
-        {/* Control Buttons - Single toggle between Start and Pause (no Stop button) */}
+        {/* Control Buttons */}
         <div className="flex gap-1.5 pt-2">
           {!status?.running && (
             <Button onClick={handleStart} disabled={isStarting} size="sm" className="flex-1 text-xs">
               <Play className="h-3 w-3 mr-1" />
-              {isStarting ? "..." : "Start"}
+              {isStarting ? "Starting..." : "Start"}
             </Button>
           )}
 
@@ -280,6 +280,20 @@ export function GlobalTradeEngineControls() {
             </Button>
           )}
 
+          {/* Stop button — always shown when running or paused */}
+          {(status?.running || status?.paused) && (
+            <Button
+              onClick={handleStop}
+              disabled={isStopping}
+              variant="outline"
+              size="sm"
+              className="flex-1 text-xs text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950/30 border-red-200 dark:border-red-800"
+            >
+              <Square className="h-3 w-3 mr-1" />
+              {isStopping ? "..." : "Stop"}
+            </Button>
+          )}
+
           {/* Preset Selection Button */}
           <Button
             onClick={() => setPresetDialogOpen(true)}
@@ -288,7 +302,7 @@ export function GlobalTradeEngineControls() {
             className="flex-1 text-xs"
           >
             <Target className="h-3 w-3 mr-1" />
-            Preset Mode
+            Preset
           </Button>
         </div>
 
