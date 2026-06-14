@@ -16,6 +16,23 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
 
+    // Idempotency guard: if connection is already in the Active panel, return
+    // the current state without resetting is_enabled_dashboard to "0". This
+    // prevents re-adding a live connection from silently disabling it.
+    const alreadyInserted =
+      connection.is_active_inserted === "1" ||
+      connection.is_active_inserted === true ||
+      (connection as any).is_dashboard_inserted === "1" ||
+      (connection as any).is_dashboard_inserted === true
+    if (alreadyInserted) {
+      return NextResponse.json({
+        success: true,
+        connection,
+        message: "Connection already in active panel (no change)",
+        alreadyActive: true,
+      })
+    }
+
     // Add connection to Active panel (assigned but NOT yet enabled — user must toggle Enable)
     const updatedConnection = {
       ...connection,
