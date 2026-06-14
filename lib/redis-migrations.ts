@@ -838,7 +838,7 @@ const migrations: Migration[] = [
     down: async (client: any) => {
       // Note: Rollback is not implemented for this migration (destructive)
       // Users should restore from backup if needed
-      await client.set("_schema_version", "18")
+      await client.set("_schema_version", "19")
     },
   },
   {
@@ -1865,6 +1865,8 @@ const migrations: Migration[] = [
     name: "033-bingx-x01-force-15-symbols",
     version: 33,
     up: async (client: any) => {
+      await client.set("_schema_version", "33")
+
       const SYMBOLS_15 = [
         "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
         "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
@@ -1899,7 +1901,6 @@ const migrations: Migration[] = [
           symbol_count:   symCount,
         }),
       ]).catch(() => {})
-      await client.set("_schema_version", "33")
       console.log(`[v0] Migration 033: bingx-x01 force_symbols set to 15 symbols: ${SYMBOLS_15.join(",")}`)
 
       // Invalidate the running engine's symbol cache so the next cycle picks up
@@ -1938,7 +1939,7 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "32")
     },
   },
-  // ── Migration 034 — operator-spec defaults ──────────────────────────────────
+  // ── Migration 034 — operator-spec defaults ─────────────���────────────────────
   // Seeds the operator-directed configuration defaults for bingx-x01:
   //   • live_volume_factor = 2.2  (written to BOTH connection:{id} and
   //     connection_settings:{id} so all three priority tiers in
