@@ -72,6 +72,13 @@ interface ConnectionSettingsDialogProps {
   exchange?: string
 }
 
+interface SettingsPreset {
+  name:       string
+  created_at: string
+  updated_at: string
+  payload:    Record<string, unknown>
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // DATA SHAPES
 // ─────────────────────────────────────────────────────────────────────
@@ -200,12 +207,6 @@ export function ConnectionSettingsDialog({
   const [coordination, setCoordination] = useState<CoordinationSettings>(DEFAULT_COORDINATION_SETTINGS)
 
   // ── Settings presets ────────────────────────────────────────────
-  interface SettingsPreset {
-    name:       string
-    created_at: string
-    updated_at: string
-    payload:    Record<string, unknown>
-  }
   const [presets,        setPresets]        = useState<SettingsPreset[]>([])
   const [presetsOpen,    setPresetsOpen]    = useState(false)
   const [presetName,     setPresetName]     = useState("")
@@ -575,22 +576,6 @@ export function ConnectionSettingsDialog({
       setSaving(false)
     }
   }, [connectionId, connectionName, overview, symbolsCfg, stratMain, stratPreset, indMain, indPreset, coordination, onOpenChange])
-
-  // ── OPEN / SYMBOL EFFECTS ─────────────────────────────────────────
-  // Placed here — after loadAllSettings, saveAll, fetchPresets, and
-  // fetchExchangeSymbols are all declared — so TypeScript can see their
-  // types before the useEffect references them.
-
-  useEffect(() => {
-    if (!open) return
-    setTab("overview")
-    setPresetsOpen(false)
-    setPresetName("")
-    setPresetConfirm(null)
-    loadAllSettings()
-    fetchPresets()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
 
   // ─────────────────────────────────────────────────────────────────
   // SYMBOL HELPERS

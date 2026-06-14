@@ -1,99 +1,74 @@
 import { NextResponse } from "next/server"
-import { query } from "@/lib/db"
+import { getConnection, initRedis } from "@/lib/redis-db"
 import { fetchTopSymbols } from "@/lib/top-symbols"
 
-export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
+export const dynamic = "force-dynamic"
+
+/**
+ * GET /api/settings/connections/[id]/symbols
+ *
+ * Returns a list of tradeable symbols for the connection's exchange.
+ * Order of resolution:
+ *   1. Live exchange API via fetchTopSymbols (top-50 by volume, volatile cache 60s)
+ *   2. Hardcoded safe-majors fallback (always works offline)
+ *
+ * Previous implementation used SQL tables (exchange_connections, exchange_symbols)
+ * that do not exist in this Redis-backed system. Rewritten to use Redis + the
+ * shared fetchTopSymbols helper that already handles BingX/Bybit/Binance/etc.
+ */
+export async function GET(
+  _request: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
   try {
+    await initRedis()
     const { id } = await params
 
-    // Get connection details
-    const connections = await query<any>(`SELECT * FROM exchange_connections WHERE id = $1`, [id])
+    // Resolve connection from Redis to learn the exchange name.
+    const connection = await getConnection(id).catch(() => null)
 
-    if (!connections || connections.length === 0) {
-      return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+    if (!connection) {
+      return NextResponse.json(
+        { error: "Connection not found", symbols: [] },
+        { status: 404 },
+      )
     }
 
-    const connection = connections[0]
-    const exchange = connection.exchange?.toLowerCase() || "bingx"
+    const exchange = String(connection.exchange || "bingx").toLowerCase()
 
-    // Get cached symbols for this exchange
-    const cachedSymbols = await query<any>(
-      `SELECT symbol FROM exchange_symbols 
-       WHERE exchange = $1 
-       ORDER BY volume_24h DESC 
-       LIMIT 100`,
-      [connection.exchange],
-    )
-
-    if (cachedSymbols && cachedSymbols.length > 0) {
-      return NextResponse.json({
-        symbols: cachedSymbols.map((s: any) => s.symbol),
-        source: "cache",
-        exchange: connection.exchange,
-        count: cachedSymbols.length,
-      })
-    }
-
-    // If no cache, fetch top 5 symbols by 1h volatility and sort with most volatile LAST
+    // Try live exchange API (50 most-liquid USDT perps sorted by volume)
     try {
-      const { symbols } = await fetchTopSymbols(exchange, 5, "volatility")
-      const symbolList = symbols.map((s) => s.symbol)
-      // Sort ascending by volatility (most volatile LAST)
-      const sorted = symbols.sort((a, b) => Math.abs(a.priceChangePercent) - Math.abs(b.priceChangePercent))
-      return NextResponse.json({
-        symbols: sorted.map((s) => s.symbol),
-        source: "volatility-sorted",
-        exchange: exchange,
-        count: sorted.length,
-        sortedByVolatility: true,
-        mostVolatileLast: true,
-      })
+      const { symbols: tickers } = await fetchTopSymbols(exchange, 50, "volume")
+      if (tickers && tickers.length > 0) {
+        return NextResponse.json({
+          symbols: tickers.map((t) => t.symbol),
+          source: "live",
+          exchange,
+          count: tickers.length,
+        })
+      }
     } catch (fetchErr) {
-      console.warn(`[v0] Failed to fetch top symbols for ${exchange}:`, fetchErr)
+      console.warn(`[v0] [symbols] fetchTopSymbols failed for ${exchange}:`, fetchErr)
     }
 
-    // Fallback: return default symbols (legacy behavior)
-    const defaultSymbols = [
-      "BTCUSDT",
-      "ETHUSDT",
-      "BNBUSDT",
-      "XRPUSDT",
-      "ADAUSDT",
-      "DOGEUSDT",
-      "SOLUSDT",
-      "DOTUSDT",
-      "MATICUSDT",
-      "LTCUSDT",
-      "AVAXUSDT",
-      "LINKUSDT",
-      "ATOMUSDT",
-      "UNIUSDT",
-      "ETCUSDT",
-      "XLMUSDT",
-      "BCHUSDT",
-      "FILUSDT",
-      "TRXUSDT",
-      "NEARUSDT",
-      "ALGOUSDT",
-      "VETUSDT",
-      "ICPUSDT",
-      "FTMUSDT",
-      "SANDUSDT",
+    // Hardcoded safe-majors fallback — always available offline
+    const fallback = [
+      "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
+      "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+      "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+      "OPUSDT",   "ARBUSDT",  "APTUSDT",  "SUIUSDT",  "INJUSDT",
+      "TIAUSDT",  "SEIUSDT",  "WLDUSDT",  "PYTHUSDT", "JUPUSDT",
     ]
-
     return NextResponse.json({
-      symbols: defaultSymbols,
-      source: "default",
-      exchange: connection.exchange,
-      count: defaultSymbols.length,
+      symbols: fallback,
+      source: "fallback",
+      exchange,
+      count: fallback.length,
     })
   } catch (error) {
-    console.error("Error fetching exchange symbols:", error)
+    console.error("[v0] [symbols] Unexpected error:", error)
     return NextResponse.json(
-      {
-        error: "Failed to fetch symbols",
-        symbols: [],
-      },
+      { error: "Failed to fetch symbols", symbols: [] },
       { status: 500 },
     )
   }
