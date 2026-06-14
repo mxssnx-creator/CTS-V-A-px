@@ -578,10 +578,15 @@ export class TradeEngineManager {
       }
 
       // Initialize engine state
+      console.log(`[v0] [Engine] startEngine: step A — updateProgressionPhase initializing`)
       await this.updateProgressionPhase("initializing", 5, "Starting engine components")
+      console.log(`[v0] [Engine] startEngine: step B — logProgressionEvent`)
       await logProgressionEvent(this.connectionId, "initializing", "info", "Engine initialization started")
+      console.log(`[v0] [Engine] startEngine: step C — updateEngineState running`)
       await this.updateEngineState("running")
+      console.log(`[v0] [Engine] startEngine: step D — setRunningFlag`)
       await this.setRunningFlag(true)
+      console.log(`[v0] [Engine] startEngine: step E — past setRunningFlag`)
 
       // Load market data for all symbols
       await this.updateProgressionPhase("market_data", 8, "Loading market data...")
