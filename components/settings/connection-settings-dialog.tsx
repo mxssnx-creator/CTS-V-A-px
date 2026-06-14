@@ -482,7 +482,7 @@ export function ConnectionSettingsDialog({
 
   // ─────────────────────────────────────────────────────────────────
   // SAVE
-  // ────────────────────────────────────��────────────────────────────
+  // ─��──────────────────────────────────��────────────────────────────
 
   const saveAll = useCallback(async () => {
     setSaving(true)
@@ -654,7 +654,7 @@ export function ConnectionSettingsDialog({
 
   // ─────────────────────────────────────────────────────────────────
   // RENDER
-  // ─────────────────────────────────────────────────────────────────
+  // ────────────────────────────────────────────────────────���────────
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -696,13 +696,14 @@ export function ConnectionSettingsDialog({
             </TabsTrigger>
           </TabsList>
 
-          {/* ScrollArea must have a fixed height so Radix can measure the
-              viewport and enable the internal scroll thumb. Without `h-full`
-              the Radix viewport collapses to 0px and the content overflows
-              the DialogContent instead. `overflow-y-auto` on the outer
-              wrapper handles the fallback when the Radix scroll thumb is
-              hidden (e.g. touch devices). */}
-          <ScrollArea className="flex-1 h-full px-5 py-4">
+          {/* The ScrollArea must receive a concrete height so Radix can
+              measure its internal viewport and position the scroll thumb.
+              `min-h-0` is critical on flex children: without it the flex
+              item expands to fit its content and never scrolls. The
+              `overflow-hidden` on the `Tabs` parent above combined with
+              `flex-1 min-h-0` here constrains the height to the remaining
+              space below the TabsList. */}
+          <ScrollArea className="flex-1 min-h-0 px-5 py-4">
             {loading && (
               <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-sm">
                 <Loader2 className="h-4 w-4 animate-spin" /> Loading settings…
