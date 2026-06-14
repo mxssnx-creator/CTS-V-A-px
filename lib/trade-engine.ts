@@ -237,6 +237,13 @@ export class GlobalTradeEngineCoordinator {
       lockHandle = undefined
       console.log(`[v0] [STARTUP LOCK] TradeEngine successfully started for connection: ${connectionId}`)
 
+      // ── Set isGloballyRunning so the watchdog monitors this engine ────
+      // `startEngine` is the entry-point for individual connection starts
+      // (dashboard toggle, settings save, quickstart) — none of which go
+      // through `startAll()`. Without this flag the watchdog short-circuits
+      // (`if (!this.isGloballyRunning) return`) and never recovers stalls.
+      this.isGloballyRunning = true
+
       // ── Mark connection as active-inserted now that engine is live ────
       // is_active_inserted controls the "Active Connections" panel on the
       // dashboard. The migration seeds it as "0" (operator hasn't inserted

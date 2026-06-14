@@ -148,10 +148,11 @@ const DEFAULT_INDICATION_PROFILE: ChannelProfile = {
 }
 // Operator-spec defaults: base PF 1.0, main/real PF 1.2; max positions
 // raised for high-throughput pipelines (base/main: 5000, real: 2000).
+// Operator spec: base PF=1.0, main/real PF=1.2; max positions raised for high-throughput pipelines.
 const DEFAULT_STRATEGY_PROFILE: StrategyChannel = {
-  base: { enabled: true, min_profit_factor: 1.0, max_drawdown_time: 160, max_positions: 5000 },
-  main: { enabled: true, min_profit_factor: 1.2, max_drawdown_time: 160, max_positions: 5000 },
-  real: { enabled: true, min_profit_factor: 1.2, max_drawdown_time: 160, max_positions: 2000 },
+  base: { enabled: true, min_profit_factor: 1.0, max_drawdown_time: 160, max_positions: 10000 },
+  main: { enabled: true, min_profit_factor: 1.2, max_drawdown_time: 160, max_positions: 10000 },
+  real: { enabled: true, min_profit_factor: 1.2, max_drawdown_time: 160, max_positions: 5000  },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -481,7 +482,7 @@ export function ConnectionSettingsDialog({
 
   // ─────────────────────────────────────────────────────────────────
   // SAVE
-  // ─────────────────────────────────────────────────────────────────
+  // ────────────────────────────────────��────────────────────────────
 
   const saveAll = useCallback(async () => {
     setSaving(true)
@@ -657,7 +658,7 @@ export function ConnectionSettingsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl h-[90vh] overflow-hidden flex flex-col p-0">
+      <DialogContent className="max-w-3xl h-[90vh] overflow-hidden flex flex-col p-0 [&>button]:z-10">
         {/* Header */}
         <DialogHeader className="px-5 pt-4 pb-3 border-b shrink-0">
           <div className="flex items-center gap-2">
@@ -695,7 +696,13 @@ export function ConnectionSettingsDialog({
             </TabsTrigger>
           </TabsList>
 
-          <ScrollArea className="flex-1 min-h-0 overflow-y-auto px-5 py-4" style={{ overflowY: "auto" }}>
+          {/* ScrollArea must have a fixed height so Radix can measure the
+              viewport and enable the internal scroll thumb. Without `h-full`
+              the Radix viewport collapses to 0px and the content overflows
+              the DialogContent instead. `overflow-y-auto` on the outer
+              wrapper handles the fallback when the Radix scroll thumb is
+              hidden (e.g. touch devices). */}
+          <ScrollArea className="flex-1 h-full px-5 py-4">
             {loading && (
               <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-sm">
                 <Loader2 className="h-4 w-4 animate-spin" /> Loading settings…
@@ -1389,7 +1396,9 @@ function StrategyProfileEditor({
               />
               <div className="flex justify-between text-[10px] text-muted-foreground">
                 <span>0.1</span>
-                <span className="text-muted-foreground/60">default 0.9</span>
+                <span className="text-muted-foreground/60">
+                  {type === "base" ? "default 1.0" : "default 1.2"}
+                </span>
                 <span>3.0</span>
               </div>
             </div>
@@ -1431,7 +1440,7 @@ function StrategyProfileEditor({
                 </span>
               </div>
               <Slider
-                min={100} max={10000} step={100}
+                min={100} max={50000} step={100}
                 value={[p.max_positions]}
                 onValueChange={([v]) => update(type, { max_positions: v })}
                 disabled={!p.enabled}
@@ -1439,8 +1448,8 @@ function StrategyProfileEditor({
               />
               <div className="flex justify-between text-[10px] text-muted-foreground">
                 <span>100</span>
-                <span className="text-muted-foreground/60">{type === "real" ? "default 1,000" : "default 2,000"}</span>
-                <span>10,000</span>
+                <span className="text-muted-foreground/60">{type === "real" ? "default 2,000" : "default 5,000"}</span>
+                <span>50,000</span>
               </div>
             </div>
           </div>

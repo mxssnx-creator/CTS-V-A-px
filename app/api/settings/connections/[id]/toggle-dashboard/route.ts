@@ -183,18 +183,27 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
         }
         
-        // Update global engine state to show running (stored as Redis HASH)
+        // Update global engine state — but ONLY propagate/mirror, never force
+        // status="running" if the operator has stopped the global engine.
+        // Previously this block unconditionally wrote status:"running", causing
+        // the engine to resurrect itself after every connection-enable even when
+        // the operator had explicitly pressed Stop.
         const toggleClient = getRedisClient()
         const globalState: Record<string, string> = await toggleClient.hgetall("trade_engine:global").catch(() => ({})) || {}
+        const isGlobalRunning = globalState.status === "running"
         const allConnections = await getAllConnections()
         // Use clean helper function for counting main-enabled connections
         const activeDashboardCount = allConnections.filter((c: any) => 
           c.id === resolvedId || isConnectionReadyForEngine(c)
         ).length
+        // Only update status if already running — never flip from stopped→running
+        // on a per-connection enable. The operator must explicitly start the
+        // global engine via /api/trade-engine/start.
+        const newGlobalStatus = isGlobalRunning ? "running" : (globalState.status || "stopped")
         await toggleClient.hset("trade_engine:global", {
           ...globalState,
-          status: "running",
-          started_at: globalState.started_at || new Date().toISOString(),
+          status: newGlobalStatus,
+          ...(isGlobalRunning && !globalState.started_at ? { started_at: new Date().toISOString() } : {}),
           updated_at: new Date().toISOString(),
           active_connections: String(activeDashboardCount),
         })

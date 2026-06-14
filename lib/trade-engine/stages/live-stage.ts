@@ -2062,7 +2062,7 @@ export async function executeLivePosition(
       return livePosition
     }
 
-    // ── Step 2: Fetch current market price ──────���──────────────────────────
+    // ── Step 2: Fetch current market price ──────�����──────────────────────────
     let currentPrice = realPosition.entryPrice
     if (!currentPrice || currentPrice <= 0) {
       currentPrice = await fetchCurrentPrice(realPosition.symbol)
@@ -4082,10 +4082,14 @@ export async function reconcileLivePositions(
     const openPositions = allOpen.filter(
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
     )
-    if (openPositions.length === 0 && !reconcileMode) {
-      await orphanCloseExpiredPositions(connectionId, exchangeConnector, summary)
-      return summary
-    }
+    // ── NOTE: Do NOT early-return here even when openPositions is empty ──────
+    // The orphan-adoption block below (which runs before per-position sync)
+    // fetches live exchange positions and may add newly-discovered positions
+    // into openPositions. Short-circuiting here prevents that adoption from
+    // ever running when the operator restarts after a terminate (Redis is
+    // cleared but exchange still has open positions).
+    // The skipOrphanAdoption flag and the check at the bottom of the adoption
+    // block still handle the no-positions-after-adoption exit.
 
     // Single batch fetch of ALL exchange positions rather than per-symbol
     // calls — dramatically fewer API hits when multiple positions are open.
@@ -4096,6 +4100,13 @@ export async function reconcileLivePositions(
       console.warn(`${LOG_PREFIX} reconcile getPositions failed:`, err instanceof Error ? err.message : String(err))
       // Exchange unreachable — still run the orphan-close sweep so positions
       // that exceeded max hold time are not stranded open in Redis indefinitely.
+      await orphanCloseExpiredPositions(connectionId, exchangeConnector, summary)
+      return summary
+    }
+
+    // If we have no tracked positions AND the exchange returned nothing to
+    // adopt, bail out early (orphan adoption won't help us here).
+    if (openPositions.length === 0 && (!exchangePositions || exchangePositions.length === 0) && !reconcileMode) {
       await orphanCloseExpiredPositions(connectionId, exchangeConnector, summary)
       return summary
     }
@@ -4835,47 +4846,19 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     }
 
     // ── Exchange-orphan adoption (P0 fix for "positions not closing") ──
-    // The user repeatedly reported live exchange positions that never get
-    // closed. Investigation showed the root cause: positions on the
-    // exchange that AREN'T in our Redis open-index are completely
-    // invisible to every close path (SL/TP cross, max-hold, reconcile,
-    // sync). They sit there forever with no control orders armed.
+    // Positions on the exchange that AREN'T in our Redis open-index are
+    // completely invisible to every close path (SL/TP cross, max-hold,
+    // reconcile, sync). They sit there forever with no control orders armed.
     //
-    // This block runs BEFORE the early-return on `openPositions.length=0`
-    // so even a system with zero tracked positions still discovers and
-    // adopts exchange-side positions. Adopted positions get the
-    // connection's default SL/TP percentages applied via
-    // `updateProtectionOrders` on the next iteration of the per-position
-    // loop below, restoring full close-path coverage.
-    //
-    // Cheap when the exchange has no positions (one HTTP call returning
-    // empty array). The exchange call is gated by the realtime sync's
-    // 5-second throttle so it doesn't hammer the venue.
+    // This block now runs AFTER the batch getPositions() fetch above (which
+    // already populates `exchangePositions`) so we use the SAME single
+    // API call for both orphan adoption and per-position sync below.
+    // Adopted positions are pushed into `openPositions` so the per-position
+    // loop arms SL/TP immediately without waiting for the next tick.
     let adoptedCount = 0
-    // Hoisted out of the orphan-adoption block so the per-position sync
-    // loop below can build a (symbol|direction)→exchangePos map from the
-    // SAME single batch fetch, instead of issuing N getPosition(symbol)
-    // calls (which on hedge-mode accounts returned positions[0] regardless
-    // of direction — clobbering markPrice across long/short legs and
-    // never detecting external closures).
-    let exchangePositions: any[] = []
-    if (exchangeConnector && typeof exchangeConnector.getPositions === "function") {
-      try {
-        // Bounded — a hanging getPositions() would freeze every close path
-        // (externally-closed detection, orphan adoption, mark-price refresh,
-        // SL/TP cross check) all of which depend on this single call.
-        exchangePositions = (await withTimeout(
-          exchangeConnector.getPositions() as Promise<any[]>,
-          EXCHANGE_TIMEOUT_GET_POSITIONS_MS,
-          "syncWithExchange:getPositions",
-        ).catch((err: any) => {
-          console.warn(
-            `${LOG_PREFIX} getPositions failed/timeout in syncWithExchange:`,
-            err instanceof Error ? err.message : String(err),
-          )
-          return [] as any[]
-        })) || []
-        if (Array.isArray(exchangePositions) && exchangePositions.length > 0) {
+    if (!skipOrphanAdoption && exchangeConnector) {
+      // `exchangePositions` is already populated by the fetch above.
+      if (Array.isArray(exchangePositions) && exchangePositions.length > 0) {
           // Build a set of (symbol|direction) keys we already track in any
           // status — including terminal ones — so we don't re-adopt a
           // position that was just closed but the exchange hasn't yet
@@ -5014,16 +4997,13 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             console.log(`${LOG_PREFIX} Adopted ${adoptedCount} untracked exchange position(s) for ${connectionId}`)
           }
         }
-      } catch (sweepErr) {
-        console.warn(
-          `${LOG_PREFIX} Orphan sweep failed:`,
-          sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
-        )
       }
     }
 
     if (openPositions.length === 0) {
-      return
+      // Still run TTL-expiry closer even if no positions to sync.
+      await orphanCloseExpiredPositions(connectionId, exchangeConnector, summary)
+      return summary
     }
 
     console.log(`${LOG_PREFIX} Syncing ${openPositions.length} open/placed positions with exchange (adopted=${adoptedCount})`)

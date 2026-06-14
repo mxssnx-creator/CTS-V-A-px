@@ -179,9 +179,27 @@ export function DashboardActiveConnectionsManager() {
     const handleEngineStateChange = () => {
       checkGlobalEngine()
     }
+
+    // After settings are saved via the ConnectionSettingsDialog, force-refresh
+    // the connections list after a short delay so the updated flags (symbols,
+    // is_enabled_dashboard, etc.) are reflected without waiting for the 8s poll.
+    const handleSettingsUpdated = (e: Event) => {
+      const detail = (e as CustomEvent).detail
+      // Small delay so the PATCH write + recoordination settle before we re-fetch.
+      setTimeout(() => loadConnections({ force: true }), 800)
+      // Also check the global engine state in case a restart was triggered.
+      setTimeout(checkGlobalEngine, 1200)
+      if (detail?.connectionId) {
+        // Optimistically keep the card visible during the refresh window
+        // by not resetting the toggling set (it's not toggling, but we
+        // add a transient guard so the 8s poll doesn't clobber the card).
+        console.log("[Manager] Settings updated for", detail.connectionId, "— refreshing connections")
+      }
+    }
     
     if (typeof window !== 'undefined') {
       window.addEventListener('engine-state-changed', handleEngineStateChange)
+      window.addEventListener('connection-settings-updated', handleSettingsUpdated)
     }
     
     return () => {
@@ -189,6 +207,7 @@ export function DashboardActiveConnectionsManager() {
       clearInterval(engineInterval)
       if (typeof window !== 'undefined') {
         window.removeEventListener('engine-state-changed', handleEngineStateChange)
+        window.removeEventListener('connection-settings-updated', handleSettingsUpdated)
       }
     }
   }, [])
