@@ -481,18 +481,36 @@ export class InlineLocalRedis {
     // live trading the pipeline creates thousands of these per minute.
     let evicted = 0
 
+    // Keys that must NEVER be evicted by memory pressure — they are either
+    // stateful operator decisions or live-position tracking records.
+    const isProtected = (k: string): boolean =>
+      k.startsWith("live:position:") ||      // open/closed live positions (JSON)
+      k.startsWith("live:positions:") ||      // open/closed index LISTs
+      k.startsWith("progression:") ||         // progression counters + metadata
+      k.startsWith("connection:") ||          // exchange credentials + config
+      k.startsWith("settings:") ||            // operator settings
+      k.startsWith("strategy_count:") ||      // strategy count totals
+      k.startsWith("real_pi_acc:") ||         // real PI accumulation ledger
+      k.startsWith("axis_pos_acc:") ||        // axis position accumulation
+      k.startsWith("app_settings") ||         // global app settings
+      k.startsWith("trade_engine:") ||        // engine state
+      k.startsWith("_migration") ||           // migration markers
+      k.startsWith("_schema_version") ||      // schema version
+      k.startsWith("market_data:") ||         // candle blobs (handled separately)
+      false
+
     // 1) Hash families that grow per-cycle. Keep only the newest CAP entries
     //    of each family (FIFO — Map preserves insertion order, so the first
     //    entries are the oldest). config_set/pseudo_position carry a trailing
     //    `-<nowMs>` or timestamp component, so insertion order ≈ chronological.
     const hashFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
-      { match: (k) => k.startsWith("pseudo_position:"), cap: 4000 },
-      { match: (k) => k.startsWith("config_set:") || k.includes(":config_set:"), cap: 3000 },
-      { match: (k) => k.startsWith("strategy:") && k.includes(":positions"), cap: 2000 },
-      { match: (k) => k.startsWith("strategy:") && k.includes(":detail"), cap: 2000 },
-      { match: (k) => k.startsWith("real_stage:") || k.startsWith("realstage:"), cap: 2000 },
-      { match: (k) => k.startsWith("indication:") && k.includes(":result"), cap: 3000 },
-      { match: (k) => k.startsWith("live_positions:") && k.includes(":history"), cap: 1000 },
+      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 4000 },
+      { match: (k) => !isProtected(k) && (k.startsWith("config_set:") || k.includes(":config_set:")), cap: 3000 },
+      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":positions"), cap: 2000 },
+      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":detail"), cap: 2000 },
+      { match: (k) => !isProtected(k) && (k.startsWith("real_stage:") || k.startsWith("realstage:")), cap: 2000 },
+      { match: (k) => !isProtected(k) && k.startsWith("indication:") && k.includes(":result"), cap: 3000 },
+      { match: (k) => !isProtected(k) && k.startsWith("live_positions:") && k.includes(":history"), cap: 1000 },
     ]
     for (const { match, cap } of hashFamilyCaps) {
       const matching: string[] = []
@@ -511,10 +529,10 @@ export class InlineLocalRedis {
 
     // 2) String families (setSettings can store flat JSON as strings too).
     const stringFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
-      { match: (k) => k.startsWith("pseudo_position:"), cap: 4000 },
-      { match: (k) => k.includes(":exists:") || k.includes(":dedup:"), cap: 6000 },
-      { match: (k) => k.startsWith("strategy_detail:"), cap: 2000 },
-      { match: (k) => k.startsWith("candle_cache:") || k.startsWith("market_data_cache:"), cap: 60 },
+      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 4000 },
+      { match: (k) => !isProtected(k) && (k.includes(":exists:") || k.includes(":dedup:")), cap: 6000 },
+      { match: (k) => !isProtected(k) && k.startsWith("strategy_detail:"), cap: 2000 },
+      { match: (k) => !isProtected(k) && (k.startsWith("candle_cache:") || k.startsWith("market_data_cache:")), cap: 60 },
     ]
     for (const { match, cap } of stringFamilyCaps) {
       const matching: string[] = []

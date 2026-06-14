@@ -474,6 +474,12 @@ export function ConnectionSettingsDialog({
         realEvalPosCount: coordination.realEvalPosCount,
         prevPosWindow:    coordination.prevPosWindow,
         minStep:          coordination.minStep ?? 5,
+        // Control orders (SL/TP placement toggle) — operator spec: on by default
+        control_orders:   true,
+        // Flat variant toggles for backwards compat with old hash readers
+        variant_trailing: coordination.variants.trailing !== false,
+        variant_block:    coordination.variants.block    !== false,
+        variant_dca:      coordination.variants.dca      === true,
       }
 
       const [settingsRes, indRes] = await Promise.all([

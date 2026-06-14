@@ -227,7 +227,12 @@ export async function PATCH(
       ] as const
       for (const k of knobKeys) {
         const v = (merged as Record<string, unknown>)[k]
-        if (typeof v === "number" && Number.isFinite(v)) flatKnobs[k] = String(v)
+        if (typeof v === "number" && Number.isFinite(v)) {
+          flatKnobs[k] = String(v)
+          // Also write snake_case aliases so both naming styles resolve
+          const snake = k.replace(/([A-Z])/g, (m) => "_" + m.toLowerCase())
+          if (snake !== k) flatKnobs[snake] = String(v)
+        }
       }
 
       // ── Symbol selection fields ─────────────────────────────────────────
@@ -324,6 +329,31 @@ export async function PATCH(
           if (Number.isFinite(bms) && bms >= 2) {
             flatKnobs.blockMaxStack = String(Math.min(8, Math.max(2, Math.floor(bms))))
           }
+        }
+      }
+
+      // ── Volume factor mirror ──────────────────────────────────────────────
+      // VolumeCalculator reads volume_factor_live and volume_factor from the
+      // connection_settings:{id} hash. Mirror all three so per-connection
+      // volume factor saves actually reach the engine.
+      {
+        const vfl = Number((merged as Record<string, unknown>).volume_factor_live)
+        if (Number.isFinite(vfl) && vfl > 0) {
+          flatKnobs.volume_factor_live   = String(Math.max(0.1, Math.min(10, vfl)))
+        }
+        const vfb = Number((merged as Record<string, unknown>).volume_factor ?? (merged as Record<string, unknown>).volume_factor_base)
+        if (Number.isFinite(vfb) && vfb > 0) {
+          flatKnobs.volume_factor        = String(Math.max(0.1, Math.min(10, vfb)))
+          flatKnobs.volume_factor_base   = flatKnobs.volume_factor
+        }
+        const vfp = Number((merged as Record<string, unknown>).volume_factor_preset)
+        if (Number.isFinite(vfp) && vfp > 0) {
+          flatKnobs.volume_factor_preset = String(Math.max(0.1, Math.min(10, vfp)))
+        }
+        // control_orders flag — whether to place SL/TP orders
+        const co = (merged as Record<string, unknown>).control_orders
+        if (co !== undefined && co !== null) {
+          flatKnobs.control_orders = co === true || co === "1" || co === "true" ? "1" : "0"
         }
       }
 

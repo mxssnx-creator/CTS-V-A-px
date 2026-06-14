@@ -1919,6 +1919,79 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "32")
     },
   },
+  // ── Migration 034 — operator-spec defaults ──────────────────────────────────
+  // Seeds the operator-directed configuration defaults into bingx-x01 settings:
+  //   • volumeFactorLive = 2.2 (was 1.0)
+  //   • pf_base_min = 1.0, pf_main_min = 1.2, pf_real_min = 1.2
+  //   • symbol_order = volatility_1h, symbol_count = 15 (already correct via 033)
+  //   • variants: trailing=true, block=true, dca=false, control_orders=true
+  //   • minStep = 5 (default, range 3-30)
+  //   • max_positions: base/main = 5000, real = 2000
+  //
+  // These are idempotent — already-correct values are overwritten harmlessly.
+  // Does NOT touch live:position:* or active_symbols (migration 033 handles those).
+  {
+    version: 34,
+    name: "operator_spec_defaults",
+    up: async (client: any) => {
+      const CONN_ID = "bingx-x01"
+      const now = new Date().toISOString()
+
+      // ── App-level PF thresholds (shared across all connections) ──────────────
+      await client.hset("app_settings", {
+        pf_base_min:         "1.0",
+        pf_main_min:         "1.2",
+        pf_real_min:         "1.2",
+        pf_live_min:         "1.2",
+        updated_at:          now,
+      }).catch(() => {})
+
+      // ── Per-connection operator settings ────────────────────────────────────
+      const settingsKey = `settings:connection:${CONN_ID}`
+      await client.hset(settingsKey, {
+        volume_factor_live:   "2.2",
+        volume_factor_base:   "1.0",
+        volume_factor_preset: "1.0",
+        symbol_order:         "volatility_1h",
+        symbol_count:         "15",
+        // Strategy PF thresholds (per-connection override)
+        pf_base_min:          "1.0",
+        pf_main_min:          "1.2",
+        pf_real_min:          "1.2",
+        pf_live_min:          "1.2",
+        // Max positions per stage (increased for high-throughput)
+        max_positions_base:   "5000",
+        max_positions_main:   "5000",
+        max_positions_real:   "2000",
+        // Coordination variants per operator spec
+        variant_trailing:     "1",
+        variant_block:        "1",
+        variant_dca:          "0",
+        control_orders:       "1",
+        // Minimum position-creation step
+        min_step:             "5",
+        updated_at:           now,
+      }).catch(() => {})
+
+      // Also write into the trade_engine_state settings for the running engine
+      await client.hset(`settings:trade_engine_state:${CONN_ID}`, {
+        volume_factor:       "1.0",
+        volume_factor_live:  "2.2",
+        symbol_order:        "volatility_1h",
+        pf_base_min:         "1.0",
+        pf_main_min:         "1.2",
+        pf_real_min:         "1.2",
+        control_orders:      "1",
+        updated_at:          now,
+      }).catch(() => {})
+
+      await client.set("_schema_version", "34")
+      console.log("[v0] Migration 034: operator-spec defaults applied (pf=1.0/1.2/1.2, volumeFactor=2.2, symbolOrder=volatility_1h, max_positions=5000/5000/2000)")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "33")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
