@@ -200,6 +200,12 @@ export async function PATCH(
       ...(settings.is_live_trade !== undefined ? { is_live_trade: toRedisFlag(settings.is_live_trade) } : {}),
       ...(settings.is_testnet !== undefined ? { is_testnet: toRedisFlag(settings.is_testnet) } : {}),
       ...(settings.is_preset_trade !== undefined ? { is_preset_trade: toRedisFlag(settings.is_preset_trade) } : {}),
+      // Mirror symbol_count and force_symbols onto the connection hash so
+      // getAllConnections() (and the UI card) always shows the current count.
+      ...(settings.symbol_count !== undefined ? { symbol_count: String(Number(settings.symbol_count)) } : {}),
+      ...(Array.isArray(settings.symbols) && settings.symbols.length > 0
+        ? { force_symbols: JSON.stringify(settings.symbols), symbol_count: String(settings.symbols.length) }
+        : {}),
       updated_at: new Date().toISOString(),
     }
 
@@ -332,7 +338,7 @@ export async function PATCH(
         }
       }
 
-      // ── Volume factor mirror ──────────────────────────────────────────────
+      // ── Volume factor mirror ─���────────────────────────────────────────────
       // VolumeCalculator reads volume_factor_live and volume_factor from the
       // connection_settings:{id} hash. Mirror all three so per-connection
       // volume factor saves actually reach the engine.

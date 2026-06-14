@@ -1166,8 +1166,10 @@ export function ActiveConnectionCard({
 
                 {/* Per-connection engine stats — always shown when connection is active.
                     Layout matches the idle variant: Symbols | Cycles | Pseudo|Live.
-                    Indications / Strategies / Sets live in the Realtime Execution panel. */}
-                {liveStats && phase !== "prehistoric_data" && (
+                    Indications / Strategies / Sets live in the Realtime Execution panel.
+                    When liveStats hasn't loaded yet we render with 0-fallbacks so the
+                    tiles are always visible once we leave prehistoric_data phase. */}
+                {phase !== "prehistoric_data" && (
                   <div className="flex items-center gap-3 mt-1.5 flex-wrap">
                     {(() => {
                       const symbolsProcessed = progression?.prehistoricProgress?.symbolsProcessed ?? 0
@@ -1182,12 +1184,12 @@ export function ActiveConnectionCard({
                       }
                       tiles.push({
                         label: "Cycles",
-                        value: liveStats.indicationCycles,
+                        value: liveStats?.indicationCycles ?? 0,
                         title: "Realtime indication processor ticks since engine start.",
                       })
                       tiles.push({
                         label: (prehistoricStats?.liveOpenPositions ?? 0) > 0 ? "Live" : "Pseudo",
-                        value: liveStats.positions,
+                        value: liveStats?.positions ?? 0,
                         title: (prehistoricStats?.liveOpenPositions ?? 0) > 0
                           ? "Open exchange positions (live)."
                           : "Open pseudo positions (evaluation stage).",
