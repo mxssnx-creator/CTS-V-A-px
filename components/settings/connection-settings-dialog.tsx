@@ -368,8 +368,12 @@ export function ConnectionSettingsDialog({
         setExchangeKey(String(conn.exchange || exchange).toLowerCase())
         setOverview({
           volumeFactorBase:   Number(settings.volume_factor)        || Number(conn.volume_factor) || 1.0,
-          volumeFactorLive:   Number(settings.volume_factor_live)   || 2.2,
-          volumeFactorPreset: Number(settings.volume_factor_preset) || 1.0,
+          // Read live/preset factor from BOTH the settings hash (volume_factor_live) and
+          // the connection hash (live_volume_factor) so changes made via the card's inline
+          // volume sliders (which write to the connection hash via the /volume route) are
+          // always reflected when the dialog opens.
+          volumeFactorLive:   Number(settings.volume_factor_live)   || Number(conn.live_volume_factor)   || 2.2,
+          volumeFactorPreset: Number(settings.volume_factor_preset) || Number(conn.preset_volume_factor) || 1.0,
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
           positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
@@ -542,6 +546,19 @@ export function ConnectionSettingsDialog({
           headers: { "Content-Type": "application/json" },
           body:    JSON.stringify({ channels: { main: indMain, preset: indPreset } }),
         }),
+        // Keep the connection hash (live_volume_factor / preset_volume_factor)
+        // in sync with the settings hash. The card's inline volume sliders and
+        // VolumeCalculator both read from the connection hash via getConnection().
+        // Without this extra write the two storage locations diverge as soon as
+        // the user saves from the dialog.
+        fetch(`/api/settings/connections/${connectionId}/volume`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({
+            live_volume_factor:   overview.volumeFactorLive,
+            preset_volume_factor: overview.volumeFactorPreset,
+          }),
+        }).catch(() => { /* non-fatal — connection hash is a secondary write */ }),
       ])
 
       if (!settingsRes.ok) throw new Error("Settings save failed")
