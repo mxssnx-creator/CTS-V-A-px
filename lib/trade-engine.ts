@@ -307,11 +307,6 @@ export class GlobalTradeEngineCoordinator {
 
       await manager.stop()
       this.engineManagers.delete(connectionId)
-      // If the manager was mid-startup when this stop arrived, its entry in
-      // startingEngines was never cleared (the start() promise is still
-      // awaited somewhere). Remove it here so the next startEngine() call
-      // isn't permanently blocked by a stale startup lock.
-      this.startingEngines.delete(connectionId)
 
       // Clear the `engine_is_running` Redis flag immediately after the manager
       // stops. This prevents the subsequent `startEngine` call from hitting its
@@ -889,23 +884,8 @@ export class GlobalTradeEngineCoordinator {
     }
 
     this.engineManagers.clear()
-
-    // Break lingering Redis progression locks for any connection that was
-    // mid-startup when stopAll() fired (its startingEngines slot was never
-    // cleared because the start() promise never resolved/rejected).
-    // Capture BEFORE clearing so the loop has something to iterate.
-    const hangingStarts = Array.from(this.startingEngines)
-    // Clear in-process startup/stop locks so a subsequent startEngine() call
-    // can proceed without seeing a stale lock from a startup that was stuck
-    // (e.g. hung in recoordinateForActualOne) when stopAll() was called.
-    this.startingEngines.clear()
-    this.stoppingEngines.clear()
     this.isGloballyRunning = false
     this.isPaused = false
-
-    for (const connectionId of hangingStarts) {
-      try { await forceBreakProgressionLock(connectionId) } catch { /* TTL will reclaim */ }
-    }
 
     console.log("[v0] All TradeEngines stopped")
   }
@@ -1577,23 +1557,6 @@ export async function getTradeEngineStatus(connectionId: string): Promise<any | 
 
 export function initializeTradeEngine(): GlobalTradeEngineCoordinator {
   return initializeGlobalCoordinator()
-}
-
-/**
- * Null out the global coordinator singleton so the next call to
- * getGlobalTradeEngineCoordinator() creates a fresh instance.
- *
- * Call this from the stop route immediately after coordinator.stopAll() to
- * guarantee that the next start gets a clean coordinator with empty
- * startingEngines/stoppingEngines Sets — even if a previous startEngine()
- * call was mid-flight and had already added a connection to startingEngines
- * before stopAll() cleared it.
- */
-export function resetGlobalCoordinator(): void {
-  globalCoordinator = null
-  const g = globalThis as unknown as { __tradeEngineCoordinator?: GlobalTradeEngineCoordinator }
-  g.__tradeEngineCoordinator = undefined
-  console.log("[v0] [Trade Engine] Coordinator singleton reset — next start creates fresh instance")
 }
 
 export type TradeEngineInterface = GlobalTradeEngineCoordinator

@@ -547,15 +547,11 @@ export class TradeEngineManager {
       // Ensure Redis is initialized before using it
       await initRedis()
 
-      // Bail out immediately if stop() was called while we were awaiting initRedis.
-      // This covers the race where stopAll() sets isStarting=false before we even
-      // reach the progression coordination steps.
-      if (!this.isStarting) {
-        console.log(`[v0] [Engine] start: aborted by stop() after initRedis — bailing out`)
-        return
-      }
-
       // ── RE-COORDINATE FOR ACTUAL LIVE STATE (prevents stalling to old/different settings+symbols) ──
+      // Before starting anything, check if the existing progression (if any) was born for
+      // different settings / symbol count than what is live *right now*.
+      // If mismatch → previous running progress is stopped (via archive) and we start a fresh,
+      // unique, solid progression for the *actual* current configuration of this connection.
       try {
         await ProgressionStateManager.recoordinateForActualOne(this.connectionId)
       } catch (recoordErr) {
@@ -563,6 +559,11 @@ export class TradeEngineManager {
       }
 
       // ── ENSURE JUST UNIQUE PROGRESSION (per connection, solid, one at a time) ──
+      // Guarantees exactly one unique solid progression per connection.
+      // - Reuses the existing one when it matches current live settings/symbols.
+      // - When starting new (or recoordinate detects mismatch), previous is stopped/archived.
+      // - Page refreshes / independent opens attach to the current unique one (no explosion of instances).
+      // "Just Unique" — one canonical active progression for the actual state.
       try {
         const u = await ProgressionStateManager.ensureJustUniqueProgression(this.connectionId)
         this.epoch = u.epoch
@@ -1167,10 +1168,6 @@ export class TradeEngineManager {
     }
 
     this.isRunning = false
-    // Signal any in-progress start() coroutine that stop was requested.
-    // start() polls this.isRunning at multiple checkpoints and will bail
-    // out once it resumes from its current await.
-    this.isStarting = false
     // Capture epoch before zeroing so endProgression can use it for the
     // stale-stop guard (prevents a delayed stop() from closing a newer
     // progression that already started in a different worker/restart).

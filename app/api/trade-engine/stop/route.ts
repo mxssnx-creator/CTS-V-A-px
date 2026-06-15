@@ -79,15 +79,6 @@ export async function POST(request: NextRequest) {
       try {
         if (coordinator) await coordinator.stopAll()
       } catch { /* ignore */ }
-
-      // Reset the coordinator singleton so the next POST /api/trade-engine/start
-      // gets a brand-new instance with empty startingEngines/stoppingEngines.
-      // This prevents stale startup locks (from a mid-startup engine that was
-      // stuck when stopAll() ran) from permanently blocking the next start.
-      try {
-        const { resetGlobalCoordinator } = await import("@/lib/trade-engine")
-        resetGlobalCoordinator()
-      } catch { /* non-critical — fresh start path will recreate via ??= */ }
       
       // 3. Save paused lists so start route can resume them
       if (pausedConnections.length > 0) {
