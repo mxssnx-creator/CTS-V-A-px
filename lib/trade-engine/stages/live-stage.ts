@@ -691,6 +691,12 @@ async function pollOrderFill(
   _legacyIntervalMs = 800,
 ): Promise<{ filled: boolean; filledQty: number; filledPrice: number; status: string }> {
   void _legacyIntervalMs
+  // Guard: a missing orderId means the exchange didn't return one (API
+  // issue or order was immediately rejected). Don't call getOrder(undefined)
+  // — it generates exchange API spam and never confirms a fill.
+  if (!orderId) {
+    return { filled: false, filledQty: 0, filledPrice: 0, status: "pending" }
+  }
   const intervals = [100, 200, 350, 600]
   const deadline = Date.now() + timeoutMs
   let lastStatus = "pending"
@@ -2676,9 +2682,14 @@ export async function executeLivePosition(
       // A) placeOrder response already contains fill confirmation — skip poll.
       fill = { filled: true, filledQty: inlineFillQty, filledPrice: inlineFillPrice, status: "filled" }
       console.log(`${LOG_PREFIX} Inline fill detected for ${realPosition.symbol}: qty=${inlineFillQty} @ ${inlineFillPrice}`)
+    } else if (livePosition.orderId) {
+      // B) Standard poll path — only when we have a confirmed orderId.
+      fill = await pollOrderFill(exchangeConnector, realPosition.symbol, livePosition.orderId)
     } else {
-      // B) Standard poll path.
-      fill = await pollOrderFill(exchangeConnector, realPosition.symbol, livePosition.orderId!)
+      // No orderId from placeOrder response — skip polling entirely and
+      // fall through to the getPosition() fallback (layer C below).
+      fill = { filled: false, filledQty: 0, filledPrice: 0, status: "pending" }
+      console.warn(`${LOG_PREFIX} No orderId from placeOrder for ${realPosition.symbol} — skipping poll, using getPosition() fallback`)
     }
 
     // C) getPosition() fallback when poll timed out without fill data.

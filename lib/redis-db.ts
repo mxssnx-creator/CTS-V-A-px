@@ -505,6 +505,9 @@ export class InlineLocalRedis {
     //    `-<nowMs>` or timestamp component, so insertion order ≈ chronological.
     const hashFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
       { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 4000 },
+      // setSettings() prepends "settings:" so pseudo_position keys written via
+      // setSettings land as "settings:pseudo_position:*" — cap those separately.
+      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 3000 },
       { match: (k) => !isProtected(k) && (k.startsWith("config_set:") || k.includes(":config_set:")), cap: 3000 },
       { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":positions"), cap: 2000 },
       { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":detail"), cap: 2000 },
@@ -530,6 +533,7 @@ export class InlineLocalRedis {
     // 2) String families (setSettings can store flat JSON as strings too).
     const stringFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
       { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 4000 },
+      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 3000 },
       { match: (k) => !isProtected(k) && (k.includes(":exists:") || k.includes(":dedup:")), cap: 6000 },
       { match: (k) => !isProtected(k) && k.startsWith("strategy_detail:"), cap: 2000 },
       { match: (k) => !isProtected(k) && (k.startsWith("candle_cache:") || k.startsWith("market_data_cache:")), cap: 60 },
