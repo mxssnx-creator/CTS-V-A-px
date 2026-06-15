@@ -617,7 +617,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ────────────────────────────────────────────────
+      // ── Price tracking ───────────────────────────────────���────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -888,11 +888,20 @@ export async function GET(
       }))
       .sort((a, b) => (b.long + b.short) - (a.long + a.short))
 
+    // engineProgression phase and engine_state status are the canonical source of
+    // truth for whether the engine is actively running. realtimeIndicationCycles
+    // stays non-zero after a stop (it reflects the last run's cycle count, not
+    // a live signal), so it must be gated by the authoritative phase/status.
+    const engineIsStopped =
+      ep?.phase === "stopped" ||
+      es.status === "stopped" ||
+      es.status === "idle"
     const realtimeIsActive =
-      realtimeIndicationCycles > 0 ||
-      ep?.phase === "live_trading" ||
-      ep?.phase === "realtime" ||
-      es.status === "running"
+      !engineIsStopped &&
+      (realtimeIndicationCycles > 0 ||
+        ep?.phase === "live_trading" ||
+        ep?.phase === "realtime" ||
+        es.status === "running")
 
     // ── BREAKDOWN section ────────────────────────────────���───────────────────
     // Indication per-type counts live in two places:
@@ -1469,7 +1478,7 @@ export async function GET(
     }
 
     // ── SINGLE closed-archive fetch shared by stratDetail.live and
-    //    closedPositionsForHistory (below) ────────────────────────────────
+    //    closedPositionsForHistory (below) ───��────────────────────────────
     // Previously the archive was fetched TWICE:
     //   1. lrange(0, 199) for stratDetail.live PF/hold/ROI numbers.
     //   2. lrange(0, 499) for closedPositionsForHistory rows + perf tiers.
