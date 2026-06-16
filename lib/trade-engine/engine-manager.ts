@@ -233,8 +233,12 @@ import {
  * peak allocation. At 20 symbols with 6144 MB dev heap we drop to 5 concurrent
  * to keep peak live Set-graph allocation below the eviction trigger threshold.
  * Node is single-threaded — tighter concurrency yields to GC between symbols.
+ * At 20 symbols: 3 concurrent means each batch of 3 completes, yields the
+ * event loop (letting the 4s eviction interval fire), then starts the next 3.
+ * 5 concurrent keeps the event loop blocked long enough that the eviction
+ * setInterval callback cannot fire between batches.
  */
-const SYMBOL_CONCURRENCY = 5
+const SYMBOL_CONCURRENCY = 3
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -356,6 +360,12 @@ async function mapWithConcurrency<TIn, TOut>(
       const i = nextIndex++
       if (i >= items.length) return
       results[i] = await task(items[i], i)
+      // Yield to the event loop after each task so GC and setInterval callbacks
+      // (eviction, GC trigger) have a guaranteed chance to run between symbols.
+      // Without this yield, tight synchronous computation inside async tasks can
+      // block the event loop for seconds, preventing the 4s eviction timer from
+      // firing and causing InlineLocalRedis heap to grow unchecked.
+      await new Promise<void>((resolve) => setImmediate(resolve))
     }
   }
   const workers: Promise<void>[] = []
