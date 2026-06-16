@@ -631,7 +631,36 @@ export class InlineLocalRedis {
       }
     }
 
-    // 4) Prune oversized membership sets so smembers() can't materialise huge
+    // 4b) List families — lpush/ltrim style lists that can grow unboundedly.
+    //     The strategy-evaluator writes per-symbol/stage StrategyResult lists;
+    //     even with ltrim(0,499) the 20-symbol × 500-item × ~2KB = 20 MB total
+    //     makes this the largest single family. Cap these lists in the eviction
+    //     by deleting the key entirely when it holds more items than needed —
+    //     the ltrim built into storeStrategyResult keeps the in-flight list
+    //     bounded, but stale keys from prior sessions grow without bound.
+    {
+      const listFamilyCaps: Array<{ prefix: string; cap: number }> = [
+        // strategies:{conn}:{symbol|stage} — StrategyResult lists written by
+        // strategy-evaluator.ts. 20 symbols × 500 items × 2 KB = 20 MB.
+        // Keep at most 50 total across the family (legacy; not used by pipeline).
+        { prefix: "strategies:", cap: 50 },
+      ]
+      for (const { prefix, cap } of listFamilyCaps) {
+        const matching: string[] = []
+        for (const [key] of this.data.lists.entries()) {
+          if (!isProtected(key) && key.startsWith(prefix)) matching.push(key)
+        }
+        if (matching.length > cap) {
+          const dropCount = matching.length - cap
+          for (let i = 0; i < dropCount; i++) {
+            this.deleteKey(matching[i])
+            evicted++
+          }
+        }
+      }
+    }
+
+    // 5) Prune oversized membership sets so smembers() can't materialise huge
     //    arrays. These hold pseudo-position ids; trim to the newest entries.
     const SET_MEMBER_CAP = 4000
     for (const [key, members] of this.data.sets.entries()) {
