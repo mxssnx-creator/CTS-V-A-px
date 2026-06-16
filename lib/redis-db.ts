@@ -560,13 +560,19 @@ export class InlineLocalRedis {
       // settings:strategies:* — base:sets / real:sets blobs (main:sets skipped in dev).
       // 80 keys × ~250KB each = 20 MB; keep only the newest 20 per connection.
       { match: (k) => !isProtected(k) && k.startsWith("settings:strategies"), cap: 20 },
-      // strategies:bingx-x01 (no symbol) — connection-level coord hashes, 58 keys / 19 MB.
-      { match: (k) => !isProtected(k) && /^strategies:[^:]+$/.test(k), cap: 10 },
+      // strategies:{conn}:* — all sub-keys under a connection's strategy family,
+      // including stage/symbol evaluator hashes. 58 keys × ~345KB = 20 MB.
+      // These keys start with "strategies:" but NOT "settings:strategies:".
+      { match: (k) => !isProtected(k) && k.startsWith("strategies:") && !k.startsWith("strategies:all") && !k.startsWith("strategies:counter") && !k.startsWith("strategies:metadata"), cap: 100 },
       { match: (k) => !isProtected(k) && (k.startsWith("config_set:") || k.includes(":config_set:")), cap: 1500 },
       { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":positions"), cap: 1000 },
       { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":detail"), cap: 1000 },
       { match: (k) => !isProtected(k) && (k.startsWith("real_stage:") || k.startsWith("realstage:")), cap: 1000 },
       { match: (k) => !isProtected(k) && k.startsWith("indication:") && k.includes(":result"), cap: 1500 },
+      // indication:{conn}:* — per-cycle indication hashes, 200 keys per connection.
+      { match: (k) => !isProtected(k) && k.startsWith("indication:") && !k.includes(":result"), cap: 100 },
+      // prehistoric:{conn}:* — historical candle/indication replay state.
+      { match: (k) => !isProtected(k) && k.startsWith("prehistoric:"), cap: 30 },
       { match: (k) => !isProtected(k) && k.startsWith("live_positions:") && k.includes(":history"), cap: 500 },
     ]
     for (const { match, cap } of hashFamilyCaps) {
