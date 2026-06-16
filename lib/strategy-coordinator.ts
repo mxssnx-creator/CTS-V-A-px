@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─����������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─������������������ Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -3598,7 +3598,7 @@ export class StrategyCoordinator {
           evaluated:         String(realSets.length),
           passed_sets:       String(qualifying.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
-          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────────
+          // ── ACTIVELY-RUNNING metrics (operator spec) ───────────���──
           //   Live's `qualifying` Sets ARE the executed orders. They
           //   are by definition "running" — exchange has accepted the
           //   order or is holding the position. `sets_progressing` is
@@ -4273,7 +4273,7 @@ export class StrategyCoordinator {
       return enabled === true
     })
 
-    // ── Block: live position × vol-ratio scaling ──────────────────��───
+    // ── Block: live position × vol-ratio scaling ─────────────────����───
     //
     // The Block variant's `configs[].size` is the *base* multiplier. The
     // emitted Sets must scale on TWO live axes:
@@ -4477,53 +4477,54 @@ export class StrategyCoordinator {
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate
               //   �� per-axis Pos-acc ledger has a non-zero delta to record
-              // Quality fields are inherited from the Base default's
-              // realised-history aggregates; positionState carries the
-              // axis tuple so the dashboard can drill in.
-              const synthEntry: StrategySetEntry = {
-                id: `${parentKey}#axis:${axisKey}#axis-synth`,
-                sizeMultiplier: 1,
-                leverage: 1,
-                positionState: `axis:p${prev}|l${last}|c${cont}|${outcome}|${dir}`,
-                profitFactor: inheritedPF,
-                drawdownTime: inheritedDDT,
-                confidence: inheritedConf,
+              // ── Axis-Set LRU cache ───────────────────────────────────────
+              // Axis Set objects are now pure value objects (the Real-stage tuner
+              // writes sizeDelta onto the CoordRecord instead of mutating entries).
+              // They can be safely reused across cycles without cloning.
+              // Key encodes every field that varies: parentKey, axisKey, ec.
+              const axisLruKey = `${parentKey}:${axisKey}:ec${ec}`
+              const cachedAxisSet = StrategyCoordinator._axisLruGet(axisLruKey)
+              if (cachedAxisSet) {
+                axisSets.push(cachedAxisSet)
+              } else {
+                // Cache miss — build once, store immutably.
+                // createdAt omitted: it served no semantic purpose for axis Sets
+                // and changed every cycle, preventing cache hits.
+                const synthEntry: StrategySetEntry = {
+                  id: `${parentKey}#axis:${axisKey}#axis-synth`,
+                  sizeMultiplier: 1,
+                  leverage: 1,
+                  positionState: `axis:p${prev}|l${last}|c${cont}|${outcome}|${dir}`,
+                  profitFactor: inheritedPF,
+                  drawdownTime: inheritedDDT,
+                  confidence: inheritedConf,
+                }
+                const axisSet: StrategySet = {
+                  setKey:          `${parentKey}#axis:${axisKey}`,
+                  parentSetKey:    parentKey,
+                  variant:         "default",
+                  indicationType:  baseDefault.indicationType,
+                  direction:       dir,
+                  avgProfitFactor: inheritedPF,
+                  avgConfidence:   inheritedConf,
+                  avgDrawdownTime: inheritedDDT,
+                  entryCount:      ec,
+                  entries:         [synthEntry],
+                  axisWindows: {
+                    prev,
+                    last,
+                    cont,
+                    pause:     0,
+                    direction: dir,
+                    axisKey,
+                    outcome,
+                  },
+                  trailingProfile: baseDefault.trailingProfile,
+                  ...(baseDefault.prevPos && { prevPos: baseDefault.prevPos }),
+                }
+                StrategyCoordinator._axisLruSet(axisLruKey, axisSet)
+                axisSets.push(axisSet)
               }
-
-              axisSets.push({
-                setKey:          `${parentKey}#axis:${axisKey}`,
-                parentSetKey:    parentKey,
-                variant:         "default",
-                indicationType:  baseDefault.indicationType,
-                // Direction is fan-out axis (Cartesian), not inherited.
-                direction:       dir,
-                // Inherited quality fields — axis Sets do not re-evaluate.
-                avgProfitFactor: inheritedPF,
-                avgConfidence:   inheritedConf,
-                avgDrawdownTime: inheritedDDT,
-                // Position-count contribution per spec:
-                //   baseEC = parent's COMPLETED historic entry count.
-                //   credited = OPEN positions actually accumulated onto
-                //              this Set right now (cap min(cont, liveCont)).
-                entryCount:      ec,
-                // ONE synthetic representative entry — see comment above.
-                entries:         [synthEntry],
-                createdAt:       new Date().toISOString(),
-                axisWindows: {
-                  prev,
-                  last,
-                  cont,
-                  pause:     0,
-                  direction: dir,
-                  axisKey,
-                  outcome,
-                },
-                trailingProfile: baseDefault.trailingProfile,
-                // Carry parent's prev-pos snapshot through the axis fan-out
-                // unchanged — same realised-history regime applies to every
-                // axis projection of the same Base Set.
-                ...(baseDefault.prevPos && { prevPos: baseDefault.prevPos }),
-              })
             }
           }
         }
@@ -4682,7 +4683,7 @@ export class StrategyCoordinator {
     maxEntries: number,
     ctx?: PositionContext,
   ): Promise<StrategySet | null> {
-    // ── SLIM PATH (Base-Anchored Coordination Model) ──────────────────────
+    // ── SLIM PATH (Base-Anchored Coordination Model) ────────��─────────────
     // Previously this function allocated a full entries[] by cross-joining
     // baseSet.entries × profile.configs — ~800 array allocations/sec and
     // ~80 000 object allocations/sec at 20-symbol live-trading scale.
