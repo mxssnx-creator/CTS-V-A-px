@@ -318,6 +318,37 @@ export interface SetCoordRecord {
   overrideDirection?: "long" | "short"
   /** entryCount override for axis records (baseEC + credited liveCont). */
   overrideEntryCount?: number
+
+  // ── Scalar value fields (Base-Anchored carrier) ────────────────────────────
+  // These mirror the slim StrategySet scalars so Real/Live can validate, switch
+  // states, and compute aggregates by iterating coord records DIRECTLY — never
+  // materialising a parallel StrategySet[] array after Base. Quality entries[]
+  // are still resolved from the shared immutable Base Set on demand at dispatch.
+  /** Variant/axis profit factor (pre-tuner). Real/Live PF gate reads this. */
+  avgProfitFactor: number
+  /** Variant/axis drawdown-time. Real/Live DDT gate reads this. */
+  avgDrawdownTime: number
+  /** Variant/axis confidence (advisory). */
+  avgConfidence: number
+  /** Effective entry/position count for this projection (post axis credit). */
+  entryCount: number
+  /** Indication type inherited from the Base Set (hedge-bucket identity). */
+  indicationType: string
+  /** Effective direction (overrideDirection ?? Base direction). */
+  direction: "long" | "short"
+  /** Base-Set prev-position stats — drives the Real-stage tuner. */
+  prevPos?: StrategySet["prevPos"]
+  /** Trailing profile carried from the Base Set (lineage only). */
+  trailingProfile?: StrategySet["trailingProfile"]
+  /**
+   * Lazily-hydrated full StrategySet VIEW for this record, built at most once
+   * per cycle (only when a consumer needs a full set object — e.g. live
+   * dispatch, pseudo-positions). Resolved from this record + the shared Base
+   * Set. Transient: never persisted, never shared across cycles.
+   */
+  _setView?: StrategySet
+  /** Set when this record currently backs an OPEN live position (gate exemption). */
+  _hasLivePositions?: boolean
 }
 
 /**
@@ -362,7 +393,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─��������������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─����������������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -4575,7 +4606,7 @@ export class StrategyCoordinator {
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate
               //   �� per-axis Pos-acc ledger has a non-zero delta to record
-              // ── Axis-Set LRU cache ───────────────────────────────────────
+              // ── Axis-Set LRU cache ────────��──────────────────────────────
               // Axis Set objects are now pure value objects (the Real-stage tuner
               // writes sizeDelta onto the CoordRecord instead of mutating entries).
               // They can be safely reused across cycles without cloning.
