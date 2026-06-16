@@ -2109,6 +2109,39 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "34")
     },
   },
+
+  // Migration 036 — Make bingx-x01 visible in the Active panel from first boot
+  // Previous seed set is_active_inserted="0" so the connections route showed
+  // "Inserted (visible): none" and system-stats showed exchangeConnections=0.
+  // Patch is_active_inserted="1" on any existing bingx-x01 row that has it unset.
+  {
+    name: "036-bingx-x01-active-inserted",
+    version: 36,
+    up: async (client: any) => {
+      await client.set("_schema_version", "36")
+      const CONN_ID = "bingx-x01"
+      const existing = await client.hgetall(`connection:${CONN_ID}`).catch(() => null)
+      if (existing && typeof existing === "object") {
+        const patch: Record<string, string> = { updated_at: new Date().toISOString() }
+        // Only patch if not already set — preserve operator overrides.
+        if (!existing["is_active_inserted"] || existing["is_active_inserted"] === "0" || existing["is_active_inserted"] === "false") {
+          patch["is_active_inserted"] = "1"
+        }
+        if (!existing["is_dashboard_inserted"] || existing["is_dashboard_inserted"] === "0" || existing["is_dashboard_inserted"] === "false") {
+          patch["is_dashboard_inserted"] = "1"
+        }
+        if (Object.keys(patch).length > 1) {
+          await client.hset(`connection:${CONN_ID}`, patch)
+          console.log(`[v0] Migration 036: patched ${CONN_ID} is_active_inserted=1`)
+        } else {
+          console.log(`[v0] Migration 036: ${CONN_ID} is_active_inserted already set, no patch needed`)
+        }
+      }
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "35")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -2252,9 +2285,16 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
         // AUTO-START DISABLED: never seed connections as dashboard-enabled.
         // `autoActive` now only controls insertion + symbol/live-trade seeding;
         // the operator must explicitly enable the connection via the dashboard.
+        // autoActive connections (bingx-x01) are inserted and visible in the
+        // Active panel from the very first boot. This does NOT start the engine —
+        // the operator must explicitly click Start. Without this flag the
+        // connections route reports "inserted=0" and Smart Overview shows 0/0.
         is_dashboard_inserted: cfg.autoActive ? "1" : "0",
-        is_active_inserted: "0",
+        is_active_inserted: cfg.autoActive ? "1" : "0",
         is_enabled: "1",
+        // is_enabled_dashboard stays 0 on fresh seed — operator must explicitly
+        // enable via the dashboard toggle. Only is_active_inserted (visibility)
+        // is pre-set; is_enabled_dashboard (processing) requires operator action.
         is_enabled_dashboard: "0",
         is_active: "0",
         connection_method: "library",

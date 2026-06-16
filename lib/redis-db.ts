@@ -573,6 +573,10 @@ export class InlineLocalRedis {
       { match: (k) => !isProtected(k) && k.startsWith("indication:") && !k.includes(":result"), cap: 100 },
       // prehistoric:{conn}:* — historical candle/indication replay state.
       { match: (k) => !isProtected(k) && k.startsWith("prehistoric:"), cap: 30 },
+      // indications:* — raw indication blobs (3.1 MB each); keep newest 5.
+      { match: (k) => !isProtected(k) && k.startsWith("indications:"), cap: 5 },
+      // indications:{conn}:* — per-connection indication sub-keys (22 keys/0.6MB).
+      { match: (k) => !isProtected(k) && k.startsWith("indications:") && k.split(":").length >= 3, cap: 40 },
       { match: (k) => !isProtected(k) && k.startsWith("live_positions:") && k.includes(":history"), cap: 500 },
     ]
     for (const { match, cap } of hashFamilyCaps) {
@@ -598,6 +602,9 @@ export class InlineLocalRedis {
       { match: (k) => !isProtected(k) && (k.includes(":exists:") || k.includes(":dedup:")), cap: 3000 },
       { match: (k) => !isProtected(k) && k.startsWith("strategy_detail:"), cap: 1000 },
       { match: (k) => !isProtected(k) && (k.startsWith("candle_cache:") || k.startsWith("market_data_cache:")), cap: 30 },
+      // indications:* — raw indication blobs (1 key / 3.1 MB per connection).
+      // Keep only the newest 5 (one per connection with buffer).
+      { match: (k) => !isProtected(k) && k.startsWith("indications:"), cap: 5 },
     ]
     for (const { match, cap } of stringFamilyCaps) {
       const matching: string[] = []
@@ -632,18 +639,18 @@ export class InlineLocalRedis {
     }
 
     // 4b) List families — lpush/ltrim style lists that can grow unboundedly.
-    //     The strategy-evaluator writes per-symbol/stage StrategyResult lists;
-    //     even with ltrim(0,499) the 20-symbol × 500-item × ~2KB = 20 MB total
-    //     makes this the largest single family. Cap these lists in the eviction
-    //     by deleting the key entirely when it holds more items than needed —
-    //     the ltrim built into storeStrategyResult keeps the in-flight list
-    //     bounded, but stale keys from prior sessions grow without bound.
+    //     strategy-evaluator.ts writes per-symbol/stage StrategyResult lists
+    //     (~2 KB each, up to 500 per symbol). At 20 symbols that is 20 MB of
+    //     live heap, enough to push the process into OOM at ~5.9 GB RSS.
+    //
+    //     In development: storeStrategyResult() returns early (no new writes),
+    //     but stale list keys from hot-reload cycles persist in data.lists and
+    //     keep consuming heap. Cap=0 purges all of them every eviction pass.
+    //     In production: keep the 50 newest keys for metrics-aggregator queries.
     {
+      const strategiesListCap = process.env.NODE_ENV === "development" ? 0 : 50
       const listFamilyCaps: Array<{ prefix: string; cap: number }> = [
-        // strategies:{conn}:{symbol|stage} — StrategyResult lists written by
-        // strategy-evaluator.ts. 20 symbols × 500 items × 2 KB = 20 MB.
-        // Keep at most 50 total across the family (legacy; not used by pipeline).
-        { prefix: "strategies:", cap: 50 },
+        { prefix: "strategies:", cap: strategiesListCap },
       ]
       for (const { prefix, cap } of listFamilyCaps) {
         const matching: string[] = []
@@ -651,6 +658,7 @@ export class InlineLocalRedis {
           if (!isProtected(key) && key.startsWith(prefix)) matching.push(key)
         }
         if (matching.length > cap) {
+          // Delete oldest entries first (insertion order preserved by Map).
           const dropCount = matching.length - cap
           for (let i = 0; i < dropCount; i++) {
             this.deleteKey(matching[i])
