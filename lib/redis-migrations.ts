@@ -2249,6 +2249,63 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "37")
     },
   },
+
+  {
+    // Migration 038 was shipped with a bug — it wrote force_symbols to the raw
+    // "connection:{id}" hash instead of the "settings:*" prefixed hashes that
+    // getSymbols() actually reads.  Migration 039 re-applies the correct write
+    // regardless of whether 038 ran.
+    version: 39,
+    description: "Re-apply POLUSDT force_symbols to settings: prefixed hashes (fixes 038 write-path bug)",
+    up: async (client: any) => {
+      const CONN_ID = "bingx-x01"
+      const PREFIXED_STATE = `settings:trade_engine_state:${CONN_ID}`
+      const PREFIXED_CONN  = `settings:connection:${CONN_ID}`
+      const RAW_CONN       = `connection:${CONN_ID}`
+
+      const parseSyms = (raw: string | null | undefined): string[] => {
+        if (!raw) return []
+        try { const arr = JSON.parse(raw); return Array.isArray(arr) ? arr : [] } catch { /* ignore */ }
+        return raw.split(",").map((s: string) => s.trim()).filter(Boolean)
+      }
+
+      const [stateHash, connHash] = await Promise.all([
+        client.hgetall(PREFIXED_STATE).catch(() => null),
+        client.hgetall(RAW_CONN).catch(() => null),
+      ])
+
+      const existing = parseSyms((stateHash as any)?.force_symbols)
+        .concat(parseSyms((stateHash as any)?.active_symbols))
+        .concat(parseSyms((connHash as any)?.force_symbols || (connHash as any)?.active_symbols))
+
+      // Use first non-empty list found; fall back to canonical 20-symbol list.
+      const found = [
+        parseSyms((stateHash as any)?.force_symbols),
+        parseSyms((stateHash as any)?.active_symbols),
+        parseSyms((connHash as any)?.force_symbols),
+        parseSyms((connHash as any)?.active_symbols),
+        [...BASE_TEST_SYMBOLS],
+      ].find((arr) => arr.length > 0) ?? [...BASE_TEST_SYMBOLS]
+
+      void existing  // suppress unused warning
+
+      const syms = found.map((s) => (s === "MATICUSDT" ? "POLUSDT" : s))
+      const symJson = JSON.stringify(syms)
+
+      await Promise.all([
+        client.hset(PREFIXED_STATE, { force_symbols: symJson, symbol_count: String(syms.length) }),
+        client.hset(PREFIXED_CONN,  { force_symbols: symJson, symbol_count: String(syms.length) }),
+        client.hset(RAW_CONN,       { force_symbols: symJson, symbol_count: String(syms.length) }),
+      ])
+
+      console.log(
+        `[v0] Migration 039: force_symbols written to settings: hashes — ${syms.join(",")}`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "38")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

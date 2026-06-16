@@ -1610,9 +1610,8 @@ export async function initRedis(): Promise<void> {
           for (const key of data.hashes.keys()) {
             if (isLiveKey(key)) { data.hashes.delete(key); cleared++ }
           }
-          if (cleared > 0) {
-            console.log(`[v0] [Redis] Dev initRedis flush: cleared ${cleared} stale live position/lock keys`)
-          }
+          console.log(`[v0] [Redis] Dev initRedis flush: cleared ${cleared} stale live position/lock keys (strings=${data.strings.size} hashes=${data.hashes.size} lists=${data.lists.size})`)
+          
         }
       } catch { /* non-fatal */ }
     }
