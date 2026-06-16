@@ -2308,34 +2308,133 @@ const migrations: Migration[] = [
     },
   },
 
+  // ── Migration 040 — Canonical bingx-x01 state (supersedes 033-039) ────────
+  //
+  // Consolidates what migrations 033 (15 symbols), 034 (operator defaults),
+  // 035 (20 symbols), 036 (trailing/enabled tweaks), 037 (is_enabled_dashboard),
+  // 038 (MATICUSDT→POLUSDT), and 039 (fix 038 write-path) each patched in
+  // isolation.  This migration applies the FULL desired canonical state in one
+  // atomic pass so fresh DBs and existing DBs (already at version 39) both
+  // land in the same known-good configuration:
+  //
+  //   • 20 symbols with POLUSDT (not MATICUSDT) written to all three hashes
+  //   • Operator-spec volume/PF/variant defaults in app_settings +
+  //     connection:bingx-x01 + connection_settings:bingx-x01
+  //   • symbol_order = volatility in connection:bingx-x01
+  //   • Fresh progression snapshot so status API reflects 20 symbols
+  //   • symbol cache invalidated on running engine
+  //
+  // KEY INVARIANT: every field is written to the hash the engine code actually
+  // reads.  See migration 034 comments for the full field-name / hash-key matrix.
   {
-    // Migration 040 — Canonical 20-symbol consolidation + system defaults
-    //
-    // Consolidates the compounding patches from migrations 035 (20 symbols with
-    // MATICUSDT), 038 (replace MATICUSDT with POLUSDT in raw connection hash),
-    // and 039 (re-apply to settings: prefixed hashes) into one idempotent write
-    // that stamps the final desired state into ALL THREE hashes simultaneously.
-    //
-    // Also writes optimal system defaults (heap/memory tuning, eval thresholds,
-    // volume factors) that are sourced from verified live-trade sessions, so a
-    // fresh DB gets the right settings without needing a full session history.
-    //
-    // IDEMPOTENT: uses unconditional hset on symbols (safe — migration version
-    // guard ensures this runs exactly once per DB) and "set if absent" for
-    // operator-configurable settings (never clobbers manual overrides).
     version: 40,
-    name: "040-canonical-20-symbol-consolidation-and-defaults",
+    name: "040-canonical-bingx-x01-state",
     up: async (client: any) => {
       await client.set("_schema_version", "40")
-      const CONN_ID = "bingx-x01"
 
-      // ── Canonical 20-symbol list (MATICUSDT permanently replaced by POLUSDT) ─
-      const CANONICAL_SYMBOLS = [
-        "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
-        "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
-        "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "POLUSDT",
-        "AAVEUSDT", "SUIUSDT",  "APTUSDT",  "ARBUSDT",  "OPUSDT",
-      ]
+      const CONN_ID = "bingx-x01"
+      const now     = new Date().toISOString()
+
+      // The authoritative canonical 20-symbol list (shared constant, POLUSDT not MATICUSDT)
+      const SYMS = [...BASE_TEST_SYMBOLS]   // ["BTCUSDT", ..., "POLUSDT", ..., "OPUSDT"]
+      const symJson  = JSON.stringify(SYMS)
+      const symCount = String(SYMS.length)
+
+      // ── 1. Write force_symbols to ALL three hashes ──────────────────────
+      // getSymbols() priority: settings:trade_engine_state > settings:connection > connection.
+      // All three must agree so no staleness survives a hot-reload.
+      await Promise.all([
+        client.hset(`settings:trade_engine_state:${CONN_ID}`, {
+          active_symbols:           symJson,
+          force_symbols:            symJson,
+          symbols:                  symJson,
+          symbol_count:             symCount,
+          config_set_symbols_total: symCount,
+        }),
+        client.hset(`settings:connection:${CONN_ID}`, {
+          active_symbols: symJson,
+          force_symbols:  symJson,
+          symbol_count:   symCount,
+        }),
+        client.hset(`connection:${CONN_ID}`, {
+          active_symbols:       symJson,
+          force_symbols:        symJson,
+          symbol_count:         symCount,
+          live_volume_factor:   "2.2",
+          preset_volume_factor: "1.0",
+          symbol_order:         "volatility",
+          updated_at:           now,
+        }),
+      ]).catch(() => {})
+
+      // ── 2. app_settings — global PF thresholds + volume fallback ─────────
+      await client.hset("app_settings", {
+        volume_factor_live:   "2.2",
+        volume_factor_preset: "1.0",
+        baseProfitFactor:     "1.0",
+        mainProfitFactor:     "1.2",
+        realProfitFactor:     "1.2",
+        liveProfitFactor:     "1.2",
+        updated_at:           now,
+      }).catch(() => {})
+
+      // ── 3. connection_settings:bingx-x01 — coordinator + volume overlay ──
+      // StrategyCoordinator.loadProfitFactors() + loadCoordinationSettings()
+      // both read exclusively from connection_settings:{id} (hgetall).
+      await client.hset(`connection_settings:${CONN_ID}`, {
+        live_volume_factor:     "2.2",
+        preset_volume_factor:   "1.0",
+        baseProfitFactor:       "1.0",
+        mainProfitFactor:       "1.2",
+        realProfitFactor:       "1.2",
+        liveProfitFactor:       "1.2",
+        variantTrailingEnabled: "true",
+        variantBlockEnabled:    "true",
+        variantDcaEnabled:      "false",
+        variantPauseEnabled:    "true",
+        blockVolumeRatio:       "1.0",
+        blockMaxStack:          "3",
+        mainEvalPosCount:       "3",
+        realEvalPosCount:       "3",
+        minStep:                "5",
+        updated_at:             now,
+      }).catch(() => {})
+
+      // ── 4. Progression snapshot so status API reflects 20 symbols ─────────
+      await client.hset(`progression:${CONN_ID}`, {
+        symbol_count:                 symCount,
+        active_symbols_hash:          SYMS.slice().sort().join("|"),
+        started_for_settings_version: now,
+        progress_settings_snapshot:   JSON.stringify({
+          symbol_count:       Number(symCount),
+          symbols_hash:       SYMS.slice().sort().join("|"),
+          is_live_trade:      "1",
+          is_preset_trade:    "0",
+          live_volume_factor: "2.2",
+          connection_method:  "library",
+          updated_at:         now,
+        }),
+      }).catch(() => {})
+
+      // ── 5. Invalidate running engine's symbol cache ────────────────────────
+      try {
+        const { getTradeEngine } = await import("@/lib/trade-engine")
+        const coordinator = getTradeEngine()
+        if (coordinator && typeof (coordinator as any).invalidateSymbolsCacheForConnection === "function") {
+          ;(coordinator as any).invalidateSymbolsCacheForConnection(CONN_ID)
+        }
+      } catch { /* engine may not be running */ }
+
+      console.log(
+        `[v0] Migration 040: canonical bingx-x01 state applied — ` +
+        `${SYMS.length} symbols (POLUSDT), pf=1.0/1.2/1.2, live_volume_factor=2.2`
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "39")
+    },
+  },
+]
       const symJson  = JSON.stringify(CANONICAL_SYMBOLS)
       const symCount = String(CANONICAL_SYMBOLS.length)
 
