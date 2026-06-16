@@ -230,6 +230,12 @@ export class IndicationEvaluator {
    * Store indication in Redis
    */
   private async storeIndication(indication: IndicationResult): Promise<void> {
+    // DEV-MODE BYPASS: storeIndication writes per-indication lpush lists (type + symbol)
+    // and a latest blob per type. At 20 symbols × 4 types, this generates 88 list
+    // operations per cycle plus 4 latest-blob sets, each growing the InlineLocalRedis
+    // Map. The lists are only read by historical query routes (non-critical for the
+    // engine). Skip the entire Redis write in dev to prevent OOM.
+    if (process.env.NODE_ENV === "development") return
     try {
       const client = getRedisClient()
       

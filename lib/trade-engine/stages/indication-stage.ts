@@ -58,6 +58,12 @@ export async function processIndications(
 
     // Build all indication payloads up front, then fan out the 5 Redis
     // setex writes concurrently instead of awaiting them serially.
+    // DEV-MODE BYPASS: indication:{conn}:{sym}:{timeframe} setex keys (86400s TTL,
+    // never evicted during the session) accumulate at 20 symbols × 4 timeframes =
+    // 80 new keys per indication cycle, plus 200 pre-existing keys carried over from
+    // prior hot-reload sessions. They live only in InlineLocalRedis in dev and are
+    // only read by the indication stage reader (which falls back to the in-memory
+    // signal when the key is absent). Skip the write in dev to avoid OOM.
     const writes: Promise<any>[] = []
     for (const timeframe of timeframes) {
       const indication: IndicationSignal = {
@@ -72,11 +78,13 @@ export async function processIndications(
         price: lastPrice,
       }
       signals.push(indication)
-      writes.push(
-        client.setex(`indication:${connection.id}:${symbol}:${timeframe}`, 86400, JSON.stringify(indication)),
-      )
+      if (process.env.NODE_ENV !== "development") {
+        writes.push(
+          client.setex(`indication:${connection.id}:${symbol}:${timeframe}`, 86400, JSON.stringify(indication)),
+        )
+      }
     }
-    await Promise.all(writes)
+    if (writes.length > 0) await Promise.all(writes)
 
     return signals
   } catch (err) {

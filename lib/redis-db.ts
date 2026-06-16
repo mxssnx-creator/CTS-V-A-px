@@ -545,39 +545,34 @@ export class InlineLocalRedis {
       return false
     }
 
-    // 1) Hash families that grow per-cycle. Keep only the newest CAP entries
-    //    of each family (FIFO — Map preserves insertion order, so the first
-    //    entries are the oldest). config_set/pseudo_position carry a trailing
-    //    `-<nowMs>` or timestamp component, so insertion order ≈ chronological.
-    // Caps are sized for 20-symbol live trading on a 6 GB dev heap.
-    // Each cap was halved vs the 5-symbol tuning (2025-06-12) because the
-    // per-cycle write rate scales linearly with symbol count.
+    // 1) Hash families that grow per-cycle.
+    // In dev mode, most write paths are bypassed at the source (statistics-tracker,
+    // indication-evaluator, indication-stage, strategy-evaluator). The caps here
+    // are a safety net to flush stale keys from pre-bypass hot-reload sessions.
+    // In dev, transient pipeline families are capped at 0 to force immediate flush.
+    const isDev = process.env.NODE_ENV === "development"
     const hashFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
-      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 2000 },
-      // setSettings() prepends "settings:" so pseudo_position keys written via
-      // setSettings land as "settings:pseudo_position:*" — cap those separately.
-      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 1500 },
-      // settings:strategies:* — base:sets / real:sets blobs (main:sets skipped in dev).
-      // 80 keys × ~250KB each = 20 MB; keep only the newest 20 per connection.
-      { match: (k) => !isProtected(k) && k.startsWith("settings:strategies"), cap: 20 },
-      // strategies:{conn}:* — all sub-keys under a connection's strategy family,
-      // including stage/symbol evaluator hashes. 58 keys × ~345KB = 20 MB.
-      // These keys start with "strategies:" but NOT "settings:strategies:".
-      { match: (k) => !isProtected(k) && k.startsWith("strategies:") && !k.startsWith("strategies:all") && !k.startsWith("strategies:counter") && !k.startsWith("strategies:metadata"), cap: 100 },
-      { match: (k) => !isProtected(k) && (k.startsWith("config_set:") || k.includes(":config_set:")), cap: 1500 },
-      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":positions"), cap: 1000 },
-      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":detail"), cap: 1000 },
-      { match: (k) => !isProtected(k) && (k.startsWith("real_stage:") || k.startsWith("realstage:")), cap: 1000 },
-      { match: (k) => !isProtected(k) && k.startsWith("indication:") && k.includes(":result"), cap: 1500 },
-      // indication:{conn}:* — per-cycle indication hashes, 200 keys per connection.
-      { match: (k) => !isProtected(k) && k.startsWith("indication:") && !k.includes(":result"), cap: 100 },
-      // prehistoric:{conn}:* — historical candle/indication replay state.
-      { match: (k) => !isProtected(k) && k.startsWith("prehistoric:"), cap: 30 },
-      // indications:* — raw indication blobs (3.1 MB each); keep newest 5.
-      { match: (k) => !isProtected(k) && k.startsWith("indications:"), cap: 5 },
-      // indications:{conn}:* — per-connection indication sub-keys (22 keys/0.6MB).
-      { match: (k) => !isProtected(k) && k.startsWith("indications:") && k.split(":").length >= 3, cap: 40 },
-      { match: (k) => !isProtected(k) && k.startsWith("live_positions:") && k.includes(":history"), cap: 500 },
+      // pseudo_position:{conn}:{id} — bypassed in dev (createPseudoPositions returns early).
+      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: isDev ? 0 : 2000 },
+      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: isDev ? 0 : 1500 },
+      // strategies:{conn}:{type}:* — bypassed in dev (trackStrategyStats returns early).
+      { match: (k) => !isProtected(k) && k.startsWith("strategies:") &&
+          !k.startsWith("strategies:all") && !k.startsWith("strategies:counter") &&
+          !k.startsWith("strategies:metadata"),
+        cap: isDev ? 0 : 100 },
+      // settings:strategies:* — real:sets blobs. Cap low to bound coord record persistence.
+      { match: (k) => !isProtected(k) && k.startsWith("settings:strategies"), cap: isDev ? 5 : 20 },
+      { match: (k) => !isProtected(k) && (k.startsWith("config_set:") || k.includes(":config_set:")), cap: isDev ? 200 : 1500 },
+      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":positions"), cap: isDev ? 100 : 1000 },
+      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":detail"), cap: isDev ? 100 : 1000 },
+      { match: (k) => !isProtected(k) && (k.startsWith("real_stage:") || k.startsWith("realstage:")), cap: isDev ? 100 : 1000 },
+      // indication:* — bypassed in dev (indication-stage setex returns early).
+      { match: (k) => !isProtected(k) && k.startsWith("indication:"), cap: isDev ? 0 : 500 },
+      // indications:* — bypassed in dev (indication-evaluator storeIndication returns early).
+      { match: (k) => !isProtected(k) && k.startsWith("indications:"), cap: isDev ? 0 : 100 },
+      // prehistoric:{conn}:* — written once per prehistoric run, not per cycle.
+      { match: (k) => !isProtected(k) && k.startsWith("prehistoric:"), cap: 20 },
+      { match: (k) => !isProtected(k) && k.startsWith("live_positions:") && k.includes(":history"), cap: isDev ? 100 : 500 },
     ]
     for (const { match, cap } of hashFamilyCaps) {
       const matching: string[] = []
@@ -596,15 +591,22 @@ export class InlineLocalRedis {
 
     // 2) String families (setSettings can store flat JSON as strings too).
     const stringFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
-      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 2000 },
-      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 1500 },
-      { match: (k) => !isProtected(k) && k.startsWith("settings:strategies"), cap: 20 },
-      { match: (k) => !isProtected(k) && (k.includes(":exists:") || k.includes(":dedup:")), cap: 3000 },
-      { match: (k) => !isProtected(k) && k.startsWith("strategy_detail:"), cap: 1000 },
-      { match: (k) => !isProtected(k) && (k.startsWith("candle_cache:") || k.startsWith("market_data_cache:")), cap: 30 },
-      // indications:* — raw indication blobs (1 key / 3.1 MB per connection).
-      // Keep only the newest 5 (one per connection with buffer).
-      { match: (k) => !isProtected(k) && k.startsWith("indications:"), cap: 5 },
+      // Bypassed in dev — flush stale residue.
+      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: isDev ? 0 : 2000 },
+      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: isDev ? 0 : 1500 },
+      { match: (k) => !isProtected(k) && k.startsWith("settings:strategies"), cap: isDev ? 5 : 20 },
+      // indication:* string keys (setex) — bypassed in dev.
+      { match: (k) => !isProtected(k) && k.startsWith("indication:"), cap: isDev ? 0 : 500 },
+      // indications:* string blobs — bypassed in dev (storeIndication + trackIndicationStats).
+      { match: (k) => !isProtected(k) && k.startsWith("indications:"), cap: isDev ? 0 : 50 },
+      // strategies:* string keys — bypassed in dev (trackStrategyStats).
+      { match: (k) => !isProtected(k) && k.startsWith("strategies:") &&
+          !k.startsWith("strategies:all") && !k.startsWith("strategies:counter") &&
+          !k.startsWith("strategies:metadata"),
+        cap: isDev ? 0 : 100 },
+      { match: (k) => !isProtected(k) && (k.includes(":exists:") || k.includes(":dedup:")), cap: isDev ? 500 : 3000 },
+      { match: (k) => !isProtected(k) && k.startsWith("strategy_detail:"), cap: isDev ? 100 : 1000 },
+      { match: (k) => !isProtected(k) && (k.startsWith("candle_cache:") || k.startsWith("market_data_cache:")), cap: 20 },
     ]
     for (const { match, cap } of stringFamilyCaps) {
       const matching: string[] = []
