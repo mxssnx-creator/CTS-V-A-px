@@ -403,10 +403,23 @@ export class InlineLocalRedis {
         // First, clean up expired keys
         this.cleanupExpiredKeys()
 
-        // Check memory pressure: if heap > threshold, evict accumulators.
+        // Check memory pressure: evict if EITHER heap OR total key count is too high.
+        // RSS can be 5x higher than heapUsed due to external buffers and code segments,
+        // so we guard on key count as a proxy for RSS growth even when heapUsed is low.
+        // 20 symbols × 1000 real sets + 20 symbols × overhead = ~30K keys needed;
+        // 20000 cap adds a 33% buffer while preventing the 84K+ unbounded accumulation
+        // that causes OOM at ~5 GB RSS on the 8 GB VM.
         const heapUsedMB = (process.memoryUsage?.().heapUsed || 0) / 1024 / 1024
-        if (heapUsedMB > HEAP_PRESSURE_MB) {
-          console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
+        const totalKeys = this.data.strings.size + this.data.hashes.size +
+                          this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
+        const MAX_TOTAL_KEYS = 20_000
+        const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
+        if (shouldEvict) {
+          if (heapUsedMB > HEAP_PRESSURE_MB) {
+            console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
+          } else {
+            console.log(`[v0] [Redis Memory] Key count at ${totalKeys} (>${MAX_TOTAL_KEYS}), evicting old records...`)
+          }
           console.log(`[v0] [Redis Memory] Top key families: ${this.describeKeyFamilies()}`)
           this.evictOldRecords()
           // Nudge GC if exposed (dev runs with --expose-gc sometimes); the
