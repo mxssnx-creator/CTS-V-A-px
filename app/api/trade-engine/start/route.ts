@@ -115,12 +115,14 @@ export async function POST(request: NextRequest) {
     try {
       const { getAllConnections, updateConnection: updateConn } = await import("@/lib/redis-db")
       const runningIds: Set<string> = new Set()
-      // Engines are stored on globalThis.__engine_instances (engine-manager.ts line 28).
-      // The coordinator itself does not expose a direct engines property.
+      // The coordinator is stored at globalThis.__tradeEngineCoordinator and
+      // tracks running engines in its private `engineManagers` Map. Access it
+      // through the globalThis singleton so we always hit the live instance.
+      const liveCoord: any =
+        (globalThis as any).__tradeEngineCoordinator ?? coordinator
       const engines: Map<string, unknown> =
-        (globalThis as any).__engine_instances ||
-        (coordinator as any).engines ||
-        (coordinator as any)._engines ||
+        liveCoord?.engineManagers ??
+        (coordinator as any).engineManagers ??
         new Map()
       for (const [connId] of engines) runningIds.add(String(connId))
       console.log(`[v0] [Trade Engine] Flag sync: found ${runningIds.size} running engine(s): ${[...runningIds].join(", ")}`)

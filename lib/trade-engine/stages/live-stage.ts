@@ -1131,8 +1131,8 @@ async function placeProtectionOrder(
     if (!result?.success) {
       const errMsg109 = String(result?.error || "")
       if (errMsg109.includes("109420") || /position not exist/i.test(errMsg109)) {
-        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 3s before retry`)
-        await new Promise((r) => setTimeout(r, 3000))
+        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 4s before retry`)
+        await new Promise((r) => setTimeout(r, 4000))
         result = await placeStop(effectiveQty)
         if (!result?.success) {
           console.warn(`${tag} 109420 retry also failed (error=${result?.error}) — reconcile will retry on next tick`)
@@ -2818,13 +2818,13 @@ export async function executeLivePosition(
         `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP will use order qty as fallback`,
         { orderId: livePosition.orderId, status: fill.status, fallbackQty: computedVolume }
       )
-      // BingX hedge-mode positions need 2-4s after market order acceptance
+      // BingX hedge-mode positions need 3-5s after market order acceptance
       // before a stop/TP can reference them — 109420 "position not exist"
-      // fires if SL/TP is submitted too quickly (seen on DOGE, ADA). The
-      // placeProtectionOrder function also has a 109420 retry (+2s) so the
-      // total window is effectively 3.5s + 2s = 5.5s before giving up.
-      // Reconcile will arm the order on the next tick if both attempts fail.
-      await new Promise((r) => setTimeout(r, 3500))
+      // fires if SL/TP is submitted too quickly (confirmed in DOGE/ADA logs).
+      // The placeProtectionOrder function also has a 109420 retry (+4s), so
+      // the total window before giving up is 5s + 4s = 9s. Reconcile arms
+      // protection on the next tick if both attempts fail.
+      await new Promise((r) => setTimeout(r, 5000))
       await logLiveOrderFinal(orderTrace, {
         status: "placed",
         livePositionId: livePosition.id,
@@ -4148,7 +4148,7 @@ export async function reconcileLivePositions(
       errors: number
       protectionRearmed: number
     }
-    // ── Canonical-position-per-slot resolution (BUG 4) ────────────────
+    // ── Canonical-position-per-slot resolution (BUG 4) ────────��───────
     // The venue holds exactly ONE position per (symbol, direction). If
     // Redis tracks more than one open position for the same slot
     // (lock-expiry edge, restart mid-entry, or migrated legacy data),
