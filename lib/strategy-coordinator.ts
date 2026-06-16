@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─��������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -4791,7 +4791,6 @@ export class StrategyCoordinator {
       // coordIndex.base.byKey.get(parentSetKey).  Eliminates the primary
       // V8 heap driver (~80 000 object allocations per second).
       entries:         [],
-      createdAt:       new Date().toISOString(),
       ...(baseSet.prevPos && { prevPos: baseSet.prevPos }),
     }
   }

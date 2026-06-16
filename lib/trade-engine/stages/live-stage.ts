@@ -2790,6 +2790,14 @@ export async function executeLivePosition(
         reason: `fill via=${fill.status}`,
         extra: { orderId: livePosition.orderId, attempts: placeAttempt },
       })
+      // BingX hedge-mode positions need a brief settling period after a
+      // market order fills before a STOP/TP_MARKET can reference them.
+      // Even when the fill is confirmed by pollOrderFill / getPosition,
+      // the exchange position registry may lag by ~1-2 s. This 2 s wait
+      // (combined with the 4 s retry inside placeProtectionOrder for
+      // code=109420) gives a total 6 s window — sufficient for all
+      // observed symbols including DOGE, ADA, and SOL.
+      await new Promise((r) => setTimeout(r, 2000))
     } else {
       // D) Final guard: fill unconfirmed but order was accepted �� treat as filled
       // with computedVolume so SL/TP can be placed. The position is "open" on the

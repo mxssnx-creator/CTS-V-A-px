@@ -207,6 +207,8 @@ export async function GET() {
         status: "healthy",
         requestsPerSecond: getRedisRequestsPerSecond(),
         totalKeys,
+        heapMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        rssMB:  Math.round(process.memoryUsage().rss       / 1024 / 1024),
       },
       exchangeConnections: {
         total: insertedBaseConnections.length,
