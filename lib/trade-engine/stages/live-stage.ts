@@ -2877,30 +2877,39 @@ export async function executeLivePosition(
       // for that leg. A failed placement leaves it at 0, which
       // `priceDrifted(0, desired)` correctly classifies as "needs arming"
       // on the next reconcile pass.
-      const [slOrderId, tpOrderId] = await Promise.all([
-        (slPrice > 0 && !livePosition.stopLossOrderId)
-          ? placeProtectionOrder(
-              exchangeConnector,
-              realPosition.symbol,
-              sideClose,
-              livePosition.executedQuantity,
-              slPrice,
-              "StopLoss",
-              realPosition.direction,
-            )
-          : Promise.resolve(livePosition.stopLossOrderId || null),
-        (tpPrice > 0 && !livePosition.takeProfitOrderId)
-          ? placeProtectionOrder(
-              exchangeConnector,
-              realPosition.symbol,
-              sideClose,
-              livePosition.executedQuantity,
-              tpPrice,
-              "TakeProfit",
-              realPosition.direction,
-            )
-          : Promise.resolve(livePosition.takeProfitOrderId || null),
-      ])
+      // BingX hedge-mode: placing SL and TP concurrently (Promise.all) causes
+      // the second order to receive code=109420 "position not exist" while the
+      // first order is still being registered by the exchange.  Serialise SL
+      // first, wait 500 ms, then place TP.  The 500 ms gap is enough for the
+      // exchange registry to reflect the first stop order.  The existing 4 s
+      // retry inside placeProtectionOrder handles any residual 109420s.
+      const slOrderId = (slPrice > 0 && !livePosition.stopLossOrderId)
+        ? await placeProtectionOrder(
+            exchangeConnector,
+            realPosition.symbol,
+            sideClose,
+            livePosition.executedQuantity,
+            slPrice,
+            "StopLoss",
+            realPosition.direction,
+          )
+        : (livePosition.stopLossOrderId || null)
+
+      if (slPrice > 0 && tpPrice > 0 && !livePosition.takeProfitOrderId) {
+        await new Promise((r) => setTimeout(r, 500))
+      }
+
+      const tpOrderId = (tpPrice > 0 && !livePosition.takeProfitOrderId)
+        ? await placeProtectionOrder(
+            exchangeConnector,
+            realPosition.symbol,
+            sideClose,
+            livePosition.executedQuantity,
+            tpPrice,
+            "TakeProfit",
+            realPosition.direction,
+          )
+        : (livePosition.takeProfitOrderId || null)
 
       if (slOrderId) {
         livePosition.stopLossOrderId = slOrderId
@@ -3335,7 +3344,7 @@ export async function closeLivePosition(
 
           lastErrorMsg = (r && typeof r === "object" && r.error) ? String(r.error) : "invalid_response"
 
-          // ── Already-closed reconciliation ───���─────────────────────────
+          // ── Already-closed reconciliation ─��─���─────────────────────────
           // If the venue says the position is gone, we treat the close as
           // successful and stop retrying. The DB-side terminal-state
           // pipeline below still runs (PnL is computed from `closePrice`,
