@@ -2014,6 +2014,17 @@ export class StrategyCoordinator {
           status:             "valid_main",
           overrideDirection:  set.axisWindows?.direction as "long" | "short" | undefined,
           overrideEntryCount: set.entryCount !== baseSet.entryCount ? set.entryCount : undefined,
+          // ── Scalar value carrier (Base-Anchored) ──────────────────────
+          // Mirror the slim set scalars so Real/Live validate + switch states
+          // by iterating coord records directly, never a parallel set array.
+          avgProfitFactor:    set.avgProfitFactor,
+          avgDrawdownTime:    set.avgDrawdownTime,
+          avgConfidence:      set.avgConfidence,
+          entryCount:         set.entryCount,
+          indicationType:     set.indicationType,
+          direction:          (set.axisWindows?.direction as "long" | "short" | undefined) ?? set.direction,
+          prevPos:            set.prevPos,
+          trailingProfile:    set.trailingProfile,
         }
         registerCoordRecord(coordIndex, rec)
       }
@@ -2102,6 +2113,15 @@ export class StrategyCoordinator {
               status:             "valid_main",
               overrideDirection:  axisSet.axisWindows?.direction as "long" | "short" | undefined,
               overrideEntryCount: axisSet.entryCount,
+              // ── Scalar value carrier (axis projection of parent default) ──
+              avgProfitFactor:    axisSet.avgProfitFactor,
+              avgDrawdownTime:    axisSet.avgDrawdownTime,
+              avgConfidence:      axisSet.avgConfidence,
+              entryCount:         axisSet.entryCount,
+              indicationType:     axisSet.indicationType,
+              direction:          (axisSet.axisWindows?.direction as "long" | "short" | undefined) ?? axisSet.direction,
+              prevPos:            axisSet.prevPos,
+              trailingProfile:    axisSet.trailingProfile,
             }
             registerCoordRecord(coordIndex, axisRec)
           }
