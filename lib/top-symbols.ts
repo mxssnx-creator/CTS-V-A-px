@@ -159,11 +159,20 @@ export async function fetchTopSymbols(
   limit = 1,
   sort: SortKey = "volume",
 ): Promise<{ symbol: string; priceChangePercent: number; symbols: Ticker[] }> {
-  // For volatility_1h we first fetch a larger pool (top-50 by volume) to
+  // For volatility_1h we first fetch a larger pool (top-100 by volume) to
   // narrow candidates before making one kline request per symbol.
+  // MIN_VOLUME_USDT filters out newly listed micro-caps and wash-traded coins
+  // that appear at the top of any ATR ranking but have no real liquidity.
+  // Threshold: $5M 24h USDT quoteVolume — excludes anything below that floor.
   if (sort === "volatility_1h") {
-    const pool = await fetchTopSymbols(exchange, Math.max(50, limit * 3), "volume")
-    const enriched = await enrich1hAtr(exchange, pool.symbols, 8)
+    const MIN_VOLUME_USDT = 5_000_000
+    // Fetch a wide pool (up to 100 by volume) so we have enough after filtering.
+    const pool = await fetchTopSymbols(exchange, 100, "volume")
+    // Drop micro-caps before fetching klines — saves round-trips and
+    // prevents wash-traded coins from polluting the ATR ranking.
+    const liquid = pool.symbols.filter((t) => t.volume >= MIN_VOLUME_USDT)
+    const candidates = liquid.length >= limit ? liquid : pool.symbols // fallback if filter over-prunes
+    const enriched = await enrich1hAtr(exchange, candidates, 8)
     enriched.sort((a, b) => (b.atr1h ?? 0) - (a.atr1h ?? 0))
     const topN = enriched.slice(0, limit)
     const top  = topN[0] ?? pool.symbols[0]
@@ -203,12 +212,12 @@ export async function fetchTopSymbols(
             !t.symbol.includes("DOWN") &&
             !t.symbol.includes("UP") &&
             !["USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT"].includes(t.symbol) &&
-            Number.parseFloat(t.quoteVolume) > 1_000_000,
-        )
-        .map((t) => ({
-          symbol: t.symbol,
-          priceChangePercent: Math.abs(Number.parseFloat(t.priceChangePercent)),
-          volume: Number.parseFloat(t.quoteVolume) || 0,
+            Number.parseFloat(t.quoteVolume) > 5_000_000,
+          )
+          .map((t: any) => ({
+            symbol:             t.symbol,
+            priceChangePercent: Math.abs(Number.parseFloat(t.priceChangePercent)),
+            volume: Number.parseFloat(t.quoteVolume) || 0,
         }))
     } else if (exchange === "bybit") {
       try {
@@ -230,7 +239,7 @@ export async function fetchTopSymbols(
                   !t.symbol.includes("DOWN") &&
                   !t.symbol.includes("UP") &&
                   !["USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT"].includes(t.symbol) &&
-                  Number.parseFloat(t.quoteVolume) > 1_000_000,
+                  Number.parseFloat(t.quoteVolume) > 5_000_000,
               )
               .map((t) => ({
                 symbol: t.symbol,

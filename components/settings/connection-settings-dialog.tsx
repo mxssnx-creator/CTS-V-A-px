@@ -1089,12 +1089,13 @@ export function ConnectionSettingsDialog({
                       <Flame className="h-4 w-4 text-amber-500 shrink-0" />
                       <div className="flex-1 min-w-0">
                         <div className="text-xs font-semibold">Auto-select by 1h Volatility</div>
-                        <div className="text-[11px] text-muted-foreground">
-                          Fetches the last 1h kline for each candidate and ranks by{" "}
-                          <span className="font-mono">(high−low)/open×100</span>. Fills the symbol list
-                          with the top-N most volatile and sets order to{" "}
-                          <span className="font-mono">volatility_1h</span>.
-                        </div>
+                <div className="text-[11px] text-muted-foreground">
+                  Fetches the last 1h kline for each candidate and ranks by{" "}
+                  <span className="font-mono">(high−low)/open×100</span>. Pool is pre-filtered to{" "}
+                  <span className="font-mono">&gt;$5M</span> 24h volume to exclude micro-caps. Fills
+                  the symbol list with the top-N most volatile and sets order to{" "}
+                  <span className="font-mono">volatility_1h</span>.
+                </div>
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
