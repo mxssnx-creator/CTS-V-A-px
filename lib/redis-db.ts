@@ -2828,48 +2828,49 @@ export async function storeIndications(connectionId: string, symbol: string, ind
   const mainKey = `indications:${connectionId}`
   
   try {
-    // Read existing indications
+    // Stamp new indications with metadata.
+    const ts = new Date().toISOString()
+    const newIndications = indications.map(ind => ({
+      ...ind,
+      symbol,
+      connectionId,
+      timestamp: ts,
+      configSet: getConfigurationSet(ind.type, ind.value),
+    }))
+
+    // ── Main key: read → append → trim → write ───────────────────────────
     const existingRaw = await client.get(mainKey)
     let existing: any[] = []
     if (existingRaw) {
       try {
         existing = JSON.parse(typeof existingRaw === "string" ? existingRaw : JSON.stringify(existingRaw))
         if (!Array.isArray(existing)) existing = []
-      } catch {
-        existing = []
-      }
+      } catch { existing = [] }
     }
-    
-    // Add new indications with metadata for per-config tracking
-    const newIndications = indications.map(ind => ({
-      ...ind,
-      symbol,
-      connectionId,
-      timestamp: new Date().toISOString(),
-      configSet: getConfigurationSet(ind.type, ind.value), // Track which config set this belongs to
-    }))
-    
     existing.push(...newIndications)
-    
-    // Keep only latest 2500 indications per connection (250 per symbol × 10 symbols typical)
-    if (existing.length > 2500) {
-      existing = existing.slice(-2500)
+    // Keep latest 2500 (250 per symbol × 10 symbols typical)
+    if (existing.length > 2500) existing = existing.slice(-2500)
+
+    // ── Per-type keys: group by type in ONE O(N) pass, NOT O(N²) ─────────
+    // The previous implementation called `indications.filter(i => i.type === ind.type)`
+    // inside a `for (const ind of indications)` loop — O(N²). For a batch of N
+    // indications that happens P times per second this is N × P string comparisons/s.
+    // Group once into a Map<type, indication[]> so each type key is written once.
+    const byType = new Map<string, any[]>()
+    for (const ind of newIndications) {
+      const t = ind.type as string
+      let bucket = byType.get(t)
+      if (!bucket) { bucket = []; byType.set(t, bucket) }
+      bucket.push(ind)
     }
-    
-    // Save to main key with 1-hour TTL
-    await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
-    
-    // Also maintain per-type independent sets for high-frequency lookups.
-    // Note: iterating once over unique types would be slightly more efficient,
-    // but `indications` is always a small batch (<=10), so the clarity of a
-    // per-indication pass is preferred.
-    for (const ind of indications) {
-      const typeKey = `indications:${connectionId}:${ind.type}`
-      const typeIndications = indications.filter(i => i.type === ind.type)
-      if (typeIndications.length > 0) {
-        await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
-      }
-    }
+
+    // Fan out all writes in parallel — single await instead of sequential loop.
+    await Promise.all([
+      client.set(mainKey, JSON.stringify(existing), { EX: 3600 } as any),
+      ...Array.from(byType.entries()).map(([type, typeInds]) =>
+        client.set(`indications:${connectionId}:${type}`, JSON.stringify(typeInds), { EX: 3600 } as any)
+      ),
+    ])
   } catch (error) {
     console.error(`[v0] Error storing indications for ${connectionId}:`, error)
   }

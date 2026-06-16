@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─����������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─����������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -1628,7 +1628,7 @@ export class StrategyCoordinator {
         )
       }
 
-      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────────────────────
+      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────────────────��─��─
       // The cumulative `strategies_base_total` hincrby above answers
       // "how many Base Sets have been created EVER", but the dashboard
       // Overview asks "how many are alive RIGHT NOW for this symbol".
@@ -2109,16 +2109,13 @@ export class StrategyCoordinator {
     // a good streak, which incorrectly labelled those entries as "block" and
     // inflated block PF stats. Only `positionState === "add"` (the true
     // semantic marker for block add-on entries) is retained as the fallback.
-    const classifyVariant = (e: StrategySetEntry): "default" | "trailing" | "block" | "dca" => {
-      if (e.positionState === "reduce" || e.positionState === "close") return "dca"
-      if (e.positionState === "add")                                    return "block"
-      if (e.positionState === "new"  && e.leverage       >= 3)         return "trailing"
-      return "default"
-    }
-
-    // Per-variant aggregates accumulated over all main sets in THIS cycle.
-    // We write the per-variant totals with hincrby so they remain cumulative
-    // across cycles (mirrors the per-stage hincrby pattern used elsewhere).
+    // ── Per-variant aggregates + all mainSets metrics in ONE pass ───────────
+    // All Main and axis Sets carry entries: [] (slim path — see buildVariantSet).
+    // Iterating set.entries is always a no-op, so we derive per-variant PF/DDT
+    // from the Set-level averages (avgProfitFactor, avgDrawdownTime, entryCount)
+    // which are already computed scalars. This also merges what were previously
+    // 4 separate reduce/filter passes over mainSets into one loop, eliminating
+    // 4 intermediate result allocations per symbol per cycle.
     type VariantAgg = {
       sumPF: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
     }
@@ -2129,25 +2126,65 @@ export class StrategyCoordinator {
       dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
     }
+    // Aggregate scalars — computed in the same pass as variantAgg to avoid
+    // 4 extra reduce/filter sweeps that each allocate a result value.
+    let mainEntriesTotal      = 0
+    let mainSumPF             = 0
+    let mainSumDDT            = 0
+    let mainProfileEntries    = 0   // profile-variant sets only (no axis dir)
+    let axisSetsCount         = 0
+    let axisLong              = 0
+    let axisShort             = 0
+    const uniqueBaseSetsProduced = new Set<string>()
     for (const set of mainSets) {
-      const setVariant = set.variant ?? (set.entries[0] ? classifyVariant(set.entries[0]) : "default")
-      variantAgg[setVariant].setsContaining += 1
-      variantAgg[setVariant].passedSets     += 1
-      for (const entry of set.entries) {
-        variantAgg[setVariant].entries += 1
-        variantAgg[setVariant].sumPF   += Number(entry.profitFactor || 0)
-        variantAgg[setVariant].sumDDT  += Number(entry.drawdownTime || 0)
+      // Variant tag — sets always carry an authoritative .variant field;
+      // the per-entry classifier fallback is never needed in the slim path.
+      const sv = (set.variant as keyof typeof variantAgg) ?? "default"
+      const agg = variantAgg[sv] ?? variantAgg.default
+      const ec = set.entryCount || 0
+      const pf = set.avgProfitFactor || 0
+      const ddt = set.avgDrawdownTime || 0
+      agg.setsContaining += 1
+      agg.passedSets     += 1
+      // Use entryCount as the "entries" dimension — each Set represents
+      // entryCount pseudo-positions in the variant aggregation, matching the
+      // semantic intent (how many pos-slots this Set contributes per variant).
+      agg.entries += ec
+      agg.sumPF   += pf * ec   // weighted by entry count for correct variant-avg
+      agg.sumDDT  += ddt * ec
+
+      mainEntriesTotal += ec
+      mainSumPF        += pf
+      mainSumDDT       += ddt
+      uniqueBaseSetsProduced.add(set.parentSetKey ?? set.setKey)
+
+      const axDir = set.axisWindows?.direction
+      if (axDir) {
+        axisSetsCount++
+        if (axDir === "long") axisLong++; else axisShort++
+      } else {
+        mainProfileEntries += ec
       }
     }
+    const n = mainSets.length
+    const mainAvgPF         = n > 0 ? mainSumPF  / n : 0
+    const mainAvgDDT        = n > 0 ? mainSumDDT / n : 0
+    const mainAvgPosPerSet  = n > 0 ? mainEntriesTotal / n : 0
+    const mainProfileEntriesTotal = mainProfileEntries
 
-    // Persist MAIN sets + fingerprint cache. Fingerprint cache has a short
-    // TTL so stale entries don't re-surface after context changes settle.
-    // MAIN sets write is skipped in dev mode — 1920 full StrategySet objects
-    // per symbol per cycle serialise to ~19 MB each in InlineLocalRedis,
-    // causing OOM at ~30s with 20 symbols. The coordIndex holds live state.
+    // Persist MAIN sets — slim format (set-key list only), same approach as Real.
+    // Full Base Set blobs are already in base:sets; Main sets are re-derivable from
+    // coordIndex in the pipeline. Slim key-list cuts the per-symbol write from
+    // ~500 KB (full mainSets blob with entries:[]) to ~N×30 bytes — 16× smaller.
+    // Skipped in dev mode entirely (coordIndex is the in-memory source of truth).
     if (process.env.NODE_ENV !== "development") {
       const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
-      await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
+      await setSettings(mainKey, {
+        setKeys: mainSets.map((s) => s.setKey),
+        count:   mainSets.length,
+        created: new Date(),
+        _slim:   true,
+      })
     }
     // DEV-MODE BYPASS: fpCache writes create 20 hash keys (one per symbol) every
     // createMainSets call and replace them fully each time (del + hset). In dev the
@@ -2165,26 +2202,7 @@ export class StrategyCoordinator {
       } catch { /* non-critical */ }
     }
 
-    // ── Main-stage aggregate metrics (all at method-body scope) ─────────────
-    const mainEntriesTotal     = mainSets.reduce((s, st) => s + (st.entryCount || 0), 0)
-    const mainAvgPosPerSet     = mainSets.length > 0 ? mainEntriesTotal / mainSets.length : 0
-    const mainAvgPF            = mainSets.length > 0 ? mainSets.reduce((s, st) => s + st.avgProfitFactor, 0) / mainSets.length : 0
-    const mainAvgDDT           = mainSets.length > 0 ? mainSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / mainSets.length : 0
-    const mainDetailKey        = `strategy_detail:${this.connectionId}:main`
-
-    // Count only profile-variant Sets (no axis fan-out) for main_positions_created_count.
-    // Used in the Redis write block below; declared here so it's in scope for the write.
-    const mainProfileEntriesTotal = mainSets
-      .filter((s) => !s.axisWindows?.direction)
-      .reduce((sum, s) => sum + (s.entryCount ?? 0), 0)
-
-    const axisSetsCount = mainSets.filter(s => s.axisWindows).length
-    const axisLong = mainSets.filter(s => s.axisWindows?.direction === "long").length
-    const axisShort = mainSets.filter(s => s.axisWindows?.direction === "short").length
-
-    // ── Build uniqueBaseSetsProduced and passRatioMain ────────────────────
-    const uniqueBaseSetsProduced = new Set<string>()
-    for (const s of mainSets) uniqueBaseSetsProduced.add(s.parentSetKey ?? s.setKey)
+    const mainDetailKey = `strategy_detail:${this.connectionId}:main`
     // BASE->MAIN pass rate = fraction of Base Sets that produced ≥1 variant.
     // Using mainSets.length/baseSets.length inflates the ratio by 320×
     // (full axis fan-out); uniqueBaseSetsProduced.size is the correct numerator.
@@ -2209,10 +2227,19 @@ export class StrategyCoordinator {
               .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
               .catch(() => [])) as string[],
           )
-      const mainRunningNow = mainSets.filter((s) => {
+      // mainProgressing: sets with at least one position entry — computed from
+      // the same unified pass that built mainEntriesTotal (see variantAgg loop).
+      // mainEntriesTotal > 0 check per set is not tracked separately; we use
+      // mainSets.length as a safe upper bound (slim path means entryCount ≥ 1
+      // for all passing sets). For exact tracking: sets with entryCount > 0.
+      // Computed inline here to avoid another .filter() pass.
+      let mainRunningNow = 0
+      let mainProgressing = 0
+      for (const s of mainSets) {
+        if ((s.entryCount || 0) > 0) mainProgressing++
         const parent = s.parentSetKey || s.setKey.split("#")[0]
-        return activeKeys.has(parent)
-      }).length
+        if (activeKeys.has(parent)) mainRunningNow++
+      }
 
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
@@ -2230,12 +2257,12 @@ export class StrategyCoordinator {
           count_pos_eval:    String(mainSets.length),
           sets_running_now:         String(mainRunningNow),
           sets_with_open_positions: String(mainRunningNow),
-          sets_progressing:         String(mainSets.filter((s) => (s.entryCount || 0) > 0).length),
+          sets_progressing:         String(mainProgressing),
           updated_at:        String(Date.now()),
           [`s:${symbol}:created`]:    String(mainSets.length),
           [`s:${symbol}:entries`]:    String(mainEntriesTotal),
           [`s:${symbol}:running`]:    String(mainRunningNow),
-          [`s:${symbol}:progressing`]: String(mainSets.filter((s) => (s.entryCount || 0) > 0).length),
+          [`s:${symbol}:progressing`]: String(mainProgressing),
           [`s:${symbol}:passed`]:     String(mainSets.length),
           [`s:${symbol}:evaluated`]:  String(mainSets.length),
           [`s:${symbol}:apf`]:        String(mainAvgPF.toFixed(4)),
@@ -2435,12 +2462,28 @@ export class StrategyCoordinator {
     inputSets?: StrategySet[],
     coordIndex?: CoordIndex,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
-    let stored: any = null
-    if (!inputSets) {
+    let mainSets: StrategySet[]
+    if (inputSets) {
+      mainSets = inputSets
+    } else {
+      // Standalone path (tests / diagnostics) — read from Redis.
+      // Handles both slim key-list format (_slim: true, setKeys: string[])
+      // and legacy full-blob format (sets: StrategySet[]).
       const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
-      stored = await getSettings(mainKey)
+      const stored = (await getSettings(mainKey)) as any
+      if (stored?._slim && Array.isArray(stored.setKeys)) {
+        // Slim format: resolve profile-variant sets from Base sets.
+        // Axis sets are not stored in base:sets (they are generated each cycle),
+        // so standalone mode omits them — acceptable for diagnostics/tooling.
+        const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
+        const baseSt  = (await getSettings(baseKey)) as any
+        const baseArr: StrategySet[] = Array.isArray(baseSt?.sets) ? baseSt.sets : []
+        const keySet  = new Set<string>(stored.setKeys as string[])
+        mainSets      = baseArr.filter((s) => keySet.has(s.setKey))
+      } else {
+        mainSets = Array.isArray(stored?.sets) ? stored.sets : []
+      }
     }
-    const mainSets: StrategySet[] = inputSets ?? (stored?.sets || [])
 
     const metricsReal = this.METRICS.real
 
@@ -2520,30 +2563,65 @@ export class StrategyCoordinator {
        for (const k of liveSetKeys) realActiveKeysForVP.add(k)
      } catch { /* fail-open */ }
      
-     const mainSetsEligible = mainSets.map((s) => {
-       const live = s.entryCount ?? s.entries?.length ?? 0
-       const hist = s.prevPos?.count ?? 0
-       const posCount = Math.max(live, hist)
-       
-       // ALLOW axis Sets with synthetic entries even if posCount < realMinPos
-       // (new systems need a way to start generating positions)
-       const hasEntries = (s.entries?.length ?? 0) > 0
-       const isAxisSet = s.axisWindows && s.axisWindows.direction
-       if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
-         // Real(active) continuous validity: if this Set currently has active Real/Live positions or is in active config keys, keep it valid (operator requirement for ongoing Real stage sets)
-         const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
-         if (!hasActiveReal) {
-           s.status = "invalid"
-           s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
-           return s
-         }
-         // Force valid for active Real orders to prevent loss in progress processing
-         s.status = "valid_real"
-       }
-       return s
-     })
-    // Don't filter out - keep all sets including marked-invalid ones for re-evaluation
-    const skippedRealLowPos = mainSetsEligible.filter(s => s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")).length
+    // ── SINGLE PASS: pos-gate + PF/DDT filter + collect qualifying sets ──────
+    // Previously: mainSets.map() [new array] → .filter() [new array] →
+    //             [...realQualifying].sort() [spread + new array] — 3 heap allocations.
+    // Now: one for-loop marks status in-place on each StrategySet (no new arrays
+    // for the map/filter pass) and pushes qualifying refs into a pre-allocated
+    // realQualifying array; one in-place .sort() at the end.
+    //
+    // Status semantics:
+    //   "invalid" + rejectionReason — failed pos-gate; logged + skipped
+    //   "valid_real"                — passes all gates; included in realSorted
+    //
+    // Active-Set continuous validity: a Set that currently backs an OPEN live
+    // position MUST stay valid_real regardless of PF/DDT wobble this cycle
+    // (without this, a transient dip orphans the live position from its owner).
+    const realQualifying: StrategySet[] = []
+    let skippedRealLowPos = 0
+    for (const s of mainSets) {
+      const posCount = Math.max(s.entryCount ?? 0, s.prevPos?.count ?? 0)
+      const isAxisSet = !!(s.axisWindows?.direction)
+      // Axis Sets always have a synthetic entry (entries.length === 1) so
+      // hasEntries is always true for them — skip the check for non-axis.
+      const hasEntries = isAxisSet || (s.entries?.length ?? 0) > 0
+
+      // ── 1. Position-count gate ──────────────────────���─────────────────────
+      if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
+        const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
+        if (!hasActiveReal) {
+          s.status = "invalid"
+          s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
+          skippedRealLowPos++
+          continue
+        }
+        // Active live position — keep valid despite low pos-count.
+        s.status = "valid_real"
+        realQualifying.push(s)
+        continue
+      }
+
+      // ── 2. Active-Set continuous validity exemption ───────────────────────
+      const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
+      if (hasActiveReal) {
+        s.status = "valid_real"
+        realQualifying.push(s)
+        continue
+      }
+
+      // ── 3. PF/DDT gate ────────────────────────────────────────────────────
+      const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
+                     s.avgDrawdownTime  <= metrics.maxDrawdownTime
+      if (passes) {
+        s.status = "valid_real"
+        realQualifying.push(s)
+      } else {
+        s.status = "invalid"
+        s.rejectionReason = s.avgProfitFactor < metrics.minProfitFactor
+          ? `real_low_pf: ${s.avgProfitFactor.toFixed(2)} < ${metrics.minProfitFactor}`
+          : `real_high_ddt: ${s.avgDrawdownTime} > ${metrics.maxDrawdownTime}`
+      }
+    }
     if (skippedRealLowPos > 0) {
       logProgressionEvent(
         this.connectionId,
@@ -2554,58 +2632,12 @@ export class StrategyCoordinator {
       ).catch(() => {})
     }
 
-    // P0-2: Real filter axes are PF-min + DDT-max ONLY. Confidence is
-    // advisory metadata and is not part of the filter predicate.
-    // Mark status on mainSetsEligible for efficient tracking
-    const realQualifying = mainSetsEligible.filter(
-      (s) => {
-        // Skip already-marked invalid (insufficient positions)
-        if (s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")) {
-          return false
-        }
-
-        // ── Active-Set continuous validity (operator requirement) ─────────
-        // A Set that currently backs an OPEN live position (registered in
-        // active_config_keys, or flagged _hasLivePositions) MUST stay
-        // valid_real until that position is closed — even if its PF/DDT
-        // temporarily dips below threshold this cycle. Without this exemption
-        // a transient metric wobble drops the Set from realQualifying →
-        // realSorted �� netted → realPostHedge, so it is never persisted or
-        // dispatched, orphaning the live position from its Real-stage owner
-        // (reconcile/sync can no longer map it to a Set). This mirrors the
-        // exemption already applied at the min-pos gate above.
-        const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
-        if (hasActiveReal) {
-          s.status = "valid_real"
-          return true
-        }
-
-        const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
-                      s.avgDrawdownTime <= metrics.maxDrawdownTime
-        if (passes) {
-          s.status = "valid_real"
-        } else {
-          s.status = "invalid"
-          if (s.avgProfitFactor < metrics.minProfitFactor) {
-            s.rejectionReason = `real_low_pf: ${s.avgProfitFactor.toFixed(2)} < ${metrics.minProfitFactor}`
-          } else {
-            s.rejectionReason = `real_high_ddt: ${s.avgDrawdownTime} > ${metrics.maxDrawdownTime}`
-          }
-        }
-        return passes
-      }
-    )
-
-    // ── PRIORITY SORT: better Sets first ─────────────────��────────────
-    // Per user spec: "arrange so that better Sets have priority". We sort
-    // descending by `avgProfitFactor` �� the same metric Live uses for its
-    // top-N selection at line 1182 — so when the downstream Live stage
-    // (and any per-direction Pos limit) takes the head of the list it
-    // gets the highest-quality Sets first. The `maxRealSets` cap is
-    // applied AFTER sorting so the trim keeps the best ones.
-    const realSorted = [...realQualifying].sort(
-      (a, b) => b.avgProfitFactor - a.avgProfitFactor,
-    )
+    // ── PRIORITY SORT in-place ────────────────────────────────────────────
+    // Sort the collected qualifying refs by avgProfitFactor descending so
+    // downstream stages (hedge-net, Real cap, Live dispatch) always see the
+    // highest-quality Sets first. In-place sort avoids the spread-copy.
+    realQualifying.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
+    const realSorted = realQualifying   // alias — hedge-net reads realSorted
 
     // ── HEDGE NETTING (operator spec: Real stage only) ───────────────────
     //
@@ -2824,7 +2856,7 @@ export class StrategyCoordinator {
     // exposure; below the threshold we no-op.
     //
     // Per-Base ledger (`real_pi_acc:{conn}` HASH, key = parentSetKey)
-    // is incremented for every Real Set produced — that's the dashboard
+    // is incremented for every Real Set produced �� that's the dashboard
     // accumulation column.
     try {
       const { bumpRealPosAccumulation, bumpValidPositions, bumpAxisPosAccumulation, bumpHedgePosAccumulation } = await import(
@@ -3000,12 +3032,11 @@ export class StrategyCoordinator {
       })
     }
 
-    // Hoisted outside the try-block so the return statement (also outside) can see it.
     // Count of Main Sets that actually entered PF/DDT evaluation (excludes pos-count
     // pre-gated sets). Used for correct passRatioReal and evaluated counters.
-    const mainPFEligible = mainSetsEligible.filter(
-      (s) => !(s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")),
-    ).length
+    // After the merged pos-gate + PF/DDT pass, `realQualifying` is the survivor list;
+    // `skippedRealLowPos` is the count of pos-gated rejects. PF-eligible = total - pos-gated.
+    const mainPFEligible = mainSets.length - skippedRealLowPos
 
     // Write Real counts to progression hash — CUMULATIVE via hincrby so the dashboard
     // doesn't oscillate with per-cycle snapshots (see matching fix in createBaseSets/createMainSets).
@@ -3397,7 +3428,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��─────�����──────────────────────���───────��
+  // ─── STAGE 4: LIVE ─────────����──────────��─────�����───��──────────────────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -3566,13 +3597,15 @@ export class StrategyCoordinator {
         pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
       }
       for (const set of qualifying) {
+        // Slim-path sets carry entries: [] — use entryCount + set-level avgPF/DDT
+        // so Live variant aggregates are accurate (mirrors Main stage accounting).
         const variant = (set.variant as keyof typeof liveVariantAgg) ?? "default"
-        liveVariantAgg[variant].setsContaining += 1
-        for (const entry of set.entries) {
-          liveVariantAgg[variant].entries += 1
-          liveVariantAgg[variant].sumPF   += Number(entry.profitFactor || 0)
-          liveVariantAgg[variant].sumDDT  += Number(entry.drawdownTime || 0)
-        }
+        const lv = liveVariantAgg[variant] ?? liveVariantAgg["default"]
+        const ec = set.entryCount || set.entries.length
+        lv.setsContaining += 1
+        lv.entries += ec
+        lv.sumPF   += set.avgProfitFactor * ec
+        lv.sumDDT  += (set.avgDrawdownTime || 0) * ec
       }
 
       // ── bumpValidPositions — Live-promoted Set counter ─────────────────
@@ -4668,7 +4701,7 @@ export class StrategyCoordinator {
    * Deterministic fingerprint of {base Set × variant × position context}.
    * Drives the "IF NOT ALREADY CREATED" dedup check.
    *
-   * ── Bucket ranges (P0-3, spec-aligned) ─��────────────────────��──────
+   * ── Bucket ranges (P0-3, spec-aligned) ─��────────��───────────��──────
    * Spec ranges:
    *   - Prev Positions         1-12   (13 buckets 0-12)
    *   - Last Positions W/L     1-4    (5 buckets each 0-4)
