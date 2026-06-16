@@ -2440,6 +2440,63 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "39")
     },
   },
+
+  // ── Migration 041 ──────────────────────────────────────────────────────────
+  // Fix stale live_volume_factor < 1.0 on connection:bingx-x01 and clear the
+  // prehistoric_loaded:bingx-x01 cache gate that prevents re-runs when the DB
+  // is wiped but the marker survives.
+  //
+  // Problem 1 — liveVolumeFactor: 0.1 in stats:
+  //   Some earlier write path stored live_volume_factor: "0.1" on
+  //   connection:bingx-x01. VolumeCalculator.resolveLiveEngine reads this hash
+  //   first (highest priority), so 0.1 beats the correct 2.2 from app_settings
+  //   and connection_settings. Any value below 1.0 is a misconfiguration —
+  //   live_volume_factor is a scaling multiplier and sub-1 shrinks positions.
+  //   Correct unconditionally to 2.2.
+  //
+  // Problem 2 — prehistoric re-run gate:
+  //   `prehistoric_loaded:{conn}` (plain string "1") is the 24-hour cache key
+  //   engine-manager uses to skip the ConfigSetProcessor pass. If it survives a
+  //   sandbox reset / full DB wipe, the engine advances straight to live_trading
+  //   with 0 pi_history keys → createBaseSets returns 0 → no strategy sets
+  //   ever build → B=0 M=0 R=0 L=0 in stats forever. Delete it here so the
+  //   migration always forces a fresh prehistoric run on the next engine boot.
+  {
+    version: 41,
+    up: async (client: any) => {
+      await client.set("_schema_version", "41")
+      const CONN_ID = "bingx-x01"
+      const now = new Date().toISOString()
+
+      // 1. Correct stale volume factor — only fix if below minimum floor (1.0)
+      const connHash = (await client.hgetall(`connection:${CONN_ID}`).catch(() => null)) as Record<string,string> | null ?? {}
+      const storedFactor = parseFloat(connHash["live_volume_factor"] || "0")
+      if (!storedFactor || storedFactor < 1.0) {
+        await client.hset(`connection:${CONN_ID}`, {
+          live_volume_factor:   "2.2",
+          preset_volume_factor: "1.0",
+          updated_at:           now,
+        }).catch(() => {})
+        console.log(`[v0] Migration 041: corrected live_volume_factor ${storedFactor} → 2.2 on connection:${CONN_ID}`)
+      }
+
+      // 2. Clear prehistoric_loaded cache gate — forces fresh prehistoric on
+      //    next engine boot. This is idempotent: engine re-stamps it after a
+      //    successful prehistoric run so subsequent hot-reloads within the same
+      //    session skip preprocessing correctly (as intended).
+      await client.del(`prehistoric_loaded:${CONN_ID}`).catch(() => {})
+      await client.del(`prehistoric_loaded:${CONN_ID}:verified`).catch(() => {})
+
+      // 3. Clear the prehistoric:progress:{conn} tracker so the UI progress bar
+      //    resets cleanly for the new session.
+      await client.del(`prehistoric:progress:${CONN_ID}`).catch(() => {})
+
+      console.log(`[v0] Migration 041: cleared prehistoric_loaded gate + progress tracker for ${CONN_ID}`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "40")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -2489,7 +2546,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     }
   }
 
-  // ── Honour operator-issued tombstones ────────────────────────────
+  // ���─ Honour operator-issued tombstones ────────────────────────────
   // The DELETE endpoint (`app/api/settings/connections/[id]/route.ts`)
   // adds deleted connection IDs to the `connections:tombstoned` Set so
   // we don't immediately resurrect them on the next migration sweep

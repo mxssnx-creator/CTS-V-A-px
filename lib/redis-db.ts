@@ -445,37 +445,33 @@ export class InlineLocalRedis {
             }
           }
 
-          // 2b. prehistoric:{conn}:done + prehistoric:{conn} hash —
-          //     The `:done` plain-string marker written by completePrehistoricPhase
-          //     survives hot-reloads inside globalThis (the Map is never GC'd between
-          //     Next.js HMR cycles). If it lingers from a prior session the engine sees
-          //     prehistoric as "already complete" and skips the full preprocessing pass,
-          //     so pi_history:{conn}:{symbol}:{type}:{dir} keys are never written and
-          //     createBaseSets returns 0 sets every cycle for the entire session.
-          //     Wipe both the hash AND the plain `:done` marker so every hot-reload
-          //     triggers a fresh prehistoric run. Also wipe pi_history and market_data
-          //     candle strings (stale from prior session; fresh ones are fetched on startup).
+          // 2b. prehistoric cache-gate + progress-tracker keys only.
+          //
+          // The engine uses TWO separate keys to decide whether to re-run prehistoric:
+          //   a) `prehistoric_loaded:{conn}` (plain string "1") — the 24-h cache gate
+          //      in engine-manager.ts. If this key survives a sandbox reset / full-DB
+          //      wipe the engine skips the entire ConfigSetProcessor pass and stamps
+          //      fake completion fields with 0 candles/indicators. Wipe it so every
+          //      fresh-DB session re-runs prehistoric from scratch.
+          //   b) `prehistoric:progress:{conn}` — the PrehistoricProgressTracker hash.
+          //      Stale from prior session; wipe so the UI progress bar resets cleanly.
+          //
+          // DO NOT wipe:
+          //   - `prehistoric:{conn}` hash (is_complete, symbols_processed, etc.) —
+          //     the stats route reads this; wiping causes candlesLoaded=0 forever.
+          //   - `progression:{conn}` hash (placed_count, filled_count, cycle counters)
+          //     — live counters that must survive hot-reloads.
+          //   - `strategies_active:{conn}` — written by coordinator each cycle.
+          //   - `pi_history:*` — written by ConfigSetProcessor; must survive.
           for (const key of this.data.strings.keys()) {
-            if (
-              key.startsWith("prehistoric:") ||
-              key.startsWith("pi_history:")   ||
-              key.startsWith("market_data:")
-            ) { this.data.strings.delete(key); flushed++ }
+            if (key.startsWith("prehistoric_loaded:")) {
+              this.data.strings.delete(key); flushed++
+            }
           }
           for (const key of this.data.hashes.keys()) {
-            if (
-              key.startsWith("prehistoric:") ||
-              key.startsWith("pi_history:")   ||
-              key.startsWith("market_data:")  ||
-              // progression:{conn} hash — clear to reset cycle counters so the new
-              // session doesn't inherit stale placed/filled order counts
-              key.startsWith("progression:")  ||
-              key.startsWith("realtime:")     ||
-              key.startsWith("strategies_active:")
-            ) { this.data.hashes.delete(key); flushed++ }
-          }
-          for (const key of this.data.sets.keys()) {
-            if (key.startsWith("prehistoric:")) { this.data.sets.delete(key); flushed++ }
+            if (key.startsWith("prehistoric:progress:")) {
+              this.data.hashes.delete(key); flushed++
+            }
           }
 
           // 3. pseudo_position:{conn}:{id} + pseudo_positions:{conn} set —
