@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─�������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─����������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -1203,13 +1203,21 @@ export class StrategyCoordinator {
     // effect on the very next cycle (no engine restart required).
     ;(this as any)._trailingVariantsCache = undefined
     const out: Record<string, StrategyEvaluation[]> = {}
-    // Run per-symbol flows in parallel — they only share the ctx snapshot and
-    // each touches distinct symbol-scoped Redis keys.
-    await Promise.all(
-      items.map(async ({ symbol, indications }) => {
-        out[symbol] = await this.executeStrategyFlow(symbol, indications, isPrehistoric, ctx)
-      }),
-    )
+    // Cap concurrency so at most SYMBOL_CONCURRENCY symbol pipelines run
+    // simultaneously.  Each pipeline allocates Base + Main + Real + Live set
+    // graphs; running all N symbols in parallel multiplies peak live heap by N.
+    // SYMBOL_CONCURRENCY=3 (dev) / 6 (prod) keeps the in-flight set count
+    // proportional to what was previously tested at 5 symbols.
+    const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development" ? 3 : 6
+    const queue = [...items]
+    const workers = Array.from({ length: Math.min(SYMBOL_CONCURRENCY, queue.length) }, async () => {
+      while (queue.length > 0) {
+        const item = queue.shift()
+        if (!item) break
+        out[item.symbol] = await this.executeStrategyFlow(item.symbol, item.indications, isPrehistoric, ctx)
+      }
+    })
+    await Promise.all(workers)
     return out
   }
 
@@ -2822,15 +2830,19 @@ export class StrategyCoordinator {
           )
         }
 
-        // ── Variant tuning ──
-        // Block (size scaling) / DCA (leverage cap & DDT bias proxy) /
-        // pos-coord axis Sets (entries[].sizeMultiplier) / default+trailing
-        // (size only). All clamped to operator-safe bounds.
+        // ── Variant tuning — IMMUTABLE ENTRIES ──────────────────────────────
+        // Tuning deltas are written onto the CoordRecord (sizeDelta /
+        // leverageDelta / tunedAvgPF) instead of mutating entries[].sizeMultiplier
+        // in-place.
+        //
+        // WHY: axis Sets carry a synthetic representative entry that is now shared
+        // across cycles via the _axisSetLru cache. In-place entry mutation would
+        // corrupt the cached object for the next cycle. Writing a relative delta
+        // onto the per-cycle CoordRecord achieves the same sizing at dispatch:
+        //   tuned_size = bestEntry.sizeMultiplier × (1 + sizeDelta)
+        // (createLiveSets ~line 3791 already implements this exact formula.)
         const pos = s.prevPos
         if (pos && pos.count > 0) {
-          // Bias factor in [0.6, 1.4] derived from successRate (0.45 = neutral).
-          // Maps PF ≥ 1.5 → boost, PF < 0.8 → cut. Smooth so small PF wobbles
-          // don't cause jagged size jumps cycle-over-cycle.
           const sr = Math.max(0, Math.min(1, pos.successRate))
           const pfBias = pos.profitFactor <= 0
             ? 0.85
@@ -2838,64 +2850,33 @@ export class StrategyCoordinator {
           const sigBias = Math.max(0.7, Math.min(1.3, 0.7 + 1.2 * sr))
           const combined = (pfBias + sigBias) / 2
 
-          for (const e of s.entries) {
-            // Variant-specific tuning rules.
-            if (s.variant === "block") {
-              // Block scales size via the combined bias, but the operator
-              // explicitly configured block aggression (1.5× / 2.0× base).
-              // The tuner should only attenuate on bad signals — it must not
-              // reduce block sizing below 50% of the operator's chosen base
-              // (i.e. floor at 0.5 × base, not the universal 0.5 absolute).
-              // Without this floor a combined=0.65 cycle would shrink a 2.0×
-              // block entry to 1.3×, losing most of the block strategy's
-              // purpose (accumulating into an existing position at higher size).
-              const blockFloor = Math.max(0.5, e.sizeMultiplier * 0.5)
-              e.sizeMultiplier = Math.max(blockFloor, Math.min(2.0, e.sizeMultiplier * combined))
-            } else if (s.variant === "dca") {
-              // DCA recovery — only ATTENUATE leverage when historic PF poor;
-              // never amplify (recovery gambling is an anti-pattern).
-              if (pfBias < 1.0) {
-                e.leverage = Math.max(1, Math.floor(e.leverage * pfBias))
-                e.sizeMultiplier = Math.max(0.3, e.sizeMultiplier * pfBias)
-              }
-            } else if (s.axisWindows?.direction) {
-              // Position-count axis Set (Cartesian fan-out). Apply both
-              // sides of the bias — these are the "pos coord, ratios"
-              // family from the spec.
-              e.sizeMultiplier = Math.max(0.5, Math.min(1.5, e.sizeMultiplier * combined))
-            } else {
-              // default / trailing / pause — modest size bias, leverage left alone.
-              e.sizeMultiplier = Math.max(0.5, Math.min(1.5, e.sizeMultiplier * combined))
-            }
-          }
-          // Recompute aggregate PF/DDT after entry mutation so downstream
-          // ranking / filtering sees current values (Real already passed
-          // its filter pre-tuner, but Live ranks on these).
-          if (s.entries.length > 0) {
-            s.avgProfitFactor =
-              s.entries.reduce((a, e) => a + Number(e.profitFactor || 0), 0) /
-              s.entries.length
+          // sizeDelta = relative multiplier so dispatch applies:
+          //   tuned_size = base_size × (1 + sizeDelta)
+          let sizeDelta: number
+          let leverageDelta: number | undefined
+          if (s.variant === "block") {
+            // Block: attenuate via combined; floor at −0.5 keeps result ≥ 50% base.
+            sizeDelta = Math.max(-0.5, combined - 1)
+          } else if (s.variant === "dca") {
+            // DCA: only attenuate when historic PF poor — never amplify.
+            sizeDelta     = pfBias < 1.0 ? Math.max(-0.7, pfBias - 1) : 0
+            leverageDelta = pfBias < 1.0 ? pfBias - 1 : undefined
+          } else {
+            // default / trailing / pause / axis — symmetric bias ±0.5.
+            sizeDelta = Math.max(-0.5, Math.min(0.5, combined - 1))
           }
 
-          // ── Write tuning onto the CoordRecord ────────────────────────────
-          // The Real-stage tuner already mutated s.entries[].sizeMultiplier
-          // in-place above.  createLiveSets picks bestEntry from those same
-          // in-memory entry objects, so bestEntry.sizeMultiplier is already
-          // the post-tuned value.  We must NOT store a non-zero sizeDelta on
-          // the CoordRecord — if we did, createLiveSets would apply the
-          // combined bias a second time (double-tuning), e.g. a block entry
-          // at 2.0× tuned down to 1.3× would then get multiplied by 1.3 again
-          // to reach 1.69× — wrong.  Only tunedAvgPF is written here (used for
-          // SL/TP derivation at dispatch); sizeDelta is left undefined so the
-          // dispatch path falls through to bestEntry.sizeMultiplier directly.
+          // tunedAvgPF: apply combined bias to the current avgPF
+          // (avoids re-summing the now-unmodified entries array each cycle).
+          const tunedAvgPF = Math.max(0.5, (s.avgProfitFactor ?? 1) * combined)
+
           if (coordIndex) {
             const coordRec = coordIndex.byCoordKey.get(s.setKey)
             if (coordRec) {
-              coordRec.tunedAvgPF = s.avgProfitFactor  // post-tuner recomputed PF
-              // sizeDelta intentionally NOT set — entries already tuned in-place;
-              // setting it would cause a second application in createLiveSets.
-              coordRec.sizeDelta  = undefined
-              coordRec.status     = "valid_real"
+              coordRec.sizeDelta     = sizeDelta !== 0 ? sizeDelta : undefined
+              coordRec.leverageDelta = leverageDelta
+              coordRec.tunedAvgPF    = tunedAvgPF
+              coordRec.status        = "valid_real"
             }
           }
         }
@@ -4292,7 +4273,7 @@ export class StrategyCoordinator {
       return enabled === true
     })
 
-    // ── Block: live position × vol-ratio scaling ──────────────────────
+    // ── Block: live position × vol-ratio scaling ──────────────────��───
     //
     // The Block variant's `configs[].size` is the *base* multiplier. The
     // emitted Sets must scale on TWO live axes:
@@ -4701,54 +4682,38 @@ export class StrategyCoordinator {
     maxEntries: number,
     ctx?: PositionContext,
   ): Promise<StrategySet | null> {
-    const entries: StrategySetEntry[] = []
-    let idx = 0
+    // ── SLIM PATH (Base-Anchored Coordination Model) ──────────────────────
+    // Previously this function allocated a full entries[] by cross-joining
+    // baseSet.entries × profile.configs — ~800 array allocations/sec and
+    // ~80 000 object allocations/sec at 20-symbol live-trading scale.
+    // New design: compute avgPF/DDT/Cnf as scalars; return entries: [].
+    // createLiveSets (line ~3774) already handles entries.length === 0 by
+    // resolving Base entries via coordIndex.base.byKey.get(parentSetKey) —
+    // O(1), zero-copy.  The Real-stage tuner for-loop over s.entries becomes
+    // a no-op; coordRec.tunedAvgPF is written from s.avgProfitFactor here.
+    let sumPF = 0, sumDDT = 0, sumCnf = 0, count = 0
+    const baseDDTFallback = baseSet.avgDrawdownTime || 0
 
     outer: for (const baseEntry of baseSet.entries) {
       for (const cfg of profile.configs) {
-        if (idx >= maxEntries) break outer
-        // Project the base entry through the variant config
-        const pf  = Math.max(metrics.minProfitFactor, baseEntry.profitFactor * cfg.pfBias)
-        // Per-entry drawdownTime is 0 at Base (entries are raw indication
-        // slots), so seed it from the parent Base Set's historic windowed
-        // DDT (baseSet.avgDrawdownTime). Without this floor the variant DDT
-        // would always be just `cfg.ddtBias`, leaving the Real/Live DDT gate
-        // blind to realised drawdown-duration risk. The variant bias is then
-        // applied on top so Block/DCA/etc. can shift the structural baseline.
-        const baseDDT = baseEntry.drawdownTime > 0 ? baseEntry.drawdownTime : (baseSet.avgDrawdownTime || 0)
-        const ddt = baseDDT + cfg.ddtBias
+        if (count >= maxEntries) break outer
+        const pf      = Math.max(metrics.minProfitFactor, baseEntry.profitFactor * cfg.pfBias)
+        const baseDDT = baseEntry.drawdownTime > 0 ? baseEntry.drawdownTime : baseDDTFallback
+        const ddt     = baseDDT + cfg.ddtBias
         if (ddt > metrics.maxDrawdownTime) continue
-
-        entries.push({
-          id: `${baseSet.setKey}-${profile.name}-${idx}`,
-          sizeMultiplier: cfg.size,
-          leverage:       cfg.leverage,
-          positionState:  cfg.state,
-          profitFactor:   pf,
-          drawdownTime:   ddt,
-          // Confidence is preserved from the base entry — the variant changes
-          // sizing/leverage/state, not the underlying signal quality.
-          confidence:     Math.min(0.99, baseEntry.confidence),
-        })
-        idx++
+        sumPF  += pf
+        sumDDT += ddt
+        sumCnf += Math.min(0.99, baseEntry.confidence)
+        count++
       }
     }
 
-    if (entries.length === 0) return null
-    const capped = await this.pruneEntries(entries, maxEntries)
-    const avgPF  = capped.reduce((s, e) => s + Number(e.profitFactor  || 0), 0) / capped.length
-    const avgCnf = capped.reduce((s, e) => s + Number(e.confidence    || 0), 0) / capped.length
-    const avgDDT = capped.reduce((s, e) => s + Number(e.drawdownTime  || 0), 0) / capped.length
+    if (count === 0) return null
 
-    // ── Axis-window snapshot for this Set ──���────────────────────────────
-    // Mirrors the spec's four position-count axes with the documented
-    // step-1 windows (see StrategySet.axisWindows). When ctx is absent
-    // (legacy diagnostic call paths) we emit zeros, signalling "no axis
-    // dimensioning available". The `last` axis encodes the total count
-    // of recently-closed positions (lastPosCount, capped at 4) — using
-    // the raw count rather than the directional skew keeps the axis
-    // semantics consistent with the pause axis (which also counts all
-    // recent closes) and avoids the two-counters vs one-counter mismatch.
+    const avgPF  = sumPF  / count
+    const avgDDT = sumDDT / count
+    const avgCnf = sumCnf / count
+
     const axisWindows = ctx
       ? {
           prev:  Math.max(0, Math.min(12, ctx.prevPosCount)),
@@ -4759,10 +4724,6 @@ export class StrategyCoordinator {
       : { prev: 0, last: 0, cont: 0, pause: 0 }
 
     return {
-      // Variant-scoped setKey — `direction:long#default`, `direction:long#block`, …
-      // This guarantees unique identity downstream so Real/Live treat each
-      // variant as a distinct Set while still letting consumers trace
-      // lineage via `parentSetKey`.
       setKey:          `${baseSet.setKey}#${profile.name}`,
       parentSetKey:    baseSet.setKey,
       variant:         profile.name,
@@ -4772,13 +4733,12 @@ export class StrategyCoordinator {
       avgProfitFactor: avgPF,
       avgConfidence:   avgCnf,
       avgDrawdownTime: avgDDT,
-      entryCount:      capped.length,
-      entries:         capped,
+      entryCount:      count,
+      // EMPTY entries[] — Base entries resolved at dispatch via
+      // coordIndex.base.byKey.get(parentSetKey).  Eliminates the primary
+      // V8 heap driver (~80 000 object allocations per second).
+      entries:         [],
       createdAt:       new Date().toISOString(),
-      // Propagate prev-pos snapshot from parent Base Set unchanged. Real
-      // stage uses it to tune size/leverage; Live stage uses it for
-      // ranking. We never recompute here — the Base-stage snapshot is
-      // canonical for this Run cycle.
       ...(baseSet.prevPos && { prevPos: baseSet.prevPos }),
     }
   }
