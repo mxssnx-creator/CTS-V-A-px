@@ -2468,17 +2468,18 @@ const migrations: Migration[] = [
       const CONN_ID = "bingx-x01"
       const now = new Date().toISOString()
 
-      // 1. Correct stale volume factor — only fix if below minimum floor (1.0)
-      const connHash = (await client.hgetall(`connection:${CONN_ID}`).catch(() => null)) as Record<string,string> | null ?? {}
-      const storedFactor = parseFloat(connHash["live_volume_factor"] || "0")
-      if (!storedFactor || storedFactor < 1.0) {
-        await client.hset(`connection:${CONN_ID}`, {
-          live_volume_factor:   "2.2",
-          preset_volume_factor: "1.0",
-          updated_at:           now,
-        }).catch(() => {})
-        console.log(`[v0] Migration 041: corrected live_volume_factor ${storedFactor} → 2.2 on connection:${CONN_ID}`)
-      }
+      // 1. Correct stale volume factor unconditionally.
+      //    Some write paths stored a boolean "true" (live_volume_factor=true) instead
+      //    of a number string. parseFloat("true")=NaN, clampFactor("true")=null, so any
+      //    non-numeric value silently falls back to 1.0 in the volume route and the
+      //    QuickstartOptionsBar shows the wrong factor. Always overwrite with the
+      //    correct 2.2 default so every fresh DB starts with a sane live factor.
+      await client.hset(`connection:${CONN_ID}`, {
+        live_volume_factor:   "2.2",
+        preset_volume_factor: "1.0",
+        updated_at:           now,
+      }).catch(() => {})
+      console.log(`[v0] Migration 041: set live_volume_factor=2.2 on connection:${CONN_ID}`)
 
       // 2. Clear prehistoric_loaded cache gate — forces fresh prehistoric on
       //    next engine boot. This is idempotent: engine re-stamps it after a
