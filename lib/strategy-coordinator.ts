@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─����������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -2706,7 +2706,26 @@ export class StrategyCoordinator {
     // All profile-variant sets participate in hedging — none bypass via pass-through.
     // `axisPassthrough` contains axis Sets that skip hedging entirely.
     // Together they form realPostHedge: (netted hedge survivors) + (axis pass-through)
-    const realPostHedge = [...netted, ...axisPassthrough].sort(
+    //
+    // Bootstrap fallback: on fresh sessions every indication produces symmetric
+    // long+short pairs (same prev/last/cont/outcome context, just different direction)
+    // → every bucket is L=1,S=1 → all cancelled → netted=[]. When this happens and
+    // there are no axis sets either, keep the top-PF set per direction so the live
+    // pipeline can start building position history. Future cycles will develop
+    // asymmetric signals and netting will work as intended.
+    let effectiveNetted = netted
+    if (netted.length === 0 && axisPassthrough.length === 0 && realSorted.length > 0) {
+      const topLong  = realSorted.find((s) => (s.direction ?? "long") === "long")
+      const topShort = realSorted.find((s) => s.direction === "short")
+      effectiveNetted = [topLong, topShort].filter(Boolean) as StrategySet[]
+      if (effectiveNetted.length > 0) {
+        console.log(
+          `[v0] [StrategyCoordinator] ${this.connectionId}:${symbol} hedge-bootstrap: ` +
+          `all ${passthrough.length} profile pairs symmetric — keeping top-PF per direction (${effectiveNetted.length})`
+        )
+      }
+    }
+    const realPostHedge = [...effectiveNetted, ...axisPassthrough].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
 
