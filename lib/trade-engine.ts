@@ -257,6 +257,12 @@ export class GlobalTradeEngineCoordinator {
         await _cl.hset(`connection:${connectionId}`, {
           is_active_inserted:  "1",
           is_active:           "1",
+          // is_enabled_dashboard must also be "1" here so system-stats-v3
+          // reports the correct "Enabled on dashboard" count when the engine
+          // starts. The toggle-dashboard route sets it on explicit operator
+          // toggle, but startEngine is also called on OOM auto-restart where
+          // toggle-dashboard was never invoked.
+          is_enabled_dashboard: "1",
           updated_at:          new Date().toISOString(),
         })
       } catch { /* non-critical — dashboard can lag */ }

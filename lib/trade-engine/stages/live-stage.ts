@@ -2787,6 +2787,12 @@ export async function executeLivePosition(
         `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP will use order qty as fallback`,
         { orderId: livePosition.orderId, status: fill.status, fallbackQty: computedVolume }
       )
+      // BingX hedge-mode positions need ~1-2s after the market order is
+      // accepted before a stop/TP order can reference them — the venue returns
+      // 109420 "position not exist" if SL/TP is submitted too quickly after
+      // the entry in the unconfirmed-fill path. A 2 s wait here eliminates
+      // the race; reconcile will retry on the next tick regardless.
+      await new Promise((r) => setTimeout(r, 2000))
       await logLiveOrderFinal(orderTrace, {
         status: "placed",
         livePositionId: livePosition.id,
