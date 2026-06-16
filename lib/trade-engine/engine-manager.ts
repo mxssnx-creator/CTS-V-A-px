@@ -230,10 +230,11 @@ import {
  * MEMORY: raised 6 → 8 for 20-symbol runs. Each symbol's strategy pass builds a
  * large in-memory Set graph (Base→Main→Real). The CoordIndex optimisation (slim
  * SetCoordRecord scalars vs full StrategySet clones) significantly reduced per-symbol
- * peak allocation, making 8 safe at 6144 MB dev heap. At 20 symbols this keeps
- * strong parallelism (8 concurrent) while bounding simultaneous Set graphs.
+ * peak allocation. At 20 symbols with 6144 MB dev heap we drop to 5 concurrent
+ * to keep peak live Set-graph allocation below the eviction trigger threshold.
+ * Node is single-threaded — tighter concurrency yields to GC between symbols.
  */
-const SYMBOL_CONCURRENCY = 8
+const SYMBOL_CONCURRENCY = 5
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -3171,10 +3172,9 @@ export class TradeEngineManager {
 
         // OOM-protection: replay runs the FULL Base→Main→Real pipeline per
         // candle step (each step can materialise thousands of axis Sets +
-        // pseudo-position writes). Raised 2→3 with the 6144 MB heap budget and
-        // CoordIndex slim-allocation path; three symbols build Set graphs at once
-        // without the spike that previously OOM-killed at 4 GB.
-        const REPLAY_CONCURRENCY = 3
+        // pseudo-position writes). At 20 symbols we drop back to 2 concurrent
+        // to keep peak prehistoric-replay heap below the 1200 MB eviction floor.
+        const REPLAY_CONCURRENCY = 2
         const results = await withCycleDeadline(
           mapWithConcurrency(symbols, REPLAY_CONCURRENCY, replayOneSymbol),
           `Engine ${connId} prehistoric-progression`,
@@ -3637,7 +3637,7 @@ export class TradeEngineManager {
    * lost and self-stop. With LOCK_EXTEND_INTERVAL_MS = 15s and the
    * lock TTL = 90s we can comfortably tolerate up to 5 consecutive
    * miss-extends (75s) before the lock would naturally expire. 3 was
-   * too tight — a Redis blip of ~46s would cascade-self-stop ALL
+   * too tight ��� a Redis blip of ~46s would cascade-self-stop ALL
    * engines, requiring full auto-start-sweep restart (~75s total
    * downtime). 5 extends the survival window to 75s before self-stop.
    */

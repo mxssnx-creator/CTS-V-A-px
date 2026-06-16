@@ -389,13 +389,14 @@ export class InlineLocalRedis {
     if (globalCleanup.__redis_cleanup_started) return
     globalCleanup.__redis_cleanup_started = true
 
-    // Fire FREQUENTLY: the old 60s cadence could not keep up with the burst,
-    // which exceeded the ceiling well inside one interval. 8s catches it.
-    const CLEANUP_INTERVAL_MS = 8_000
-    // Trigger eviction well below the 4GB V8 ceiling so there is headroom to
-    // actually reclaim before allocation failure (the old 1GB constant was
-    // fine but the eviction it triggered was too narrow to matter).
-    const HEAP_PRESSURE_MB = 1800
+    // Fire FREQUENTLY: with 20 symbols live-trading the pipeline writes ~20x
+    // more keys per second than a 5-symbol run. 4s catches bursts before they
+    // compound across multiple intervals.
+    const CLEANUP_INTERVAL_MS = 4_000
+    // Trigger eviction at 1200 MB — well below the 4 GB V8 ceiling. With 20
+    // symbols the heap can jump ~400 MB in a single realtime cycle; we need
+    // to start shedding before the jump, not after.
+    const HEAP_PRESSURE_MB = 1200
 
     const ttlCleanupTimer = setInterval(() => {
       try {
@@ -503,17 +504,20 @@ export class InlineLocalRedis {
     //    of each family (FIFO — Map preserves insertion order, so the first
     //    entries are the oldest). config_set/pseudo_position carry a trailing
     //    `-<nowMs>` or timestamp component, so insertion order ≈ chronological.
+    // Caps are sized for 20-symbol live trading on a 6 GB dev heap.
+    // Each cap was halved vs the 5-symbol tuning (2025-06-12) because the
+    // per-cycle write rate scales linearly with symbol count.
     const hashFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
-      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 4000 },
+      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 2000 },
       // setSettings() prepends "settings:" so pseudo_position keys written via
       // setSettings land as "settings:pseudo_position:*" — cap those separately.
-      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 3000 },
-      { match: (k) => !isProtected(k) && (k.startsWith("config_set:") || k.includes(":config_set:")), cap: 3000 },
-      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":positions"), cap: 2000 },
-      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":detail"), cap: 2000 },
-      { match: (k) => !isProtected(k) && (k.startsWith("real_stage:") || k.startsWith("realstage:")), cap: 2000 },
-      { match: (k) => !isProtected(k) && k.startsWith("indication:") && k.includes(":result"), cap: 3000 },
-      { match: (k) => !isProtected(k) && k.startsWith("live_positions:") && k.includes(":history"), cap: 1000 },
+      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 1500 },
+      { match: (k) => !isProtected(k) && (k.startsWith("config_set:") || k.includes(":config_set:")), cap: 1500 },
+      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":positions"), cap: 1000 },
+      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":detail"), cap: 1000 },
+      { match: (k) => !isProtected(k) && (k.startsWith("real_stage:") || k.startsWith("realstage:")), cap: 1000 },
+      { match: (k) => !isProtected(k) && k.startsWith("indication:") && k.includes(":result"), cap: 1500 },
+      { match: (k) => !isProtected(k) && k.startsWith("live_positions:") && k.includes(":history"), cap: 500 },
     ]
     for (const { match, cap } of hashFamilyCaps) {
       const matching: string[] = []
@@ -532,11 +536,11 @@ export class InlineLocalRedis {
 
     // 2) String families (setSettings can store flat JSON as strings too).
     const stringFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
-      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 4000 },
-      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 3000 },
-      { match: (k) => !isProtected(k) && (k.includes(":exists:") || k.includes(":dedup:")), cap: 6000 },
-      { match: (k) => !isProtected(k) && k.startsWith("strategy_detail:"), cap: 2000 },
-      { match: (k) => !isProtected(k) && (k.startsWith("candle_cache:") || k.startsWith("market_data_cache:")), cap: 60 },
+      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 2000 },
+      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 1500 },
+      { match: (k) => !isProtected(k) && (k.includes(":exists:") || k.includes(":dedup:")), cap: 3000 },
+      { match: (k) => !isProtected(k) && k.startsWith("strategy_detail:"), cap: 1000 },
+      { match: (k) => !isProtected(k) && (k.startsWith("candle_cache:") || k.startsWith("market_data_cache:")), cap: 30 },
     ]
     for (const { match, cap } of stringFamilyCaps) {
       const matching: string[] = []
@@ -572,7 +576,7 @@ export class InlineLocalRedis {
 
     // 4) Prune oversized membership sets so smembers() can't materialise huge
     //    arrays. These hold pseudo-position ids; trim to the newest entries.
-    const SET_MEMBER_CAP = 8000
+    const SET_MEMBER_CAP = 4000
     for (const [key, members] of this.data.sets.entries()) {
       if (
         (key.startsWith("pseudo_positions:") || key.startsWith("real_pseudo_positions:")) &&
