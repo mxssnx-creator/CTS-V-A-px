@@ -1133,8 +1133,8 @@ async function placeProtectionOrder(
     if (!result?.success) {
       const errMsg109 = String(result?.error || "")
       if (errMsg109.includes("109420") || /position not exist/i.test(errMsg109)) {
-        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 4s before retry`)
-        await new Promise((r) => setTimeout(r, 4000))
+        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 6s before retry`)
+        await new Promise((r) => setTimeout(r, 6000))
         result = await placeStop(effectiveQty)
         if (!result?.success) {
           console.warn(`${tag} 109420 retry also failed (error=${result?.error}) — reconcile will retry on next tick`)
@@ -1701,7 +1701,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ────────────────────────────────────────────────────────────
+// ── Main Pipeline ───���────────────────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -2828,13 +2828,14 @@ export async function executeLivePosition(
         `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP will use order qty as fallback`,
         { orderId: livePosition.orderId, status: fill.status, fallbackQty: computedVolume }
       )
-      // BingX hedge-mode positions need 3-5s after market order acceptance
-      // before a stop/TP can reference them — 109420 "position not exist"
-      // fires if SL/TP is submitted too quickly (confirmed in DOGE/ADA logs).
-      // The placeProtectionOrder function also has a 109420 retry (+4s), so
-      // the total window before giving up is 5s + 4s = 9s. Reconcile arms
-      // protection on the next tick if both attempts fail.
-      await new Promise((r) => setTimeout(r, 5000))
+      // BingX hedge-mode positions need time after market order acceptance
+      // before a STOP/TP_MARKET can reference them — 109420 "position not exist"
+      // fires if SL/TP is submitted too quickly (confirmed in DOGE/ADA/AAVE logs).
+      // AAVEUSDT observed to need >9s (5s wait + 4s retry both failed), so
+      // raised to 8s here. Combined with the 6s 109420 retry inside
+      // placeProtectionOrder the total window is 8s + 6s = 14s before giving up.
+      // Reconcile arms protection on the next tick if both attempts still fail.
+      await new Promise((r) => setTimeout(r, 8000))
       await logLiveOrderFinal(orderTrace, {
         status: "placed",
         livePositionId: livePosition.id,
