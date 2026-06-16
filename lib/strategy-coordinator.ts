@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─����������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─������������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -698,7 +698,11 @@ export class StrategyCoordinator {
   // Axis Set objects are pure value objects once the tuner writes sizeDelta
   // onto the CoordRecord instead of mutating entries[] in-place.  Safe to
   // reuse across cycles without cloning.  Key = "${parentKey}:${axisKey}:ec${ec}".
-  private static readonly _AXIS_LRU_MAX = 16_000
+  // 20 symbols × MAIN_AXIS_SETS_CEILING(6000) = up to 120k unique axis keys.
+  // 32k fits ~2 full-ceiling symbols without eviction, making the cache effective
+  // for the hot symbols that consistently clear the 6000-set ceiling.
+  // Previously 16k caused constant eviction+re-allocation on the 6000-set ceiling.
+  private static readonly _AXIS_LRU_MAX = 32_000
   private static readonly _axisLruMap: Map<string, StrategySet> = new Map()
   private static _axisLruGet(key: string): StrategySet | undefined {
     const hit = StrategyCoordinator._axisLruMap.get(key)
@@ -1628,7 +1632,7 @@ export class StrategyCoordinator {
         )
       }
 
-      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────────────────��─��─
+      // ── ACTIVE-NOW snapshot per (symbol, stage) ─────────────────��─��─��─
       // The cumulative `strategies_base_total` hincrby above answers
       // "how many Base Sets have been created EVER", but the dashboard
       // Overview asks "how many are alive RIGHT NOW for this symbol".
@@ -3045,18 +3049,23 @@ export class StrategyCoordinator {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
       const realDetailKey = `strategy_detail:${this.connectionId}:real`
-      const realAvgPF   = realSets.length > 0 ? realSets.reduce((s, st) => s + st.avgProfitFactor, 0) / realSets.length : 0
-      const realAvgDDT  = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / realSets.length : 0
-      // Position evaluation real: average confidence of REAL sets
-      // (how well did the Real stage filter perform)
-      const realAvgConf = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgConfidence || 0), 0) / realSets.length : 0
+      // Single pass over realSets — replaces 4 separate .reduce() calls that each
+      // allocated an intermediate result and iterated the full array independently.
+      let _sumPF = 0, _sumDDT = 0, _sumConf = 0, _sumEC = 0
+      for (const st of realSets) {
+        _sumPF   += st.avgProfitFactor
+        _sumDDT  += st.avgDrawdownTime  || 0
+        _sumConf += st.avgConfidence    || 0
+        _sumEC   += st.entryCount       || 0
+      }
+      const n = realSets.length
+      const realAvgPF        = n > 0 ? _sumPF   / n : 0
+      const realAvgDDT       = n > 0 ? _sumDDT  / n : 0
+      const realAvgConf      = n > 0 ? _sumConf / n : 0
+      const realEntriesTotal = _sumEC
+      const realAvgPosPerSet = n > 0 ? _sumEC   / n : 0
       // passRatioReal = fraction of ELIGIBLE Main Sets that passed into Real.
-      // `mainPFEligible` is computed once above (outside this try-block) and
-      // reused here — the duplicate inner `const mainPFEligible` that used to
-      // shadow it was removed to fix the redundant filter re-computation.
-      const passRatioReal = mainPFEligible > 0 ? realSets.length / mainPFEligible : 0
-      const realEntriesTotal  = realSets.reduce((s, st) => s + (st.entryCount || 0), 0)
-      const realAvgPosPerSet  = realSets.length > 0 ? realEntriesTotal / realSets.length : 0
+      const passRatioReal = mainPFEligible > 0 ? n / mainPFEligible : 0
       // Average entryCount per Real Set — identical to realAvgPosPerSet.
       // The previous formula used Math.max(1, entryCount||1) which biased
       // Sets with entryCount=0 upward. Reuse the already-correct value.
@@ -3187,26 +3196,15 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:main:passed`, 86400),
       ]
-      // Persist Real Sets for Live evaluation — skip in dev to prevent OOM.
-      // In dev, createLiveSets is always called with in-memory realSets directly
-      // (coordinateForActualOne ~line 1179), so the Redis persist is unnecessary.
-      // In prod, the blob is needed so the NEXT cycle can load realSets from Redis.
-      // Serialising 960 Sets × ~250 KB × 20 symbols = ~4.8 GB/cycle was the
-      // primary OOM cause: 856 MB/min RSS growth until the server was killed.
-      if (process.env.NODE_ENV !== "development") {
-        writes.push(
-          client.set(
-            `strategies:${this.connectionId}:${symbol}:real:sets`,
-            JSON.stringify({
-              sets: realSets,
-              count: realSets.length,
-              created: new Date().toISOString(),
-              updatedAt: Date.now(),
-            }),
-          ),
-          client.expire(`strategies:${this.connectionId}:${symbol}:real:sets`, 86400),
-        )
-      }
+      // NOTE: real:sets persistence is handled earlier in evaluateRealSets via the
+      // slim-format write (setKeys array only, ~30 bytes/set vs ~2-5 KB for a full blob).
+      // The legacy full-blob write that was here was: (a) writing to a different Redis
+      // key than the slim writer (raw key vs settings:-prefixed key), so it was never
+      // read by createLiveSets; (b) consuming ~50 KB × 20 symbols = 1 MB/cycle in prod
+      // with no benefit. It has been removed. The slim write at line ~3027 is the only
+      // real:sets persistence path and the reader at createLiveSets uses getSettings()
+      // which resolves the settings:-prefixed path correctly.
+
       // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
       // strategies_real_evaluated = Main Sets that entered REAL (input count).
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
@@ -3267,19 +3265,26 @@ export class StrategyCoordinator {
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       }
+      // Slim-path Real Sets carry entries:[] — use set-level scalar aggregates
+      // (entryCount, avgProfitFactor, avgDrawdownTime) instead of iterating
+      // entries. This mirrors the Main-stage variantAgg fix and ensures
+      // strategy_variant_real:* hashes are populated (the old entry loop never
+      // ran, so agg.entries was always 0 and the write guard below always skipped).
       for (const set of realSets) {
-        const setVariant = (set.variant as keyof typeof realVariantAgg) ?? "default"
-        realVariantAgg[setVariant].setsContaining += 1
-        realVariantAgg[setVariant].passedSets     += 1
-        for (const entry of set.entries) {
-          realVariantAgg[setVariant].entries += 1
-          realVariantAgg[setVariant].sumPF   += Number(entry.profitFactor || 0)
-          realVariantAgg[setVariant].sumDDT  += Number(entry.drawdownTime || 0)
-        }
+        const sv = (set.variant as keyof typeof realVariantAgg) ?? "default"
+        const agg = realVariantAgg[sv] ?? realVariantAgg.default
+        const ec  = set.entryCount || 0
+        agg.setsContaining += 1
+        agg.passedSets     += 1
+        agg.entries        += ec
+        agg.sumPF          += set.avgProfitFactor * ec
+        agg.sumDDT         += (set.avgDrawdownTime || 0) * ec
       }
       for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
         const agg = realVariantAgg[variant]
-        if (agg.entries === 0) continue
+        // Guard on setsContaining (not entries) so sets with entryCount=0 still
+        // contribute their count metadata to the variant hash.
+        if (agg.setsContaining === 0) continue
         const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
         writes.push(
           client.hincrby(vKey, "entries_count",  agg.entries),
@@ -3375,7 +3380,7 @@ export class StrategyCoordinator {
       try {
         const recompute: Promise<any>[] = []
         for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
-          if (realVariantAgg[variant].entries === 0) continue
+          if (realVariantAgg[variant].setsContaining === 0) continue
           const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
           recompute.push(
             (async () => {
@@ -3563,8 +3568,12 @@ export class StrategyCoordinator {
       })
     }
 
-    // Create pseudo positions from REAL/LIVE sets so they appear on dashboard
-    await this.createPseudoPositionsFromRealSets(symbol, realSets)
+    // Create pseudo positions from the LIVE-qualifying subset only.
+    // Previously received all `realSets` (up to 3000/symbol), causing N×3 Redis
+    // writes for sets that never reach live dispatch. `qualifying` is the capped
+    // Live subset (typically ≤500/symbol) — the only sets that semantically need
+    // pseudo-position records (they represent active dispatch candidates).
+    await this.createPseudoPositionsFromRealSets(symbol, qualifying)
 
     // Write live set count into progression hash — use hset so count reflects current cycle snapshot.
     // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
@@ -3638,10 +3647,13 @@ export class StrategyCoordinator {
       const liveVariantWrites: Promise<any>[] = []
       for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
         const agg = liveVariantAgg[variant]
-        if (agg.entries === 0) continue
-        const vKey = `strategy_variant_live:${this.connectionId}:${variant}`
-        const avgPF  = agg.sumPF  / agg.entries
-        const avgDDT = agg.sumDDT / agg.entries
+        // Guard on setsContaining — a variant bucket with sets but entryCount=0
+        // still contributes count metadata. Avoids writing empty buckets.
+        if (agg.setsContaining === 0) continue
+        const vKey   = `strategy_variant_live:${this.connectionId}:${variant}`
+        const ec     = agg.entries || 1   // guard division — falls back to 1 if entryCount unset
+        const avgPF  = agg.sumPF  / ec
+        const avgDDT = agg.sumDDT / ec
         liveVariantWrites.push(
           client.hset(vKey, {
             created_sets:      String(agg.setsContaining),
