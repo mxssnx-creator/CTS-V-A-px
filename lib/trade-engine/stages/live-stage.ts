@@ -624,8 +624,10 @@ function isCircuitBreakerError(payload: unknown): boolean {
   }
   return (
     /\bcode\s*=?\s*109400\b/.test(text) ||
+    /\bcode\s*=?\s*109418\b/.test(text) ||   // symbol offline / delisted
     /api orders? (?:are )?temporarily disabled/i.test(text) ||
-    /large market fluctuations/i.test(text)
+    /large market fluctuations/i.test(text) ||
+    /is offline currently/i.test(text)
   )
 }
 

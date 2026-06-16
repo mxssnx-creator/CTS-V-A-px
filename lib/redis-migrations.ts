@@ -2187,6 +2187,43 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "36")
     },
   },
+
+  {
+    version: 38,
+    description: "Replace delisted MATICUSDT with POLUSDT in bingx-x01 force_symbols",
+    up: async (client: any) => {
+      const CONN_ID = "bingx-x01"
+      const conn = await client.hgetall(`connection:${CONN_ID}`)
+      if (!conn) {
+        console.log(`[v0] Migration 038: ${CONN_ID} not found — skipping`)
+        return
+      }
+      // Parse existing force_symbols and replace MATICUSDT → POLUSDT.
+      // Handles both plain JSON array strings and comma-separated strings.
+      let syms: string[] = []
+      const raw = conn.force_symbols || conn.active_symbols || ""
+      try { syms = JSON.parse(raw) } catch {
+        syms = raw ? raw.split(",").map((s: string) => s.trim()).filter(Boolean) : []
+      }
+      if (!syms.length) {
+        // No existing override — seed the canonical 20-symbol list with POLUSDT
+        syms = BASE_TEST_SYMBOLS
+      } else if (syms.includes("MATICUSDT")) {
+        syms = syms.map((s) => (s === "MATICUSDT" ? "POLUSDT" : s))
+      } else {
+        console.log(`[v0] Migration 038: MATICUSDT not in ${CONN_ID} force_symbols — no change needed`)
+        return
+      }
+      const symJson = JSON.stringify(syms)
+      await client.hset(`connection:${CONN_ID}`, "force_symbols", symJson)
+      // Also sync the symbol_count field so the dashboard shows the correct number.
+      await client.hset(`connection:${CONN_ID}`, "symbol_count", String(syms.length))
+      console.log(`[v0] Migration 038: ${CONN_ID} force_symbols updated (MATICUSDT → POLUSDT): ${syms.join(",")}`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "37")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -2215,7 +2252,7 @@ const BASE_CONNECTION_CONFIG: Array<{
 const BASE_TEST_SYMBOLS = [
   "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
   "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
-  "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+  "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "POLUSDT",
   "AAVEUSDT", "SUIUSDT",  "APTUSDT",  "ARBUSDT",  "OPUSDT",
 ]
 

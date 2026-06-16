@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─��������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─����������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -2324,7 +2324,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 3: REAL ────────────────────────────────────────────────────────��──
+  // ─── STAGE 3: REAL ──��─────────────────────────────────────────────────────��──
 
   /**
    * Create pseudo positions from REAL sets for dashboard visualization.
