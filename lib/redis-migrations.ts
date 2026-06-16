@@ -2256,6 +2256,7 @@ const migrations: Migration[] = [
     // getSymbols() actually reads.  Migration 039 re-applies the correct write
     // regardless of whether 038 ran.
     version: 39,
+    // ↑ keep 038/039 as-is for existing DBs that already ran them
     description: "Re-apply POLUSDT force_symbols to settings: prefixed hashes (fixes 038 write-path bug)",
     up: async (client: any) => {
       const CONN_ID = "bingx-x01"
