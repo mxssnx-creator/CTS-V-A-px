@@ -1590,20 +1590,25 @@ export async function initRedis(): Promise<void> {
         const data = (globalForRedis as any).__redis_data as typeof globalForRedis.__redis_data | undefined
         if (data) {
           let cleared = 0
+          // live:position:* keys are written via setSettings() which prepends
+          // "settings:" — so the actual Map keys are "settings:live:position:*".
+          // The lock keys (live:lock:*) are written via client.set() directly so
+          // they have no prefix. Clear both prefixed and un-prefixed variants.
+          const isLiveKey = (k: string) =>
+            k.startsWith("live:position:") ||
+            k.startsWith("live:positions:") ||
+            k.startsWith("settings:live:position:") ||
+            k.startsWith("settings:live:positions:") ||
+            k.startsWith("live:lock:")
+
           for (const key of data.strings.keys()) {
-            if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("live:lock:")) {
-              data.strings.delete(key); cleared++
-            }
+            if (isLiveKey(key)) { data.strings.delete(key); cleared++ }
           }
           for (const key of data.lists.keys()) {
-            if (key.startsWith("live:positions:") || key.startsWith("live:position:")) {
-              data.lists.delete(key); cleared++
-            }
+            if (isLiveKey(key)) { data.lists.delete(key); cleared++ }
           }
           for (const key of data.hashes.keys()) {
-            if (key.startsWith("live:position:")) {
-              data.hashes.delete(key); cleared++
-            }
+            if (isLiveKey(key)) { data.hashes.delete(key); cleared++ }
           }
           if (cleared > 0) {
             console.log(`[v0] [Redis] Dev initRedis flush: cleared ${cleared} stale live position/lock keys`)

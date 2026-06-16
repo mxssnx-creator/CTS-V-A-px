@@ -2194,32 +2194,56 @@ const migrations: Migration[] = [
     description: "Replace delisted MATICUSDT with POLUSDT in bingx-x01 force_symbols",
     up: async (client: any) => {
       const CONN_ID = "bingx-x01"
-      const conn = await client.hgetall(`connection:${CONN_ID}`)
-      if (!conn) {
-        console.log(`[v0] Migration 038: ${CONN_ID} not found — skipping`)
-        return
+
+      // getSymbols() calls getSettings("trade_engine_state:{id}") and
+      // getSettings("connection:{id}") — getSettings() prepends "settings:"
+      // so the actual Redis keys are "settings:trade_engine_state:{id}" and
+      // "settings:connection:{id}".  We must write force_symbols to those
+      // prefixed hashes, NOT to the raw "connection:{id}" hash, for the
+      // engine to pick it up without a restart.
+      const PREFIXED_STATE  = `settings:trade_engine_state:${CONN_ID}`
+      const PREFIXED_CONN   = `settings:connection:${CONN_ID}`
+      const RAW_CONN        = `connection:${CONN_ID}`
+
+      // Read current force_symbols from the prefixed state hash first
+      // (highest priority in getSymbols), then fall back to the raw conn hash.
+      const [stateHash, connHash] = await Promise.all([
+        client.hgetall(PREFIXED_STATE).catch(() => null),
+        client.hgetall(RAW_CONN).catch(() => null),
+      ])
+
+      const parseSyms = (raw: string | null | undefined): string[] => {
+        if (!raw) return []
+        try { const arr = JSON.parse(raw); return Array.isArray(arr) ? arr : [] } catch { /* ignore */ }
+        return raw.split(",").map((s: string) => s.trim()).filter(Boolean)
       }
-      // Parse existing force_symbols and replace MATICUSDT → POLUSDT.
-      // Handles both plain JSON array strings and comma-separated strings.
-      let syms: string[] = []
-      const raw = conn.force_symbols || conn.active_symbols || ""
-      try { syms = JSON.parse(raw) } catch {
-        syms = raw ? raw.split(",").map((s: string) => s.trim()).filter(Boolean) : []
-      }
-      if (!syms.length) {
-        // No existing override — seed the canonical 20-symbol list with POLUSDT
-        syms = BASE_TEST_SYMBOLS
-      } else if (syms.includes("MATICUSDT")) {
-        syms = syms.map((s) => (s === "MATICUSDT" ? "POLUSDT" : s))
-      } else {
-        console.log(`[v0] Migration 038: MATICUSDT not in ${CONN_ID} force_symbols — no change needed`)
-        return
-      }
+
+      // Determine current symbol list: prefer what the engine will actually read.
+      const existingForce  = parseSyms((stateHash as any)?.force_symbols)
+      const existingActive = parseSyms((stateHash as any)?.active_symbols)
+      const rawConnSyms    = parseSyms((connHash as any)?.force_symbols || (connHash as any)?.active_symbols)
+
+      let syms = existingForce.length ? existingForce
+               : existingActive.length ? existingActive
+               : rawConnSyms.length ? rawConnSyms
+               : [...BASE_TEST_SYMBOLS]          // fresh DB — seed canonical list
+
+      const hadMatic = syms.includes("MATICUSDT")
+      syms = syms.map((s) => (s === "MATICUSDT" ? "POLUSDT" : s))
+
       const symJson = JSON.stringify(syms)
-      await client.hset(`connection:${CONN_ID}`, "force_symbols", symJson)
-      // Also sync the symbol_count field so the dashboard shows the correct number.
-      await client.hset(`connection:${CONN_ID}`, "symbol_count", String(syms.length))
-      console.log(`[v0] Migration 038: ${CONN_ID} force_symbols updated (MATICUSDT → POLUSDT): ${syms.join(",")}`)
+
+      // Write to all three hashes so nothing is stale regardless of read path.
+      await Promise.all([
+        client.hset(PREFIXED_STATE, { force_symbols: symJson, symbol_count: String(syms.length) }),
+        client.hset(PREFIXED_CONN,  { force_symbols: symJson, symbol_count: String(syms.length) }),
+        client.hset(RAW_CONN,       { force_symbols: symJson, symbol_count: String(syms.length) }),
+      ])
+
+      console.log(
+        `[v0] Migration 038: ${CONN_ID} force_symbols updated ` +
+        `(MATICUSDT→POLUSDT: ${hadMatic}): ${syms.join(",")}`,
+      )
     },
     down: async (client: any) => {
       await client.set("_schema_version", "37")
@@ -2845,7 +2869,7 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
     
     if (pendingMigrations.length === 0) {
       // Suppress the "already at latest" line after the first occurrence
-      // in this process — it fires on every module reload and contributes
+      // in this process ��� it fires on every module reload and contributes
       // most of the log noise during normal operation.
       if (!ensureBootstrapDiag.has("already_latest")) {
         ensureBootstrapDiag.add("already_latest")
