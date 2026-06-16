@@ -58,7 +58,7 @@ export interface StrategySet {
   avgDrawdownTime: number
   entryCount: number        // number of config entries in this set (max 250)
   entries: StrategySetEntry[]
-  createdAt: string
+  createdAt?: string
   
   /**
    * ── Set validity status across stages ──────────────────────────────────
@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─������������������ Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -692,6 +692,28 @@ export class StrategyCoordinator {
       if (oldest !== undefined) StrategyCoordinator._fpLru.delete(oldest)
     }
     StrategyCoordinator._fpLru.set(fp, set)
+  }
+
+  // ── Axis-Set LRU ─────────────────────────────────────────────────────────
+  // Axis Set objects are pure value objects once the tuner writes sizeDelta
+  // onto the CoordRecord instead of mutating entries[] in-place.  Safe to
+  // reuse across cycles without cloning.  Key = "${parentKey}:${axisKey}:ec${ec}".
+  private static readonly _AXIS_LRU_MAX = 16_000
+  private static readonly _axisLruMap: Map<string, StrategySet> = new Map()
+  private static _axisLruGet(key: string): StrategySet | undefined {
+    const hit = StrategyCoordinator._axisLruMap.get(key)
+    if (hit !== undefined) {
+      StrategyCoordinator._axisLruMap.delete(key)
+      StrategyCoordinator._axisLruMap.set(key, hit)
+    }
+    return hit
+  }
+  private static _axisLruSet(key: string, set: StrategySet): void {
+    if (StrategyCoordinator._axisLruMap.size >= StrategyCoordinator._AXIS_LRU_MAX) {
+      const oldest = StrategyCoordinator._axisLruMap.keys().next().value
+      if (oldest !== undefined) StrategyCoordinator._axisLruMap.delete(oldest)
+    }
+    StrategyCoordinator._axisLruMap.set(key, set)
   }
 
   /**
@@ -3598,7 +3620,7 @@ export class StrategyCoordinator {
           evaluated:         String(realSets.length),
           passed_sets:       String(qualifying.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
-          // ── ACTIVELY-RUNNING metrics (operator spec) ───────────���──
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
           //   Live's `qualifying` Sets ARE the executed orders. They
           //   are by definition "running" — exchange has accepted the
           //   order or is holding the position. `sets_progressing` is
@@ -4273,7 +4295,7 @@ export class StrategyCoordinator {
       return enabled === true
     })
 
-    // ── Block: live position × vol-ratio scaling ─────────────────����───
+    // ── Block: live position × vol-ratio scaling ──────────────��──����───
     //
     // The Block variant's `configs[].size` is the *base* multiplier. The
     // emitted Sets must scale on TWO live axes:
