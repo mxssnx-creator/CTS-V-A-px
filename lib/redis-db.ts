@@ -398,6 +398,24 @@ export class InlineLocalRedis {
     // to start shedding before the jump, not after.
     const HEAP_PRESSURE_MB = 1200
 
+    // Run one immediate eviction pass at startup to clear any stale keys left
+    // from previous hot-reload cycles (the globalThis Map persists across
+    // Next.js module hot-reloads without a full process restart).
+    setTimeout(() => {
+      try {
+        const totalKeys = this.data.strings.size + this.data.hashes.size +
+                          this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
+        if (totalKeys > 5_000) {
+          console.log(`[v0] [Redis Memory] Startup: ${totalKeys} stale keys from hot-reload, evicting...`)
+          this.evictOldRecords()
+          ;(globalThis as any).gc?.()
+          const after = this.data.strings.size + this.data.hashes.size +
+                        this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
+          console.log(`[v0] [Redis Memory] Startup eviction complete: ${totalKeys} → ${after} keys`)
+        }
+      } catch (_) {}
+    }, 500)
+
     const ttlCleanupTimer = setInterval(() => {
       try {
         // First, clean up expired keys
