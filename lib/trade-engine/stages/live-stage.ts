@@ -1109,6 +1109,25 @@ async function placeProtectionOrder(
       }
     }
 
+    // ── code=109420: "position not exist" ──────────────────────────────────
+    // BingX hedge-mode positions need a short settling period after a market
+    // order is accepted before a STOP/TP can reference them. In the
+    // unconfirmed-fill path the 2 s post-fill wait (live-stage ~line 2795)
+    // is sometimes insufficient for volatile symbols (DOGE, ADA). Retry once
+    // after an additional 2 s; reconcile will arm the order on the next tick
+    // if the retry also fails (position will have settled by then).
+    if (!result?.success) {
+      const errMsg109 = String(result?.error || "")
+      if (errMsg109.includes("109420") || /position not exist/i.test(errMsg109)) {
+        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 2s before retry`)
+        await new Promise((r) => setTimeout(r, 2000))
+        result = await placeStop(effectiveQty)
+        if (!result?.success) {
+          console.warn(`${tag} 109420 retry also failed — reconcile will retry on next tick`)
+        }
+      }
+    }
+
     const latencyMs = Date.now() - placeStart
     // Coerce id to string. Some venues return numeric ids; downstream
     // code does `if (pos.stopLossOrderId)` checks that would mistake a
@@ -2787,12 +2806,13 @@ export async function executeLivePosition(
         `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP will use order qty as fallback`,
         { orderId: livePosition.orderId, status: fill.status, fallbackQty: computedVolume }
       )
-      // BingX hedge-mode positions need ~1-2s after the market order is
-      // accepted before a stop/TP order can reference them — the venue returns
-      // 109420 "position not exist" if SL/TP is submitted too quickly after
-      // the entry in the unconfirmed-fill path. A 2 s wait here eliminates
-      // the race; reconcile will retry on the next tick regardless.
-      await new Promise((r) => setTimeout(r, 2000))
+      // BingX hedge-mode positions need 2-4s after market order acceptance
+      // before a stop/TP can reference them — 109420 "position not exist"
+      // fires if SL/TP is submitted too quickly (seen on DOGE, ADA). The
+      // placeProtectionOrder function also has a 109420 retry (+2s) so the
+      // total window is effectively 3.5s + 2s = 5.5s before giving up.
+      // Reconcile will arm the order on the next tick if both attempts fail.
+      await new Promise((r) => setTimeout(r, 3500))
       await logLiveOrderFinal(orderTrace, {
         status: "placed",
         livePositionId: livePosition.id,
