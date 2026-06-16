@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─��������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─���������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -1475,9 +1475,15 @@ export class StrategyCoordinator {
       }
     }
 
-    // Persist BASE sets
-    const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
-    await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
+    // Persist BASE sets — skipped in dev mode.
+    // Each baseSets blob contains full StrategySet objects (~10 KB each).
+    // Writing these to InlineLocalRedis on every cycle causes rapid heap growth
+    // that OOM-kills the dev server with 20 symbols. In prod this write is kept
+    // for cross-restart recovery; in dev the coordIndex holds the live state.
+    if (process.env.NODE_ENV !== "development") {
+      const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
+      await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
+    }
 
     // Write Base counts to progression hash so stats API and dashboard read accurate per-stage counts.
     // CRITICAL: Use hincrby (cumulative) not hset (snapshot). Previously each cycle overwrote the
@@ -1937,7 +1943,7 @@ export class StrategyCoordinator {
       }
     }
 
-    // ── Log min-pos skip count (diagnostic) ───────────────────────
+    // ── Log min-pos skip count (diagnostic) ──────────────────���────
     // Surface the number of Base Sets that didn't meet `mainEvalPosCount`
     // at this cycle so the operator can see when the threshold is
     // throttling promotion. Non-critical; debug level.
@@ -2092,8 +2098,13 @@ export class StrategyCoordinator {
 
     // Persist MAIN sets + fingerprint cache. Fingerprint cache has a short
     // TTL so stale entries don't re-surface after context changes settle.
-    const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
-    await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
+    // MAIN sets write is skipped in dev mode — 1920 full StrategySet objects
+    // per symbol per cycle serialise to ~19 MB each in InlineLocalRedis,
+    // causing OOM at ~30s with 20 symbols. The coordIndex holds live state.
+    if (process.env.NODE_ENV !== "development") {
+      const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
+      await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
+    }
     try {
       if (Object.keys(nextFpCache).length > 0) {
         // Replace the cache atomically so deletions take effect (a Set that
@@ -3240,7 +3251,7 @@ export class StrategyCoordinator {
         }
       }
       for (const axis of ["prev", "last", "cont", "pause"] as const) {
-        // Combined (direction-agnostic) — backwards-compatible key
+        // Combined (direction-agnostic) ��� backwards-compatible key
         const aKey      = `strategy_axis_real:${this.connectionId}:${axis}`
         // Direction-split keys — per-spec granularity
         const aKeyLong  = `strategy_axis_real:${this.connectionId}:${axis}:long`
