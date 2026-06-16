@@ -200,7 +200,7 @@ export interface StrategySet {
    *      Base→Main filters reject it.
    *   2. evaluateRealSets uses `successRate`/`profitFactor` to TUNE
    *      `entries[].sizeMultiplier` and `leverage` per variant — the
-   *      "Real stage �� accumulation for pos cnts sets … relying to
+   *      "Real stage ��� accumulation for pos cnts sets … relying to
    *      their base sets configs independent" path.
    */
   prevPos?: {
@@ -252,7 +252,117 @@ export interface PositionContext {
   perSymbolOpenByDir: Record<string, { long: number; short: number }>
 }
 
-// ── Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─── BASE-ANCHORED COORDINATION MODEL ────────────────────────────────────────
+//
+// Downstream stages (Main, Real, Live) no longer construct or clone full
+// StrategySet objects solely for status tracking / tuning. Instead they:
+//   1. Operate on lightweight SetCoordRecord scalars that point at Base Sets.
+//   2. Resolve Base Set data on demand via O(1) BaseRegistry.byKey lookups.
+//   3. Write tuning deltas (sizeDelta, tunedAvgPF) onto the record — not onto
+//      mutated entry copies spread across N clones.
+//
+// The StrategySet interface and its entries[] array remain the authoritative
+// representation for Redis persistence and live-position dispatch; CoordIndex
+// is a per-cycle in-memory acceleration layer only.
+//
+// IMMUTABILITY CONTRACT: Base Sets stored in BaseRegistry.byKey are READ-ONLY
+// after createBaseSets returns. createMainSets / evaluateRealSets / Real tuner
+// MUST NOT mutate them. Tuning writes go to SetCoordRecord.sizeDelta only.
+
+/**
+ * Per-cycle Base registry — built once in createBaseSets, passed by
+ * reference through all stages. Base Sets are read-only after construction.
+ */
+export interface BaseRegistry {
+  /** Primary O(1) index: setKey → Base StrategySet (immutable, never mutated downstream). */
+  byKey: Map<string, StrategySet>
+  /** Creation-order list of setKeys (for fan-out iteration without Map overhead). */
+  orderedKeys: string[]
+}
+
+/**
+ * Lightweight coordination record emitted at Main stage for each
+ * (Base Set × variant × axisConfig) combination.
+ *
+ * Stores ONLY the delta between the Base Set and this variant/axis
+ * projection — all quality fields (PF, DDT, entries[], trailingProfile,
+ * prevPos, indicationType) are resolved from BaseRegistry.byKey[parentKey]
+ * on demand. This eliminates the per-variant full-object clone that previously
+ * drove ~3 000 StrategySet allocations per symbol per cycle.
+ */
+export interface SetCoordRecord {
+  /** Globally unique key for this coordination slot (= Main set's setKey). */
+  coordKey: string
+  /** Points at the originating Base Set in BaseRegistry. */
+  parentKey: string
+  /** Variant profile this record represents. */
+  variant: "default" | "trailing" | "block" | "dca" | "pause"
+  /** Axis tuple — null for profile-variant (non-axis) records. */
+  axisWindows: StrategySet["axisWindows"] | null
+  /**
+   * Stage-validity state machine — updated in-place as the record passes
+   * through pipeline gates. No new object is created on status transitions.
+   */
+  status: "pending" | "valid_base" | "valid_main" | "valid_real" | "invalid"
+  rejectionReason?: string
+  /**
+   * Real-stage tuner delta written by evaluateRealSets. Applied on top of
+   * Base entries at Live dispatch time — avoids mutating Base entry objects.
+   * Undefined means "no tuning applied this cycle, use Base values directly".
+   */
+  sizeDelta?: number    // multiplicative (applied as e.sizeMultiplier × (1 + sizeDelta))
+  leverageDelta?: number
+  /** Post-tuner average profit factor; undefined → use Base Set avgProfitFactor. */
+  tunedAvgPF?: number
+  /** Direction override for axis records (Base Set direction is ignored). */
+  overrideDirection?: "long" | "short"
+  /** entryCount override for axis records (baseEC + credited liveCont). */
+  overrideEntryCount?: number
+}
+
+/**
+ * Per-cycle coordination index — single allocation per executeStrategyFlow call,
+ * passed by reference through createBaseSets → createMainSets → evaluateRealSets
+ * → createLiveSets. Never stored on `this` (cross-cycle contamination).
+ */
+export interface CoordIndex {
+  /** All coord records for this cycle; stages iterate and mark status in-place. */
+  records: SetCoordRecord[]
+  /** O(1) lookup by coordKey (used by createLiveSets for dispatch). */
+  byCoordKey: Map<string, SetCoordRecord>
+  /**
+   * O(1) lookup by parentKey → all records derived from that Base Set.
+   * Used by evaluateRealSets to mark all axis/variant records of a rejected
+   * Base Set without re-scanning the full records array.
+   */
+  byParentKey: Map<string, SetCoordRecord[]>
+  /** Base registry (shared immutable reference). */
+  base: BaseRegistry
+  /** Snapshot of the qualifying Real Set keys this cycle (populated by evaluateRealSets). */
+  validRealKeys: Set<string>
+}
+
+/** Allocate an empty CoordIndex from a freshly-built BaseRegistry. */
+function makeCoordIndex(base: BaseRegistry): CoordIndex {
+  return {
+    records: [],
+    byCoordKey: new Map(),
+    byParentKey: new Map(),
+    base,
+    validRealKeys: new Set(),
+  }
+}
+
+/** Register a SetCoordRecord into a CoordIndex (updates all three indexes). */
+function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
+  idx.records.push(rec)
+  idx.byCoordKey.set(rec.coordKey, rec)
+  let arr = idx.byParentKey.get(rec.parentKey)
+  if (!arr) { arr = []; idx.byParentKey.set(rec.parentKey, arr) }
+  arr.push(rec)
+}
+
+// ─���������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -389,9 +499,16 @@ export class StrategyCoordinator {
     maxEntriesPerSet: 250,
     // Live Sets default is now per-exchange (see setExchangeMaxLive).
     // This is a placeholder; the real value is set during init.
-    maxLiveSets: 500,
-    // Strategies (Real Sets) are now unlimited by default — no hard cap.
-    maxRealSets: Infinity,
+    // 400 per symbol × 20 symbols = 8000 max live stage entries total;
+    // calibrated to prevent InlineLocalRedis growth past the 1200 MB
+    // eviction trigger between 4s cleanup cycles.
+    maxLiveSets: 400,
+    // Real Sets default to the safety ceiling (20000). "Unlimited" (Infinity)
+    // previously bypassed the OOM-protection ceiling because the enforcement
+    // used `??` (Infinity is not nullish) — next-server was OOM-killed at the
+    // 4GB heap limit during live multi-symbol runs. The evaluate path also
+    // hard-clamps with Math.min as defense in depth.
+    maxRealSets: 20000,
     pruneStrategy: "hybrid",
   }
 
@@ -531,6 +648,9 @@ export class StrategyCoordinator {
    * fire once every 500 cycles instead of on every cycle.
    */
   private _stratCycleCount = 0
+  // Dev-mode real:sets write throttle — only persists every 5th cycle to keep
+  // the InlineLocalRedis heap bounded. Initialised lazily in createRealSets.
+  private _realSetWriteCounter = 0
 
   /**
    * ── Plan-perf Tier 1: parsed-fingerprint LRU ───────────────────────
@@ -626,10 +746,12 @@ export class StrategyCoordinator {
   // values gate the AVERAGE-PF of an already-built Set into the next
   // stage. Conceptually the operator wants ONE Base PF knob — so we
   // load the same `baseProfitFactor` into both fields.
-  private PF_BASE_MIN = 0.9    // Minimum to enter BASE set
-  private PF_MAIN_MIN = 1.0    // Base sets must have avgPF >= 1.0 to enter MAIN
-  private PF_REAL_MIN = 1.0    // Main sets must have avgPF >= 1.0 to enter REAL
-  private PF_LIVE_MIN = 1.0    // Real sets must have avgPF >= 1.0 to enter LIVE
+  // Operator spec defaults: base=1.0, main=1.2, real=1.2, live=1.2
+  // These are fallbacks used when no operator setting is found in Redis.
+  private PF_BASE_MIN = 1.0    // Minimum to enter BASE set
+  private PF_MAIN_MIN = 1.2    // Base sets must have avgPF >= 1.2 to enter MAIN
+  private PF_REAL_MIN = 1.2    // Main sets must have avgPF >= 1.2 to enter REAL
+  private PF_LIVE_MIN = 1.2    // Real sets must have avgPF >= 1.2 to enter LIVE
 
   // ── PF threshold settings cache (per-cycle) ─────────────────────
   // `loadAppPFThresholds()` hits Redis to pull the operator's slider
@@ -682,25 +804,25 @@ export class StrategyCoordinator {
   private METRICS: Record<string, EvaluationMetrics> = {
     base: {
       maxDrawdownTime: 999999,
-      minProfitFactor: 0.9,   // spec default — operator-tunable
-      confidence: 0.3,  // advisory only
+      minProfitFactor: 1.0,   // operator spec default (base=1.0)
+      confidence: 0.3,        // advisory only
       description: "One Set per (indication_type × direction) — all qualifying",
     },
     main: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default — operator-tunable
+      minProfitFactor: 1.2,   // operator spec default (main=1.2)
       confidence: 0.5,        // advisory only
       description: "Sets promoted from BASE with profitFactor >= main-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ����������������� operator-tunable
+      minProfitFactor: 1.2,   // operator spec default (real=1.2)
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
     live: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default — operator-tunable
+      minProfitFactor: 1.2,   // operator spec default (live=1.2)
       confidence: 0.65,       // advisory only
       description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= maxDrawdownTime) ready for live trading",
     },
@@ -759,10 +881,12 @@ export class StrategyCoordinator {
         if (!Number.isFinite(n) || n < 0) return fallback
         return Math.max(0, Math.min(5, n))
       }
-      const basePF = clamp(s.baseProfitFactor, 0.9)
-      const mainPF = clamp(s.mainProfitFactor, 1.0)
-      const realPF = clamp(s.realProfitFactor, 1.0)
-      const livePF = clamp(s.liveProfitFactor, 1.0)
+      // Operator spec: base=1.0, main/real/live=1.2 as the fallback when
+      // the operator has never touched the PF sliders.
+      const basePF = clamp(s.baseProfitFactor, 1.0)
+      const mainPF = clamp(s.mainProfitFactor, 1.2)
+      const realPF = clamp(s.realProfitFactor, 1.2)
+      const livePF = clamp(s.liveProfitFactor, 1.2)
 
       this.PF_BASE_MIN = basePF
       this.PF_MAIN_MIN = mainPF
@@ -1026,23 +1150,33 @@ export class StrategyCoordinator {
       // Redis round-trips per symbol per cycle. Each stage still persists
       // its own output to Redis for downstream consumers (stats API, dashboard).
       //
+      // A CoordIndex is allocated once in createBaseSets and threaded through
+      // all downstream stages by reference. It carries the BaseRegistry (O(1)
+      // base lookup), per-record tuning deltas, and the validRealKeys set so
+      // createLiveSets can resolve axis parent entries in O(1) instead of O(N).
+      //
       // STAGE 1: BASE — one Set per (indication_type × direction)
-      const { result: baseResult, sets: baseSets } = await this.createBaseSets(symbol, indications)
+      const { result: baseResult, sets: baseSets, coordIndex } = await this.createBaseSets(symbol, indications)
       results.push(baseResult)
 
       // STAGE 2: MAIN — validate Base Sets AND create additional related
       // variant Sets (Default / Trailing / Block / DCA) gated by posCtx.
-      const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx)
+      // CoordIndex receives a SetCoordRecord per built set (O(1) per set).
+      const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx, coordIndex)
       results.push(mainResult)
 
       // STAGE 3: REAL — promote Sets with avgPF >= 1.4 (base-promoted AND
-      // additional related variants flow uniformly through this filter)
-      const { result: realResult, sets: realSets } = await this.evaluateRealSets(symbol, mainSets)
+      // additional related variants flow uniformly through this filter).
+      // CoordIndex.validRealKeys is populated here; Real tuner writes sizeDelta
+      // / tunedAvgPF onto each record for O(1) access at Live dispatch.
+      const { result: realResult, sets: realSets } = await this.evaluateRealSets(symbol, mainSets, coordIndex)
       results.push(realResult)
 
-      // STAGE 4: LIVE — best 500 Sets for execution (skip in prehistoric mode)
+      // STAGE 4: LIVE — best 500 Sets for execution (skip in prehistoric mode).
+      // Axis-entry hydration uses coordIndex.base.byKey.get(parentKey) — O(1)
+      // instead of the prior O(N) realSets.find() scan.
       if (!isPrehistoric) {
-        const { result: liveResult } = await this.createLiveSets(symbol, realSets)
+        const { result: liveResult } = await this.createLiveSets(symbol, realSets, coordIndex)
         results.push(liveResult)
       }
 
@@ -1151,7 +1285,7 @@ export class StrategyCoordinator {
   private async createBaseSets(
     symbol: string,
     indications: any[],
-  ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
+  ): Promise<{ result: StrategyEvaluation; sets: StrategySet[]; coordIndex: CoordIndex }> {
     // Group indications by (type × direction)
     const setMap = new Map<string, { indicationType: string; direction: "long" | "short"; indications: any[] }>()
 
@@ -1341,9 +1475,15 @@ export class StrategyCoordinator {
       }
     }
 
-    // Persist BASE sets
-    const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
-    await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
+    // Persist BASE sets — skipped in dev mode.
+    // Each baseSets blob contains full StrategySet objects (~10 KB each).
+    // Writing these to InlineLocalRedis on every cycle causes rapid heap growth
+    // that OOM-kills the dev server with 20 symbols. In prod this write is kept
+    // for cross-restart recovery; in dev the coordIndex holds the live state.
+    if (process.env.NODE_ENV !== "development") {
+      const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
+      await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
+    }
 
     // Write Base counts to progression hash so stats API and dashboard read accurate per-stage counts.
     // CRITICAL: Use hincrby (cumulative) not hset (snapshot). Previously each cycle overwrote the
@@ -1480,6 +1620,15 @@ export class StrategyCoordinator {
       await Promise.all(writes)
     } catch { /* non-critical */ }
 
+    // ── Build BaseRegistry + seed CoordIndex for downstream stages ───────
+    // This is the SINGLE allocation point for base data. All downstream stages
+    // reference baseSets via coordIndex.base.byKey — no copies made.
+    const baseRegistry: BaseRegistry = {
+      byKey:       new Map(baseSets.map((s) => [s.setKey, s])),
+      orderedKeys: baseSets.map((s) => s.setKey),
+    }
+    const coordIndex = makeCoordIndex(baseRegistry)
+
     return {
       result: {
         type: "base",
@@ -1492,10 +1641,11 @@ export class StrategyCoordinator {
         avgDrawdownTime: 0,
       },
       sets: baseSets,
+      coordIndex,
     }
   }
 
-  // ─── STAGE 2: MAIN ───────────────────────────────────────────────────────────
+  // ─── STAGE 2: MAIN ──────────────────────���────────────────────────────────────
 
   /**
    * Validate BASE Sets (avgPF >= 1.2, avgConf >= 0.5, DDT <= 24h) AND create
@@ -1528,6 +1678,7 @@ export class StrategyCoordinator {
     symbol: string,
     inputSets?: StrategySet[],
     posCtx?: PositionContext,
+    coordIndex?: CoordIndex,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
     // Prefer in-memory input (hot-path pipelined from createBaseSets). Fall
     // back to Redis only when called standalone (tests / diagnostics).
@@ -1592,12 +1743,14 @@ export class StrategyCoordinator {
     let skippedLowPos = 0
 
     // ── 1. Fingerprint-cache lookup ────────────────────────────────────────
-    // Fetch last cycle's fingerprint map up-front. `fpCacheKey` stores a
-    // per-symbol hash of { fingerprint: JSON.stringify(set) } entries. We
-    // read it once, check each candidate (baseSet × variant), and rebuild
-    // only what's new. This cuts Main regeneration cost to ~0 when nothing
-    // upstream has changed.
-    const fpCacheKey = `strategies:${this.connectionId}:${symbol}:main:fp`
+    // Fetch last cycle's fingerprint map up-front. `fpCacheKey:v2` stores a
+    // per-symbol hash of { fingerprint: JSON.stringify(slimDelta) } entries
+    // where slimDelta carries ONLY scalar aggregate fields (no entries[]).
+    // `:v2` suffix ensures old full-set blobs (stored under `main:fp`) are
+    // ignored — they would fail the `Array.isArray(cached.entries)` guard
+    // and cause unnecessary rebuilds until expiry. New slim format: ~80 bytes
+    // per record vs ~2-5 KB for the old full-set JSON.
+    const fpCacheKey = `strategies:${this.connectionId}:${symbol}:main:fp:v2`
     const client = getRedisClient()
     const fpCache = ((await client.hgetall(fpCacheKey).catch(() => null)) || {}) as Record<string, string>
     const nextFpCache: Record<string, string> = {}
@@ -1679,16 +1832,45 @@ export class StrategyCoordinator {
       for (const profile of variantsForThisBase) {
         // Spawn async build task for this variant
         buildTasks.push((async () => {
-          const fingerprint = this.variantFingerprint(baseSet, profile.name, ctx)
+          // ── IMPORTANT: fingerprint must use symbolCtx (per-symbol continuousCount)
+          // not the global ctx — the block variant's configs were built from symbolCtx
+          // (which patches continuousCount to perSymbolOpen[symbol]).  Using global ctx
+          // here caused cross-symbol cache collisions: a symbol with 0 open positions
+          // would receive a cached block Set that was originally sized for a different
+          // symbol that had 2 open positions (wrong sizeMultiplier baked in).
+          const fingerprint = this.variantFingerprint(baseSet, profile.name, symbolCtx)
           let cachedSet: StrategySet | null = null
 
-          // Check fingerprint cache (fast path)
+          // ── Fingerprint cache (fast path) ─────────────────────────────
+          // v2 format: Redis stores a slim coord-delta JSON (~80 bytes) with
+          // only scalar aggregate fields. The in-process LRU still stores the
+          // full StrategySet (built once, reused across cycles without re-parse).
+          // On a Redis hit + LRU miss we rebuild from the slim delta + Base Set
+          // entries (one buildVariantSet call, no Redis entries[] serialisation).
           if (fpCache[fingerprint]) {
+            // 1. Check in-process LRU first (zero alloc on hit).
             let cached = StrategyCoordinator._fpLruGet(fingerprint)
             if (cached === undefined) {
+              // 2. Redis hit but LRU evicted — parse the slim delta and rebuild
+              //    the full Set from Base entries. The slim delta carries only
+              //    the scalar aggregates produced by buildVariantSet; the real
+              //    entries are re-derived cheaply because buildVariantSet is
+              //    pure (no side-effects). On a fingerprint match the result is
+              //    identical to what was stored last cycle.
               try {
-                cached = JSON.parse(fpCache[fingerprint]) as StrategySet
-                if (cached) StrategyCoordinator._fpLruSet(fingerprint, cached)
+                const delta = JSON.parse(fpCache[fingerprint]) as Partial<StrategySet> & { _slim?: boolean }
+                if (delta?._slim && delta.setKey) {
+                  // Rebuild full Set from Base + slim delta via buildVariantSet.
+                  const rebuilt = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, symbolCtx)
+                  if (rebuilt) {
+                    cached = rebuilt
+                    StrategyCoordinator._fpLruSet(fingerprint, rebuilt)
+                  }
+                } else if (delta?.setKey) {
+                  // Legacy full-set blob (tolerate for one cycle during v2 rollout).
+                  cached = delta as StrategySet
+                  StrategyCoordinator._fpLruSet(fingerprint, cached)
+                }
               } catch { /* fall through — regenerate on parse failure */ }
             }
             if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
@@ -1706,7 +1888,21 @@ export class StrategyCoordinator {
             built = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, symbolCtx)
             if (built) {
               if (baseSet.trailingProfile) built.trailingProfile = baseSet.trailingProfile
-              nextFpCache[fingerprint] = JSON.stringify(built)
+              // Store SLIM coord-delta in Redis (no entries[] serialised).
+              // The LRU keeps the full Set in-process; Redis only needs the
+              // scalar aggregates to confirm "this fingerprint was built last
+              // cycle" on a subsequent cache hit.
+              const slimDelta = {
+                _slim:           true,
+                setKey:          built.setKey,
+                parentSetKey:    built.parentSetKey,
+                variant:         built.variant,
+                avgProfitFactor: built.avgProfitFactor,
+                avgDrawdownTime: built.avgDrawdownTime,
+                avgConfidence:   built.avgConfidence,
+                entryCount:      built.entryCount,
+              }
+              nextFpCache[fingerprint] = JSON.stringify(slimDelta)
               StrategyCoordinator._fpLruSet(fingerprint, built)
             }
           }
@@ -1728,9 +1924,26 @@ export class StrategyCoordinator {
       mainSets.push(set)
       if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, set)
       if (cachedSet) reused++
+
+      // ── Register SetCoordRecord for this variant (O(1) per set) ──────
+      // CoordIndex is the per-cycle performance index; registering here
+      // avoids a second full scan of mainSets downstream. Stores only
+      // scalars — quality fields are resolved from BaseRegistry on demand.
+      if (coordIndex) {
+        const rec: SetCoordRecord = {
+          coordKey:           set.setKey,
+          parentKey:          set.parentSetKey || baseSet.setKey,
+          variant:            (set.variant ?? profile.name) as SetCoordRecord["variant"],
+          axisWindows:        set.axisWindows ?? null,
+          status:             "valid_main",
+          overrideDirection:  set.axisWindows?.direction as "long" | "short" | undefined,
+          overrideEntryCount: set.entryCount !== baseSet.entryCount ? set.entryCount : undefined,
+        }
+        registerCoordRecord(coordIndex, rec)
+      }
     }
 
-    // ── Log min-pos skip count (diagnostic) ───────────────────────
+    // ── Log min-pos skip count (diagnostic) ──────────────────���────
     // Surface the number of Base Sets that didn't meet `mainEvalPosCount`
     // at this cycle so the operator can see when the threshold is
     // throttling promotion. Non-critical; debug level.
@@ -1763,25 +1976,69 @@ export class StrategyCoordinator {
     let axisSetsAdded = 0
     if (defaultByBaseKey.size > 0) {
       const minPF = metrics.minProfitFactor   // Same gate as Base→Main
-      // Live continuous-count snapshot from the **per-symbol** position
-      // context (continuousCount on `symbolCtx` was already patched to
-      // `ctx.perSymbolOpen[symbol]` at line ~1339). Capping each axis
-      // Set's `entryCount` by this value (inside expandAxisSets) is what
-      // makes the axis fan-out reflect the operator-spec'd "ongoing
-      // continuous count of Pis to be added, counted onto the new sets"
-      // instead of static projections. Per-symbol is correct because
-      // axis Sets and their hedge bucketing are scoped to one symbol.
+      // ── Per-symbol axis fan-out ceiling (OOM-protection) ─────────────
+      // expandAxisSets emits up to AXIS_PREV(5)×AXIS_LAST(4)×AXIS_CONT(8)×
+      // AXIS_DIRS(2)×outcomes(2 while warming up) = 640 Sets PER default
+      // Base. On a fresh bootstrap (no completed history) the prev PF gate
+      // admits neutrally and BOTH outcomes fire, so every default hits that
+      // maximum. With dozens of Base defaults × multiple symbols evaluated
+      // concurrently each cycle, the materialised StrategySet count exploded
+      // into the hundreds of thousands and was then expanded 1:1 into Real
+      // sets — BEFORE the Real-stage 12000 ceiling could apply. That burst
+      // drove RSS 1.5GB→7.3GB in ~60s and OOM-killed the process right as
+      // live trading began. Cap the fan-out PER SYMBOL so memory is bounded;
+      // because AXIS_PREV/AXIS_CONT are iterated ascending, the retained
+      // projections are the highest-priority (smallest prev/cont) ones.
+      //
+      // OOM calibration (2026-06-16): 10000 was tuned for 5 symbols; at 20
+      // symbols the InlineLocalRedis coord-record Map grew to 4058 MB of LIVE
+      // (reachable) objects — Mark-Compact cannot reclaim live objects so the
+      // heap ceiling is dominated by simultaneous coord-record count.
+      // 2500 keeps the per-symbol footprint ≈ the 5-symbol total divided by 4.
+      const MAIN_AXIS_SETS_CEILING = 2500
+      let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
       // independent liveCont per direction so long and short axis Sets get
       // different entryCount values when one direction is more accumulated.
       const liveContByDir = ctx.perSymbolOpenByDir?.[symbol] ?? { long: 0, short: 0 }
       for (const defaultSet of defaultByBaseKey.values()) {
+        if (axisCapHit) break
         const expanded = this.expandAxisSets(defaultSet, minPF, liveCont, liveContByDir)
         for (const axisSet of expanded) {
           mainSets.push(axisSet)
           axisSetsAdded++
+
+          // ── Register axis SetCoordRecord ─────────────────────────────
+          // Axis sets carry a synthetic entry but their quality data lives
+          // on the parent Base Set. Recording the parentKey here enables
+          // createLiveSets to do a O(1) base lookup instead of O(N) find().
+          if (coordIndex) {
+            const axisRec: SetCoordRecord = {
+              coordKey:           axisSet.setKey,
+              parentKey:          axisSet.parentSetKey || axisSet.setKey.split("#")[0],
+              variant:            "default",
+              axisWindows:        axisSet.axisWindows ?? null,
+              status:             "valid_main",
+              overrideDirection:  axisSet.axisWindows?.direction as "long" | "short" | undefined,
+              overrideEntryCount: axisSet.entryCount,
+            }
+            registerCoordRecord(coordIndex, axisRec)
+          }
+
+          if (axisSetsAdded >= MAIN_AXIS_SETS_CEILING) {
+            axisCapHit = true
+            break
+          }
         }
+      }
+      if (axisCapHit) {
+        console.warn(
+          `[v0] [StrategyCoordinator] ${this.connectionId} ${symbol} axis fan-out hit ` +
+          `safety ceiling ${MAIN_AXIS_SETS_CEILING} (OOM-protection); ` +
+          `remaining Base defaults skipped this cycle. Highest-priority ` +
+          `(smallest prev/cont) projections retained.`,
+        )
       }
       if (axisSetsAdded > 0) {
         // Axis fan-out complete — each qualifying default Main variant
@@ -1797,15 +2054,20 @@ export class StrategyCoordinator {
       }
     }
 
-    // ─── VARIANT accounting ───────────────────────�������───────────────────────
+    // ─── VARIANT accounting ───────────────────────�������────���──────────────────
     // Each related Main Set now carries an authoritative `variant` tag set
     // at build time, so we no longer have to heuristically classify
     // individual entries. Entries within a Set share the variant label.
     // Legacy entry-level classifier is kept as a fallback for any caller
     // that produces a Set without the variant field (back-compat safety).
+    // NOTE: `sizeMultiplier >= 1.5` was deliberately removed — Real-stage
+    // coord-record tuning can push a default/trailing entry above 1.5× after
+    // a good streak, which incorrectly labelled those entries as "block" and
+    // inflated block PF stats. Only `positionState === "add"` (the true
+    // semantic marker for block add-on entries) is retained as the fallback.
     const classifyVariant = (e: StrategySetEntry): "default" | "trailing" | "block" | "dca" => {
       if (e.positionState === "reduce" || e.positionState === "close") return "dca"
-      if (e.positionState === "add" || e.sizeMultiplier >= 1.5)        return "block"
+      if (e.positionState === "add")                                    return "block"
       if (e.positionState === "new"  && e.leverage       >= 3)         return "trailing"
       return "default"
     }
@@ -1836,8 +2098,13 @@ export class StrategyCoordinator {
 
     // Persist MAIN sets + fingerprint cache. Fingerprint cache has a short
     // TTL so stale entries don't re-surface after context changes settle.
-    const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
-    await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
+    // MAIN sets write is skipped in dev mode — 1920 full StrategySet objects
+    // per symbol per cycle serialise to ~19 MB each in InlineLocalRedis,
+    // causing OOM at ~30s with 20 symbols. The coordIndex holds live state.
+    if (process.env.NODE_ENV !== "development") {
+      const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
+      await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
+    }
     try {
       if (Object.keys(nextFpCache).length > 0) {
         // Replace the cache atomically so deletions take effect (a Set that
@@ -2018,6 +2285,12 @@ export class StrategyCoordinator {
     symbol: string,
     realSets: StrategySet[],
   ): Promise<void> {
+    // DEV-MODE BYPASS: pseudo_position hashes are only used by the dashboard
+    // "Positions" tile. Writing up to 3000 hashes per symbol per cycle (3 writes
+    // each = 9000 InlineLocalRedis operations per symbol) is the single largest
+    // heap allocator in the 20-symbol dev run, causing OOM at ~30s. The engine
+    // pipeline decisions use the in-memory coordIndex, not Redis pseudo_positions.
+    if (process.env.NODE_ENV === "development") return
     try {
       if (!realSets || realSets.length === 0) return
 
@@ -2110,6 +2383,7 @@ export class StrategyCoordinator {
   private async evaluateRealSets(
     symbol: string,
     inputSets?: StrategySet[],
+    coordIndex?: CoordIndex,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
     let stored: any = null
     if (!inputSets) {
@@ -2410,7 +2684,7 @@ export class StrategyCoordinator {
     // clamped to `maxRealSets` (default 12000); now we pass all
     // qualifying Real Sets to the Live stage. The operator still gates
     // via preset inclusion, profit-factor minimums, and coordination
-    // toggles ��� removing this funnel cap lifts the ceiling without
+    // toggles ���� removing this funnel cap lifts the ceiling without
     // sacrificing control.
     // For future use: if we need to re-cap (e.g. for perf), read the
     // operator's `maxRealSets` setting and apply it here.
@@ -2425,11 +2699,21 @@ export class StrategyCoordinator {
     // SIGKILL (verified via dmesg: anon-rss 7334448kB). The Sets are already
     // sorted best-first (winnerPool ordering above), so an operator who sets
     // no explicit `maxRealSets` still keeps the highest-quality Sets; only a
-    // pathological long tail is dropped. The ceiling is deliberately far
-    // above any realistic per-symbol Set count so normal multi-symbol runs
-    // are unaffected — it exists purely to keep the process from being killed.
-    const REAL_SETS_SAFETY_CEILING = 12000
-    const realSetsCap = this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING
+    // pathological long tail is dropped.
+    //
+    // OOM calibration (2026-06-16): 20000 was calibrated for 5 symbols; at
+    // 20 symbols the cumulative coord-record Map hit 4058 MB LIVE objects.
+    // 3000 per symbol × 20 symbols concurrently = 60000 coord records maximum
+    // alive at once, keeping the InlineLocalRedis heap well within the 6144 MB
+    // budget with room for eviction to operate before the next burst.
+    const REAL_SETS_SAFETY_CEILING = 3000
+    // HARD ENFORCE with Math.min: the config default is Infinity, and
+    // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
+    // the safety ceiling NEVER engaged and the process was OOM-killed at
+    // ~4GB heap (verified: FATAL "Ineffective mark-compacts near heap limit"
+    // during a 5-symbol live run). The operator can LOWER the cap via
+    // maxRealSets but can never exceed the ceiling.
+    const realSetsCap = Math.min(this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING, REAL_SETS_SAFETY_CEILING)
     const realSets = realPostHedge.slice(0, realSetsCap)
     if (realPostHedge.length > realSetsCap) {
       console.warn(
@@ -2437,6 +2721,20 @@ export class StrategyCoordinator {
         `safety ceiling ${realSetsCap}; keeping top ${realSetsCap} by rank. ` +
         `Set maxRealSets in Settings to override.`,
       )
+    }
+
+    // ── Populate CoordIndex.validRealKeys — O(N) single pass ───────────────
+    // Stamp every surviving real set's coord record as `valid_real` and
+    // populate the fast Set<string> for O(1) membership checks downstream.
+    // Sets that were dropped by the cap or hedge-net are left at `valid_main`.
+    if (coordIndex) {
+      for (const s of realSets) {
+        coordIndex.validRealKeys.add(s.setKey)
+        const coordRec = coordIndex.byCoordKey.get(s.setKey)
+        if (coordRec && coordRec.status !== "valid_real") {
+          coordRec.status = "valid_real"
+        }
+      }
     }
 
     // ── Real-stage tuner — per-variant adjustments from Base prev-pos ──
@@ -2531,8 +2829,16 @@ export class StrategyCoordinator {
           for (const e of s.entries) {
             // Variant-specific tuning rules.
             if (s.variant === "block") {
-              // Block scales size — bias the existing multiplier directly.
-              e.sizeMultiplier = Math.max(0.5, Math.min(2.0, e.sizeMultiplier * combined))
+              // Block scales size via the combined bias, but the operator
+              // explicitly configured block aggression (1.5× / 2.0× base).
+              // The tuner should only attenuate on bad signals — it must not
+              // reduce block sizing below 50% of the operator's chosen base
+              // (i.e. floor at 0.5 × base, not the universal 0.5 absolute).
+              // Without this floor a combined=0.65 cycle would shrink a 2.0×
+              // block entry to 1.3×, losing most of the block strategy's
+              // purpose (accumulating into an existing position at higher size).
+              const blockFloor = Math.max(0.5, e.sizeMultiplier * 0.5)
+              e.sizeMultiplier = Math.max(blockFloor, Math.min(2.0, e.sizeMultiplier * combined))
             } else if (s.variant === "dca") {
               // DCA recovery — only ATTENUATE leverage when historic PF poor;
               // never amplify (recovery gambling is an anti-pattern).
@@ -2557,6 +2863,28 @@ export class StrategyCoordinator {
             s.avgProfitFactor =
               s.entries.reduce((a, e) => a + Number(e.profitFactor || 0), 0) /
               s.entries.length
+          }
+
+          // ── Write tuning onto the CoordRecord ────────────────────────────
+          // The Real-stage tuner already mutated s.entries[].sizeMultiplier
+          // in-place above.  createLiveSets picks bestEntry from those same
+          // in-memory entry objects, so bestEntry.sizeMultiplier is already
+          // the post-tuned value.  We must NOT store a non-zero sizeDelta on
+          // the CoordRecord — if we did, createLiveSets would apply the
+          // combined bias a second time (double-tuning), e.g. a block entry
+          // at 2.0× tuned down to 1.3× would then get multiplied by 1.3 again
+          // to reach 1.69× — wrong.  Only tunedAvgPF is written here (used for
+          // SL/TP derivation at dispatch); sizeDelta is left undefined so the
+          // dispatch path falls through to bestEntry.sizeMultiplier directly.
+          if (coordIndex) {
+            const coordRec = coordIndex.byCoordKey.get(s.setKey)
+            if (coordRec) {
+              coordRec.tunedAvgPF = s.avgProfitFactor  // post-tuner recomputed PF
+              // sizeDelta intentionally NOT set — entries already tuned in-place;
+              // setting it would cause a second application in createLiveSets.
+              coordRec.sizeDelta  = undefined
+              coordRec.status     = "valid_real"
+            }
           }
         }
 
@@ -2586,7 +2914,7 @@ export class StrategyCoordinator {
 
     // Persist per-bucket net targets for the Live-stage partial open/close
     // reconciliation hook. Documented on `reconcileLivePositions` —
-    // direction unchanged & magnitude grew → partial OPEN for Δ; direction
+    // direction unchanged & magnitude grew → partial OPEN for ��; direction
     // unchanged & magnitude shrunk → partial CLOSE lowest-PF; direction
     // flipped or flat:0 ��� close all in bucket then optionally re-open.
     if (Object.keys(netTargetWrites).length > 0) {
@@ -2602,9 +2930,27 @@ export class StrategyCoordinator {
       } catch { /* non-critical */ }
     }
 
-    // Persist REAL sets
+    // Persist REAL sets — slim format (set keys only).
+    // Full Base Set blobs are already persisted at `base:sets` and are the single
+    // authoritative source for entries/quality data. Writing only the qualifying
+    // key list cuts this payload from ~N×2-5 KB to N×~30 bytes per symbol per cycle.
+    // Readers resolve full Set objects via Base sets (one extra read, warm in LRU).
+    //
+    // DEV-MODE THROTTLE: only write every 5th cycle to keep InlineLocalRedis Map
+    // growth bounded. Dashboard stats read from in-memory progression counters for
+    // the current count and only need the key list for structural queries (rare).
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
-    await setSettings(realKey, { sets: realSets, count: realSets.length, created: new Date() })
+    const shouldWriteRealSets =
+      process.env.NODE_ENV !== "development" ||
+      (this._realSetWriteCounter = ((this._realSetWriteCounter ?? 0) + 1)) % 5 === 1
+    if (shouldWriteRealSets) {
+      await setSettings(realKey, {
+        setKeys: realSets.map((s) => s.setKey),
+        count:   realSets.length,
+        created: new Date(),
+        _slim:   true,
+      })
+    }
 
     // Hoisted outside the try-block so the return statement (also outside) can see it.
     // Count of Main Sets that actually entered PF/DDT evaluation (excludes pos-count
@@ -2758,7 +3104,7 @@ export class StrategyCoordinator {
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainPFEligible)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
-        // ── CRITICAL: Persist Real Sets for Live evaluation ────────────────────
+        // ── CRITICAL: Persist Real Sets for Live evaluation ───────────────────��
         // Bug fix: Real Sets were computed but never written, causing Live to load
         // an empty array and never fire. Now serialize the full realSets array so
         // createLiveSets can read and filter them for Live stage.
@@ -2905,7 +3251,7 @@ export class StrategyCoordinator {
         }
       }
       for (const axis of ["prev", "last", "cont", "pause"] as const) {
-        // Combined (direction-agnostic) — backwards-compatible key
+        // Combined (direction-agnostic) ��� backwards-compatible key
         const aKey      = `strategy_axis_real:${this.connectionId}:${axis}`
         // Direction-split keys — per-spec granularity
         const aKeyLong  = `strategy_axis_real:${this.connectionId}:${axis}:long`
@@ -2997,7 +3343,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��─────����──────────────────────���───────��
+  // ─── STAGE 4: LIVE ─────────����──────────��─────�����──────────────────────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -3006,20 +3352,29 @@ export class StrategyCoordinator {
   private async createLiveSets(
     symbol: string,
     inputSets?: StrategySet[],
+    coordIndex?: CoordIndex,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
     let realSets: StrategySet[]
     if (inputSets) {
       realSets = inputSets
     } else {
       const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
-      const stored = await getSettings(realKey)
-      // Parse the serialized Real Sets array. The value is a JSON object
-      // with a `sets` field (the actual array).
+      const stored  = await getSettings(realKey) as any
       if (stored && typeof stored === "object") {
-        const parsed = stored as any
-        // Handle both the new format (nested in `sets` field) and legacy
-        // in case there's a mix.
-        realSets = Array.isArray(parsed.sets) ? parsed.sets : Array.isArray(parsed) ? parsed : []
+        if (stored._slim && Array.isArray(stored.setKeys)) {
+          // ── Slim format: key list only — resolve full Sets from Base ───
+          // Base sets carry entries/quality data and are always written as
+          // full blobs. A single base:sets read is cheaper than deserialising
+          // the old full Real blob, and the result is always fresh-cycle data.
+          const baseKey  = `strategies:${this.connectionId}:${symbol}:base:sets`
+          const baseSt   = await getSettings(baseKey) as any
+          const baseArr: StrategySet[] = Array.isArray(baseSt?.sets) ? baseSt.sets : []
+          const keySet   = new Set<string>(stored.setKeys as string[])
+          realSets       = baseArr.filter((s) => keySet.has(s.setKey))
+        } else {
+          // Legacy full-blob format — tolerate during rollout period.
+          realSets = Array.isArray(stored.sets) ? stored.sets : Array.isArray(stored) ? stored : []
+        }
       } else {
         realSets = []
       }
@@ -3102,13 +3457,16 @@ export class StrategyCoordinator {
 
 
 
-    // Persist LIVE sets
+    // Persist LIVE sets — slim format (coord keys only).
+    // Same rationale as the Real slim write above: qualifying sets all have their
+    // full entries in Base sets. Writing keys+metadata cuts Live payload ~60×.
     const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
     await setSettings(liveKey, {
-      sets: qualifying,
-      count: qualifying.length,
-      created: new Date(),
+      setKeys:    qualifying.map((s) => s.setKey),
+      count:      qualifying.length,
+      created:    new Date(),
       executable: true,
+      _slim:      true,
     })
 
     // Create pseudo positions from REAL/LIVE sets so they appear on dashboard
@@ -3288,33 +3646,16 @@ export class StrategyCoordinator {
 
     // Attempt real exchange trading for qualifying LIVE sets when the connection has live trading enabled.
     // This is guarded by is_live_trade flag on the connection — if disabled, only pseudo positions are created.
-    // DEV/TEST fallback: if no qualifying Real sets but we're in test/dev/testnet, inject a synthetic qualifying set from Main so live dispatch can be exercised.
-    if (qualifying.length === 0) {
-      try {
-        const conn = await (await import("@/lib/redis-db")).getConnection(this.connectionId)
-        const isTestConn = conn?.is_testnet === true || conn?.is_testnet === "1" || process.env.FORCE_LIVE === "1" || process.env.NODE_ENV === "development"
-        if (isTestConn) {
-          const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
-          const mainStored = await getSettings(mainKey)
-          const mainSets = mainStored && typeof mainStored === "object" ? (Array.isArray((mainStored as any).sets) ? (mainStored as any).sets : Array.isArray(mainStored) ? mainStored : []) : []
-          if (mainSets && mainSets.length > 0) {
-            const top = mainSets.sort((a: any, b: any) => (b.avgProfitFactor || 0) - (a.avgProfitFactor || 0))[0]
-            const synth: any = {
-              ...top,
-              setKey: top.setKey || `${symbol}:${top.direction || "long"}:test-synth`,
-              parentSetKey: top.setKey || null,
-              avgProfitFactor: Math.max(0.9, top.avgProfitFactor || 0.9),
-              avgDrawdownTime: top.avgDrawdownTime || 0,
-              entries: top.entries && top.entries.length > 0 ? top.entries : [{ profitFactor: Math.max(1.0, (top.avgProfitFactor || 1.0)), leverage: 1, confidence: 0.85, sizeMultiplier: 1 }],
-              entryCount: top.entryCount || (top.entries ? top.entries.length : 1),
-              status: "valid_real",
-            }
-            qualifying = [synth]
-            console.log(`[v0] [StrategyFlow] ${this.connectionId}:${symbol} injecting synthetic qualifying set for test/dev to allow live dispatch`)
-          }
-        }
-      } catch (e) { /* non-fatal */ }
-    }
+    //
+    // NOTE: Dev-synth fallback REMOVED. It injected a synthetic qualifying set from Main
+    // when qualifying.length === 0 so live dispatch could be exercised during dev. The
+    // synthetic set inherited `setKey` from the top Main set (e.g. "move:short#axis:p4_l1_c1_opos_dlong")
+    // and the real position ID construction then embedded that key AGAIN:
+    //   real:{conn}:{setKey}:{symbol}:{ts}:{rand}  →  "real:bingx-x01:move:short#axis:p4_l1_c1_opos_dlong:BTCUSDT:..."
+    // which is correct — but the synth setKey was further mutated in Phase 4's separate
+    // executeReadyStrategiesAsLiveOrders path, producing double-IDs with "#axis-synth" suffixes.
+    // The real pipeline now produces qualifying sets reliably (REAL bootstrap relaxes
+    // minProfitFactor to 0.75 on first run), so this workaround is no longer needed.
 
     if (qualifying.length > 0) {
       try {
@@ -3349,15 +3690,43 @@ export class StrategyCoordinator {
             // will always be deferred on the same cycle.
             //
             // The qualifying array is already sorted by avgProfitFactor desc.
-            // Walk it once and keep only the first Set seen for each direction.
+            //
+            // Preselection rules:
+            //   • "new" variants (default, trailing, pause): at most 1 per
+            //     direction — first (highest-PF) wins.
+            //   • "block" variant: allowed through even when the direction
+            //     already has a "new" set selected. Block places an ADD-ON
+            //     order into an existing open position; the dedup-lock path
+            //     handles whether to accumulate or open a fresh add-on lot.
+            //     At most 1 block set per direction (the highest-PF one).
+            //   • "dca" variant: same as block — at most 1 per direction,
+            //     allowed alongside a "new" set.
+            //
+            // Without this rule, block/dca sets targeting e.g. long were
+            // always dropped because `sawLong=true` was already set by the
+            // default set, meaning block strategy NEVER dispatched.
             const dispatchSets: StrategySet[] = []
             {
-              let sawLong  = false
-              let sawShort = false
+              let sawNewLong  = false
+              let sawNewShort = false
+              let sawBlockLong  = false
+              let sawBlockShort = false
+              let sawDcaLong    = false
+              let sawDcaShort   = false
               for (const s of qualifying) {
-                if (s.direction === "long"  && !sawLong)  { dispatchSets.push(s); sawLong  = true }
-                if (s.direction === "short" && !sawShort) { dispatchSets.push(s); sawShort = true }
-                if (sawLong && sawShort) break
+                const isBlock = s.variant === "block"
+                const isDca   = s.variant === "dca"
+                const isNew   = !isBlock && !isDca // default / trailing / pause
+                if (s.direction === "long") {
+                  if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
+                  if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
+                  if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
+                } else {
+                  if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
+                  if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
+                  if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
+                }
+                if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
               }
             }
 
@@ -3368,23 +3737,47 @@ export class StrategyCoordinator {
 
             for (const set of dispatchSets) {
               try {
-                // Axis Sets are pure-metadata projections (entries=[]).
-                // Hydrate from the parent Real Set when entries is empty so
-                // the live execution path can still derive SL/TP from PF.
-                const effectiveEntries =
+                // ── Axis-entry hydration — O(1) via BaseRegistry ──────────────
+                // Axis Sets carry one synthetic representative entry. When
+                // dispatching to Live we need the full entries[] (for SL/TP
+                // derivation) from the originating Base Set. Previously this
+                // was a O(N) realSets.find() scan; now it is a O(1) Map lookup
+                // via CoordIndex.base.byKey (built once in createBaseSets and
+                // passed by reference through the entire pipeline).
+                //
+                // Fallback chain:
+                //   1. set.entries (non-empty, e.g. profile-variant sets)
+                //   2. coordIndex.base.byKey.get(parentKey).entries  ← O(1)
+                //   3. realSets.find() linear scan  ← only when no coordIndex
+                const parentKey = set.parentSetKey || set.setKey.split("#")[0]
+                const effectiveEntries: StrategySetEntry[] =
                   set.entries.length > 0
                     ? set.entries
-                    : (realSets.find((s) => s.setKey === set.parentSetKey)?.entries ?? [])
+                    : coordIndex
+                      ? (coordIndex.base.byKey.get(parentKey)?.entries ?? [])
+                      : (realSets.find((s) => s.setKey === parentKey)?.entries ?? [])
                 const bestEntry = effectiveEntries.reduce(
                   (best, e) => (e.profitFactor > best.profitFactor ? e : best),
                   effectiveEntries[0]
                 )
                 if (!bestEntry) continue
 
+                // ── Apply CoordRecord tuning delta at dispatch (zero extra reads) ─
+                // The Real-stage tuner wrote sizeDelta + tunedAvgPF onto the coord
+                // record so we don't re-scan entries here. We apply the delta to the
+                // bestEntry SIZE only — all other entry fields come from Base unchanged.
+                const dispatchCoordRec = coordIndex?.byCoordKey.get(set.setKey)
+                const effectiveSizeMult = dispatchCoordRec?.sizeDelta !== undefined
+                  ? Math.max(0.5, Math.min(2.0, (bestEntry.sizeMultiplier ?? 1) * (1 + dispatchCoordRec.sizeDelta)))
+                  : (bestEntry.sizeMultiplier ?? 1)
+                // Use tunedAvgPF for SL/TP derivation when available — reflects the
+                // Real-stage tuner's per-variant performance bias.
+                const effectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
+
                 // Derive SL/TP % from the set's profit factor. The pipeline
                 // converts these to concrete prices after the entry fills.
-                const tp = Math.max(0.5, (bestEntry.profitFactor - 1) * 100)
-                const sl = Math.min(5, (100 / Math.max(1, bestEntry.profitFactor)) * 0.5)
+                const tp = Math.max(0.5, (effectivePF - 1) * 100)
+                const sl = Math.min(5, (100 / Math.max(1, effectivePF)) * 0.5)
 
                 const liveResult = await executeLivePosition(
                   this.connectionId,
@@ -3409,7 +3802,9 @@ export class StrategyCoordinator {
                     ratioMet: bestEntry.confidence >= 0.65,
                     timestamp: Date.now(),
                     ratios: {
-                      profitabilityRatio: bestEntry.profitFactor,
+                      // Use effectivePF (coord-record tuned) so risk ratios reflect
+                      // the Real-stage performance bias rather than raw Base entry PF.
+                      profitabilityRatio: effectivePF,
                       accountRiskRatio: sl / 100,
                       successRateRatio: bestEntry.confidence,
                       consistencyRatio: set.avgConfidence,
@@ -3433,9 +3828,10 @@ export class StrategyCoordinator {
                     axisWindows:  set.axisWindows,
                     // Forward the variant size multiplier so VolumeCalculator
                     // can apply Block (1.5–2.0×) or DCA (0.5×) notional scaling
-                    // before placing the exchange order. Falls back to set-level
-                    // sizeMultiplier then 1.0 if the entry doesn't carry one.
-                    sizeMultiplier: bestEntry.sizeMultiplier ?? (set as any).sizeMultiplier ?? 1,
+                    // before placing the exchange order. `effectiveSizeMult` has
+                    // already incorporated the CoordRecord sizeDelta from the
+                    // Real-stage tuner — no extra entry scan needed.
+                    sizeMultiplier: effectiveSizeMult,
                   },
                   connector
                 )
@@ -3574,13 +3970,17 @@ export class StrategyCoordinator {
           const creations = await Promise.all(
             qualifying.map(async (set) => {
               try {
-                // Axis Sets are pure-metadata projections (entries=[]).
-                // Hydrate from the parent Real Set when entries is empty so
-                // the pseudo creation path can still derive SL/TP from PF.
+                // Axis Sets carry one synthetic representative entry; for SL/TP
+                // derivation we need the full entries[] from the Base Set.
+                // Priority: set.entries (non-empty profile-variant sets) →
+                //   coordIndex.base.byKey O(1) lookup → O(N) realSets.find() fallback.
+                const _pseudoParentKey = set.parentSetKey || set.setKey.split("#")[0]
                 const effectiveEntries =
                   set.entries.length > 0
                     ? set.entries
-                    : (realSets.find((s) => s.setKey === set.parentSetKey)?.entries ?? [])
+                    : coordIndex
+                      ? (coordIndex.base.byKey.get(_pseudoParentKey)?.entries ?? [])
+                      : (realSets.find((s) => s.setKey === _pseudoParentKey)?.entries ?? [])
                 const bestEntry = effectiveEntries.reduce(
                   (best, e) => (e.profitFactor > best.profitFactor ? e : best),
                   effectiveEntries[0],
@@ -3761,7 +4161,7 @@ export class StrategyCoordinator {
 
         for (const h of hashes) {
           if (!h) continue
-          // ── P2-1: Strict closed-only gate ──────────────────────────────
+          // ── P2-1: Strict closed-only gate ───────────────────��──────────
           // Positions in the closed_index are always closed by construction
           // (closePosition writes to the index). We still enforce the
           // status check as a defence against stale/corrupted rows.

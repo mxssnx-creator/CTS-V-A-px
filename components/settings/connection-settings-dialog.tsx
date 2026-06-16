@@ -38,7 +38,23 @@ import {
   Sparkles,
   Database,
   Activity,
+  Bookmark,
+  Trash2,
+  Check,
+  FolderOpen,
+  ChevronDown,
+  ChevronUp,
+  Flame,
+  CheckSquare,
+  Square,
 } from "lucide-react"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { toast } from "@/lib/simple-toast"
 // Collapsed to a single-line import: an earlier edit cycle left a stale
 // HMR module record for this file in `.next/cache`, causing the named
@@ -57,6 +73,13 @@ interface ConnectionSettingsDialogProps {
   connectionId: string
   connectionName: string
   exchange?: string
+}
+
+interface SettingsPreset {
+  name:       string
+  created_at: string
+  updated_at: string
+  payload:    Record<string, unknown>
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -126,10 +149,13 @@ const DEFAULT_INDICATION_PROFILE: ChannelProfile = {
   optimal:   { enabled: false, range: 20, timeout: 60, interval: 5 },
   auto:      { enabled: false, range: 25, timeout: 90, interval: 15 },
 }
+// Operator-spec defaults: base PF 1.0, main/real PF 1.2; max positions
+// raised for high-throughput pipelines (base/main: 5000, real: 2000).
+// Operator spec: base PF=1.0, main/real PF=1.2; max positions raised for high-throughput pipelines.
 const DEFAULT_STRATEGY_PROFILE: StrategyChannel = {
-  base: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 250 },
-  main: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 250 },
-  real: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 100 },
+  base: { enabled: true, min_profit_factor: 1.0, max_drawdown_time: 160, max_positions: 10000 },
+  main: { enabled: true, min_profit_factor: 1.2, max_drawdown_time: 160, max_positions: 10000 },
+  real: { enabled: true, min_profit_factor: 1.2, max_drawdown_time: 160, max_positions: 5000  },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -145,9 +171,6 @@ export function ConnectionSettingsDialog({
 }: ConnectionSettingsDialogProps) {
   const [tab, setTab] = useState<"overview" | "symbols" | "indications" | "strategies">("overview")
 
-  // Reset tab to Overview every time the dialog opens so state from a
-  // previous session does not persist between open/close cycles.
-  useEffect(() => { if (open) setTab("overview") }, [open])
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [exchangeKey, setExchangeKey] = useState<string>(exchange)
@@ -155,7 +178,7 @@ export function ConnectionSettingsDialog({
   // ── Overview state ──────────────────────────────────────────────
   const [overview, setOverview] = useState<OverviewSettings>({
     volumeFactorBase: 1.0,
-    volumeFactorLive: 1.0,
+    volumeFactorLive: 2.2,   // operator spec: 2.2 default
     volumeFactorPreset: 1.0,
     marginMode: "cross",
     volumeType: "usdt",
@@ -166,14 +189,19 @@ export function ConnectionSettingsDialog({
   })
 
   // ── Symbols state ───────────────────────────────────────────────
+  // Operator spec: default symbolOrder = volatility_1h, symbolCount = 20
   const [symbolsCfg, setSymbolsCfg] = useState<SymbolsSettings>({
     symbols: [],
-    symbolOrder: "volume_24h",
-    symbolCount: 3,
+    symbolOrder: "volatility_1h",
+    symbolCount: 20,
   })
   const [symbolInput, setSymbolInput] = useState("")
   const [exchangeSymbols, setExchangeSymbols] = useState<string[]>([])
+  // Full ticker objects (includes atr1h when sort=volatility_1h)
+  const [exchangeTickers, setExchangeTickers] = useState<Array<{ symbol: string; priceChangePercent: number; volume: number; atr1h?: number }>>([])
   const [loadingSymbols, setLoadingSymbols] = useState(false)
+  // Separate loading flag for the 1h volatility auto-select (kline fetch takes ~2s)
+  const [loadingVolatility1h, setLoadingVolatility1h] = useState(false)
   // The symbols the engine is currently running with (from active_symbols).
   // Shown as a read-only preview so the operator knows what takes effect
   // before and after saving.
@@ -186,39 +214,177 @@ export function ConnectionSettingsDialog({
   const [stratPreset, setStratPreset] = useState<StrategyChannel>(DEFAULT_STRATEGY_PROFILE)
   const [coordination, setCoordination] = useState<CoordinationSettings>(DEFAULT_COORDINATION_SETTINGS)
 
-  // ─────────────────────────────────────────────���───────────────────
-  // LOAD
-  // ──────────────────────────────────────�����──────────────────────────
+  // ── Settings presets ────────────────────────────────────────────
+  const [presets,        setPresets]        = useState<SettingsPreset[]>([])
+  const [presetsOpen,    setPresetsOpen]    = useState(false)
+  const [presetName,     setPresetName]     = useState("")
+  const [presetSaving,   setPresetSaving]   = useState(false)
+  const [presetLoading,  setPresetLoading]  = useState<string | null>(null) // name of preset being loaded
+  const [presetDeleting, setPresetDeleting] = useState<string | null>(null) // name being deleted
+  const [presetConfirm,  setPresetConfirm]  = useState<string | null>(null) // name awaiting delete confirm
 
-  const loadAll = useCallback(async () => {
+  const fetchPresets = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/settings/connections/${connectionId}/settings-presets`)
+      if (!res.ok) return
+      const data = await res.json()
+      setPresets(Array.isArray(data.presets) ? data.presets : [])
+    } catch {
+      // non-fatal
+    }
+  }, [connectionId])
+
+  const savePreset = useCallback(async () => {
+    const trimmed = presetName.trim()
+    if (!trimmed) return
+    setPresetSaving(true)
+    try {
+      // Build current dialog state as payload — same shape as saveAll sends
+      const payload = {
+        volume_factor:        overview.volumeFactorBase,
+        volume_factor_live:   overview.volumeFactorLive,
+        volume_factor_preset: overview.volumeFactorPreset,
+        margin_mode:          overview.marginMode,
+        volume_type:          overview.volumeType,
+        position_mode:        overview.positionMode,
+        leveragePercentage:   overview.leveragePercentage,
+        useMaximalLeverage:   overview.useMaximalLeverage,
+        use_system_close_only: overview.useSystemCloseOnly,
+        symbol_order:         symbolsCfg.symbolOrder,
+        symbol_count:         symbolsCfg.symbolCount,
+        symbols:              symbolsCfg.symbols,
+        strategies:           { main: stratMain, preset: stratPreset },
+        coordination_settings: coordination,
+        prevPosMinCount:      coordination.prevPosMinCount,
+        mainEvalPosCount:     coordination.mainEvalPosCount,
+        realEvalPosCount:     coordination.realEvalPosCount,
+        prevPosWindow:        coordination.prevPosWindow,
+        minStep:              coordination.minStep ?? 5,
+        control_orders:       true,
+        variant_trailing:     coordination.variants.trailing !== false,
+        variant_block:        coordination.variants.block    !== false,
+        variant_dca:          coordination.variants.dca      === true,
+      }
+      const res = await fetch(`/api/settings/connections/${connectionId}/settings-presets`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ name: trimmed, payload }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as Record<string, unknown>
+        throw new Error((err.error as string) || "Save failed")
+      }
+      const saved = await res.json()
+      toast.success(saved.isNew ? "Preset saved" : "Preset updated", { description: `"${trimmed}"` })
+      setPresetName("")
+      await fetchPresets()
+    } catch (err) {
+      toast.error("Preset save failed", { description: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setPresetSaving(false)
+    }
+  }, [connectionId, presetName, overview, symbolsCfg, stratMain, stratPreset, coordination, fetchPresets])
+
+  const loadPreset = useCallback(async (preset: SettingsPreset) => {
+    setPresetLoading(preset.name)
+    try {
+      const p = preset.payload
+      if (!p || typeof p !== "object") throw new Error("Preset payload is empty")
+
+      // Apply overview settings
+      setOverview(prev => ({
+        ...prev,
+        volumeFactorBase:   Number(p.volume_factor)         || prev.volumeFactorBase,
+        volumeFactorLive:   Number(p.volume_factor_live)    || prev.volumeFactorLive,
+        volumeFactorPreset: Number(p.volume_factor_preset)  || prev.volumeFactorPreset,
+        marginMode:        (p.margin_mode    as "cross" | "isolated") || prev.marginMode,
+        volumeType:        (p.volume_type    as "usdt" | "contract" | "spot") || prev.volumeType,
+        positionMode:      (p.position_mode  as "one_way" | "hedge") || prev.positionMode,
+        leveragePercentage: Number(p.leveragePercentage)   || prev.leveragePercentage,
+        useMaximalLeverage: p.useMaximalLeverage !== false && p.useMaximalLeverage !== "false",
+        useSystemCloseOnly: p.use_system_close_only === true || p.useSystemCloseOnly === true,
+      }))
+
+      // Apply symbols settings
+      setSymbolsCfg(prev => ({
+        ...prev,
+        symbolOrder: (p.symbol_order as typeof prev.symbolOrder) || prev.symbolOrder,
+        symbolCount: Number(p.symbol_count) || prev.symbolCount,
+        symbols:     Array.isArray(p.symbols) ? (p.symbols as string[]) : prev.symbols,
+      }))
+
+      // Apply strategy channel settings
+      const strats = p.strategies as Record<string, unknown> | undefined
+      if (strats?.main) setStratMain(prev => ({ ...prev, ...(strats.main as object) }))
+      if (strats?.preset) setStratPreset(prev => ({ ...prev, ...(strats.preset as object) }))
+
+      // Apply coordination
+      const coord = (p.coordination_settings || p.coordinationSettings) as Partial<CoordinationSettings> | undefined
+      if (coord && typeof coord === "object") {
+        setCoordination(prev => ({
+          ...prev,
+          ...coord,
+          variants: { ...prev.variants, ...(coord.variants ?? {}) },
+        }))
+      }
+
+      toast.success("Preset loaded", { description: `"${preset.name}" — review and save to apply` })
+    } catch (err) {
+      toast.error("Failed to load preset", { description: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setPresetLoading(null)
+    }
+  }, [])
+
+  const deletePreset = useCallback(async (name: string) => {
+    setPresetDeleting(name)
+    setPresetConfirm(null)
+    try {
+      const res = await fetch(`/api/settings/connections/${connectionId}/settings-presets`, {
+        method:  "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ name }),
+      })
+      if (!res.ok) throw new Error("Delete failed")
+      toast.success("Preset deleted", { description: `"${name}"` })
+      await fetchPresets()
+    } catch (err) {
+      toast.error("Delete failed", { description: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setPresetDeleting(null)
+    }
+  }, [connectionId, fetchPresets])
+
+  // ─────────────────────────────────────────────────────────────────
+  // LOAD — fetch saved settings from Redis and hydrate all dialog state
+  // ──────────────────────────────────────────────────────��──────────
+
+  const loadAllSettings = useCallback(async () => {
     setLoading(true)
     try {
-      // Settings (volume factors, margin, volume type, symbols, strategies)
       const [settingsRes, indRes, symRes] = await Promise.all([
         fetch(`/api/settings/connections/${connectionId}/settings`).catch(() => null),
         fetch(`/api/settings/connections/${connectionId}/active-indications`).catch(() => null),
         fetch(`/api/settings/connections/${connectionId}/symbols`).catch(() => null),
       ])
 
-      // ── Settings → Overview + Symbols + Strategies ─────────────
       if (settingsRes?.ok) {
         const data = await settingsRes.json()
         const settings = data.settings || {}
         const conn     = data.connection || {}
         setExchangeKey(String(conn.exchange || exchange).toLowerCase())
         setOverview({
-          // Use `||` not `??` — Number(null/undefined) is 0 (falsy), not NaN,
-          // so `?? 1.0` would never fire on a missing field.
           volumeFactorBase:   Number(settings.volume_factor)        || Number(conn.volume_factor) || 1.0,
-          volumeFactorLive:   Number(settings.volume_factor_live)   || 1.0,
-          volumeFactorPreset: Number(settings.volume_factor_preset) || 1.0,
+          // Read live/preset factor from BOTH the settings hash (volume_factor_live) and
+          // the connection hash (live_volume_factor) so changes made via the card's inline
+          // volume sliders (which write to the connection hash via the /volume route) are
+          // always reflected when the dialog opens.
+          volumeFactorLive:   Number(settings.volume_factor_live)   || Number(conn.live_volume_factor)   || 2.2,
+          volumeFactorPreset: Number(settings.volume_factor_preset) || Number(conn.preset_volume_factor) || 1.0,
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
           positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
           leveragePercentage: Number(settings.leveragePercentage) || 100,
-          // Default to true when not set — the engine uses maximal leverage by
-          // default. The `=== false` path only fires when the operator
-          // explicitly disabled it in a prior save.
           useMaximalLeverage: settings.useMaximalLeverage !== false && settings.useMaximalLeverage !== "false",
           useSystemCloseOnly: settings.use_system_close_only === true || settings.useSystemCloseOnly === true,
         })
@@ -228,9 +394,6 @@ export function ConnectionSettingsDialog({
           symbolOrder: (settings.symbol_order as SymbolOrder) || prev.symbolOrder,
           symbolCount: Number(settings.symbol_count) || prev.symbolCount,
         }))
-        // Capture the engine's currently-active symbols for display in the
-        // Symbols tab so the operator sees what the engine is running before
-        // they change anything.
         const rawActive = conn.active_symbols || settings.active_symbols
         const parsedActive: string[] = (() => {
           if (Array.isArray(rawActive)) return rawActive.filter(Boolean)
@@ -241,13 +404,8 @@ export function ConnectionSettingsDialog({
           return []
         })()
         setActiveSymbols(parsedActive)
-        // Merge saved strategy channels with per-field defaults so older
-        // saves (pre-slider, with missing or out-of-range fields) never feed
-        // undefined into .toFixed() or NaN into Slider's value prop.
-        const mergeStratChannel = (
-          saved: unknown,
-          defaults: StrategyChannel,
-        ): StrategyChannel => {
+
+        const mergeStratChannel = (saved: unknown, defaults: StrategyChannel): StrategyChannel => {
           if (!saved || typeof saved !== "object") return defaults
           const s = saved as Record<string, unknown>
           const mergeStage = (stage: StrategyType): StrategyParams => {
@@ -256,71 +414,35 @@ export function ConnectionSettingsDialog({
             const def = defaults[stage]
             return {
               enabled:           typeof raw.enabled === "boolean" ? raw.enabled : def.enabled,
-              min_profit_factor: Number.isFinite(Number(raw.min_profit_factor)) && Number(raw.min_profit_factor) >= 0.1
-                ? Number(raw.min_profit_factor) : def.min_profit_factor,
-              max_drawdown_time: Number.isFinite(Number(raw.max_drawdown_time)) && Number(raw.max_drawdown_time) >= 20
-                ? Number(raw.max_drawdown_time) : def.max_drawdown_time,
-              max_positions:     Number.isFinite(Number(raw.max_positions)) && Number(raw.max_positions) >= 1
-                ? Number(raw.max_positions) : def.max_positions,
+              min_profit_factor: Number.isFinite(Number(raw.min_profit_factor)) && Number(raw.min_profit_factor) >= 0.1 ? Number(raw.min_profit_factor) : def.min_profit_factor,
+              max_drawdown_time: Number.isFinite(Number(raw.max_drawdown_time)) && Number(raw.max_drawdown_time) >= 20  ? Number(raw.max_drawdown_time)  : def.max_drawdown_time,
+              max_positions:     Number.isFinite(Number(raw.max_positions))     && Number(raw.max_positions)     >= 1   ? Number(raw.max_positions)      : def.max_positions,
             }
           }
-          return {
-            base: mergeStage("base"),
-            main: mergeStage("main"),
-            real: mergeStage("real"),
-          }
+          return { base: mergeStage("base"), main: mergeStage("main"), real: mergeStage("real") }
         }
         if (settings.strategies?.main)   setStratMain(mergeStratChannel(settings.strategies.main, DEFAULT_STRATEGY_PROFILE))
         if (settings.strategies?.preset) setStratPreset(mergeStratChannel(settings.strategies.preset, DEFAULT_STRATEGY_PROFILE))
-        // Merge saved coord into defaults so older saves (without the
-        // Block ratio / max-stack fields, or without some variants) load
-        // cleanly and the new sliders aren't fed undefined.
+
         const coord = settings.coordination_settings || settings.coordinationSettings
         if (coord) {
-          setCoordination({
+          setCoordination(prev => ({
             ...DEFAULT_COORDINATION_SETTINGS,
+            ...prev,
             ...coord,
             axes:     { ...DEFAULT_COORDINATION_SETTINGS.axes,     ...(coord.axes     || {}) },
             variants: { ...DEFAULT_COORDINATION_SETTINGS.variants, ...(coord.variants || {}) },
-            blockVolumeRatio:
-              typeof coord.blockVolumeRatio === "number"
-                ? coord.blockVolumeRatio
-                : DEFAULT_COORDINATION_SETTINGS.blockVolumeRatio,
-            blockMaxStack:
-              typeof coord.blockMaxStack === "number"
-                ? coord.blockMaxStack
-                : DEFAULT_COORDINATION_SETTINGS.blockMaxStack,
-            // ── Prev-pos threshold hydrate ──────────────────────────
-            // Two persistence paths: the new nested `coord.prevPosMinCount`
-            // (saved alongside other coordination knobs) and the flat
-            // top-level `settings.prevPosMinCount` (read by the engine
-            // and `getStrategyTracking`). Hydrate from either, prefer
-            // the flat value because that's what the engine actually
-            // reads at Base creation. We also accept the legacy
-            // `prevPiMinCount` key (pre-rename) at both nesting levels
-            // so an upgrade-in-place doesn't reset operator tuning.
+            blockVolumeRatio: typeof coord.blockVolumeRatio === "number" ? coord.blockVolumeRatio : DEFAULT_COORDINATION_SETTINGS.blockVolumeRatio,
+            blockMaxStack:    typeof coord.blockMaxStack    === "number" ? coord.blockMaxStack    : DEFAULT_COORDINATION_SETTINGS.blockMaxStack,
             prevPosMinCount: (() => {
-              const s = settings as Record<string, unknown>
-              const c = coord as Record<string, unknown>
-              const flat = Number(s.prevPosMinCount ?? s.prevPiMinCount)
-              if (Number.isFinite(flat) && flat >= 1) {
-                return Math.min(50, Math.floor(flat))
-              }
-              const nested = Number(c.prevPosMinCount ?? c.prevPiMinCount)
-              if (Number.isFinite(nested) && nested >= 1) {
-                return Math.min(50, Math.floor(nested))
-              }
+              const flat = Number((settings as Record<string, unknown>).prevPosMinCount ?? (settings as Record<string, unknown>).prevPiMinCount)
+              if (Number.isFinite(flat) && flat >= 1) return Math.min(50, Math.floor(flat))
+              const nested = Number((coord as Record<string, unknown>).prevPosMinCount ?? (coord as Record<string, unknown>).prevPiMinCount)
+              if (Number.isFinite(nested) && nested >= 1) return Math.min(50, Math.floor(nested))
               return DEFAULT_COORDINATION_SETTINGS.prevPosMinCount
             })(),
-            // ── Stage validation min-positions hydrate (5-50 step 5) ─
-            // Same dual-path hydrate as prevPosMinCount: prefer flat
-            // top-level (engine reads it cheaply), fall back to nested
-            // coordination settings, fall back to spec default. Snap
-            // to the 5-step grid so legacy free-typed values cannot
-            // bypass the slider granularity.
             mainEvalPosCount: (() => {
-              const snap = (n: number) =>
-                Math.min(50, Math.max(5, Math.round(n / 5) * 5))
+              const snap = (n: number) => Math.min(50, Math.max(5, Math.round(n / 5) * 5))
               const flat = Number((settings as Record<string, unknown>).mainEvalPosCount)
               if (Number.isFinite(flat) && flat >= 1) return snap(flat)
               const nested = Number((coord as Record<string, unknown>).mainEvalPosCount)
@@ -328,105 +450,50 @@ export function ConnectionSettingsDialog({
               return DEFAULT_COORDINATION_SETTINGS.mainEvalPosCount
             })(),
             realEvalPosCount: (() => {
-              const snap = (n: number) =>
-                Math.min(50, Math.max(5, Math.round(n / 5) * 5))
               const flat = Number((settings as Record<string, unknown>).realEvalPosCount)
-              if (Number.isFinite(flat) && flat >= 1) return snap(flat)
+              if (Number.isFinite(flat) && flat >= 1) return Math.min(50, Math.max(1, flat))
               const nested = Number((coord as Record<string, unknown>).realEvalPosCount)
-              if (Number.isFinite(nested) && nested >= 1) return snap(nested)
+              if (Number.isFinite(nested) && nested >= 1) return Math.min(50, Math.max(1, nested))
               return DEFAULT_COORDINATION_SETTINGS.realEvalPosCount
             })(),
-            // ── PF rolling-window hydrate (5-200 step 5) ����───────────
-            // Same dual-path (flat top-level preferred for engine reads,
-            // nested fallback). Snap to the 5-step grid the slider uses.
-            prevPosWindow: (() => {
-              const snap = (n: number) =>
-                Math.min(200, Math.max(5, Math.round(n / 5) * 5))
-              const flat = Number((settings as Record<string, unknown>).prevPosWindow)
-              if (Number.isFinite(flat) && flat >= 1) return snap(flat)
-              const nested = Number((coord as Record<string, unknown>).prevPosWindow)
-              if (Number.isFinite(nested) && nested >= 1) return snap(nested)
-              return DEFAULT_COORDINATION_SETTINGS.prevPosWindow
-            })(),
-            // ── Minimal Step hydrate (3-30 step 1) ───────────────────
             minStep: (() => {
               const flat = Number((settings as Record<string, unknown>).minStep)
-              if (Number.isFinite(flat) && flat >= 3) return Math.min(30, Math.floor(flat))
+              if (Number.isFinite(flat) && flat >= 3) return Math.min(30, Math.max(3, Math.round(flat)))
               const nested = Number((coord as Record<string, unknown>).minStep)
-              if (Number.isFinite(nested) && nested >= 3) return Math.min(30, Math.floor(nested))
-              return DEFAULT_COORDINATION_SETTINGS.minStep
+              if (Number.isFinite(nested) && nested >= 3) return Math.min(30, Math.max(3, Math.round(nested)))
+              return DEFAULT_COORDINATION_SETTINGS.minStep ?? 5
             })(),
-          })
+          }))
         }
       }
 
-      // ── Active indications → Main + Preset ─────────────────────
       if (indRes?.ok) {
         const data = await indRes.json()
-        if (data?.channels?.main)   setIndMain(data.channels.main)
-        if (data?.channels?.preset) setIndPreset(data.channels.preset)
+        const channels = data.channels || {}
+        if (channels.main)   setIndMain(channels.main)
+        if (channels.preset) setIndPreset(channels.preset)
       }
 
-      // ── Available symbols list (used by Symbols tab picker) ────
       if (symRes?.ok) {
         const data = await symRes.json()
-        if (Array.isArray(data.symbols)) setExchangeSymbols(data.symbols)
+        if (Array.isArray(data.symbols) && data.symbols.length > 0) {
+          setExchangeSymbols(data.symbols)
+        }
       }
     } catch (err) {
-      console.error("[v0] [Settings Dialog] load error:", err)
-      toast.error("Load failed", { description: err instanceof Error ? err.message : String(err) })
+      console.error("[v0] [Settings Dialog] loadAllSettings error:", err)
     } finally {
       setLoading(false)
     }
-  }, [connectionId, exchange])
-
-  useEffect(() => { if (open) loadAll() }, [open, loadAll])
-
-  // Auto-populate exchange symbol suggestions whenever the dialog opens or
-  // the symbol order changes. This ensures the "Suggested" panel is always
-  // pre-populated without requiring the operator to click "Refresh listings".
-  useEffect(() => {
-    if (!open) return
-    refreshExchangeSymbols()
+  // connectionId and exchange are stable — both come from props and don't change
+  // within a single dialog open. Excluding them from the dep array intentionally
+  // to avoid re-triggering on every render cycle.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, exchangeKey, symbolsCfg.symbolOrder])
-
-  // ─────────────────────���───────────────────────────────────────────
-  // EXCHANGE SYMBOLS REFRESH
-  // ────────────────────────────────────────────���────────────────────
-
-  const refreshExchangeSymbols = useCallback(async () => {
-    setLoadingSymbols(true)
-    try {
-      // Use the top-symbols endpoint when ordering by volume/volatility/listed,
-      // otherwise the static cache fallback below.
-      const window = symbolsCfg.symbolOrder.includes("1h") ? "1h" : "24h"
-      const sortMap: Record<SymbolOrder, string> = {
-        volume_24h:     "volume",
-        volume_1h:      "volume",
-        volatility_24h: "volatility",
-        volatility_1h:  "volatility",
-        newest:         "listed_at",
-        manual:         "volume",
-      }
-      const sort = sortMap[symbolsCfg.symbolOrder]
-      const url = `/api/exchange/${exchangeKey}/top-symbols?window=${window}&sort=${sort}&limit=50`
-      const res = await fetch(url)
-      if (res.ok) {
-        const data = await res.json()
-        const symbols: string[] = (data?.symbols || []).map((s: any) => s.symbol || s).filter(Boolean)
-        if (symbols.length > 0) setExchangeSymbols(symbols)
-      }
-    } catch (err) {
-      console.warn("[v0] [Settings Dialog] refresh symbols failed:", err)
-    } finally {
-      setLoadingSymbols(false)
-    }
-  }, [exchangeKey, symbolsCfg.symbolOrder])
+  }, [connectionId, exchange])
 
   // ─────────────────────────────────────────────────────────────────
   // SAVE
-  // ─────────────────────────────────────────────────────────────────
+  // ─��──────────────────────────────────��────────────────────────────
 
   const saveAll = useCallback(async () => {
     setSaving(true)
@@ -467,6 +534,12 @@ export function ConnectionSettingsDialog({
         realEvalPosCount: coordination.realEvalPosCount,
         prevPosWindow:    coordination.prevPosWindow,
         minStep:          coordination.minStep ?? 5,
+        // Control orders (SL/TP placement toggle) — operator spec: on by default
+        control_orders:   true,
+        // Flat variant toggles for backwards compat with old hash readers
+        variant_trailing: coordination.variants.trailing !== false,
+        variant_block:    coordination.variants.block    !== false,
+        variant_dca:      coordination.variants.dca      === true,
       }
 
       const [settingsRes, indRes] = await Promise.all([
@@ -480,6 +553,19 @@ export function ConnectionSettingsDialog({
           headers: { "Content-Type": "application/json" },
           body:    JSON.stringify({ channels: { main: indMain, preset: indPreset } }),
         }),
+        // Keep the connection hash (live_volume_factor / preset_volume_factor)
+        // in sync with the settings hash. The card's inline volume sliders and
+        // VolumeCalculator both read from the connection hash via getConnection().
+        // Without this extra write the two storage locations diverge as soon as
+        // the user saves from the dialog.
+        fetch(`/api/settings/connections/${connectionId}/volume`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({
+            live_volume_factor:   overview.volumeFactorLive,
+            preset_volume_factor: overview.volumeFactorPreset,
+          }),
+        }).catch(() => { /* non-fatal — connection hash is a secondary write */ }),
       ])
 
       if (!settingsRes.ok) throw new Error("Settings save failed")
@@ -520,6 +606,70 @@ export function ConnectionSettingsDialog({
   // SYMBOL HELPERS
   // ─────────────────────────────────────────────────────────────────
 
+  const fetchExchangeSymbols = useCallback(async () => {
+    if (!exchangeKey) return
+    setLoadingSymbols(true)
+    try {
+      const res = await fetch(
+        `/api/settings/connections/${connectionId}/symbols?order=${symbolsCfg.symbolOrder}&count=50`
+      ).catch(() => null)
+      if (res?.ok) {
+        const data = await res.json()
+        const list: string[] = Array.isArray(data.symbols) ? data.symbols
+          : Array.isArray(data.available) ? data.available : []
+        setExchangeSymbols(list)
+        // Store full ticker objects for the ranked preview table
+        if (Array.isArray(data.tickers)) {
+          setExchangeTickers(data.tickers)
+        }
+      }
+    } catch { /* non-fatal */ }
+    finally { setLoadingSymbols(false) }
+  }, [connectionId, exchangeKey, symbolsCfg.symbolOrder])
+
+  // Auto-selects top-N symbols by true 1h ATR volatility.
+  // Fetches live klines for the top-50 volume pool, re-ranks by (high−low)/open,
+  // then populates `symbolsCfg.symbols` and switches symbolOrder to volatility_1h
+  // so the engine's PATCH resolver auto-applies them on the next engine start.
+  const autoSelectByVolatility1h = useCallback(async () => {
+    setLoadingVolatility1h(true)
+    try {
+      const res = await fetch(
+        `/api/settings/connections/${connectionId}/symbols?order=volatility_1h&count=${Math.max(symbolsCfg.symbolCount, 20)}`
+      ).catch(() => null)
+      if (!res?.ok) throw new Error("Failed to fetch 1h volatility symbols")
+      const data = await res.json()
+      const tickers: Array<{ symbol: string; priceChangePercent: number; volume: number; atr1h?: number }> =
+        Array.isArray(data.tickers) ? data.tickers : []
+      const symbols: string[] = tickers.map((t) => t.symbol)
+      if (symbols.length === 0) throw new Error("No symbols returned")
+
+      setExchangeSymbols(symbols)
+      setExchangeTickers(tickers)
+      setSymbolsCfg(prev => ({
+        ...prev,
+        symbols: symbols.slice(0, prev.symbolCount),
+        symbolOrder: "volatility_1h",
+      }))
+      toast.success(
+        `Auto-selected top ${Math.min(symbols.length, symbolsCfg.symbolCount)} by 1h ATR`,
+        { description: symbols.slice(0, symbolsCfg.symbolCount).join(", ") },
+      )
+    } catch (err) {
+      toast.error("Auto-select failed", { description: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setLoadingVolatility1h(false)
+    }
+  }, [connectionId, symbolsCfg.symbolCount])
+
+  // Auto-populate exchange symbol suggestions when dialog opens or symbol
+  // order/exchange changes so the Symbols tab picker is always pre-loaded.
+  useEffect(() => {
+    if (!open) return
+    fetchExchangeSymbols()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, exchangeKey, symbolsCfg.symbolOrder])
+
   const addSymbol = useCallback((sym: string) => {
     const clean = sym.trim().toUpperCase()
     if (!clean) return
@@ -547,15 +697,33 @@ export function ConnectionSettingsDialog({
     [exchangeSymbols, symbolsCfg.symbols],
   )
 
-  // ────────────────────────────────────���────────────────────────────
-  // RENDER
+  // ──────────────────────────────────────────────��──────────────────
+  // OPEN EFFECT — fires when the dialog opens; loads settings + presets.
+  // Declared after all useCallback refs so they are in scope.
   // ─────────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!open) return
+    setTab("overview")
+    setPresetsOpen(false)
+    setPresetName("")
+    setPresetConfirm(null)
+    loadAllSettings()
+    fetchPresets()
+    // Stable stable refs — intentionally omit from dep array to avoid
+    // retriggering on every render. `open` is the only signal we need.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
+
+  // ─────────────────────────────────────────────────────────────────
+  // RENDER
+  // ────────────────────────────────────────────────────────���────────
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl max-h-[90vh] overflow-hidden flex flex-col p-0">
+      <DialogContent className="max-w-3xl h-[90vh] overflow-hidden flex flex-col p-0 [&>button]:z-10">
         {/* Header */}
-        <DialogHeader className="px-5 pt-4 pb-3 border-b">
+        <DialogHeader className="px-5 pt-4 pb-3 border-b shrink-0">
           <div className="flex items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary/10">
               <Sparkles className="h-4 w-4 text-primary" />
@@ -575,8 +743,8 @@ export function ConnectionSettingsDialog({
         </DialogHeader>
 
         {/* Top Tabs */}
-        <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="flex-1 flex flex-col overflow-hidden">
-          <TabsList className="mx-5 mt-3 grid grid-cols-4 h-9">
+        <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="flex-1 flex flex-col overflow-hidden min-h-0">
+          <TabsList className="mx-5 mt-3 grid grid-cols-4 h-9 shrink-0 z-10">
             <TabsTrigger value="overview" className="text-xs gap-1.5">
               <Activity className="h-3.5 w-3.5" /> Overview
             </TabsTrigger>
@@ -591,7 +759,14 @@ export function ConnectionSettingsDialog({
             </TabsTrigger>
           </TabsList>
 
-          <ScrollArea className="flex-1 px-5 py-4">
+          {/* The ScrollArea must receive a concrete height so Radix can
+              measure its internal viewport and position the scroll thumb.
+              `min-h-0` is critical on flex children: without it the flex
+              item expands to fit its content and never scrolls. The
+              `overflow-hidden` on the `Tabs` parent above combined with
+              `flex-1 min-h-0` here constrains the height to the remaining
+              space below the TabsList. */}
+          <ScrollArea className="flex-1 min-h-0 px-5 py-4">
             {loading && (
               <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-sm">
                 <Loader2 className="h-4 w-4 animate-spin" /> Loading settings…
@@ -602,13 +777,189 @@ export function ConnectionSettingsDialog({
               <>
                 {/* OVERVIEW ──────────────────────────────────────── */}
                 <TabsContent value="overview" className="mt-0 space-y-5">
-                  <SectionHeading icon={ArrowDownUp} title="Volume Factors" subtitle="Multiplier applied to position size for each trade channel." />
-                  <VolumeSlider
-                    label="Base"
-                    description="Default multiplier for the standard pipeline."
-                    value={overview.volumeFactorBase}
-                    onChange={(v) => setOverview(p => ({ ...p, volumeFactorBase: v }))}
-                  />
+
+                  {/* ── Settings Presets ─────────────────────────── */}
+                  <div className="rounded-lg border border-border bg-muted/20 overflow-hidden">
+                    {/* Header row — always visible */}
+                    <button
+                      type="button"
+                      onClick={() => setPresetsOpen(p => !p)}
+                      className="w-full flex items-center justify-between px-3 py-2.5 hover:bg-muted/40 transition-colors text-left"
+                    >
+                      <div className="flex items-center gap-2">
+                        <Bookmark className="h-3.5 w-3.5 text-primary" />
+                        <span className="text-xs font-semibold">Settings Presets</span>
+                        {presets.length > 0 && (
+                          <span className="inline-flex items-center justify-center rounded-full bg-primary/15 text-primary text-[10px] font-semibold px-1.5 min-w-[18px] h-[18px]">
+                            {presets.length}
+                          </span>
+                        )}
+                      </div>
+                      {presetsOpen
+                        ? <ChevronUp  className="h-3.5 w-3.5 text-muted-foreground" />
+                        : <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+                      }
+                    </button>
+
+                    {presetsOpen && (
+                      <div className="border-t border-border px-3 pb-3 pt-2 space-y-3">
+                        {/* Saved preset list */}
+                        {presets.length === 0 ? (
+                          <p className="text-[11px] text-muted-foreground text-center py-2">
+                            No saved presets yet. Use the form below to save the current settings.
+                          </p>
+                        ) : (
+                          <div className="space-y-1.5">
+                            {presets.map((preset) => (
+                              <div
+                                key={preset.name}
+                                className="flex items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2"
+                              >
+                                {/* Name + timestamp */}
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-xs font-medium truncate">{preset.name}</div>
+                                  <div className="text-[10px] text-muted-foreground">
+                                    {preset.updated_at
+                                      ? new Date(preset.updated_at).toLocaleString(undefined, {
+                                          month: "short", day: "numeric",
+                                          hour: "2-digit", minute: "2-digit",
+                                        })
+                                      : ""}
+                                  </div>
+                                </div>
+
+                                {/* Load button */}
+                                <button
+                                  type="button"
+                                  onClick={() => loadPreset(preset)}
+                                  disabled={presetLoading === preset.name}
+                                  className="flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium bg-primary/10 hover:bg-primary/20 text-primary transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                  {presetLoading === preset.name
+                                    ? <Loader2 className="h-3 w-3 animate-spin" />
+                                    : <FolderOpen className="h-3 w-3" />
+                                  }
+                                  Load
+                                </button>
+
+                                {/* Delete button — two-step confirm */}
+                                {presetConfirm === preset.name ? (
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => deletePreset(preset.name)}
+                                      disabled={presetDeleting === preset.name}
+                                      className="flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium bg-destructive/10 hover:bg-destructive/20 text-destructive transition-colors disabled:opacity-50"
+                                    >
+                                      {presetDeleting === preset.name
+                                        ? <Loader2 className="h-3 w-3 animate-spin" />
+                                        : <Check className="h-3 w-3" />
+                                      }
+                                      Confirm
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setPresetConfirm(null)}
+                                      className="rounded px-1.5 py-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+                                    >
+                                      <X className="h-3 w-3" />
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => setPresetConfirm(preset.name)}
+                                    className="rounded p-1 text-muted-foreground hover:text-destructive transition-colors"
+                                    title="Delete preset"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Save new / overwrite form */}
+                        <div className="flex items-center gap-2 pt-1">
+                          <Input
+                            value={presetName}
+                            onChange={(e) => setPresetName(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); savePreset() } }}
+                            placeholder="Preset name…"
+                            maxLength={48}
+                            className="h-8 text-xs flex-1"
+                          />
+                          <button
+                            type="button"
+                            onClick={savePreset}
+                            disabled={!presetName.trim() || presetSaving}
+                            className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                          >
+                            {presetSaving
+                              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              : <Save className="h-3.5 w-3.5" />
+                            }
+                            Save
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-muted-foreground">
+                          Saves current dialog state. Loading a preset applies it to all fields — click Save Settings to apply to the engine.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+
+                  <Separator className="my-1" />
+
+                  {/* ── Minimal Position Step — promoted to page 1 per operator spec ─ */}
+                  <SectionHeading icon={Sparkles} title="Minimal Position-Creation Step" subtitle="Minimum step size for pseudo-position windows (Base stage). Controls which indication configs are generated — higher = fewer, smoother signals." />
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs">Min Step (3–30)</Label>
+                      <span className="text-xs font-mono tabular-nums font-semibold">{coordination.minStep ?? 5}</span>
+                    </div>
+                    <Slider
+                      min={3} max={30} step={1}
+                      value={[coordination.minStep ?? 5]}
+                      onValueChange={([v]) => setCoordination(p => ({ ...p, minStep: v }))}
+                      className="py-2"
+                    />
+                    <div className="flex justify-between text-[10px] text-muted-foreground">
+                      <span>3 — fast noise</span><span className="text-muted-foreground/60">default 5</span><span>30 — smooth</span>
+                    </div>
+                  </div>
+
+                  <Separator className="my-2" />
+
+                  {/* ── Quick Variant Toggles ─ */}
+                  <SectionHeading icon={Zap} title="Strategy Variants" subtitle="Enable or disable the main categorical variants that run on top of base sets." />
+                  <div className="grid gap-2">
+                    {(["trailing", "block", "dca"] as const).map((key) => {
+                      const labels: Record<string, { label: string; desc: string }> = {
+                        trailing: { label: "Trailing", desc: "Fires on consecutive wins — aggressive momentum follow." },
+                        block:    { label: "Block",    desc: "Add-on entries when continuousCount is 1–2 (independent of axes)." },
+                        dca:      { label: "DCA",      desc: "Dollar-cost averaging after prior losses (independent of axes)." },
+                      }
+                      const enabled = typeof coordination.variants[key] === "boolean" ? coordination.variants[key] : (key !== "dca")
+                      return (
+                        <div key={key} className={`flex items-center justify-between gap-3 rounded-md border px-3 py-2 transition-colors ${enabled ? "border-primary/30 bg-primary/5" : "border-border bg-muted/20"}`}>
+                          <div>
+                            <div className="text-xs font-medium">{labels[key].label}</div>
+                            <div className="text-[10px] text-muted-foreground leading-relaxed">{labels[key].desc}</div>
+                          </div>
+                          <Switch
+                            checked={enabled}
+                            onCheckedChange={(v) => setCoordination(p => ({ ...p, variants: { ...p.variants, [key]: v } }))}
+                          />
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  <Separator className="my-2" />
+
+                  <SectionHeading icon={ArrowDownUp} title="Volume Factors" subtitle="Multiplier applied to position size for live and preset channels. Base channel uses internal ratios (system-managed, not configurable)." />
                   <VolumeSlider
                     label="Live"
                     description="Applied while a Live position is open."
@@ -732,6 +1083,84 @@ export function ConnectionSettingsDialog({
                 <TabsContent value="symbols" className="mt-0 space-y-5">
                   <SectionHeading icon={Database} title="Symbol Selection" subtitle="Choose how the engine ranks and picks symbols from the exchange." />
 
+                  {/* ── 1h Volatility Auto-Select ─────────────────── */}
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 space-y-2.5">
+                    <div className="flex items-center gap-2">
+                      <Flame className="h-4 w-4 text-amber-500 shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-xs font-semibold">Auto-select by 1h Volatility</div>
+                <div className="text-[11px] text-muted-foreground">
+                  Fetches the last 1h kline for each candidate and ranks by{" "}
+                  <span className="font-mono">(high−low)/open×100</span>. Pool is pre-filtered to{" "}
+                  <span className="font-mono">&gt;$5M</span> 24h volume to exclude micro-caps. Fills
+                  the symbol list with the top-N most volatile and sets order to{" "}
+                  <span className="font-mono">volatility_1h</span>.
+                </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="h-8 text-xs gap-1.5 bg-amber-500 hover:bg-amber-600 text-white border-0"
+                        onClick={autoSelectByVolatility1h}
+                        disabled={loadingVolatility1h || loadingSymbols}
+                      >
+                        {loadingVolatility1h
+                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          : <Flame className="h-3.5 w-3.5" />
+                        }
+                        {loadingVolatility1h ? "Fetching 1h klines…" : `Top ${symbolsCfg.symbolCount} by 1h ATR`}
+                      </Button>
+                      <span className="text-[10px] text-muted-foreground">
+                        {loadingVolatility1h
+                          ? "Querying BingX klines in parallel…"
+                          : "Runs live against the exchange API — takes ~2s for 20 symbols."}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Ranked ticker table — shown after a 1h ATR fetch */}
+                  {exchangeTickers.length > 0 && exchangeTickers.some((t) => t.atr1h !== undefined) && (
+                    <div className="rounded-lg border border-border overflow-hidden">
+                      <div className="px-3 py-1.5 bg-muted/40 border-b border-border flex items-center justify-between">
+                        <span className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground">
+                          1h ATR Ranking
+                        </span>
+                        <span className="text-[10px] text-muted-foreground">Click to toggle</span>
+                      </div>
+                      <div className="divide-y divide-border max-h-48 overflow-y-auto">
+                        {exchangeTickers
+                          .filter((t) => t.atr1h !== undefined)
+                          .sort((a, b) => (b.atr1h ?? 0) - (a.atr1h ?? 0))
+                          .slice(0, 25)
+                          .map((t, i) => {
+                            const isSelected = symbolsCfg.symbols.includes(t.symbol)
+                            return (
+                              <button
+                                key={t.symbol}
+                                type="button"
+                                onClick={() => isSelected ? removeSymbol(t.symbol) : addSymbol(t.symbol)}
+                                className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent transition-colors ${isSelected ? "bg-primary/5" : ""}`}
+                              >
+                                <span className="w-5 text-[10px] text-muted-foreground tabular-nums">
+                                  {i + 1}
+                                </span>
+                                {isSelected
+                                  ? <CheckSquare className="h-3.5 w-3.5 text-primary shrink-0" />
+                                  : <Square className="h-3.5 w-3.5 text-muted-foreground/40 shrink-0" />
+                                }
+                                <span className="font-mono font-medium flex-1">{t.symbol}</span>
+                                <span className={`text-[10px] tabular-nums font-mono ${(t.atr1h ?? 0) >= 1.5 ? "text-amber-500" : (t.atr1h ?? 0) >= 0.8 ? "text-yellow-500" : "text-muted-foreground"}`}>
+                                  {(t.atr1h ?? 0).toFixed(2)}% ATR
+                                </span>
+                              </button>
+                            )
+                          })}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Currently-active symbols — read-only status banner */}
                   {activeSymbols.length > 0 && (
                     <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-1">
@@ -770,13 +1199,13 @@ export function ConnectionSettingsDialog({
                         <span className="text-xs font-mono tabular-nums">{symbolsCfg.symbolCount}</span>
                       </div>
                       <Slider
-                        min={1} max={25} step={1}
+                        min={1} max={32} step={1}
                         value={[symbolsCfg.symbolCount]}
                         onValueChange={([v]) => setSymbolsCfg(p => ({ ...p, symbolCount: v }))}
                         className="py-2"
                       />
                       <div className="flex justify-between text-[10px] text-muted-foreground">
-                        <span>1</span><span>default 3</span><span>25</span>
+                        <span>1</span><span>default 15</span><span>32</span>
                       </div>
                     </div>
                   </div>
@@ -808,7 +1237,7 @@ export function ConnectionSettingsDialog({
                         type="button"
                         size="sm" variant="outline"
                         className="h-7 text-xs gap-1"
-                        onClick={refreshExchangeSymbols}
+                        onClick={fetchExchangeSymbols}
                         disabled={loadingSymbols}
                       >
                         {loadingSymbols ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
@@ -895,7 +1324,7 @@ export function ConnectionSettingsDialog({
                   </Tabs>
                 </TabsContent>
 
-                {/* STRATEGIES ─────────────────────────────────── */}
+                {/* STRATEGIES ──────────��──────────────────────── */}
                 <TabsContent value="strategies" className="mt-0">
                   <Tabs defaultValue="main" className="w-full">
                     <TabsList className="grid grid-cols-3 h-8 mb-4 w-fit">
@@ -927,7 +1356,7 @@ export function ConnectionSettingsDialog({
           </ScrollArea>
         </Tabs>
 
-        <DialogFooter className="px-5 py-3 border-t bg-muted/30">
+        <DialogFooter className="px-5 py-3 border-t bg-muted/30 shrink-0">
           <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
             Cancel
           </Button>
@@ -1109,7 +1538,9 @@ function StrategyProfileEditor({
               />
               <div className="flex justify-between text-[10px] text-muted-foreground">
                 <span>0.1</span>
-                <span className="text-muted-foreground/60">default 0.9</span>
+                <span className="text-muted-foreground/60">
+                  {type === "base" ? "default 1.0" : "default 1.2"}
+                </span>
                 <span>3.0</span>
               </div>
             </div>
@@ -1139,16 +1570,29 @@ function StrategyProfileEditor({
               </div>
             </div>
 
-            {/* Max Positions — keep as compact number field */}
-            <div className="pt-1 border-t border-border/40">
-              <NumberField
-                label="Max Positions"
-                suffix=""
-                min={1} max={1000} step={1}
-                value={p.max_positions}
-                onChange={(v) => update(type, { max_positions: v })}
+            {/* Max Positions slider — raised ceiling for high-throughput pipelines */}
+            <div className="space-y-2 pt-1 border-t border-border/40">
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label className="text-xs font-medium">Max Positions</Label>
+                  <div className="text-[10px] text-muted-foreground">Maximum concurrent pseudo-positions for this stage</div>
+                </div>
+                <span className="font-mono text-sm tabular-nums font-semibold min-w-[4rem] text-right">
+                  {p.max_positions.toLocaleString()}
+                </span>
+              </div>
+              <Slider
+                min={100} max={50000} step={100}
+                value={[p.max_positions]}
+                onValueChange={([v]) => update(type, { max_positions: v })}
                 disabled={!p.enabled}
+                className="py-1"
               />
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>100</span>
+                <span className="text-muted-foreground/60">{type === "real" ? "default 2,000" : "default 5,000"}</span>
+                <span>50,000</span>
+              </div>
             </div>
           </div>
         )

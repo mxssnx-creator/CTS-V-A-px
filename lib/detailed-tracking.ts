@@ -418,9 +418,12 @@ export async function getStrategyTracking(
     if (k.endsWith(":live")) liveActive += Number(v || "0")
   }
 
-  // Live data: read from `strategy_detail:{conn}:live` for symmetry
+  // Live data: read from `strategy_detail:{conn}:live` for symmetry.
+  // NOTE: hgetall returns null (does NOT throw) for missing keys — the
+  // .catch alone never fires, so the `|| {}` coercion is required or this
+  // crashes with "Cannot read properties of null" on a fresh DB.
   const liveDetailKey = `strategy_detail:${connectionId}:live`
-  const liveDetail = (await client.hgetall(liveDetailKey).catch(() => ({}))) as Record<string, string>
+  const liveDetail = ((await client.hgetall(liveDetailKey).catch(() => ({}))) || {}) as Record<string, string>
 
   // ── Pre-derive Real 4-perspective so the UI doesn't have to ──
   // Overall is cumulative across cycles, accumulated is the axis sum

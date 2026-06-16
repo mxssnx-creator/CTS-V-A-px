@@ -1,18 +1,11 @@
 import { NextResponse } from "next/server"
-import { getRedisClient, initRedis, getActiveConnectionsForEngine, getAllConnections } from "@/lib/redis-db"
+import { getRedisClient, initRedis, getActiveConnectionsForEngine } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
 export const fetchCache = "force-no-store"
-
-// Symbols to generate indications for
-const INDICATION_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-// Track last generation time to avoid spamming
-let lastIndicationGeneration = 0
-const GENERATION_INTERVAL = 2000 // Generate every 2 seconds max
 
 // RUNTIME FIX: Patch IndicationProcessor cache on every API call
 // This fixes the "Cannot read properties of undefined (reading 'get')" error
@@ -41,66 +34,12 @@ function patchIndicationProcessorCaches(coordinator: any) {
   }
 }
 
-// Generate indications using inline logic (bypasses broken IndicationProcessor)
-async function generateIndicationsIfNeeded() {
-  const now = Date.now()
-  if (now - lastIndicationGeneration < GENERATION_INTERVAL) {
-    return // Too soon, skip
-  }
-  lastIndicationGeneration = now
-  
-  try {
-    const connections = await getAllConnections()
-    const activeConnections = connections.filter((c: any) => c.isActive || c.is_active)
-    
-    if (activeConnections.length === 0) return
-    
-    const client = getRedisClient()
-    let totalGenerated = 0
-    
-    for (const connection of activeConnections) {
-      for (const symbol of INDICATION_SYMBOLS) {
-        // Generate indications inline
-        const hashData = await client.hgetall(`market_data:${symbol}`)
-        if (!hashData || Object.keys(hashData).length === 0) continue
-        
-        const close = parseFloat(hashData?.close || hashData?.c || "0")
-        const open = parseFloat(hashData?.open || hashData?.o || "0")
-        const high = parseFloat(hashData?.high || hashData?.h || "0")
-        const low = parseFloat(hashData?.low || hashData?.l || "0")
-        
-        if (close === 0) continue
-        
-        const direction = close >= open ? "long" : "short"
-        const range = high - low
-        const rangePercent = (range / close) * 100
-        
-        const indications = [
-          { type: "direction", symbol, value: direction === "long" ? 1 : -1, profitFactor: 1.2, confidence: 0.7, timestamp: now },
-          { type: "move", symbol, value: rangePercent > 2 ? 1 : 0, profitFactor: 1.0 + rangePercent/100, confidence: 0.6, timestamp: now },
-          { type: "active", symbol, value: rangePercent > 1 ? 1 : 0, profitFactor: 1.1, confidence: 0.65, timestamp: now },
-          { type: "optimal", symbol, value: direction === "long" && rangePercent > 1.5 ? 1 : 0, profitFactor: 1.3, confidence: 0.75, timestamp: now },
-        ]
-        
-        // Save to Redis
-        const key = `indications:${connection.id}`
-        const existing = await client.get(key).catch(() => null)
-        const existingArr = existing ? JSON.parse(existing) : []
-        existingArr.push(...indications)
-        const trimmed = existingArr.slice(-1000)
-        await client.set(key, JSON.stringify(trimmed))
-        
-        totalGenerated += indications.length
-      }
-    }
-    
-    if (totalGenerated > 0) {
-      console.log(`[v0] [StatusAPI] Generated ${totalGenerated} indications for ${activeConnections.length} connections`)
-    }
-  } catch (e) {
-    console.error(`[v0] [StatusAPI] Error generating indications:`, (e as Error).message)
-  }
-}
+// FAKE-DATA WRITER REMOVED (no-fake-data directive):
+// `generateIndicationsIfNeeded()` previously lived here and wrote synthetic
+// indications with HARDCODED profitFactor (1.2/1.1/1.3) and confidence
+// values into `indications:{conn}` on every status poll, bypassing the real
+// IndicationProcessor pipeline. It was a workaround for a since-fixed
+// processor bug. All indications now come exclusively from the real engine.
 
 export async function GET() {
   try {
@@ -111,42 +50,42 @@ export async function GET() {
     // Apply cache fix to all indication processors
     patchIndicationProcessorCaches(coordinator)
 
-    // Only generate synthetic indications when the engine is explicitly
-    // user-started (trade_engine:global.status === "running"). Running
-    // this during prehistoric processing or after Reset DB would write
-    // fake indication counts into `indications:{conn}:*`, inflating the
-    // stats overview counters and making the "high overall sets counts"
-    // issue look worse after a reset.
-    // Read global engine state once. We use this to gate synthetic
-    // indication generation so it never fires during prehistoric
-    // processing or after Reset DB (both set status !== "running").
+    // Read global engine state once — operator intent lives here.
     const engineHash: Record<string, string> =
       (await client.hgetall("trade_engine:global").catch(() => null) as Record<string, string> | null) ?? {}
 
     const isGloballyRunning = engineHash.status === "running"
     const isGloballyPaused  = engineHash.status === "paused"
 
-    // Only run synthetic indication generation when the operator has
-    // explicitly started the engine. Prevents fake indication keys from
-    // inflating the stats-overview counters during idle periods.
-    if (isGloballyRunning) {
-      await generateIndicationsIfNeeded()
-    }
     
     // Also check in-memory coordinator state
     const coordinatorRunning = coordinator?.isRunning() || false
-    
-    // If coordinator says running but Redis says not, fix Redis
-    if (coordinatorRunning && !isGloballyRunning) {
-      await client.hset("trade_engine:global", {
-        status: "running",
-        started_at: new Date().toISOString(),
-        coordinator_ready: "true",
+
+    // RECONCILIATION DIRECTION FIX (no-auto-start directive):
+    // Redis `trade_engine:global.status` is the OPERATOR's source of truth.
+    // The previous code did the reverse — when the in-memory coordinator
+    // still thought it was running (e.g. stopAll() threw midway, leaving
+    // isGloballyRunning=true in memory), this GET handler force-rewrote
+    // status="running" into Redis, silently resurrecting an engine the
+    // operator had explicitly stopped. Every dashboard poll re-applied it,
+    // making Stop impossible to win.
+    // Correct direction: if Redis says NOT running but the coordinator
+    // still is, stop the coordinator to honour the operator's intent.
+    if (coordinatorRunning && !isGloballyRunning && !isGloballyPaused) {
+      console.log(
+        "[v0] [StatusAPI] Coordinator running but operator status is",
+        engineHash.status || "(unset)",
+        "— stopping coordinator to honour operator intent (was previously resurrecting Redis)."
+      )
+      // Best-effort, non-blocking: the status read must stay fast.
+      coordinator?.stopAll().catch((e: unknown) => {
+        console.error("[v0] [StatusAPI] Failed to stop orphaned coordinator:", (e as Error)?.message)
       })
     }
-    
-    // Effective running state: either Redis or coordinator says running
-    const effectivelyRunning = isGloballyRunning || coordinatorRunning
+
+    // Effective running state: operator intent (Redis) only. The in-memory
+    // flag must never override an explicit operator stop.
+    const effectivelyRunning = isGloballyRunning
     
     // Get active connections
     const connections = await getActiveConnectionsForEngine()

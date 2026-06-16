@@ -38,6 +38,11 @@ export function DashboardActiveConnectionsManager() {
   // preventing the 8s poll from stomping on optimistic UI state.
   const togglingRef = React.useRef<Set<string>>(new Set())
   const removingRef = React.useRef<Set<string>>(new Set())
+  // savingRef: connections mid-settings-save. During the 2s recoordination
+  // window after a PATCH /settings, the backend may briefly return stale flags.
+  // Connections in this set are preserved in loadConnections even if Redis
+  // temporarily shows is_active_inserted=0.
+  const savingRef = React.useRef<Set<string>>(new Set())
   React.useEffect(() => { togglingRef.current = togglingIds }, [togglingIds])
   React.useEffect(() => { removingRef.current = removingIds }, [removingIds])
 
@@ -100,8 +105,14 @@ export function DashboardActiveConnectionsManager() {
           toBoolean(conn.is_enabled_dashboard)
 
         if (isActiveInserted || isEnabledDashboard) {
-          if (seenIds.has(conn.id)) continue
-          seenIds.add(conn.id)
+          // Normalise IDs: strip the "conn-" prefix so that both the raw
+          // predefined key (e.g. "bingx-x01") and its stored form
+          // ("conn-bingx-x01") collapse to the same canonical token.
+          // Without this, getAllConnections() returning both forms would
+          // create two separate cards for the same physical connection.
+          const canonId = conn.id.replace(/^conn-/, "")
+          if (seenIds.has(canonId)) continue
+          seenIds.add(canonId)
           const exchange = (conn.exchange || "").toLowerCase().trim()
           const isBase = BASE_EXCHANGES.includes(exchange)
           activeConns.push({
@@ -116,15 +127,16 @@ export function DashboardActiveConnectionsManager() {
         }
       }
 
-      // ── Merge-not-replace for in-flight toggles ─────────────────────
-      // If a connection is currently mid-toggle/mid-remove, we don't
-      // want a transient Redis read (flags briefly 0 due to write
-      // ordering, or a partial response) to drop the card and re-add
-      // it on the next poll. Preserve the optimistic entry until the
-      // toggle settles.
+      // ── Merge-not-replace for in-flight toggles / settings-saves ────
+      // If a connection is currently mid-toggle/mid-remove/mid-save, we
+      // don't want a transient Redis read (flags briefly 0 due to write
+      // ordering, recoordination window, or a partial response) to drop
+      // the card and re-add it on the next poll. Preserve the optimistic
+      // entry until the operation settles.
       const inFlight = new Set<string>([
         ...togglingRef.current,
         ...removingRef.current,
+        ...savingRef.current,
       ])
       if (inFlight.size > 0) {
         const fetchedIds = new Set(activeConns.map(ac => ac.connectionId))
@@ -173,9 +185,31 @@ export function DashboardActiveConnectionsManager() {
     const handleEngineStateChange = () => {
       checkGlobalEngine()
     }
+
+    // After settings are saved via the ConnectionSettingsDialog, force-refresh
+    // the connections list after a short delay so the updated flags (symbols,
+    // is_enabled_dashboard, etc.) are reflected without waiting for the 8s poll.
+    const handleSettingsUpdated = (e: Event) => {
+      const detail = (e as CustomEvent).detail
+      const connId: string | undefined = detail?.connectionId
+      if (connId) {
+        // Guard this connection against transient disappearance during the
+        // recoordination window (PATCH → archiveProgression → Redis writes).
+        // The card stays pinned in the list even if a background poll fires
+        // before the flags are stable.
+        savingRef.current.add(connId)
+        // Release the guard after 4s — well past the ~1s recoordination window.
+        setTimeout(() => { savingRef.current.delete(connId) }, 4000)
+      }
+      // Small delay so the PATCH write + recoordination settle before we re-fetch.
+      setTimeout(() => loadConnections({ force: true }), 800)
+      // Also check the global engine state in case a restart was triggered.
+      setTimeout(checkGlobalEngine, 1200)
+    }
     
     if (typeof window !== 'undefined') {
       window.addEventListener('engine-state-changed', handleEngineStateChange)
+      window.addEventListener('connection-settings-updated', handleSettingsUpdated)
     }
     
     return () => {
@@ -183,6 +217,7 @@ export function DashboardActiveConnectionsManager() {
       clearInterval(engineInterval)
       if (typeof window !== 'undefined') {
         window.removeEventListener('engine-state-changed', handleEngineStateChange)
+        window.removeEventListener('connection-settings-updated', handleSettingsUpdated)
       }
     }
   }, [])

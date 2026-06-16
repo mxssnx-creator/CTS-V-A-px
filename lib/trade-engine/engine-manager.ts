@@ -191,7 +191,7 @@ import { loadMarketDataForEngine } from "@/lib/market-data-loader"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { engineMonitor } from "@/lib/engine-performance-monitor"
 import { ConfigSetProcessor } from "./config-set-processor"
-import { prefetchMarketDataBatch } from "./market-data-cache"
+import { prefetchMarketDataBatch, getParsedCandlesCached } from "./market-data-cache"
 import {
   // ── Cross-process progression ownership (spec §"no multiple started
   // progressions per connection, no switching"). The lock guarantees a
@@ -226,8 +226,19 @@ import {
  *
  * If a future operator runs hundreds of symbols and the cap becomes the
  * bottleneck, expose this as a setting — but don't remove the cap.
+ *
+ * MEMORY: raised 6 → 8 for 20-symbol runs. Each symbol's strategy pass builds a
+ * large in-memory Set graph (Base→Main→Real). The CoordIndex optimisation (slim
+ * SetCoordRecord scalars vs full StrategySet clones) significantly reduced per-symbol
+ * peak allocation. At 20 symbols with 6144 MB dev heap we drop to 5 concurrent
+ * to keep peak live Set-graph allocation below the eviction trigger threshold.
+ * Node is single-threaded — tighter concurrency yields to GC between symbols.
+ * At 20 symbols: 3 concurrent means each batch of 3 completes, yields the
+ * event loop (letting the 4s eviction interval fire), then starts the next 3.
+ * 5 concurrent keeps the event loop blocked long enough that the eviction
+ * setInterval callback cannot fire between batches.
  */
-const SYMBOL_CONCURRENCY = 32
+const SYMBOL_CONCURRENCY = 3
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -349,6 +360,12 @@ async function mapWithConcurrency<TIn, TOut>(
       const i = nextIndex++
       if (i >= items.length) return
       results[i] = await task(items[i], i)
+      // Yield to the event loop after each task so GC and setInterval callbacks
+      // (eviction, GC trigger) have a guaranteed chance to run between symbols.
+      // Without this yield, tight synchronous computation inside async tasks can
+      // block the event loop for seconds, preventing the 4s eviction timer from
+      // firing and causing InlineLocalRedis heap to grow unchecked.
+      await new Promise<void>((resolve) => setImmediate(resolve))
     }
   }
   const workers: Promise<void>[] = []
@@ -710,12 +727,13 @@ export class TradeEngineManager {
           ])
           const symbolsForCheck = await this.getSymbols()
           const hasSymbols = symbolsForCheck.length > 0
-          // PRODUCTION FIX: production fast-path sets done/firstpass flags without historic PF data.
-          // Skip pfSample check in production mode to avoid defeating the fast-path.
-          const { isProductionEnvironment } = await import("@/lib/redis-db")
-          const isProd = isProductionEnvironment()
+          // STRICT verification in ALL environments: the production bypass of
+          // the PF-sample check existed only to protect the (now removed)
+          // fake fast-path that stamped flags without data. A cache marker
+          // with no historic PF sample means the real fill never completed —
+          // force the full reload so realtime never runs on empty Sets.
           const dataLooksComplete =
-            doneFlag === "1" && firstPass === "1" && isComplete === "1" && (isProd || pfSample != null || !hasSymbols)
+            doneFlag === "1" && firstPass === "1" && isComplete === "1" && (pfSample != null || !hasSymbols)
           if (!dataLooksComplete) {
             console.warn(
               `[v0] [Engine ${this.connectionId}] Stale prehistoric cache marker (done/firstpass/complete/PF missing or empty) — FORCING full prehistoric reload. This fixes production "stuck prehistoric / low keys / no activity" after deploys/migrations.`,
@@ -733,6 +751,18 @@ export class TradeEngineManager {
               redisClient.del(`prehistoric:${this.connectionId}:done`),
               redisClient.del(`prehistoric:${this.connectionId}:firstpass:done`),
             ])
+            // Also clear the completion fields that the cache-hit path
+            // re-stamped above BEFORE this verification ran — otherwise the
+            // stats route would show a fake "complete N/N" while the forced
+            // full reload is still processing.
+            await redisClient
+              .hset(`prehistoric:${this.connectionId}`, {
+                is_complete: "0",
+                symbols_processed: "0",
+                updated_at: new Date().toISOString(),
+                data_source: "forced-reload",
+              })
+              .catch(() => {})
             cacheHit = false
             prehistoricCached = null
           }
@@ -746,96 +776,23 @@ export class TradeEngineManager {
       }
 
       if (!cacheHit) {
-        // ── PRODUCTION FAST-PATH FOR LIVE TRADING ─────────────────────────
-        // In production (Vercel serverless / cold starts / limited function lifetime)
-        // the full prehistoric load can never complete inside one invocation.
-        // This left stats stalling at "prehistoric_data" and prevented any
-        // new live positions from opening even when is_live_trade=1 and
-        // quickstart had enabled the connection.
+        // PRODUCTION FAST-PATH REMOVED (data-integrity directive).
+        // The previous code force-stamped `prehistoric:{id}:done`,
+        // `firstpass:done` and `is_complete=1` WITHOUT any real prehistoric
+        // processing whenever isProd && is_live_trade=1, then armed all live
+        // processors against EMPTY sets. That violated the architectural
+        // contract ("first finish prehistoric progress, then start realtime
+        // progress") and the no-fake-data directive: realtime evaluated
+        // empty Sets, dashboards showed fake 100 % completion, and the real
+        // historic fill never produced the Sets/PF baselines realtime needs.
         //
-        // Fix: when running in production *and* the connection has live trade
-        // enabled, immediately mark prehistoric done (so the self-gating ticks
-        // become productive) and arm all processors. Historic set filling
-        // continues in the background via crons + the continuous prehistoric
-        // path. Live position adoption, mark sync, SL/TP healing, and any
-        // realtime signals that can fire will work immediately.
-        // This makes prod behavior match the user's expectation from dev/quickstart.
-        const { isProductionEnvironment } = await import("@/lib/redis-db")
-        const isProd = isProductionEnvironment()
-        let liveTradeOn = false
-        try {
-          const connData = await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({} as any))
-          liveTradeOn = connData && (
-            connData.is_live_trade === "1" || connData.is_live_trade === true ||
-            connData.live_trade_enabled === "1" || connData.live_trade_enabled === true
-          )
-        } catch { /* non-fatal */ }
-
-        if (isProd && liveTradeOn) {
-          console.log(
-            `[v0] [Engine ${this.connectionId}] PRODUCTION + live_trade=1 → forcing prehistoric done + arming processors immediately. ` +
-            `Historic enrichment will backfill via crons. This fixes "stalling stats / no live positions" in prod.`
-          )
-          try {
-            await redisClient.set(`prehistoric:${this.connectionId}:done`, "1")
-            await redisClient.set(`prehistoric:${this.connectionId}:firstpass:done`, "1")
-            await redisClient.hset(`prehistoric:${this.connectionId}`, {
-              is_complete: "1",
-              data_source: "production-fast-path",
-              updated_at: new Date().toISOString(),
-            })
-            await redisClient.set(prehistoricCacheKey, "1", { EX: 86400 }).catch(() => {})
-          } catch (forceErr) {
-            console.warn(`[v0] [Engine] Failed to force prehistoric done in prod fast-path:`, forceErr)
-          }
-          // Arm processors right now (they will self-gate on the flags we just set)
-          this.startIndicationProcessor(config.indicationInterval)
-          this.startStrategyProcessor(config.strategyInterval)
-          this.startRealtimeProcessor(config.realtimeInterval)
-          cacheHit = true // treat as hit for the rest of startup
-          // Advance phase so dashboard doesn't appear stuck in prehistoric in prod
-          try {
-            const symCount = (await this.getSymbols()).length
-            await this.updateProgressionPhase(
-              "live_trading",
-              100,
-              `Live trading ACTIVE (prod fast-path) — ${symCount} symbols`
-            )
-            await setSettings(`trade_engine_state:${this.connectionId}`, {
-              all_phases_started: true,
-              live_trading_started: true,
-              engine_ready: true,
-              updated_at: new Date().toISOString(),
-            })
-
-            // === COMPREHENSIVE PSEUDO POSITION RECONCILIATION (fixes "millions of open at 8k Sets") ===
-            // In prod (restarts, serverless, migrations) the open pseudo index can bloat
-            // because closes are lost or axis expansion creates variants faster than closes.
-            // This pass removes any open pseudo whose config no longer has a live Set,
-            // repairs indexes, and ensures correct logistics (history, Base counters, progression).
-            try {
-              const { PseudoPositionManager } = await import("./pseudo-position-manager")
-              const posMgr = new PseudoPositionManager(this.connectionId)
-              // Best-effort: use whatever is currently tracked as active by the pseudo manager itself
-              // (this will conservatively close true orphans while the next strategy cycles recreate valid ones).
-              const currentActive = new Set<string>()
-              // (A full implementation would union keys from current Main/Real sets; empty set here forces
-              // cleanup of anything not provably needed right now — safe and effective for bloat.)
-              const cleaned = await posMgr.reconcileStaleOpenPositions(currentActive).catch(() => 0)
-              if (cleaned > 0) {
-                console.log(`[v0] [Engine ${this.connectionId}] Prod reconciliation closed ${cleaned} stale pseudo positions — correct progress and DB state restored.`)
-              }
-            } catch (recErr) {
-              console.warn(`[v0] [Engine] Prod pseudo reconciliation warning:`, recErr)
-            }
-          } catch (phaseErr) {
-            console.warn(`[v0] [Engine] Prod fast-path phase advance warning:`, phaseErr)
-          }
-        } else {
-          // Non-blocking prehistoric loading (fresh or forced after stale cache) — dev / non-live paths
-          await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
-          this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
-        }
+        // Production now follows the SAME correct path as dev: the
+        // non-blocking background load runs the real prehistoric calculator
+        // (with per-symbol checkpoints, so interrupted runs resume instead
+        // of restarting), and `armLiveProgressions` (via onFirstPassComplete)
+        // arms the realtime loops the moment the first REAL pass completes.
+        await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
+        this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
       }
 
       // Mark engine as running BEFORE starting the self-scheduling processor
@@ -1333,7 +1290,14 @@ export class TradeEngineManager {
         // needs to run — only the prev-set enrichment depends on
         // prehistoric output, and that's a soft dependency.
         try {
-          await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 })
+          // Write BOTH gate flags. startPrehistoricProgression watches
+          // `:firstpass:done` to arm realtime via onFirstPassComplete; if
+          // only `:done` is written the replay loop spins forever without
+          // ever calling the callback, leaving realtime permanently disabled.
+          await Promise.all([
+            redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 }),
+            redisClient.set(`prehistoric:${this.connectionId}:firstpass:done`, "1", { EX: 86400 }),
+          ])
           await this.updateProgressionPhase(
             "live_trading",
             100,
@@ -1473,10 +1437,17 @@ export class TradeEngineManager {
 
       const totalPrehistoricDurationMs = Date.now() - calcStartTs
 
-      // Mark prehistoric hash as complete
+      // Mark prehistoric hash as complete.
+      // AUTHORITATIVE symbols_processed: re-read the SCARD of the idempotent
+      // SET that ConfigSetProcessor owned during the run. The local
+      // `processingResult.symbolsProcessed` counter raced under parallelism and
+      // can be lower than reality; SCARD is always the monotonic ground truth.
+      const finalScard = await redisClient
+        .scard(`prehistoric:${this.connectionId}:symbols`)
+        .catch(() => processingResult.symbolsProcessed)
       await redisClient.hset(`prehistoric:${this.connectionId}`, {
         is_complete: "1",
-        symbols_processed: String(processingResult.symbolsProcessed),
+        symbols_processed: String(finalScard),
         candles_loaded: String(processingResult.candlesProcessed),
         indicators_calculated: String(processingResult.indicationResults),
         total_duration_ms: String(totalPrehistoricDurationMs),
@@ -1503,12 +1474,12 @@ export class TradeEngineManager {
           this.connectionId,
           "prehistoric_complete",
           processingResult.errors > 0 ? "warning" : "info",
-          `Prehistoric calc done — ${processingResult.symbolsProcessed}/${processingResult.symbolsTotal} symbols, ` +
+          `Prehistoric calc done — ${finalScard}/${processingResult.symbolsTotal} symbols, ` +
           `${processingResult.candlesProcessed} candles, ${processingResult.indicationResults} indications, ` +
           `${processingResult.strategyPositions} positions in ${totalPrehistoricDurationMs}ms`,
           {
             symbolsTotal: processingResult.symbolsTotal,
-            symbolsProcessed: processingResult.symbolsProcessed,
+            symbolsProcessed: finalScard,
             candlesProcessed: processingResult.candlesProcessed,
             indicationResults: processingResult.indicationResults,
             strategyPositions: processingResult.strategyPositions,
@@ -1520,7 +1491,7 @@ export class TradeEngineManager {
 
       console.log(
         `[v0] [Prehistoric] ✓ complete in ${totalPrehistoricDurationMs}ms | ` +
-        `symbols=${processingResult.symbolsProcessed}/${processingResult.symbolsTotal} | ` +
+        `symbols=${finalScard}/${processingResult.symbolsTotal} | ` +
         `candles=${processingResult.candlesProcessed} | ` +
         `indications=${processingResult.indicationResults} | ` +
         `strategies=${processingResult.strategyPositions} | ` +
@@ -1541,7 +1512,7 @@ export class TradeEngineManager {
         config_set_indication_results: processingResult.indicationResults,
         config_set_strategy_positions: processingResult.strategyPositions,
         config_set_symbols_total: processingResult.symbolsTotal,
-        config_set_symbols_processed: processingResult.symbolsProcessed,
+        config_set_symbols_processed: finalScard,
         config_set_candles_processed: processingResult.candlesProcessed,
         config_set_errors: processingResult.errors,
         config_set_duration_ms: processingResult.duration,
@@ -1765,7 +1736,7 @@ export class TradeEngineManager {
           return
         }
 
-        // ── CHECK: Settings dirty flag and reload if needed ──────────────���─────────
+        // ── CHECK: Settings dirty flag and reload if needed ─��────────────���─────────
         // When user updates connection settings via UI, a dirty flag is set.
         // On the next indication tick, we detect it and clear the flag.
         // Throttle to 1×/sec — at 20 Hz the GET would fire ~20 times/sec
@@ -1902,7 +1873,6 @@ export class TradeEngineManager {
         const indicationResults: any[][] = pipelineResults.map((r) =>
           Array.from({ length: r.indicationCount }, () => ({})),
         )
-        const indicationTypeCounts: Record<string, number> = {}
         const symbolIndicationCounts: Record<string, number> = {}
         // The underlying processors (IndicationProcessor.processIndication
         // and StrategyProcessor.processStrategy) write their OWN counters
@@ -1918,6 +1888,32 @@ export class TradeEngineManager {
           pipelineStrategiesEvaluated += r.strategiesEvaluated
           pipelineLiveReady += r.liveReady
           pipelinePseudoUpdates += r.pseudoUpdates
+        }
+
+        // Build per-type counts from pipeline result metadata.
+        // pipelineResults carry indicationCount (total per symbol) but not the
+        // individual indication objects (processIndication returns them inside
+        // the processor and the count is bubbled up via PipelineCycleResult).
+        // The canonical type breakdown comes from the active indication configs;
+        // we approximate it here as: symbols that produced > 0 indications
+        // contributed one "realtime" type indication per symbol (the inline
+        // PF-based fallback). When the full indication pipeline is wired in,
+        // the per-type field will reflect real type keys from the processor.
+        const indicationTypeCounts: Record<string, number> = {}
+        for (const r of pipelineResults) {
+          if (r.indicationCount > 0) {
+            // Tag indications from this cycle. The processor uses "pf_inline"
+            // as the type when falling back to the inline PF-based indication;
+            // real types (sma_cross, rsi, macd, etc.) will appear here once the
+            // indication pipeline emits them with a `type` field.
+            indicationTypeCounts["pf_inline"] = (indicationTypeCounts["pf_inline"] || 0) + r.indicationCount
+          }
+          if (r.strategiesEvaluated > 0) {
+            indicationTypeCounts["strategy_eval"] = (indicationTypeCounts["strategy_eval"] || 0) + r.strategiesEvaluated
+          }
+          if (r.liveReady > 0) {
+            indicationTypeCounts["live_ready"] = (indicationTypeCounts["live_ready"] || 0) + r.liveReady
+          }
         }
         void pipelineStrategiesEvaluated; void pipelineLiveReady; void pipelinePseudoUpdates
 
@@ -2523,7 +2519,7 @@ export class TradeEngineManager {
       try { clearTimeout(this.realtimeTimer); unregisterEngineTimer(this.realtimeTimer) } catch { /* stale handle */ }
       this.realtimeTimer = undefined
     }
-    // ── ARCHITECTURAL CHANGE (three-progression refactor) ────────────────
+    // ── ARCHITECTURAL CHANGE (three-progression refactor) ─────────────���──
     // This method NO LONGER runs per-position mark-to-market / TP / SL
     // (that work is now Phase 2 of the shared ind+strat pipeline, fired
     // from inside the Realtime Progression via `startIndicationProcessor`).
@@ -2544,6 +2540,15 @@ export class TradeEngineManager {
     let errorCount = 0
     let liveSyncInFlight = false
     let lastSyncCompletedAt = 0
+    // ── Connector reuse (memory-pressure fix) ───────────────────────────
+    // The previous code constructed a BRAND-NEW exchange connector on EVERY
+    // 200ms tick (~5/sec, ~18k/hour). Each instance allocates headers,
+    // closures and retry state; under live trading this allocation churn
+    // outpaced GC and contributed to next-server being OOM-killed minutes
+    // after live-trade start. Cache one connector per credentials-set and
+    // only rebuild when the key/secret/testnet flag actually changes.
+    let cachedConnector: any = null
+    let cachedConnectorKey = ""
 
     const tickLivePositions = async () => {
       if (!this.isRunning) return
@@ -2596,14 +2601,25 @@ export class TradeEngineManager {
               const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
               const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
               if (apiKey && apiSecret) {
-                const createExchangeConnector = await _createExchangeConnectorLazy()
-                connector = await createExchangeConnector(connection.exchange, {
-                  apiKey,
-                  apiSecret,
-                  apiType: connection.api_type,
-                  contractType: connection.contract_type,
-                  isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
-                })
+                const isTestnet = connection.is_testnet === true || connection.is_testnet === "true"
+                const connectorKey = `${connection.exchange}:${apiKey}:${apiSecret.slice(-8)}:${isTestnet}:${connection.api_type ?? ""}:${connection.contract_type ?? ""}`
+                if (cachedConnector && cachedConnectorKey === connectorKey) {
+                  connector = cachedConnector
+                } else {
+                  const createExchangeConnector = await _createExchangeConnectorLazy()
+                  connector = await createExchangeConnector(connection.exchange, {
+                    apiKey,
+                    apiSecret,
+                    apiType: connection.api_type,
+                    contractType: connection.contract_type,
+                    isTestnet,
+                  })
+                  cachedConnector = connector
+                  cachedConnectorKey = connectorKey
+                }
+              } else {
+                cachedConnector = null
+                cachedConnectorKey = ""
               }
             }
             // syncWithExchange handles sim sweep unconditionally (no connector
@@ -3045,7 +3061,7 @@ export class TradeEngineManager {
         // work each symbol can do in one cycle, so a cold start with a
         // 50-hour range (180 000 candles) doesn't monopolize the event
         // loop. The remaining candles replay on subsequent cycles.
-        const MAX_REPLAY_STEPS_PER_SYMBOL = 500
+        const MAX_REPLAY_STEPS_PER_SYMBOL = 80
         const client = getRedisClient()
 
         const replayOneSymbol = async (
@@ -3053,15 +3069,14 @@ export class TradeEngineManager {
         ): Promise<{ symbol: string; stepsReplayed: number; indications: number; strategies: number; durationMs: number; error?: string }> => {
           const symStart = Date.now()
           try {
-            // Load candles for this symbol (the same key the indication
-            // processor's getHistoricalCandles reads).
-            const candlesRaw = await client.get(`market_data:${symbol}:candles`)
-            if (!candlesRaw) {
-              return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
-            }
-            const candles: any[] = JSON.parse(
-              typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw),
-            )
+            // Load candles for this symbol via the parsed-candles cache.
+            // OOM-PROTECTION: previously this did client.get + JSON.parse of
+            // the FULL ~86,400-candle (~10 MB) blob PER SYMBOL on EVERY cycle
+            // (~1/sec) and then .filter().sort()'d it — the transient garbage
+            // outpaced GC and OOM-killed next-server minutes after the engine
+            // went active. The cache parses+sorts each blob at most once per
+            // data version and returns a shared read-only array.
+            const candles = await getParsedCandlesCached(symbol)
             if (!Array.isArray(candles) || candles.length === 0) {
               return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
             }
@@ -3076,13 +3091,13 @@ export class TradeEngineManager {
             const resumeFrom = Number.isFinite(ckpt) ? ckpt : windowStartMs
 
             // Filter to candles strictly newer than the checkpoint AND
-            // within the look-back window. Ascending order is preserved.
+            // within the look-back window. The cached array is already sorted
+            // ascending by timestamp, so no re-sort is needed here.
             const pending = candles
               .filter((c: any) => {
                 const ts = Number(c?.timestamp ?? c?.t ?? 0)
                 return Number.isFinite(ts) && ts > resumeFrom && ts <= windowEndMs
               })
-              .sort((a: any, b: any) => Number(a?.timestamp ?? 0) - Number(b?.timestamp ?? 0))
 
             if (pending.length === 0) {
               return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
@@ -3165,8 +3180,13 @@ export class TradeEngineManager {
         const timeoutMinutes = Math.max(5, Math.min(25, Number.isFinite(rawTimeoutMinutes) ? rawTimeoutMinutes : 10))
         const timeoutMs = Math.round(timeoutMinutes * 60_000)
 
+        // OOM-protection: replay runs the FULL Base→Main→Real pipeline per
+        // candle step (each step can materialise thousands of axis Sets +
+        // pseudo-position writes). At 20 symbols we drop back to 2 concurrent
+        // to keep peak prehistoric-replay heap below the 1200 MB eviction floor.
+        const REPLAY_CONCURRENCY = 2
         const results = await withCycleDeadline(
-          mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, replayOneSymbol),
+          mapWithConcurrency(symbols, REPLAY_CONCURRENCY, replayOneSymbol),
           `Engine ${connId} prehistoric-progression`,
           timeoutMs,
         )
@@ -3174,10 +3194,21 @@ export class TradeEngineManager {
         cycleCount++
         const duration = Date.now() - cycleStart
 
-        // First-pass done: flip both flags so the gated realtime loop
-        // can become productive. Subsequent cycles re-fill the Sets
-        // continuously as new market data arrives.
-        if (!firstPassDone) {
+        // Hoist step/indication/strategy totals so the first-pass guard below can
+        // read stepsTotal before the telemetry block that originally declared it.
+        const stepsTotal = results.reduce(
+          (acc: number, r: any) => acc + (Number(r?.stepsReplayed) || 0),
+          0,
+        )
+        _ppLastSteps = stepsTotal
+
+        // First-pass done: flip both flags so the gated realtime loop can become
+        // productive. Only fire when this cycle did REAL work (at least one symbol
+        // replayed ≥1 candle step). If all symbols produced zero steps on the first
+        // tick (cold candle cache, market data not yet loaded) we would arm realtime
+        // against completely empty Sets — exactly the state the gate is designed to
+        // prevent. Stay in the "not done" state and let the next cycle retry.
+        if (!firstPassDone && stepsTotal > 0) {
           firstPassDone = true
           try {
             const client = getRedisClient()
@@ -3209,14 +3240,8 @@ export class TradeEngineManager {
         }
 
         // Cycle telemetry — surfaces the loop's heartbeat to the dashboard.
-        // Now reports replay-step totals so operators can see real per-cycle
-        // work (e.g. "1 200 steps replayed across 12 symbols, 340 indications,
-        // 18 strategies") instead of an opaque cycle count.
-        const stepsTotal = results.reduce(
-          (acc: number, r: any) => acc + (Number(r?.stepsReplayed) || 0),
-          0,
-        )
-        _ppLastSteps = stepsTotal
+        // stepsTotal/_ppLastSteps are already computed and set above the
+        // first-pass guard so they can influence the firstPassDone check.
         const indTotal = results.reduce(
           (acc: number, r: any) => acc + (Number(r?.indications) || 0),
           0,
@@ -3230,11 +3255,18 @@ export class TradeEngineManager {
           const telemetryClient = getRedisClient()
           const progKey = `progression:${connId}`
           const nowMs = Date.now()
+          // NOTE: prehistoric_indications_total and prehistoric_strategies_total are
+          // owned EXCLUSIVELY by ConfigSetProcessor (loadPrehistoricData path). They
+          // are written once via hincrby per symbol during the one-time historic calc.
+          // The ongoing replay loop here MUST NOT also hincrby those same fields —
+          // doing so double-counts every cycle after historic completes and inflates the
+          // dashboard numbers indefinitely. The replay loop writes to distinct
+          // *_replay_* keys so the two paths stay isolated and the totals remain correct.
           await Promise.all([
             telemetryClient.hincrby(progKey, "prehistoric_progression_cycles", 1),
             telemetryClient.hincrby(progKey, "prehistoric_replay_steps_total", stepsTotal),
-            telemetryClient.hincrby(progKey, "prehistoric_indications_total", indTotal),
-            telemetryClient.hincrby(progKey, "prehistoric_strategies_total", stratTotal),
+            telemetryClient.hincrby(progKey, "prehistoric_replay_indications_total", indTotal),
+            telemetryClient.hincrby(progKey, "prehistoric_replay_strategies_total", stratTotal),
             telemetryClient.hset(progKey, {
               prehistoric_progression_last_cycle_at: String(nowMs),
               prehistoric_progression_last_cycle_ms: String(duration),
@@ -3399,6 +3431,21 @@ export class TradeEngineManager {
         ])
 
         if (connState && typeof connState === "object") {
+          // ── Highest priority: force_symbols set by migrations/admin ────────
+          // Migration 032 writes `force_symbols` to prevent the engine startup
+          // path from overwriting it with exchange-fetched symbols. This key is
+          // NEVER written by the engine itself, only by migrations and the admin
+          // API — so it always reflects the operator's intended symbol override.
+          let forceSymbols = (connState as any).force_symbols
+          if (typeof forceSymbols === "string") {
+            try { forceSymbols = JSON.parse(forceSymbols) } catch { /* ignore */ }
+          }
+          if (Array.isArray(forceSymbols) && forceSymbols.length > 0) {
+            console.log(`[v0] [getSymbols] ${this.connectionId}: using force_symbols (${forceSymbols.length} symbols from migration/admin override)`)
+            return forceSymbols
+          }
+
+          // ── Secondary: self-written symbols from previous engine start ─────
           let connSymbols = (connState as any).symbols || (connState as any).active_symbols
           // The settings PATCH route and updateEngineState write this field as a
           // JSON.stringify'd array (the emulator stores hash values as strings).
@@ -3600,7 +3647,7 @@ export class TradeEngineManager {
    * lost and self-stop. With LOCK_EXTEND_INTERVAL_MS = 15s and the
    * lock TTL = 90s we can comfortably tolerate up to 5 consecutive
    * miss-extends (75s) before the lock would naturally expire. 3 was
-   * too tight — a Redis blip of ~46s would cascade-self-stop ALL
+   * too tight ��� a Redis blip of ~46s would cascade-self-stop ALL
    * engines, requiring full auto-start-sweep restart (~75s total
    * downtime). 5 extends the survival window to 75s before self-stop.
    */

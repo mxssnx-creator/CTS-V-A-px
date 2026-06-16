@@ -117,9 +117,25 @@ async function executeReadyStrategiesAsLiveOrders(
     const { getSettings, setSettings } = await import("@/lib/redis-db")
     const { executeLivePosition } = liveStageExports
 
-    const realKey = `strategies:${connectionId}:${symbol}:real:sets`
-    const stored = await getSettings(realKey)
-    const realSets = stored?.sets || []
+    const realKey    = `strategies:${connectionId}:${symbol}:real:sets`
+    const stored     = await getSettings(realKey) as any
+    let realSets: any[] = []
+
+    if (stored && typeof stored === "object") {
+      if (stored._slim && Array.isArray(stored.setKeys)) {
+        // ── Slim format: resolve full Sets from Base (Step 5 of coord plan) ──
+        // Real/Live keys are now written as slim { setKeys[], _slim:true } blobs.
+        // Base sets are the single authoritative source for entries+quality data.
+        const baseKey  = `strategies:${connectionId}:${symbol}:base:sets`
+        const baseSt   = await getSettings(baseKey) as any
+        const baseArr: any[] = Array.isArray(baseSt?.sets) ? baseSt.sets : []
+        const keySet   = new Set<string>(stored.setKeys as string[])
+        realSets       = baseArr.filter((s: any) => keySet.has(s.setKey))
+      } else {
+        // Legacy full-blob format — tolerate during rollout.
+        realSets = Array.isArray(stored.sets) ? stored.sets : []
+      }
+    }
 
     if (realSets.length === 0) return
 
@@ -361,17 +377,17 @@ export async function runIndStratCycle(
       result.strategiesEvaluated = stratResult.strategiesEvaluated || 0
       result.liveReady = stratResult.liveReady || 0
 
-      // ── Phase 4: Execute ready Real Sets as live orders (realtime only) ──
-      if (mode === "realtime" && result.liveReady > 0 && deps?.liveStage) {
-        try {
-          await executeReadyStrategiesAsLiveOrders(connectionId, symbol, deps.liveStage)
-        } catch (err) {
-          console.error(
-            `[v0] [SharedPipeline] Live order execution error:`,
-            err instanceof Error ? err.message : String(err),
-          )
-        }
-      }
+      // ── Phase 4: REMOVED — live dispatch is handled exclusively by Phase 3 ──
+      // `processStrategy → StrategyCoordinator.createLiveSets` already dispatches
+      // exactly 1 executeLivePosition call per direction (the highest-PF qualifying
+      // Real Set). Running Phase 4 here caused a DOUBLE DISPATCH every cycle:
+      //   Phase 3 → dispatches L+S → dedup lock acquired for both directions
+      //   Phase 4 → reads real:sets → attempts L+S again → dedup lock skips them
+      //             but still burns 3-5 Redis round-trips × 2 × N symbols per cycle.
+      // With 15 symbols × 2 directions = 60 wasted round-trips per cycle at ~1Hz.
+      // The secondary `executeReadyStrategiesAsLiveOrders` function below is kept
+      // for now (it is still exported and may be invoked from other callers) but is
+      // no longer called from this cycle hot-path.
     }
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err)

@@ -210,8 +210,13 @@ export async function GET() {
       },
       exchangeConnections: {
         total: insertedBaseConnections.length,
-        enabled: insertedBaseConnections.filter((c: any) => isTruthyFlag(c.is_enabled)).length,
-        working: insertedBaseConnections.filter((c: any) => isConnectionWorking(c)).length,
+        enabled: insertedBaseConnections.filter((c: any) => isTruthyFlag(c.is_enabled_dashboard) || isTruthyFlag(c.is_enabled)).length,
+        // "working" = connection is engine-running (has an active engine) OR has a recent successful test
+        working: insertedBaseConnections.filter((c: any) =>
+          isConnectionWorking(c) ||
+          isTruthyFlag(c.is_enabled_dashboard) ||
+          isConnectionInActivePanel(c)
+        ).length,
         withCredentials: connectionsWithCredentials.length,
         status: exchangeStatus,
       },

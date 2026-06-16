@@ -4,8 +4,9 @@ import { updateConnection, initRedis, getConnection, getRedisClient, setSettings
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 import { getTradeEngine } from "@/lib/trade-engine"
-import { fetchTopSymbols } from "@/lib/top-symbols"
+import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { toRedisFlag } from "@/lib/boolean-utils"
 
 export async function GET(
   request: NextRequest,
@@ -190,6 +191,29 @@ export async function PATCH(
       // (re)start uses the operator's choice.
       ...(typeof settings.position_mode === "string" ? { position_mode: settings.position_mode } : {}),
       ...(typeof settings.margin_mode === "string" ? { margin_type: settings.margin_mode } : {}),
+      // MODE FLAGS (CRITICAL): is_live_trade / is_testnet / is_preset_trade are
+      // first-class connection flags read by the engine's live-stage on every
+      // cycle (connection.is_live_trade), NOT from connection_settings. The
+      // previous code stored them only inside the nested settings JSON, so
+      // saving Live Trade through this dialog claimed success but the engine
+      // never saw it. Mirror them top-level exactly like position_mode.
+      ...(settings.is_live_trade !== undefined ? { is_live_trade: toRedisFlag(settings.is_live_trade) } : {}),
+      ...(settings.is_testnet !== undefined ? { is_testnet: toRedisFlag(settings.is_testnet) } : {}),
+      ...(settings.is_preset_trade !== undefined ? { is_preset_trade: toRedisFlag(settings.is_preset_trade) } : {}),
+      // Mirror symbol_count and force_symbols onto the connection hash so
+      // getAllConnections() (and the UI card) always shows the current count.
+      ...(settings.symbol_count !== undefined ? { symbol_count: String(Number(settings.symbol_count)) } : {}),
+      ...(Array.isArray(settings.symbols) && settings.symbols.length > 0
+        // Non-empty explicit symbol list → write as force_symbols so getSymbols()
+        // uses the operator's resolved / auto-selected list immediately.
+        ? { force_symbols: JSON.stringify(settings.symbols), symbol_count: String(settings.symbols.length) }
+        // Empty or absent symbols + non-manual order → CLEAR force_symbols so
+        // getSymbols() falls through to the exchange auto-resolve path.
+        // This lets "volatility_1h" / "volume_24h" etc. re-rank on each start.
+        : (Array.isArray(settings.symbols) && settings.symbols.length === 0 &&
+           typeof settings.symbol_order === "string" && settings.symbol_order !== "manual")
+          ? { force_symbols: "" }
+          : {}),
       updated_at: new Date().toISOString(),
     }
 
@@ -217,7 +241,12 @@ export async function PATCH(
       ] as const
       for (const k of knobKeys) {
         const v = (merged as Record<string, unknown>)[k]
-        if (typeof v === "number" && Number.isFinite(v)) flatKnobs[k] = String(v)
+        if (typeof v === "number" && Number.isFinite(v)) {
+          flatKnobs[k] = String(v)
+          // Also write snake_case aliases so both naming styles resolve
+          const snake = k.replace(/([A-Z])/g, (m) => "_" + m.toLowerCase())
+          if (snake !== k) flatKnobs[snake] = String(v)
+        }
       }
 
       // ── Symbol selection fields ─────────────────────────────────────────
@@ -317,6 +346,31 @@ export async function PATCH(
         }
       }
 
+      // ── Volume factor mirror ─���────────────────────────────────────────────
+      // VolumeCalculator reads volume_factor_live and volume_factor from the
+      // connection_settings:{id} hash. Mirror all three so per-connection
+      // volume factor saves actually reach the engine.
+      {
+        const vfl = Number((merged as Record<string, unknown>).volume_factor_live)
+        if (Number.isFinite(vfl) && vfl > 0) {
+          flatKnobs.volume_factor_live   = String(Math.max(0.1, Math.min(10, vfl)))
+        }
+        const vfb = Number((merged as Record<string, unknown>).volume_factor ?? (merged as Record<string, unknown>).volume_factor_base)
+        if (Number.isFinite(vfb) && vfb > 0) {
+          flatKnobs.volume_factor        = String(Math.max(0.1, Math.min(10, vfb)))
+          flatKnobs.volume_factor_base   = flatKnobs.volume_factor
+        }
+        const vfp = Number((merged as Record<string, unknown>).volume_factor_preset)
+        if (Number.isFinite(vfp) && vfp > 0) {
+          flatKnobs.volume_factor_preset = String(Math.max(0.1, Math.min(10, vfp)))
+        }
+        // control_orders flag — whether to place SL/TP orders
+        const co = (merged as Record<string, unknown>).control_orders
+        if (co !== undefined && co !== null) {
+          flatKnobs.control_orders = co === true || co === "1" || co === "true" ? "1" : "0"
+        }
+      }
+
       // ── Per-connection leverage mirror ──────────────────────────────────
       // VolumeCalculator overlays the `connection_settings:{id}` hash on top
       // of global app_settings, reading `leveragePercentage` (1–100) and
@@ -411,7 +465,8 @@ export async function PATCH(
       try {
         const order = String((merged as Record<string, unknown>).symbol_order || "volume_24h")
         const rawCount = Number((merged as Record<string, unknown>).symbol_count)
-        const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(1, Math.min(50, Math.floor(rawCount))) : 3
+        // Allow up to 32 symbols per operator spec (quickstart max 32)
+        const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(1, Math.min(32, Math.floor(rawCount))) : 15
         const manualList = Array.isArray((merged as Record<string, unknown>).symbols)
           ? ((merged as Record<string, unknown>).symbols as unknown[]).filter(
               (s): s is string => typeof s === "string" && s.length > 0,
@@ -427,7 +482,9 @@ export async function PATCH(
           // DIRECTLY (no HTTP self-fetch — that fails on loopback/origin inside
           // a route handler, which is why the first cut resolved 0 symbols).
           const exchange = String((connection as Record<string, unknown>).exchange || "bingx").toLowerCase()
-          const sort = order.startsWith("volatil") ? "volatility" : "volume"
+          // normaliseSort handles volatility_1h → "volatility_1h" (true 1h ATR)
+          // and volatility_24h / volatility → "volatility" (24h priceChangePercent).
+          const sort = normaliseSort(order)
           try {
             const { symbols: topSymbols } = await fetchTopSymbols(exchange, count, sort)
             resolved = topSymbols
@@ -473,36 +530,29 @@ export async function PATCH(
       }
     }
 
-    // ── Progression clean-up on significant settings changes ─────────────────
-    // When the operator changes symbols, live-trade mode, testnet flag, or other
-    // fields that alter what the progression computes, we must clean the previous
-    // progress BEFORE the engine hot-reloads — otherwise the dashboard shows a
-    // blended timeline spanning two different configurations (old symbols + old PF
-    // output mixed with new-config output). `recoordinateForActualOne` compares the
-    // stored snapshot against the current live state and archives + resets the
-    // progression hash when a mismatch is detected, producing a fresh, solid
-    // progression aligned to the new configuration.
+    // ── Progression clean-up ONLY on symbol/mode changes (not PF/coordination) ────────
+    // Archive + restart progression ONLY when the actual symbols or trade-mode flags
+    // change — not on PF / DDT / coordination adjustments which are per-cycle settings
+    // that take effect immediately via the hot-reload path. Aggressively archiving on
+    // every save caused: (a) the connection to appear "gone" briefly (progression key
+    // deleted mid-poll), (b) prehistoric re-run for every PF slider touch, (c) counts
+    // reset to 0 just because the operator opened and saved the dialog.
     //
-    // Fields that trigger this: anything that changes what symbols the engine runs,
-    // or that changes the code-path (live/testnet/preset mode, connection method,
-    // margin type, position mode). Pure cosmetic changes (name, UI labels) skip it.
-    const significantKeys = [
-      "symbols", "symbol_order", "symbol_count", "active_symbols",
+    // SAFE to recoordinate when: symbols list changed, symbol count changed,
+    // live/testnet mode flipped, or connection_method changed. NOT on PF/DDT/axis
+    // changes, coordination, volume_factor, position_mode, margin_mode alone.
+    const symbolsModeKeys = [
+      "symbols", "symbol_order", "symbol_count",
       "is_live_trade", "is_testnet", "is_preset_trade",
-      "connection_method", "margin_mode", "margin_type", "position_mode",
+      "connection_method",
     ]
-    const touchedSignificant = significantKeys.some((k) =>
+    const symbolsModeChanged = symbolsModeKeys.some((k) =>
       Object.prototype.hasOwnProperty.call(settings, k)
     )
-    if (touchedSignificant) {
+    if (symbolsModeChanged) {
       try {
-        // Allow the symbol resolver above to finish writing to Redis BEFORE
-        // we compare snapshots — use setImmediate to yield to any in-flight
-        // microtask queue flush, then call recoordinate synchronously.
         await ProgressionStateManager.recoordinateForActualOne(id)
       } catch (recoordErr) {
-        // Non-fatal: the engine will still hot-reload with the new settings;
-        // we just won't have wiped the old progression hash.
         console.warn(
           `[v0] [Settings PATCH] recoordinateForActualOne failed for ${id} (non-fatal):`,
           recoordErr instanceof Error ? recoordErr.message : String(recoordErr),

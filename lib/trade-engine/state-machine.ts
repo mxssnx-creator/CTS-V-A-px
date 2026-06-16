@@ -11,7 +11,7 @@
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { positionTracker, LivePosition, OrderRecord } from "@/lib/positions/position-tracker"
 import { indicatorCalculator, PriceData } from "@/lib/indicators/calculator"
-import { getRedisClient } from "@/lib/redis-db"
+import { getRedisClient, getConnection } from "@/lib/redis-db"
 // shim: existing code uses redisDb.set; map to InlineLocalRedis instance.
 const redisDb = {
   set: (key: string, val: string, opts?: { ex?: number }) =>
@@ -125,11 +125,22 @@ export class TradeEngineStateMachine {
     try {
       this.state = "monitoring"
 
-      const connector = await createExchangeConnector(this.config.connectionId, {
-        apiKey: "",
-        apiSecret: "",
-        isTestnet: false,
-      })
+      // Load real credentials from DB so the connector can make authenticated
+      // calls. Passing empty strings previously caused the factory to return a
+      // SimulatedConnector, which never makes real exchange requests. The
+      // state-machine cycle is used for legacy position tracking and is only
+      // called when the full live-stage pipeline does NOT handle the symbol.
+      const connData = await getConnection(this.config.connectionId)
+      const connector = await createExchangeConnector(
+        connData?.exchange || this.config.connectionId,
+        {
+          apiKey:    connData?.api_key    || "",
+          apiSecret: connData?.api_secret || "",
+          apiType:   connData?.api_type,
+          contractType: connData?.contract_type,
+          isTestnet: connData?.is_testnet === true || connData?.is_testnet === "true",
+        },
+      )
 
       // Get current balance
       const balance = await connector.getBalance()

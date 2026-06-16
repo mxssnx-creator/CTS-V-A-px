@@ -281,15 +281,16 @@ export async function POST(request: Request) {
     // but we accept `body.symbolCount` so a future caller can request N
     // without forcing array construction. Bound to [1, 50] to defend
     // against accidental absurd values.
-    let requestedCount = 1
+    // Operator spec: quickstart supports up to 32 symbols, default 15.
+    let requestedCount = 15
     if (typeof rawSymbols === "number" && Number.isFinite(rawSymbols) && rawSymbols > 0) {
-      requestedCount = Math.max(1, Math.min(50, Math.floor(rawSymbols)))
+      requestedCount = Math.max(1, Math.min(32, Math.floor(rawSymbols)))
     } else if (
       typeof body.symbolCount === "number" &&
       Number.isFinite(body.symbolCount) &&
       body.symbolCount > 0
     ) {
-      requestedCount = Math.max(1, Math.min(50, Math.floor(body.symbolCount)))
+      requestedCount = Math.max(1, Math.min(32, Math.floor(body.symbolCount)))
     }
     // The auto-pick branches honour `requestedCount` so a caller that
     // posts `{ symbolCount: 2 }` (or `symbols: 2`) gets two symbols, not
@@ -411,10 +412,12 @@ export async function POST(request: Request) {
        is_active: "1",
        is_live_trade: "1",
        active_symbols: JSON.stringify(symbols),
-       // Force minimal per-order volume on every quickstart enable.
-       // Stored as a string because that's how the rest of the
-       // connection hash is encoded (parseFloat in volume-calculator).
-       live_volume_factor: "0.1",
+       // Operator spec: volume factor 2.2 for quickstart (moderate live exposure).
+       // Previously 0.1 (exchange minimum) — updated per operator directive.
+       live_volume_factor: "2.2",
+       // Symbol ordering: operator spec is volatility_1h for quickstart.
+       symbol_order: "volatility_1h",
+       symbol_count: String(symbols.length),
        last_test_status: testPassed ? "success" : "failed",
        last_test_balance: testBalance,
        last_test_at: new Date().toISOString(),
@@ -443,6 +446,34 @@ export async function POST(request: Request) {
     // `config_set_symbols_total` so the /stats endpoint no longer defaults
     // to the hard-coded "3" when the historical phase reports progress.
     // Also reset the processed counter to 0 so progress starts correctly.
+    // Operator-spec defaults for quickstart: base PF=1.0, main/real PF=1.2,
+    // trailing on, block on, dca off, control orders on, VF 2.2, volatility_1h.
+    // These are persisted to connection_settings so the engine reads them on the
+    // first tick instead of using its compiled defaults.
+    const { getRedisClient: _gsClient } = await import("@/lib/redis-db")
+    const _gsc = _gsClient()
+    await _gsc.hset(`connection_settings:${connectionId}`, {
+      // Volume factor
+      volume_factor_live:   "2.2",
+      volume_factor_preset: "1.0",
+      // Symbol order
+      symbol_order: "volatility_1h",
+      symbol_count: String(symbols.length),
+      // Strategy PF thresholds
+      base_min_profit_factor:  "1.0",
+      main_min_profit_factor:  "1.2",
+      real_min_profit_factor:  "1.2",
+      // Variant toggles
+      variant_trailing: "true",
+      variant_block:    "true",
+      variant_dca:      "false",
+      // Control orders (SL/TP on exchange)
+      control_orders: "true",
+      // Min step for pseudo-positions
+      minStep: "5",
+      updated_at: new Date().toISOString(),
+    }).catch(() => {})
+
     await setSettings(`trade_engine_state:${connectionId}`, {
       connection_id: connectionId,
       symbols: symbols,

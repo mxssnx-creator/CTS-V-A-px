@@ -30,13 +30,17 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       )
     }
     
-    // Support both active fields:
+    // Support active fields:
     // - is_active_inserted: whether connection appears in active list
     // - is_enabled_dashboard: whether connection is enabled/active
+    // - enabled: plain alias for is_enabled_dashboard (previously ignored,
+    //   which made {"enabled":false} silently fall through to current state)
     const hasActiveInserted = body?.is_active_inserted !== undefined
-    const hasDashboardEnabled = body?.is_enabled_dashboard !== undefined
+    const hasDashboardEnabled = body?.is_enabled_dashboard !== undefined || body?.enabled !== undefined
     const isActiveInserted = parseBooleanInput(body?.is_active_inserted)
-    const isDashboardEnabled = parseBooleanInput(body?.is_enabled_dashboard)
+    const isDashboardEnabled = body?.is_enabled_dashboard !== undefined
+      ? parseBooleanInput(body?.is_enabled_dashboard)
+      : parseBooleanInput(body?.enabled)
 
     await initRedis()
     let connection = await getConnection(connectionId)
@@ -94,21 +98,21 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         console.log(`[v0] [Toggle] DISABLING: main_enabled=false (engine will stop)`)
       }
     } else {
-      // No state change but still need to ensure engine is running if already enabled
+      // No state change.
+      // AUTO-START DISABLED: this branch previously auto-started the engine
+      // whenever the connection was enabled but its engine was not running —
+      // meaning ANY request to this endpoint (dashboard polls, stray calls,
+      // bodies without recognized fields) silently resurrected the engine
+      // after an operator stop. Now the engine starts ONLY when the request
+      // EXPLICITLY asks for enabled=true (hasDashboardEnabled/hasActiveInserted)
+      // — i.e. a real user toggle, not a no-op repeat.
       updatedConnection = connection
-      if (enableMain) {
+      const explicitlyRequestedEnable =
+        (hasDashboardEnabled && isDashboardEnabled) || (hasActiveInserted && isActiveInserted)
+      if (enableMain && explicitlyRequestedEnable) {
         const coordinator = getGlobalTradeEngineCoordinator()
         if (!coordinator.isEngineRunning(resolvedId)) {
-          // ── Minimal anti-burst guard (2 s) ───────────────────────────
-          // The hard anti-flap guarantees already live in the coordinator
-          // (`startingEngines` mutex + progression-lock self-heal), which
-          // make a second `startEngine` during an in-flight start a safe
-          // no-op. This tiny 2 s window is purely cosmetic: it absorbs
-          // rapid-fire polls from the dashboard (every ~8 s) and any
-          // accidental double-click on the toggle so we don't spam
-          // `startEngine` from MULTIPLE requests in the SAME tick. A
-          // genuine user toggle to enable/disable goes through the
-          // `needsUpdate` branch above and is NEVER throttled.
+          // Anti-burst guard (2 s) absorbs accidental double-clicks.
           const cooldownKey = `engine_restart_cooldown:${resolvedId}`
           const cooldownClient = getRedisClient()
           const lastRestartRaw = await cooldownClient.get(cooldownKey).catch(() => null)
@@ -116,22 +120,22 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           const RESTART_COOLDOWN_MS = 2_000
           if (Number.isFinite(lastRestartMs) && Date.now() - lastRestartMs < RESTART_COOLDOWN_MS) {
             console.log(
-              `[v0] [Toggle] Already enabled - engine not running but restart attempted ${Date.now() - lastRestartMs}ms ago; skipping (burst guard)`,
+              `[v0] [Toggle] Explicit re-enable - restart attempted ${Date.now() - lastRestartMs}ms ago; skipping (burst guard)`,
             )
           } else {
             engineAction = "start"
             try {
-              // Short TTL so the key self-cleans well before the next
-              // legitimate restart could fire.
               await cooldownClient.set(cooldownKey, String(Date.now()), { EX: 5 })
             } catch {
               /* best-effort */
             }
-            console.log(`[v0] [Toggle] Already enabled - engine not running, starting...`)
+            console.log(`[v0] [Toggle] Explicit re-enable - engine not running, starting...`)
           }
         } else {
           console.log(`[v0] [Toggle] Already enabled - engine already running, no restart`)
         }
+      } else if (enableMain) {
+        console.log(`[v0] [Toggle] Already enabled - no explicit enable in request, engine state untouched`)
       } else {
         console.log(`[v0] [Toggle] Already disabled`)
       }
@@ -179,18 +183,27 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
         }
         
-        // Update global engine state to show running (stored as Redis HASH)
+        // Update global engine state — but ONLY propagate/mirror, never force
+        // status="running" if the operator has stopped the global engine.
+        // Previously this block unconditionally wrote status:"running", causing
+        // the engine to resurrect itself after every connection-enable even when
+        // the operator had explicitly pressed Stop.
         const toggleClient = getRedisClient()
         const globalState: Record<string, string> = await toggleClient.hgetall("trade_engine:global").catch(() => ({})) || {}
+        const isGlobalRunning = globalState.status === "running"
         const allConnections = await getAllConnections()
         // Use clean helper function for counting main-enabled connections
         const activeDashboardCount = allConnections.filter((c: any) => 
           c.id === resolvedId || isConnectionReadyForEngine(c)
         ).length
+        // Only update status if already running — never flip from stopped→running
+        // on a per-connection enable. The operator must explicitly start the
+        // global engine via /api/trade-engine/start.
+        const newGlobalStatus = isGlobalRunning ? "running" : (globalState.status || "stopped")
         await toggleClient.hset("trade_engine:global", {
           ...globalState,
-          status: "running",
-          started_at: globalState.started_at || new Date().toISOString(),
+          status: newGlobalStatus,
+          ...(isGlobalRunning && !globalState.started_at ? { started_at: new Date().toISOString() } : {}),
           updated_at: new Date().toISOString(),
           active_connections: String(activeDashboardCount),
         })
@@ -255,7 +268,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         
         // Update global engine state (stored as Redis HASH)
         const disableClient = getRedisClient()
-        const disableGlobalState = await disableClient.hgetall("trade_engine:global").catch(() => ({})) || {}
+        const disableGlobalState: Record<string, string> = await disableClient.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>)) || {}
         const allConnsForDisable = await getAllConnections()
         // Use clean helper function - exclude current connection
         const activeCount = allConnsForDisable.filter((c: any) => 
@@ -265,7 +278,14 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           ...disableGlobalState,
           updated_at: new Date().toISOString(),
           active_connections: String(activeCount),
-          status: activeCount > 0 ? "running" : "idle",
+          // When stopping/disabling a connection, keep the global status as
+          // "stopped" unless other connections are enabled AND the engine was
+          // already running. Never promote to "running" from a disable action.
+          status: (() => {
+            if (activeCount === 0) return "stopped"
+            // Only keep "running" if the engine was running before this disable
+            return (disableGlobalState?.status === "running" && activeCount > 0) ? "running" : "stopped"
+          })(),
         })
         
         // DIRECTLY STOP THE ENGINE - don't rely on coordinator polling

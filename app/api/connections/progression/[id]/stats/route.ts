@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { initRedis, getRedisClient, getSettings } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getSettings, getConnection, getAppSettings } from "@/lib/redis-db"
+import { VolumeCalculator } from "@/lib/volume-calculator"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -255,18 +256,27 @@ export async function GET(
       // have clearly been processed (Frames and Indicators are non-zero).
       historicSymbolsProcessed
     )
+    // DATA INTEGRITY: every completion signal is gated on REAL recorded work
+    // (symbolsProcessed > 0). The genuine completion path
+    // (completePrehistoricPhase) always stamps symbols_processed=max(scard,total)
+    // alongside is_complete and the `:done` marker — so a flag without work is
+    // by definition a stale/fake stamp (legacy fake-data writers stamped
+    // prehistoric_done=1, the 7-day-TTL `:done` key, and data_loaded
+    // unconditionally). Without this gate a never-run system shows a false
+    // "100 % complete" with symbolsProcessed=0.
     const historicIsComplete =
-      prehistoricHash.is_complete === "1" ||
-      // `:done` plain-key marker written by completePrehistoricPhase —
-      // survives hot-reloads where the in-memory callback may not fire.
-      String(prehistoricDoneMarker) === "1" ||
-      (progHash.prehistoric_phase_active === "false" && historicSymbolsProcessed > 0) ||
-      es.prehistoric_data_loaded === true ||
-      es.prehistoric_data_loaded === "1" ||
-      // All symbols processed — even if is_complete was never written
-      // (e.g. the processor crashed after the last symbol but before the
-      // completion pin), treat the run as done so the bar reaches 100 %.
-      (historicSymbolsTotal > 0 && historicSymbolsProcessed >= historicSymbolsTotal)
+      historicSymbolsProcessed > 0 &&
+      (prehistoricHash.is_complete === "1" ||
+        // `:done` plain-key marker written by completePrehistoricPhase —
+        // survives hot-reloads where the in-memory callback may not fire.
+        String(prehistoricDoneMarker) === "1" ||
+        progHash.prehistoric_phase_active === "false" ||
+        es.prehistoric_data_loaded === true ||
+        es.prehistoric_data_loaded === "1" ||
+        // All symbols processed — even if is_complete was never written
+        // (e.g. the processor crashed after the last symbol but before the
+        // completion pin), treat the run as done so the bar reaches 100 %.
+        (historicSymbolsTotal > 0 && historicSymbolsProcessed >= historicSymbolsTotal))
     const historicProgressPercent = historicIsComplete
       ? 100
       // No Math.min(99) cap — progress tracks real completion. The bar
@@ -464,7 +474,7 @@ export async function GET(
       .sort((a, b) => b.count - a.count)
       .slice(0, 5)
 
-    // ── Real-stage open positions ────────────────────────────────────
+    // ── Real-stage open positions ────────────���───────────────────────
     //
     // Real positions are Main→Real promotions awaiting mirror into
     // exchange orders. Count only — USD volume is NOT tracked here
@@ -607,7 +617,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ────────────────────────────────────────────────
+      // ── Price tracking ───────────────────────────────────���────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -878,11 +888,20 @@ export async function GET(
       }))
       .sort((a, b) => (b.long + b.short) - (a.long + a.short))
 
+    // engineProgression phase and engine_state status are the canonical source of
+    // truth for whether the engine is actively running. realtimeIndicationCycles
+    // stays non-zero after a stop (it reflects the last run's cycle count, not
+    // a live signal), so it must be gated by the authoritative phase/status.
+    const engineIsStopped =
+      ep?.phase === "stopped" ||
+      es.status === "stopped" ||
+      es.status === "idle"
     const realtimeIsActive =
-      realtimeIndicationCycles > 0 ||
-      ep?.phase === "live_trading" ||
-      ep?.phase === "realtime" ||
-      es.status === "running"
+      !engineIsStopped &&
+      (realtimeIndicationCycles > 0 ||
+        ep?.phase === "live_trading" ||
+        ep?.phase === "realtime" ||
+        es.status === "running")
 
     // ── BREAKDOWN section ────────────────────────────────���───────────────────
     // Indication per-type counts live in two places:
@@ -1459,7 +1478,7 @@ export async function GET(
     }
 
     // ── SINGLE closed-archive fetch shared by stratDetail.live and
-    //    closedPositionsForHistory (below) ────────────────────────────────
+    //    closedPositionsForHistory (below) ───��────────────────────────────
     // Previously the archive was fetched TWICE:
     //   1. lrange(0, 199) for stratDetail.live PF/hold/ROI numbers.
     //   2. lrange(0, 499) for closedPositionsForHistory rows + perf tiers.
@@ -1481,7 +1500,7 @@ export async function GET(
       }
     } catch { /* archive empty */ }
 
-    // ── LIVE STAGE DETAIL (4th tier — mirrors Real but from real exchange) ───
+    // ── LIVE STAGE DETAIL (4th tier — mirrors Real but from real exchange) ��──
     // Sourced entirely from local Redis — the progression hash (counters) and
     // the closed-position archive written by the live-stage pipeline. No
     // exchange history calls required.
@@ -1925,7 +1944,70 @@ export async function GET(
     let redisDbEntries = 0
     try { redisDbEntries = await client.dbSize() } catch { /* non-critical */ }
 
-    // ── Build response ─────────────────────────────────────────────�����─────────
+    // ── Volume configuration snapshot ────────────────────────────────────────
+    // Resolve the EFFECTIVE live/preset volume factors exactly as
+    // VolumeCalculator.calculateVolumeForConnection does, so the dashboard
+    // can show what multiplier is actually being applied to live orders rather
+    // than making the operator guess which settings path won.
+    let volumeConfig: {
+      liveVolumeFactor: number
+      presetVolumeFactor: number
+      tradeMode: "main" | "preset"
+      positionCostPct: number
+      positionsAverage: number
+      source: string
+    } = {
+      liveVolumeFactor:   1,
+      presetVolumeFactor: 1,
+      tradeMode:          "main",
+      positionCostPct:    0.02,
+      positionsAverage:   2,
+      source:             "default",
+    }
+    try {
+      const [vcConn, vcApp] = await Promise.all([
+        getConnection(connectionId).catch(() => null),
+        getAppSettings().catch(() => null),
+      ])
+      // Build the merged settings object the same way calculateVolumeForConnection does:
+      // global app_settings + connection_settings overlay + connection record fields.
+      const vcSettings: Record<string, unknown> = { ...(vcApp as Record<string, unknown> || {}) }
+      try {
+        const vcConnS = (await client.hgetall(`connection_settings:${connectionId}`).catch(() => null)) || {}
+        for (const [k, v] of Object.entries(vcConnS)) {
+          if (v !== undefined && v !== null && v !== "") vcSettings[k] = v
+        }
+      } catch { /* best-effort */ }
+      if (vcConn) {
+        const CONN_FIELDS = [
+          "exchangePositionCost", "exchange_position_cost", "positionCost",
+          "positions_average", "positionsAverage",
+          "live_volume_factor", "preset_volume_factor",
+          "leveragePercentage", "useMaximalLeverage",
+          "is_live_trade", "is_preset_trade",
+        ] as const
+        for (const f of CONN_FIELDS) {
+          const v = (vcConn as Record<string, unknown>)[f]
+          if (v !== undefined && v !== null && v !== "") vcSettings[f] = v
+        }
+      }
+      const resolved = VolumeCalculator.resolveLiveEngine(vcConn, vcSettings)
+      const posCostRaw = Number(
+        vcSettings.exchangePositionCost ?? vcSettings.positionCost ?? vcSettings.exchange_position_cost ?? "0.02"
+      )
+      const posAvgRaw = Number(vcSettings.positions_average ?? vcSettings.positionsAverage ?? "2")
+      volumeConfig = {
+        liveVolumeFactor:   resolved.mainVolumeFactor,
+        presetVolumeFactor: resolved.presetVolumeFactor,
+        tradeMode:          resolved.tradeMode,
+        positionCostPct:    Number.isFinite(posCostRaw) && posCostRaw > 0 ? posCostRaw : 0.02,
+        positionsAverage:   Number.isFinite(posAvgRaw) && posAvgRaw > 0 ? posAvgRaw : 2,
+        source:             vcConn?.live_volume_factor ? "connection"
+                            : (vcSettings.volume_factor_live ? "app_settings" : "default"),
+      }
+    } catch { /* non-critical — keep defaults */ }
+
+    // ── Build response ──────────────────────────────────────────────────────
     return NextResponse.json({
       success: true,
       connectionId,
@@ -2643,7 +2725,7 @@ export async function GET(
       // Prehistoric processing metadata — range, timeframe, interval progress
       prehistoricMeta,
 
-      // ── PERFORMANCE TIERS ───────────────────────────────────────────────────
+      // ── PERFORMANCE TIERS ────────────────────────────────��──────────────────
       // Per-stage (base / main / real / live) performance summary. Fields are
       // sourced from strategy_detail hashes (base/main/real: cross-symbol
       // aggregations of avg PF, DDT, pos-eval) or from the live closed archive
@@ -2831,6 +2913,15 @@ export async function GET(
       //   posOpen    = avg open positions
       //   samples    = number of in-window sample points used
       realAverages,
+
+      // volumeConfig: effective volume multiplier stack used by live orders.
+      //   liveVolumeFactor   = mainVolumeFactor applied to all main-engine live orders
+      //   presetVolumeFactor = multiplier for preset-engine live orders
+      //   tradeMode          = which engine is active ("main" | "preset")
+      //   positionCostPct    = % of balance budgeted per position (e.g. 0.02 = 0.02%)
+      //   positionsAverage   = divisor for budget allocation (concurrent positions)
+      //   source             = where the factor came from: "connection" | "app_settings" | "default"
+      volumeConfig,
 
       // Legacy flat fields kept for backward compat with existing components
       // that still read engine-stats shape directly

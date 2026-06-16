@@ -229,6 +229,14 @@ export class StrategyEvaluator {
    * Store strategy result in Redis
    */
   private async storeStrategyResult(result: StrategyResult): Promise<void> {
+    // DEV-MODE BYPASS: strategies:{conn}:{symbol} lists store up to 500 full
+    // StrategyResult JSON objects (~2 KB each) per symbol per evaluation cycle.
+    // At 20 symbols × 500 items × 2 KB = 20 MB of list data churning in the
+    // InlineLocalRedis Map every cycle, OOM-killing the dev server.
+    // StrategyEvaluator is not used by the core engine pipeline — only by
+    // metrics-aggregator for historical querying — so these lists are safe to
+    // skip in dev where cross-restart persistence is not required.
+    if (process.env.NODE_ENV === "development") return
     try {
       const client = getRedisClient()
       
