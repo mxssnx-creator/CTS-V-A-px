@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─������������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─��������������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -1957,7 +1957,7 @@ export class StrategyCoordinator {
       }
     }
 
-    // ── Await all async builds to complete ───────────────────────────────
+    // ── Await all async builds to complete ────���──────────────────────────
     const results = await Promise.all(buildTasks)
     
     // ── Process results and populate mainSets ──���─────────────────────────
@@ -2040,10 +2040,11 @@ export class StrategyCoordinator {
       // (reachable) objects — Mark-Compact cannot reclaim live objects so the
       // heap ceiling is dominated by simultaneous coord-record count.
       // 2500 keeps the per-symbol footprint ≈ the 5-symbol total divided by 4.
-      // In dev: 400 per symbol × SYMBOL_CONCURRENCY(3) = 1200 in-flight at peak
-      // vs 7500 at 2500 ceiling. Pipeline correctness is unaffected; fewer Set
-      // permutations are tested per cycle but all code paths still execute.
-      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development" ? 400 : 2500
+      // In dev: 1500 per symbol × SYMBOL_CONCURRENCY(3) = 4500 in-flight at peak.
+      // Raised from 400 so 15-symbol test sessions exercise the same code paths
+      // as prod (400 was hitting the ceiling every cycle and masking correct behaviour).
+      // Still well below the prod 2500 × 20 symbol × 6 concurrency = 300k worst-case.
+      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development" ? 1500 : 2500
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -2567,7 +2568,7 @@ export class StrategyCoordinator {
        for (const k of liveSetKeys) realActiveKeysForVP.add(k)
      } catch { /* fail-open */ }
      
-    // ── SINGLE PASS: pos-gate + PF/DDT filter + collect qualifying sets ──────
+    // ── SINGLE PASS: pos-gate + PF/DDT filter + collect qualifying sets ────���─
     // Previously: mainSets.map() [new array] → .filter() [new array] →
     //             [...realQualifying].sort() [spread + new array] — 3 heap allocations.
     // Now: one for-loop marks status in-place on each StrategySet (no new arrays
@@ -2590,7 +2591,7 @@ export class StrategyCoordinator {
       // hasEntries is always true for them — skip the check for non-axis.
       const hasEntries = isAxisSet || (s.entries?.length ?? 0) > 0
 
-      // ── 1. Position-count gate ──────────────────────���─────────────────────
+      // ── 1. Position-count gate ──────────────────────�����─────────────────────
       if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
         const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
         if (!hasActiveReal) {

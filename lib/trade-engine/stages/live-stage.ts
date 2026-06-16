@@ -1701,7 +1701,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ───���────────────────────────────────────────────────────────
+// ── Main Pipeline ───�����────────────────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -2830,12 +2830,12 @@ export async function executeLivePosition(
       )
       // BingX hedge-mode positions need time after market order acceptance
       // before a STOP/TP_MARKET can reference them — 109420 "position not exist"
-      // fires if SL/TP is submitted too quickly (confirmed in DOGE/ADA/AAVE logs).
-      // AAVEUSDT observed to need >9s (5s wait + 4s retry both failed), so
-      // raised to 8s here. Combined with the 6s 109420 retry inside
-      // placeProtectionOrder the total window is 8s + 6s = 14s before giving up.
+      // fires if SL/TP is submitted too quickly (confirmed in DOGE/ADA/AAVE/BNB/SOL logs).
+      // BNBUSDT + SOLUSDT observed to need >14s (8s initial + 6s retry both failed),
+      // so raised to 10s here. Combined with the 6s 109420 retry inside
+      // placeProtectionOrder the total window is 10s + 6s = 16s before giving up.
       // Reconcile arms protection on the next tick if both attempts still fail.
-      await new Promise((r) => setTimeout(r, 8000))
+      await new Promise((r) => setTimeout(r, 10000))
       await logLiveOrderFinal(orderTrace, {
         status: "placed",
         livePositionId: livePosition.id,
