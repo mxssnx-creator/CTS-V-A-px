@@ -3075,27 +3075,44 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
         await client.set("_migrations_run", "true")
       }
 
-      const ensured = await ensureBaseConnections(client)
-      // Only log when something actually changed; otherwise the "ensured=0,
-      // credentialsInjected=0" line spams every HTTP request because the
-      // migration loader runs on every module reload (HMR / cold-warm).
-      if (ensured.createdOrUpdated > 0 || ensured.credentialsInjected > 0) {
-        console.log(
-          `[v0] [Migrations] ✓ Already executed in this process; ` +
-            `base ensured=${ensured.createdOrUpdated}, credentialsInjected=${ensured.credentialsInjected}`,
-        )
-      }
+      // ── CRITICAL: Check for NEW pending migrations added via code change ──
+      // Previous implementation: the `haveMigrationsRun()` guard short-circuited
+      // and always returned "Already run in this process" without checking Redis
+      // `_schema_version`. If NEW migrations (e.g. migration 041) were added to
+      // the codebase via hot-reload, they NEVER ran because the process flag was
+      // already true. Now: always verify Redis is at the latest code version, and
+      // if not, fall through to the normal pending-migration path below.
+      const versionStr = await client.get("_schema_version")
+      const currentVersion = versionStr ? parseInt(versionStr as string) : 0
+      if (currentVersion < finalVer) {
+        // New migrations exist that haven't run yet — clear the process guard
+        // and fall through to the full run path below.
+        setMigrationsRun(false)
+        console.log(`[v0] [Migrations] Hot-reload detected new migrations: Redis v${currentVersion} < code v${finalVer}`)
+      } else {
+        // Redis is at latest — fast-path return.
+        const ensured = await ensureBaseConnections(client)
+        // Only log when something actually changed; otherwise the "ensured=0,
+        // credentialsInjected=0" line spams every HTTP request because the
+        // migration loader runs on every module reload (HMR / cold-warm).
+        if (ensured.createdOrUpdated > 0 || ensured.credentialsInjected > 0) {
+          console.log(
+            `[v0] [Migrations] ✓ Already executed in this process; ` +
+              `base ensured=${ensured.createdOrUpdated}, credentialsInjected=${ensured.credentialsInjected}`,
+          )
+        }
 
-      // Coverage repair runs at most ONCE per process (one-shot guard on
-      // globalThis). On every subsequent fast-path call (= every API request)
-      // we skip it entirely — it iterates all connections and was the primary
-      // cause of slow startup on repeated requests.
-      if (!globalMigrationGuard.__coverage_repair_done) {
-        globalMigrationGuard.__coverage_repair_done = true
-        await ensureCompleteProductionCoverage(client)
-      }
+        // Coverage repair runs at most ONCE per process (one-shot guard on
+        // globalThis). On every subsequent fast-path call (= every API request)
+        // we skip it entirely — it iterates all connections and was the primary
+        // cause of slow startup on repeated requests.
+        if (!globalMigrationGuard.__coverage_repair_done) {
+          globalMigrationGuard.__coverage_repair_done = true
+          await ensureCompleteProductionCoverage(client)
+        }
 
-      return { success: true, message: "Already run in this process", version: finalVer }
+        return { success: true, message: "Already run in this process", version: finalVer }
+      }
     }
 
     await ensureCoreRedis()
