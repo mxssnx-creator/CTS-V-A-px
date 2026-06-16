@@ -3104,24 +3104,30 @@ export class StrategyCoordinator {
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainPFEligible)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
-        // ── CRITICAL: Persist Real Sets for Live evaluation (prod only) ───────────────��
-        // Bug fix: Real Sets were computed but never written, causing Live to load
-        // an empty array and never fire. Now serialize the full realSets array so
-        // createLiveSets can read and filter them for Live stage.
-        client.set(
-          `strategies:${this.connectionId}:${symbol}:real:sets`,
-          JSON.stringify({
-            sets: realSets,
-            count: realSets.length,
-            created: new Date().toISOString(),
-            updatedAt: Date.now(),
-          }),
-        ),
         client.expire(`strategies:${this.connectionId}:real:count`, 86400),
         client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:main:passed`, 86400),
-        client.expire(`strategies:${this.connectionId}:${symbol}:real:sets`, 86400),
       ]
+      // Persist Real Sets for Live evaluation — skip in dev to prevent OOM.
+      // In dev, createLiveSets is always called with in-memory realSets directly
+      // (coordinateForActualOne ~line 1179), so the Redis persist is unnecessary.
+      // In prod, the blob is needed so the NEXT cycle can load realSets from Redis.
+      // Serialising 960 Sets × ~250 KB × 20 symbols = ~4.8 GB/cycle was the
+      // primary OOM cause: 856 MB/min RSS growth until the server was killed.
+      if (process.env.NODE_ENV !== "development") {
+        writes.push(
+          client.set(
+            `strategies:${this.connectionId}:${symbol}:real:sets`,
+            JSON.stringify({
+              sets: realSets,
+              count: realSets.length,
+              created: new Date().toISOString(),
+              updatedAt: Date.now(),
+            }),
+          ),
+          client.expire(`strategies:${this.connectionId}:${symbol}:real:sets`, 86400),
+        )
+      }
       // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
       // strategies_real_evaluated = Main Sets that entered REAL (input count).
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
