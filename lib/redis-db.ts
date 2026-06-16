@@ -515,21 +515,35 @@ export class InlineLocalRedis {
 
     // Keys that must NEVER be evicted by memory pressure — they are either
     // stateful operator decisions or live-position tracking records.
-    const isProtected = (k: string): boolean =>
-      k.startsWith("live:position:") ||      // open/closed live positions (JSON)
-      k.startsWith("live:positions:") ||      // open/closed index LISTs
-      k.startsWith("progression:") ||         // progression counters + metadata
-      k.startsWith("connection:") ||          // exchange credentials + config
-      k.startsWith("settings:") ||            // operator settings
-      k.startsWith("strategy_count:") ||      // strategy count totals
-      k.startsWith("real_pi_acc:") ||         // real PI accumulation ledger
-      k.startsWith("axis_pos_acc:") ||        // axis position accumulation
-      k.startsWith("app_settings") ||         // global app settings
-      k.startsWith("trade_engine:") ||        // engine state
-      k.startsWith("_migration") ||           // migration markers
-      k.startsWith("_schema_version") ||      // schema version
-      k.startsWith("market_data:") ||         // candle blobs (handled separately)
-      false
+    //
+    // IMPORTANT: "settings:*" was previously fully protected, but
+    // "settings:pseudo_position*" and "settings:strategies*" are high-volume
+    // transient pipeline data (not operator config) and must be evictable.
+    // The protected guard is narrowed to the genuine operator sub-families only.
+    const isProtected = (k: string): boolean => {
+      if (k.startsWith("live:position:"))    return true  // open/closed live positions
+      if (k.startsWith("live:positions:"))   return true  // open/closed index LISTs
+      if (k.startsWith("progression:"))      return true  // progression counters
+      if (k.startsWith("connection:"))       return true  // exchange credentials
+      if (k.startsWith("strategy_count:"))   return true  // strategy count totals
+      if (k.startsWith("real_pi_acc:"))      return true  // real PI accumulation
+      if (k.startsWith("axis_pos_acc:"))     return true  // axis position accumulation
+      if (k.startsWith("app_settings"))      return true  // global app settings
+      if (k.startsWith("trade_engine:"))     return true  // engine state
+      if (k.startsWith("_migration"))        return true  // migration markers
+      if (k.startsWith("_schema_version"))   return true  // schema version
+      if (k.startsWith("market_data:"))      return true  // candle blobs (separate cap)
+      // Protect genuine operator settings but NOT transient pipeline families.
+      // settings:pseudo_position* and settings:strategies* are written every
+      // realtime cycle and must be subject to FIFO caps.
+      if (k.startsWith("settings:")) {
+        // Transient pipeline families — NOT protected
+        if (k.startsWith("settings:pseudo_position")) return false
+        if (k.startsWith("settings:strategies"))       return false
+        return true  // all other settings: keys are protected operator config
+      }
+      return false
+    }
 
     // 1) Hash families that grow per-cycle. Keep only the newest CAP entries
     //    of each family (FIFO — Map preserves insertion order, so the first
@@ -543,6 +557,11 @@ export class InlineLocalRedis {
       // setSettings() prepends "settings:" so pseudo_position keys written via
       // setSettings land as "settings:pseudo_position:*" — cap those separately.
       { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 1500 },
+      // settings:strategies:* — base:sets / real:sets blobs (main:sets skipped in dev).
+      // 80 keys × ~250KB each = 20 MB; keep only the newest 20 per connection.
+      { match: (k) => !isProtected(k) && k.startsWith("settings:strategies"), cap: 20 },
+      // strategies:bingx-x01 (no symbol) — connection-level coord hashes, 58 keys / 19 MB.
+      { match: (k) => !isProtected(k) && /^strategies:[^:]+$/.test(k), cap: 10 },
       { match: (k) => !isProtected(k) && (k.startsWith("config_set:") || k.includes(":config_set:")), cap: 1500 },
       { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":positions"), cap: 1000 },
       { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":detail"), cap: 1000 },
@@ -569,6 +588,7 @@ export class InlineLocalRedis {
     const stringFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
       { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 2000 },
       { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 1500 },
+      { match: (k) => !isProtected(k) && k.startsWith("settings:strategies"), cap: 20 },
       { match: (k) => !isProtected(k) && (k.includes(":exists:") || k.includes(":dedup:")), cap: 3000 },
       { match: (k) => !isProtected(k) && k.startsWith("strategy_detail:"), cap: 1000 },
       { match: (k) => !isProtected(k) && (k.startsWith("candle_cache:") || k.startsWith("market_data_cache:")), cap: 30 },
@@ -1589,7 +1609,7 @@ export async function getConnection(id: string): Promise<any | null> {
   return parseHash(hash)
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────��───────────────────
 // PERF: in-memory TTL cache for `getAllConnections`.
 // The dashboard polls every ~8s and each active card fans out multiple
 // per-connection requests. Without this cache we issue N KEYS + N HGETALL
@@ -1846,7 +1866,7 @@ export function invalidateAppSettingsCache(): void {
   appSettingsCache = null
 }
 
-// ─────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────���─────────────────────────────────
 // Live-settings version counter
 //
 // When an operator hits Save in the Settings UI, the server updates the
