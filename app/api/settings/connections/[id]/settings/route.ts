@@ -4,7 +4,7 @@ import { updateConnection, initRedis, getConnection, getRedisClient, setSettings
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 import { getTradeEngine } from "@/lib/trade-engine"
-import { fetchTopSymbols } from "@/lib/top-symbols"
+import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { toRedisFlag } from "@/lib/boolean-utils"
 
@@ -204,8 +204,16 @@ export async function PATCH(
       // getAllConnections() (and the UI card) always shows the current count.
       ...(settings.symbol_count !== undefined ? { symbol_count: String(Number(settings.symbol_count)) } : {}),
       ...(Array.isArray(settings.symbols) && settings.symbols.length > 0
+        // Non-empty explicit symbol list → write as force_symbols so getSymbols()
+        // uses the operator's resolved / auto-selected list immediately.
         ? { force_symbols: JSON.stringify(settings.symbols), symbol_count: String(settings.symbols.length) }
-        : {}),
+        // Empty or absent symbols + non-manual order → CLEAR force_symbols so
+        // getSymbols() falls through to the exchange auto-resolve path.
+        // This lets "volatility_1h" / "volume_24h" etc. re-rank on each start.
+        : (Array.isArray(settings.symbols) && settings.symbols.length === 0 &&
+           typeof settings.symbol_order === "string" && settings.symbol_order !== "manual")
+          ? { force_symbols: "" }
+          : {}),
       updated_at: new Date().toISOString(),
     }
 
@@ -457,8 +465,8 @@ export async function PATCH(
       try {
         const order = String((merged as Record<string, unknown>).symbol_order || "volume_24h")
         const rawCount = Number((merged as Record<string, unknown>).symbol_count)
-        // Allow up to 32 symbols per operator spec (quickstart max 32)
-        const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(1, Math.min(32, Math.floor(rawCount))) : 15
+        // Allow up to 20 symbols per operator spec (intense-retest cap = 20)
+        const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(1, Math.min(20, Math.floor(rawCount))) : 20
         const manualList = Array.isArray((merged as Record<string, unknown>).symbols)
           ? ((merged as Record<string, unknown>).symbols as unknown[]).filter(
               (s): s is string => typeof s === "string" && s.length > 0,
@@ -474,7 +482,9 @@ export async function PATCH(
           // DIRECTLY (no HTTP self-fetch — that fails on loopback/origin inside
           // a route handler, which is why the first cut resolved 0 symbols).
           const exchange = String((connection as Record<string, unknown>).exchange || "bingx").toLowerCase()
-          const sort = order.startsWith("volatil") ? "volatility" : "volume"
+          // normaliseSort handles volatility_1h → "volatility_1h" (true 1h ATR)
+          // and volatility_24h / volatility → "volatility" (24h priceChangePercent).
+          const sort = normaliseSort(order)
           try {
             const { symbols: topSymbols } = await fetchTopSymbols(exchange, count, sort)
             resolved = topSymbols

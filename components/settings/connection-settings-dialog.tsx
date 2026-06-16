@@ -44,6 +44,9 @@ import {
   FolderOpen,
   ChevronDown,
   ChevronUp,
+  Flame,
+  CheckSquare,
+  Square,
 } from "lucide-react"
 import {
   DropdownMenu,
@@ -186,15 +189,19 @@ export function ConnectionSettingsDialog({
   })
 
   // ── Symbols state ───────────────────────────────────────────────
-  // Operator spec: default symbolOrder = volatility_1h, symbolCount = 15
+  // Operator spec: default symbolOrder = volatility_1h, symbolCount = 20
   const [symbolsCfg, setSymbolsCfg] = useState<SymbolsSettings>({
     symbols: [],
     symbolOrder: "volatility_1h",
-    symbolCount: 15,
+    symbolCount: 20,
   })
   const [symbolInput, setSymbolInput] = useState("")
   const [exchangeSymbols, setExchangeSymbols] = useState<string[]>([])
+  // Full ticker objects (includes atr1h when sort=volatility_1h)
+  const [exchangeTickers, setExchangeTickers] = useState<Array<{ symbol: string; priceChangePercent: number; volume: number; atr1h?: number }>>([])
   const [loadingSymbols, setLoadingSymbols] = useState(false)
+  // Separate loading flag for the 1h volatility auto-select (kline fetch takes ~2s)
+  const [loadingVolatility1h, setLoadingVolatility1h] = useState(false)
   // The symbols the engine is currently running with (from active_symbols).
   // Shown as a read-only preview so the operator knows what takes effect
   // before and after saving.
@@ -350,7 +357,7 @@ export function ConnectionSettingsDialog({
 
   // ─────────────────────────────────────────────────────────────────
   // LOAD — fetch saved settings from Redis and hydrate all dialog state
-  // ─────────────────────────────────────────────────────────────────
+  // ──────────────────────────────────────────────────────��──────────
 
   const loadAllSettings = useCallback(async () => {
     setLoading(true)
@@ -611,10 +618,49 @@ export function ConnectionSettingsDialog({
         const list: string[] = Array.isArray(data.symbols) ? data.symbols
           : Array.isArray(data.available) ? data.available : []
         setExchangeSymbols(list)
+        // Store full ticker objects for the ranked preview table
+        if (Array.isArray(data.tickers)) {
+          setExchangeTickers(data.tickers)
+        }
       }
     } catch { /* non-fatal */ }
     finally { setLoadingSymbols(false) }
   }, [connectionId, exchangeKey, symbolsCfg.symbolOrder])
+
+  // Auto-selects top-N symbols by true 1h ATR volatility.
+  // Fetches live klines for the top-50 volume pool, re-ranks by (high−low)/open,
+  // then populates `symbolsCfg.symbols` and switches symbolOrder to volatility_1h
+  // so the engine's PATCH resolver auto-applies them on the next engine start.
+  const autoSelectByVolatility1h = useCallback(async () => {
+    setLoadingVolatility1h(true)
+    try {
+      const res = await fetch(
+        `/api/settings/connections/${connectionId}/symbols?order=volatility_1h&count=${Math.max(symbolsCfg.symbolCount, 20)}`
+      ).catch(() => null)
+      if (!res?.ok) throw new Error("Failed to fetch 1h volatility symbols")
+      const data = await res.json()
+      const tickers: Array<{ symbol: string; priceChangePercent: number; volume: number; atr1h?: number }> =
+        Array.isArray(data.tickers) ? data.tickers : []
+      const symbols: string[] = tickers.map((t) => t.symbol)
+      if (symbols.length === 0) throw new Error("No symbols returned")
+
+      setExchangeSymbols(symbols)
+      setExchangeTickers(tickers)
+      setSymbolsCfg(prev => ({
+        ...prev,
+        symbols: symbols.slice(0, prev.symbolCount),
+        symbolOrder: "volatility_1h",
+      }))
+      toast.success(
+        `Auto-selected top ${Math.min(symbols.length, symbolsCfg.symbolCount)} by 1h ATR`,
+        { description: symbols.slice(0, symbolsCfg.symbolCount).join(", ") },
+      )
+    } catch (err) {
+      toast.error("Auto-select failed", { description: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setLoadingVolatility1h(false)
+    }
+  }, [connectionId, symbolsCfg.symbolCount])
 
   // Auto-populate exchange symbol suggestions when dialog opens or symbol
   // order/exchange changes so the Symbols tab picker is always pre-loaded.
@@ -651,7 +697,7 @@ export function ConnectionSettingsDialog({
     [exchangeSymbols, symbolsCfg.symbols],
   )
 
-  // ─────────────────────────────────────────────────────────────────
+  // ──────────────────────────────────────────────��──────────────────
   // OPEN EFFECT — fires when the dialog opens; loads settings + presets.
   // Declared after all useCallback refs so they are in scope.
   // ─────────────────────────────────────────────────────────────────
@@ -1037,6 +1083,83 @@ export function ConnectionSettingsDialog({
                 <TabsContent value="symbols" className="mt-0 space-y-5">
                   <SectionHeading icon={Database} title="Symbol Selection" subtitle="Choose how the engine ranks and picks symbols from the exchange." />
 
+                  {/* ── 1h Volatility Auto-Select ─────────────────── */}
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 space-y-2.5">
+                    <div className="flex items-center gap-2">
+                      <Flame className="h-4 w-4 text-amber-500 shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-xs font-semibold">Auto-select by 1h Volatility</div>
+                        <div className="text-[11px] text-muted-foreground">
+                          Fetches the last 1h kline for each candidate and ranks by{" "}
+                          <span className="font-mono">(high−low)/open×100</span>. Fills the symbol list
+                          with the top-N most volatile and sets order to{" "}
+                          <span className="font-mono">volatility_1h</span>.
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="h-8 text-xs gap-1.5 bg-amber-500 hover:bg-amber-600 text-white border-0"
+                        onClick={autoSelectByVolatility1h}
+                        disabled={loadingVolatility1h || loadingSymbols}
+                      >
+                        {loadingVolatility1h
+                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          : <Flame className="h-3.5 w-3.5" />
+                        }
+                        {loadingVolatility1h ? "Fetching 1h klines…" : `Top ${symbolsCfg.symbolCount} by 1h ATR`}
+                      </Button>
+                      <span className="text-[10px] text-muted-foreground">
+                        {loadingVolatility1h
+                          ? "Querying BingX klines in parallel…"
+                          : "Runs live against the exchange API — takes ~2s for 20 symbols."}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Ranked ticker table — shown after a 1h ATR fetch */}
+                  {exchangeTickers.length > 0 && exchangeTickers.some((t) => t.atr1h !== undefined) && (
+                    <div className="rounded-lg border border-border overflow-hidden">
+                      <div className="px-3 py-1.5 bg-muted/40 border-b border-border flex items-center justify-between">
+                        <span className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground">
+                          1h ATR Ranking
+                        </span>
+                        <span className="text-[10px] text-muted-foreground">Click to toggle</span>
+                      </div>
+                      <div className="divide-y divide-border max-h-48 overflow-y-auto">
+                        {exchangeTickers
+                          .filter((t) => t.atr1h !== undefined)
+                          .sort((a, b) => (b.atr1h ?? 0) - (a.atr1h ?? 0))
+                          .slice(0, 25)
+                          .map((t, i) => {
+                            const isSelected = symbolsCfg.symbols.includes(t.symbol)
+                            return (
+                              <button
+                                key={t.symbol}
+                                type="button"
+                                onClick={() => isSelected ? removeSymbol(t.symbol) : addSymbol(t.symbol)}
+                                className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent transition-colors ${isSelected ? "bg-primary/5" : ""}`}
+                              >
+                                <span className="w-5 text-[10px] text-muted-foreground tabular-nums">
+                                  {i + 1}
+                                </span>
+                                {isSelected
+                                  ? <CheckSquare className="h-3.5 w-3.5 text-primary shrink-0" />
+                                  : <Square className="h-3.5 w-3.5 text-muted-foreground/40 shrink-0" />
+                                }
+                                <span className="font-mono font-medium flex-1">{t.symbol}</span>
+                                <span className={`text-[10px] tabular-nums font-mono ${(t.atr1h ?? 0) >= 1.5 ? "text-amber-500" : (t.atr1h ?? 0) >= 0.8 ? "text-yellow-500" : "text-muted-foreground"}`}>
+                                  {(t.atr1h ?? 0).toFixed(2)}% ATR
+                                </span>
+                              </button>
+                            )
+                          })}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Currently-active symbols — read-only status banner */}
                   {activeSymbols.length > 0 && (
                     <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-1">
@@ -1075,13 +1198,13 @@ export function ConnectionSettingsDialog({
                         <span className="text-xs font-mono tabular-nums">{symbolsCfg.symbolCount}</span>
                       </div>
                       <Slider
-                        min={1} max={32} step={1}
+                        min={1} max={20} step={1}
                         value={[symbolsCfg.symbolCount]}
                         onValueChange={([v]) => setSymbolsCfg(p => ({ ...p, symbolCount: v }))}
                         className="py-2"
                       />
                       <div className="flex justify-between text-[10px] text-muted-foreground">
-                        <span>1</span><span>default 15</span><span>32</span>
+                        <span>1</span><span>default 20</span><span>20</span>
                       </div>
                     </div>
                   </div>

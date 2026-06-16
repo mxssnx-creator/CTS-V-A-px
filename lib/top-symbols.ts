@@ -7,15 +7,27 @@
 //
 // Uses public exchange REST APIs — no auth required. Always returns at least one
 // symbol (safe-major fallback) so callers never wipe a connection's symbol source.
+//
+// SortKey guide:
+//   "volume"       — top by 24h USDT-quoted volume (liquidity-first).
+//   "volatility"   — top by |24h priceChangePercent| from the ticker feed.
+//   "volatility_1h" — top by true 1h ATR: (1h high - 1h low) / 1h open × 100.
+//                     Fetches the last single 1h kline for each candidate symbol.
+//                     For BingX this hits /openApi/swap/v2/quote/klines once per
+//                     symbol (up to `limit`×top-candidates). A parallel batch with
+//                     concurrency=8 keeps total latency < 2s for 20 symbols.
 
-export type SortKey = "volume" | "volatility"
-export type Ticker = { symbol: string; priceChangePercent: number; volume: number }
+export type SortKey = "volume" | "volatility" | "volatility_1h"
+export type Ticker = { symbol: string; priceChangePercent: number; volume: number; atr1h?: number }
 
 // In-memory cache — volatile symbols don't change rapidly, 60s TTL is fine.
-// Keyed by `${exchange}:${sort}` so volume- and volatility-sorted requests
-// don't clobber each other's cached top-1.
+// Keyed by `${exchange}:${sort}` so volume-, volatility-, and 1h-sorted requests
+// don't clobber each other.
 const cache = new Map<string, { symbol: string; priceChangePercent: number; timestamp: number }>()
+// 1h ATR cache is per-symbol and shorter-lived (90s) since 1h klines refresh every ~60s.
+const atrCache = new Map<string, { atr1h: number; timestamp: number }>()
 const CACHE_TTL = 60_000
+const ATR_CACHE_TTL = 90_000
 
 const FALLBACK: Record<string, string> = {
   binance: "BTCUSDT",
@@ -34,10 +46,112 @@ const SAFE_MAJORS = [
 
 export function normaliseSort(raw: string | null | undefined): SortKey {
   const v = (raw || "").toLowerCase()
-  // The dialog maps both `volume_24h`/`volume_1h` → "volume" and
-  // `volatility_*` → "volatility"; `newest`/`manual` fall back to volume.
+  // Map the dialog's SymbolOrder values to SortKey:
+  //   volatility_1h          → "volatility_1h"  (true 1h kline ATR)
+  //   volatility_24h / volatil* → "volatility"  (24h priceChangePercent)
+  //   volume_* / newest / manual / anything else → "volume"
+  if (v === "volatility_1h") return "volatility_1h"
   if (v.startsWith("volatil")) return "volatility"
   return "volume"
+}
+
+// ─── 1h ATR helper ──────────────────────────────────────────────────────────
+// Fetches the single most-recent 1h kline for `symbol` on the given exchange
+// and computes (high - low) / open × 100 as a percentage ATR proxy.
+// Returns 0 on any failure so the symbol still appears in results.
+async function fetch1hAtr(exchange: string, symbol: string): Promise<number> {
+  const cacheKey = `${exchange}:${symbol}`
+  const cached = atrCache.get(cacheKey)
+  if (cached && Date.now() - cached.timestamp < ATR_CACHE_TTL) return cached.atr1h
+
+  try {
+    let atr1h = 0
+
+    if (exchange === "bingx") {
+      // BingX swap klines: symbol uses hyphen format (BTC-USDT)
+      const bingxSym = symbol.replace(/USDT$/, "-USDT")
+      const url =
+        `https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol=${encodeURIComponent(bingxSym)}&interval=1h&limit=2`
+      const res = await fetch(url, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(4000),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        // BingX klines: [{ open, high, low, close, volume, time }, ...]
+        // Use index 0 (newest completed candle if limit=2 returns current+prev).
+        const candles: any[] = Array.isArray(data?.data) ? data.data : []
+        // Prefer the second-to-last (fully closed) candle if two are returned.
+        const c = candles.length >= 2 ? candles[candles.length - 2] : candles[0]
+        if (c) {
+          const open  = Number(c.open  || c.o || 0)
+          const high  = Number(c.high  || c.h || 0)
+          const low   = Number(c.low   || c.l || 0)
+          if (open > 0 && high >= low) atr1h = ((high - low) / open) * 100
+        }
+      }
+    } else if (exchange === "binance") {
+      const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=2`
+      const res = await fetch(url, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(4000),
+      })
+      if (res.ok) {
+        const data: any[][] = await res.json()
+        const c = data.length >= 2 ? data[data.length - 2] : data[0]
+        if (c) {
+          const open = Number(c[1] || 0)
+          const high = Number(c[2] || 0)
+          const low  = Number(c[3] || 0)
+          if (open > 0 && high >= low) atr1h = ((high - low) / open) * 100
+        }
+      }
+    } else if (exchange === "bybit") {
+      const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=2`
+      const res = await fetch(url, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(4000),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        const list: any[][] = data?.result?.list || []
+        // Bybit returns newest-first; use index 1 for the closed candle.
+        const c = list.length >= 2 ? list[1] : list[0]
+        if (c) {
+          const open = Number(c[1] || 0)
+          const high = Number(c[2] || 0)
+          const low  = Number(c[3] || 0)
+          if (open > 0 && high >= low) atr1h = ((high - low) / open) * 100
+        }
+      }
+    }
+
+    atrCache.set(cacheKey, { atr1h, timestamp: Date.now() })
+    return atr1h
+  } catch {
+    return 0
+  }
+}
+
+// Runs fetch1hAtr for a batch of symbols with capped concurrency.
+async function enrich1hAtr(
+  exchange: string,
+  tickers: Ticker[],
+  concurrency = 8,
+): Promise<Ticker[]> {
+  const results: Ticker[] = [...tickers]
+  let i = 0
+  const worker = async () => {
+    while (i < results.length) {
+      const idx = i++
+      results[idx] = {
+        ...results[idx],
+        atr1h: await fetch1hAtr(exchange, results[idx].symbol),
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, tickers.length) }, worker))
+  return results
 }
 
 export async function fetchTopSymbols(
@@ -45,6 +159,20 @@ export async function fetchTopSymbols(
   limit = 1,
   sort: SortKey = "volume",
 ): Promise<{ symbol: string; priceChangePercent: number; symbols: Ticker[] }> {
+  // For volatility_1h we first fetch a larger pool (top-50 by volume) to
+  // narrow candidates before making one kline request per symbol.
+  if (sort === "volatility_1h") {
+    const pool = await fetchTopSymbols(exchange, Math.max(50, limit * 3), "volume")
+    const enriched = await enrich1hAtr(exchange, pool.symbols, 8)
+    enriched.sort((a, b) => (b.atr1h ?? 0) - (a.atr1h ?? 0))
+    const topN = enriched.slice(0, limit)
+    const top  = topN[0] ?? pool.symbols[0]
+    return {
+      symbol:             top.symbol,
+      priceChangePercent: top.atr1h ?? top.priceChangePercent,
+      symbols:            topN,
+    }
+  }
   const safeLimit = Math.max(1, Math.min(50, Math.floor(limit) || 1))
   const cacheKey = `${exchange}:${sort}`
   if (safeLimit === 1) {
@@ -181,8 +309,11 @@ export async function fetchTopSymbols(
     tickers = [...clean, ...extras].slice(0, Math.max(safeLimit, clean.length))
   }
 
+  // Note: "volatility_1h" returns early above; only "volume" and "volatility" reach here.
   tickers.sort((a, b) =>
-    sort === "volatility" ? b.priceChangePercent - a.priceChangePercent : b.volume - a.volume,
+    sort === "volatility"
+      ? b.priceChangePercent - a.priceChangePercent
+      : b.volume - a.volume,
   )
 
   const seen = new Set<string>()
