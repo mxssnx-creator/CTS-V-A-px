@@ -2142,6 +2142,51 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "35")
     },
   },
+  {
+    // Migration 037 — seed is_enabled_dashboard=1 for bingx-x01.
+    //
+    // ROOT CAUSE of "Enabled dashboard: none" diagnostic log:
+    //   Migration 036 sets is_active_inserted=1 but never sets
+    //   is_enabled_dashboard. The key is absent → parseHashValue returns null
+    //   → isEnabledFlag(null)=false → connections route prints "none".
+    //   The start route only writes is_enabled_dashboard=1 AFTER the engine
+    //   starts (post-boot), so every request fired before the first engine
+    //   start showed 0. This migration seeds the flag so it is "1" from the
+    //   very first boot, even before any engine ever starts.
+    //
+    // STANDING DIRECTIVE COMPLIANCE: Seeding is_enabled_dashboard=1 does NOT
+    //   auto-start the engine. The engine only starts when the operator
+    //   explicitly calls POST /api/trade-engine/start (or the dashboard Start
+    //   button). The flag is only a dashboard-display toggle; it gates live-
+    //   trade and preset operations but does NOT trigger startMissingEngines
+    //   by itself (auto-start was eliminated in ea6ec91).
+    name: "037-bingx-x01-enabled-dashboard",
+    version: 37,
+    up: async (client: any) => {
+      await client.set("_schema_version", "37")
+      const CONN_ID = "bingx-x01"
+      const existing = await client.hgetall(`connection:${CONN_ID}`).catch(() => null)
+      if (existing && typeof existing === "object") {
+        const patch: Record<string, string> = { updated_at: new Date().toISOString() }
+        // Only set if the flag is absent or explicitly "0". Preserve "1".
+        const cur = existing["is_enabled_dashboard"]
+        if (!cur || cur === "0" || cur === "false") {
+          patch["is_enabled_dashboard"] = "1"
+        }
+        if (Object.keys(patch).length > 1) {
+          await client.hset(`connection:${CONN_ID}`, patch)
+          console.log(`[v0] Migration 037: seeded ${CONN_ID} is_enabled_dashboard=1`)
+        } else {
+          console.log(`[v0] Migration 037: ${CONN_ID} is_enabled_dashboard already "1", no patch needed`)
+        }
+      } else {
+        console.log(`[v0] Migration 037: ${CONN_ID} not found — skipping`)
+      }
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "36")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─��������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─����������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -1907,7 +1907,14 @@ export class StrategyCoordinator {
                 }
               } catch { /* fall through — regenerate on parse failure */ }
             }
-            if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
+            // Accept cached slim Sets where entries[] is empty but entryCount is
+            // non-zero — buildVariantSet now returns slim format (no entries blob)
+            // and the old `entries.length > 0` guard was incorrectly rejecting
+            // every in-process LRU hit, forcing a full rebuild on every cycle.
+            const cachedHasEntries =
+              (Array.isArray(cached?.entries) && cached.entries.length > 0) ||
+              ((cached?.entryCount ?? 0) > 0)
+            if (cached && cachedHasEntries) {
               if (baseSet.trailingProfile && !cached.trailingProfile) {
                 cached.trailingProfile = baseSet.trailingProfile
               }
