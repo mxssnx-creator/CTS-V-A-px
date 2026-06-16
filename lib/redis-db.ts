@@ -526,19 +526,26 @@ export class InlineLocalRedis {
         // First, clean up expired keys
         this.cleanupExpiredKeys()
 
-        // Check memory pressure: evict if EITHER heap OR total key count is too high.
-        // RSS can be 5x higher than heapUsed due to external buffers and code segments,
-        // so we guard on key count as a proxy for RSS growth even when heapUsed is low.
-        // 20 symbols × 1000 real sets + 20 symbols × overhead = ~30K keys needed;
-        // 20000 cap adds a 33% buffer while preventing the 84K+ unbounded accumulation
-        // that causes OOM at ~5 GB RSS on the 8 GB VM.
-        const heapUsedMB = (process.memoryUsage?.().heapUsed || 0) / 1024 / 1024
+        // Check memory pressure: evict if heap, RSS, or key count is too high.
+        // heapUsed alone is insufficient — after a heavy live-trading session the GC
+        // reduces heapUsed to ~600 MB (below the 800 MB trigger) while RSS stays at
+        // 4+ GB because V8 holds committed pages for future allocation. RSS is a better
+        // proxy for true process-level memory pressure, especially on the 6 GB VM where
+        // total system RAM (RSS_all_processes) matters more than individual heap metrics.
+        const mem = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
+        const heapUsedMB = mem.heapUsed / 1024 / 1024
+        const rssMB      = mem.rss      / 1024 / 1024
+        // RSS trigger: evict when process RSS exceeds 3 GB (leaves 3 GB+ for OS/other).
+        // heapUsed trigger: evict when V8 heap exceeds 800 MB.
+        const RSS_PRESSURE_MB = 3_000
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         const MAX_TOTAL_KEYS = 8_000
-        const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
+        const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || rssMB > RSS_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
         if (shouldEvict) {
-          if (heapUsedMB > HEAP_PRESSURE_MB) {
+          if (rssMB > RSS_PRESSURE_MB) {
+            console.log(`[v0] [Redis Memory] RSS at ${rssMB.toFixed(0)}MB (>${RSS_PRESSURE_MB}MB), evicting old records...`)
+          } else if (heapUsedMB > HEAP_PRESSURE_MB) {
             console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
           } else {
             console.log(`[v0] [Redis Memory] Key count at ${totalKeys} (>${MAX_TOTAL_KEYS}), evicting old records...`)
