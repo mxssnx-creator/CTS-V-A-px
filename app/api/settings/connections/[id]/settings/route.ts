@@ -465,8 +465,8 @@ export async function PATCH(
       try {
         const order = String((merged as Record<string, unknown>).symbol_order || "volume_24h")
         const rawCount = Number((merged as Record<string, unknown>).symbol_count)
-        // Allow up to 20 symbols per operator spec (intense-retest cap = 20)
-        const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(1, Math.min(20, Math.floor(rawCount))) : 20
+        // Allow up to 32 symbols per operator spec (quickstart max 32)
+        const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(1, Math.min(32, Math.floor(rawCount))) : 15
         const manualList = Array.isArray((merged as Record<string, unknown>).symbols)
           ? ((merged as Record<string, unknown>).symbols as unknown[]).filter(
               (s): s is string => typeof s === "string" && s.length > 0,

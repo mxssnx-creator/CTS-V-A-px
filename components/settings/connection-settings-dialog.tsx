@@ -1198,13 +1198,13 @@ export function ConnectionSettingsDialog({
                         <span className="text-xs font-mono tabular-nums">{symbolsCfg.symbolCount}</span>
                       </div>
                       <Slider
-                        min={1} max={20} step={1}
+                        min={1} max={32} step={1}
                         value={[symbolsCfg.symbolCount]}
                         onValueChange={([v]) => setSymbolsCfg(p => ({ ...p, symbolCount: v }))}
                         className="py-2"
                       />
                       <div className="flex justify-between text-[10px] text-muted-foreground">
-                        <span>1</span><span>default 20</span><span>20</span>
+                        <span>1</span><span>default 15</span><span>32</span>
                       </div>
                     </div>
                   </div>
