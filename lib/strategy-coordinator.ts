@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─�������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -2929,12 +2929,12 @@ export class StrategyCoordinator {
     // direction unchanged & magnitude grew → partial OPEN for ��; direction
     // unchanged & magnitude shrunk → partial CLOSE lowest-PF; direction
     // flipped or flat:0 ��� close all in bucket then optionally re-open.
-    if (Object.keys(netTargetWrites).length > 0) {
+    // live_net_target tracks hedge-direction net positions for the live dispatch.
+    // Skip in dev: this hset fires for every qualifying Real set on every cycle.
+    // The live dispatch reads coordIndex directly; live_net_target is a prod-only
+    // cross-cycle fallback for the Phase 4 pipeline.
+    if (process.env.NODE_ENV !== "development" && Object.keys(netTargetWrites).length > 0) {
       try {
-        // Inline client — `client` for the broader function is declared
-        // further below; we want a one-shot write here without forward
-        // ref. The hot-path overhead of a second `getRedisClient()` call
-        // is negligible (returns a cached singleton).
         const netClient = getRedisClient()
         const targetKey = `live_net_target:${this.connectionId}`
         await netClient.hset(targetKey, netTargetWrites)
@@ -3403,9 +3403,12 @@ export class StrategyCoordinator {
       // DEV/TEST fallback: when no Real sets yet but Main sets exist, allow
       // a temporary synthetic Real escalation so the live pipeline can be
       // exercised in test environments. Guard by testnet flag or FORCE_LIVE env.
+      // In dev we short-circuit the getConnection() call (an async Redis read
+      // per cycle per symbol) since NODE_ENV==="development" already covers it.
       try {
-        const conn = (await (await import("@/lib/redis-db")).getConnection(this.connectionId)) || {}
-        const isTestConn = conn?.is_testnet === true || conn?.is_testnet === "1" || process.env.FORCE_LIVE === "1" || process.env.NODE_ENV === "development"
+        const isDevEnv = process.env.NODE_ENV === "development" || process.env.FORCE_LIVE === "1"
+        const conn = isDevEnv ? null : (await (await import("@/lib/redis-db")).getConnection(this.connectionId)) || {}
+        const isTestConn = isDevEnv || conn?.is_testnet === true || conn?.is_testnet === "1"
         if (realSets.length === 0 && isTestConn) {
           const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
           const mainStored = await getSettings(mainKey)
@@ -3444,11 +3447,13 @@ export class StrategyCoordinator {
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
 
-    // DEV/TEST fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run
+    // DEV/TEST fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
+    // Short-circuit getConnection() in dev — NODE_ENV check is free vs async Redis read per cycle.
     try {
-      const conn = await (await import("@/lib/redis-db")).getConnection(this.connectionId)
-      const isDevMode = process.env.FORCE_SIMULATED === "1" || process.env.FORCE_LIVE === "1" || process.env.NODE_ENV === "development" || conn?.is_testnet === true || conn?.is_testnet === "1"
-      if (qualifying.length === 0 && isDevMode) {
+      const isDevMode = process.env.FORCE_SIMULATED === "1" || process.env.FORCE_LIVE === "1" || process.env.NODE_ENV === "development"
+      const conn = isDevMode ? null : await (await import("@/lib/redis-db")).getConnection(this.connectionId)
+      const isTestOrDev = isDevMode || conn?.is_testnet === true || conn?.is_testnet === "1"
+      if (qualifying.length === 0 && isTestOrDev) {
         if (realSets.length > 0) {
           qualifying = [realSets.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)[0]]
           console.log(`[v0] [StrategyFlow] ${this.connectionId}:${symbol} dev fallback - promoted top REAL set for live dispatch`)
@@ -3478,17 +3483,21 @@ export class StrategyCoordinator {
 
 
 
-    // Persist LIVE sets — slim format (coord keys only).
-    // Same rationale as the Real slim write above: qualifying sets all have their
-    // full entries in Base sets. Writing keys+metadata cuts Live payload ~60×.
-    const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
-    await setSettings(liveKey, {
-      setKeys:    qualifying.map((s) => s.setKey),
-      count:      qualifying.length,
-      created:    new Date(),
-      executable: true,
-      _slim:      true,
-    })
+    // Persist LIVE sets — slim format (coord keys only). Skip in dev:
+    // setSettings writes to InlineLocalRedis (on-heap Map) on every cycle for
+    // every symbol; 20 symbols × every 0.3s = 67 writes/s with no reclaim.
+    // The coordIndex holds live state in dev; live:sets is only needed for the
+    // Phase 4 pipeline fallback (prod-only cross-cycle recovery path).
+    if (process.env.NODE_ENV !== "development") {
+      const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
+      await setSettings(liveKey, {
+        setKeys:    qualifying.map((s) => s.setKey),
+        count:      qualifying.length,
+        created:    new Date(),
+        executable: true,
+        _slim:      true,
+      })
+    }
 
     // Create pseudo positions from REAL/LIVE sets so they appear on dashboard
     await this.createPseudoPositionsFromRealSets(symbol, realSets)
@@ -3534,29 +3543,31 @@ export class StrategyCoordinator {
       }
 
       // ── bumpValidPositions — Live-promoted Set counter ─────────────────
-      // The `valid_positions:{conn}` hash (written by bumpValidPositions in
-      // pos-history.ts) tracks the connection-wide count of Sets that have
-      // reached Live stage, split by symbol and direction. The dashboard
-      // "Valid positions" tile reads this hash. Without this call the counter
-      // never increments regardless of how many Sets qualify each cycle.
-      try {
-        const { bumpValidPositions } = await import("@/lib/pos-history")
-        const vpPipeline = getRedisClient().multi()
-        for (const set of qualifying) {
-          bumpValidPositions({
-            connectionId: this.connectionId,
-            symbol,
-            direction: set.direction,
-            indicationType: set.indicationType,
-            // Live sets are by definition currently running (they have
-            // open or in-formation positions). isRunningNow drives the
-            // `combined` (= active accumulation) counter in valid_positions.
-            isRunningNow: true,
-            externalPipeline: vpPipeline,
-          })
-        }
-        ;(vpPipeline as any).exec().catch(() => {})
-      } catch { /* non-critical — valid_positions counter is observability only */ }
+      // The `valid_positions:{conn}` hash tracks Sets reaching Live stage.
+      // Skip in dev: qualifying.length × multi() pipeline writes fire every 0.3s
+      // per symbol (up to 400 sets × 20 symbols = 8000 writes/cycle), driving
+      // heap pressure faster than GC can reclaim. The "Valid positions" dashboard
+      // tile is observability-only; the engine does not read from valid_positions.
+      if (process.env.NODE_ENV !== "development") {
+        try {
+          const { bumpValidPositions } = await import("@/lib/pos-history")
+          const vpPipeline = getRedisClient().multi()
+          for (const set of qualifying) {
+            bumpValidPositions({
+              connectionId: this.connectionId,
+              symbol,
+              direction: set.direction,
+              indicationType: set.indicationType,
+              // Live sets are by definition currently running (they have
+              // open or in-formation positions). isRunningNow drives the
+              // `combined` (= active accumulation) counter in valid_positions.
+              isRunningNow: true,
+              externalPipeline: vpPipeline,
+            })
+          }
+          ;(vpPipeline as any).exec().catch(() => {})
+        } catch { /* non-critical — valid_positions counter is observability only */ }
+      }
 
       const liveVariantWrites: Promise<any>[] = []
       for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
