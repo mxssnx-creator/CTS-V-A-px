@@ -394,10 +394,10 @@ export class InlineLocalRedis {
     // compound across multiple intervals. The handler is cheap (~ms) when
     // heap is below threshold so the extra polling is negligible.
     const CLEANUP_INTERVAL_MS = 2_000
-    // Trigger eviction at 400 MB heapUsed — well below the 4 GB V8 ceiling.
-    // With 20 symbols the heap climbs ~800 MB in 30s; triggering at 400 MB
-    // gives the eviction pass time to reclaim before GC stalls under pressure.
-    const HEAP_PRESSURE_MB = 400
+    // Trigger eviction at 800 MB heapUsed.  Real Redis clients run off-heap;
+    // 800 MB is generous for the InlineLocalRedis emulator in dev while still
+    // leaving enough room before the 4 GB V8 ceiling (--max-old-space-size=4096).
+    const HEAP_PRESSURE_MB = 800
 
     // Run an immediate targeted flush at startup to clear volatile key families
     // that accumulate across hot-reload cycles (the globalThis Map persists
@@ -464,6 +464,31 @@ export class InlineLocalRedis {
             }
           }
 
+          // 4. live:position:{id} hashes + live:positions:{conn} lists —
+          //    In dev, live positions are real BingX orders whose orderId/SL/TP
+          //    are valid only for the session that placed them.  On hot-reload
+          //    the in-memory InlineLocalRedis is fresh but the persisted dev DB
+          //    still holds the old position hashes.  The reconcile loop then
+          //    issues exchange API calls for each stale position (×44 = 44 API
+          //    calls on startup), blowing ~200-400 MB and sometimes triggering
+          //    OOM before prehistoric can complete.  Wipe them unconditionally
+          //    on dev startup so each session begins with a clean slate.
+          for (const key of this.data.hashes.keys()) {
+            if (key.startsWith("live:position:")) {
+              this.data.hashes.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.lists.keys()) {
+            if (key.startsWith("live:positions:")) {
+              this.data.lists.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.strings.keys()) {
+            if (key.startsWith("live:positions:") || key.startsWith("live:position:")) {
+              this.data.strings.delete(key); flushed++
+            }
+          }
+
           if (flushed > 0) {
             console.log(`[v0] [Redis Memory] Dev startup flush: cleared ${flushed} stale volatile keys`)
           }
@@ -497,7 +522,7 @@ export class InlineLocalRedis {
         const heapUsedMB = (process.memoryUsage?.().heapUsed || 0) / 1024 / 1024
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        const MAX_TOTAL_KEYS = 10_000
+        const MAX_TOTAL_KEYS = 8_000
         const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
         if (shouldEvict) {
           if (heapUsedMB > HEAP_PRESSURE_MB) {
