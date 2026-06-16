@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─�������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -499,7 +499,10 @@ export class StrategyCoordinator {
     maxEntriesPerSet: 250,
     // Live Sets default is now per-exchange (see setExchangeMaxLive).
     // This is a placeholder; the real value is set during init.
-    maxLiveSets: 750,
+    // 400 per symbol × 20 symbols = 8000 max live stage entries total;
+    // calibrated to prevent InlineLocalRedis growth past the 1200 MB
+    // eviction trigger between 4s cleanup cycles.
+    maxLiveSets: 400,
     // Real Sets default to the safety ceiling (20000). "Unlimited" (Infinity)
     // previously bypassed the OOM-protection ceiling because the enforcement
     // used `??` (Infinity is not nullish) — next-server was OOM-killed at the
@@ -1633,7 +1636,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 2: MAIN ───────────────────────────────────────────────────────────
+  // ─── STAGE 2: MAIN ──────────────────────���────────────────────────────────────
 
   /**
    * Validate BASE Sets (avgPF >= 1.2, avgConf >= 0.5, DDT <= 24h) AND create
@@ -1977,7 +1980,13 @@ export class StrategyCoordinator {
       // live trading began. Cap the fan-out PER SYMBOL so memory is bounded;
       // because AXIS_PREV/AXIS_CONT are iterated ascending, the retained
       // projections are the highest-priority (smallest prev/cont) ones.
-      const MAIN_AXIS_SETS_CEILING = 10000
+      //
+      // OOM calibration (2026-06-16): 10000 was tuned for 5 symbols; at 20
+      // symbols the InlineLocalRedis coord-record Map grew to 4058 MB of LIVE
+      // (reachable) objects — Mark-Compact cannot reclaim live objects so the
+      // heap ceiling is dominated by simultaneous coord-record count.
+      // 2500 keeps the per-symbol footprint ≈ the 5-symbol total divided by 4.
+      const MAIN_AXIS_SETS_CEILING = 2500
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -2670,10 +2679,14 @@ export class StrategyCoordinator {
     // SIGKILL (verified via dmesg: anon-rss 7334448kB). The Sets are already
     // sorted best-first (winnerPool ordering above), so an operator who sets
     // no explicit `maxRealSets` still keeps the highest-quality Sets; only a
-    // pathological long tail is dropped. The ceiling is deliberately far
-    // above any realistic per-symbol Set count so normal multi-symbol runs
-    // are unaffected — it exists purely to keep the process from being killed.
-    const REAL_SETS_SAFETY_CEILING = 20000
+    // pathological long tail is dropped.
+    //
+    // OOM calibration (2026-06-16): 20000 was calibrated for 5 symbols; at
+    // 20 symbols the cumulative coord-record Map hit 4058 MB LIVE objects.
+    // 3000 per symbol × 20 symbols concurrently = 60000 coord records maximum
+    // alive at once, keeping the InlineLocalRedis heap well within the 6144 MB
+    // budget with room for eviction to operate before the next burst.
+    const REAL_SETS_SAFETY_CEILING = 3000
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at
