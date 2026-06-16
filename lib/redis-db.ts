@@ -625,6 +625,11 @@ export class InlineLocalRedis {
       if (k.startsWith("_migration"))        return true  // migration markers
       if (k.startsWith("_schema_version"))   return true  // schema version
       if (k.startsWith("market_data:"))      return true  // candle blobs (separate cap)
+      // strategies:{conn}:live:count — single small key used for dashboard display;
+      // written once per cycle (not per symbol) and must survive the strategies:* cap.
+      if (/^strategies:[^:]+:live:count$/.test(k)) return true
+      // strategies:{conn}:*:total — per-stage set counts for the dashboard.
+      if (/^strategies:[^:]+:[^:]+:total$/.test(k)) return true
       // Protect genuine operator settings but NOT transient pipeline families.
       // settings:pseudo_position* and settings:strategies* are written every
       // realtime cycle and must be subject to FIFO caps.
@@ -778,7 +783,7 @@ export class InlineLocalRedis {
       }
     }
 
-    if (evicted > 0) {
+    if (evicted > 10) {
       console.log(`[v0] [Redis Memory] Evicted ${evicted} old records to reduce memory pressure`)
     }
     return evicted
@@ -1569,6 +1574,44 @@ export async function initRedis(): Promise<void> {
   globalForRedis.__redis_init_promise = (async () => {
     await ensureCoreRedis()
 
+    // DEV ONLY — flush stale live positions on every initRedis() call.
+    //
+    // The InlineLocalRedis instance is stored on globalThis and reused across
+    // hot-reloads (the constructor — and its 500ms startup flush — only fires
+    // once per process).  On subsequent hot-reloads the same Map is reused,
+    // so the startup flush in the constructor never fires again and the 44
+    // live:position:* keys from the previous session stay in memory.
+    //
+    // These stale positions hold the dedup lock for every symbol+direction,
+    // silently preventing any new live order placement for the entire session.
+    // Flush them here so each engine Start begins with a clean position slate.
+    if (process.env.NODE_ENV === "development") {
+      try {
+        const data = (globalForRedis as any).__redis_data as typeof globalForRedis.__redis_data | undefined
+        if (data) {
+          let cleared = 0
+          for (const key of data.strings.keys()) {
+            if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("live:lock:")) {
+              data.strings.delete(key); cleared++
+            }
+          }
+          for (const key of data.lists.keys()) {
+            if (key.startsWith("live:positions:") || key.startsWith("live:position:")) {
+              data.lists.delete(key); cleared++
+            }
+          }
+          for (const key of data.hashes.keys()) {
+            if (key.startsWith("live:position:")) {
+              data.hashes.delete(key); cleared++
+            }
+          }
+          if (cleared > 0) {
+            console.log(`[v0] [Redis] Dev initRedis flush: cleared ${cleared} stale live position/lock keys`)
+          }
+        }
+      } catch { /* non-fatal */ }
+    }
+
     if (!migrationsRan) {
       // runMigrations() calls ensureCoreRedis() internally (NOT initRedis), so
       // there is no re-entrancy with the promise we are currently inside.
@@ -1753,7 +1796,7 @@ export async function getConnection(id: string): Promise<any | null> {
 // ops per poll per component. A short TTL (1.5s) dedupes bursts without
 // introducing user-visible staleness (all writes invalidate the cache
 // immediately via `invalidateConnectionsCache()`).
-// ────────────────────────────────────�����───────────────────��───────────────────
+// ────────────────────────────────────�������──────────────────��───────────────────
 const __CONN_CACHE_TTL_MS = 1500
 let __connCache: { at: number; value: any[] } | null = null
 let __connInflight: Promise<any[]> | null = null

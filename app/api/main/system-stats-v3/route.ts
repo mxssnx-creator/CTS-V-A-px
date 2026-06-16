@@ -202,6 +202,9 @@ export async function GET() {
         presetTotal: activeInsertedAll.length,
         presetEnabled: presetTradeEnabled,
         totalEnabled: mainConnections.length + liveTradeConnections.length + presetTradeConnections.length,
+        // Convenience aliases expected by dashboard components
+        enabledConnections: enabledBase.length,
+        activeConnections:  activeInsertedAll.length,
       },
       database: {
         status: "healthy",

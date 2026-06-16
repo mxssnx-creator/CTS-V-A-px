@@ -617,7 +617,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ───────────────────────────────────�����────────────
+      // ── Price tracking ───────────────────────────────────�������────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -2121,11 +2121,11 @@ export async function GET(
           base:  stratCounts.base  || 0,
           main:  stratCounts.main  || 0,
           real:  stratCounts.real  || 0,
-          // `total` is the pipeline's final-stage output (Real), NOT a sum of
-          // Base+Main+Real. See `stratTotal` derivation above — Base and Main
-          // are intermediate filter stages of the SAME logical strategy, so
-          // they must not be summed with Real.
-          total: stratCounts.real || 0,
+          // Live is the final dispatch stage (sets actually selected for order dispatch).
+          // Written per-cycle by createLiveSets into strategies_active:{conn} hash.
+          live:  stratCounts.live  || 0,
+          // `total` is the pipeline's final-stage output (Live when available, else Real).
+          total: stratCounts.live || stratCounts.real || 0,
         },
         positions: {
           opened:    n(progHash.live_positions_created_count),
