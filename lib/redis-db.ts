@@ -390,23 +390,77 @@ export class InlineLocalRedis {
     globalCleanup.__redis_cleanup_started = true
 
     // Fire FREQUENTLY: with 20 symbols live-trading the pipeline writes ~20x
-    // more keys per second than a 5-symbol run. 4s catches bursts before they
-    // compound across multiple intervals.
-    const CLEANUP_INTERVAL_MS = 4_000
-    // Trigger eviction at 1200 MB — well below the 4 GB V8 ceiling. With 20
-    // symbols the heap can jump ~400 MB in a single realtime cycle; we need
-    // to start shedding before the jump, not after.
-    const HEAP_PRESSURE_MB = 1200
+    // more keys per second than a 5-symbol run. 2s catches bursts before they
+    // compound across multiple intervals. The handler is cheap (~ms) when
+    // heap is below threshold so the extra polling is negligible.
+    const CLEANUP_INTERVAL_MS = 2_000
+    // Trigger eviction at 800 MB heapUsed — well below the 4 GB V8 ceiling.
+    // With 20 symbols the heap can jump ~400 MB in a single realtime cycle so
+    // we want to start shedding with plenty of headroom before GC can't keep up.
+    const HEAP_PRESSURE_MB = 800
 
-    // Run one immediate eviction pass at startup to clear any stale keys left
-    // from previous hot-reload cycles (the globalThis Map persists across
-    // Next.js module hot-reloads without a full process restart).
+    // Run an immediate targeted flush at startup to clear volatile key families
+    // that accumulate across hot-reload cycles (the globalThis Map persists
+    // between Next.js hot-reloads without a full process restart). This runs
+    // UNCONDITIONALLY in dev — even if totalKeys is low — because the OOM-
+    // causing families (strategies: lists, indication: strings, pseudo_position:
+    // hashes) can hold 20+ MB each while only occupying a few hundred key slots.
     setTimeout(() => {
       try {
+        if (process.env.NODE_ENV === "development") {
+          let flushed = 0
+
+          // 1. strategies:{conn}:{symbol|stage} — lpush lists written by
+          //    strategy-evaluator.ts. 20 symbols × 500 items × 2 KB = 20 MB.
+          //    storeStrategyResult() now returns early in dev, but pre-bypass
+          //    runs leave stale list keys in the Map.
+          for (const key of this.data.lists.keys()) {
+            if (key.startsWith("strategies:")) { this.data.lists.delete(key); flushed++ }
+          }
+
+          // 2. indication:{conn}:{symbol} — per-symbol indication strings/hashes
+          //    (200 keys × ~3 KB each = 0.6 MB). Written every indication cycle;
+          //    stale copies from hot-reload cycles remain.
+          for (const key of this.data.strings.keys()) {
+            if (key.startsWith("indication:") || key.startsWith("indications:")) {
+              this.data.strings.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.hashes.keys()) {
+            if (key.startsWith("indication:") || key.startsWith("indications:")) {
+              this.data.hashes.delete(key); flushed++
+            }
+          }
+
+          // 3. pseudo_position:{conn}:{id} + pseudo_positions:{conn} set —
+          //    createPseudoPositionsFromRealSets() bypassed in dev but prior runs
+          //    left 400 position hashes (0.6 MB) + membership sets.
+          for (const key of this.data.hashes.keys()) {
+            if (key.startsWith("pseudo_position:") || key.startsWith("settings:pseudo_position")) {
+              this.data.hashes.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.strings.keys()) {
+            if (key.startsWith("pseudo_position:") || key.startsWith("settings:pseudo_position")) {
+              this.data.strings.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.sets.keys()) {
+            if (key.startsWith("pseudo_positions:") || key.startsWith("real_pseudo_positions:")) {
+              this.data.sets.delete(key); flushed++
+            }
+          }
+
+          if (flushed > 0) {
+            console.log(`[v0] [Redis Memory] Dev startup flush: cleared ${flushed} stale volatile keys`)
+          }
+        }
+
+        // Full eviction pass for remaining pressure (covers non-dev or larger leftovers).
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         if (totalKeys > 5_000) {
-          console.log(`[v0] [Redis Memory] Startup: ${totalKeys} stale keys from hot-reload, evicting...`)
+          console.log(`[v0] [Redis Memory] Startup: ${totalKeys} stale keys after flush, evicting...`)
           this.evictOldRecords()
           ;(globalThis as any).gc?.()
           const after = this.data.strings.size + this.data.hashes.size +
@@ -430,7 +484,7 @@ export class InlineLocalRedis {
         const heapUsedMB = (process.memoryUsage?.().heapUsed || 0) / 1024 / 1024
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        const MAX_TOTAL_KEYS = 20_000
+        const MAX_TOTAL_KEYS = 10_000
         const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
         if (shouldEvict) {
           if (heapUsedMB > HEAP_PRESSURE_MB) {

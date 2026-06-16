@@ -732,6 +732,22 @@ export class GlobalTradeEngineCoordinator {
             
             await this.startEngine(connection.id, config)
             started++
+
+            // Mirror the enabled/inserted flags that toggle-dashboard writes so
+            // the connections API + system-stats-v3 show correct counts even
+            // when this code path (auto-restart after OOM) bypasses toggle-dashboard.
+            try {
+              const { updateConnection } = await import("@/lib/redis-db")
+              await updateConnection(connection.id, {
+                is_active_inserted: "1",
+                is_enabled_dashboard: "1",
+              })
+            } catch (flagErr) {
+              console.warn(
+                `[v0] [Coordinator] Could not update is_active_inserted for ${connection.id}:`,
+                flagErr instanceof Error ? flagErr.message : flagErr,
+              )
+            }
             
             await logProgressionEvent(connection.id, "engine_started", "info", "Main Trade Engine started for progression", {
               connectionId: connection.id,
