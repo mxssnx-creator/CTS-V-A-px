@@ -617,7 +617,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ───────────────────────────────────���────────────
+      // ── Price tracking ───────────────────────────────────�����────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -1010,9 +1010,14 @@ export async function GET(
       }
       if (stratActiveHash && typeof stratActiveHash === "object") {
         for (const [field, val] of Object.entries(stratActiveHash)) {
-          const idx = field.lastIndexOf(":")
-          if (idx <= 0) continue
-          const suffix = field.slice(idx + 1)   // e.g. "base", "main", "real", "base:evaluated"
+          // Field shape: "{SYMBOL}:{stage}" or "{SYMBOL}:{stage}:evaluated"
+          // e.g. "BTCUSDT:base", "BTCUSDT:base:evaluated", "ETHUSDT:real:evaluated"
+          // Strip the symbol prefix by slicing from the FIRST colon, not the last.
+          // Using lastIndexOf would split "BTCUSDT:base:evaluated" into suffix="evaluated"
+          // which never matches "base:evaluated" — the root cause of baseEvaluated=0.
+          const firstColon = field.indexOf(":")
+          if (firstColon <= 0) continue
+          const suffix = field.slice(firstColon + 1)   // e.g. "base", "main", "real", "base:evaluated"
           const numVal = n(val)
           // Fields ending in ":evaluated" are written by the engine to give cross-symbol
           // evaluated counts in the same scope as the stage counts. Aggregate them into
@@ -1478,7 +1483,7 @@ export async function GET(
     }
 
     // ── SINGLE closed-archive fetch shared by stratDetail.live and
-    //    closedPositionsForHistory (below) ───��────────────────────────────
+    //    closedPositionsForHistory (below) ───��───────���────────────────────
     // Previously the archive was fetched TWICE:
     //   1. lrange(0, 199) for stratDetail.live PF/hold/ROI numbers.
     //   2. lrange(0, 499) for closedPositionsForHistory rows + perf tiers.
