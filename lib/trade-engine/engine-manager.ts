@@ -237,8 +237,12 @@ import {
  * event loop (letting the 4s eviction interval fire), then starts the next 3.
  * 5 concurrent keeps the event loop blocked long enough that the eviction
  * setInterval callback cannot fire between batches.
+ *
+ * DEV NOTE: Set to 1 in development. Combined with MAIN_AXIS_SETS_CEILING=400
+ * and REAL_SETS_SAFETY_CEILING=600 this keeps peak in-flight StrategySet
+ * objects at 1000 vs 9000 in prod (3 × 3000), cutting V8 heap by ~90%.
  */
-const SYMBOL_CONCURRENCY = 3
+const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development" ? 1 : 3
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -1835,7 +1839,7 @@ export class TradeEngineManager {
               // each task's catch handler, NOT deferred to the outer
               // `failedSymbols` array. If `withCycleDeadline` fires before
               // all tasks complete, the tasks that DID complete still write
-              // their errors — no silent data loss.
+              // their errors ��� no silent data loss.
               try {
                 const client = getRedisClient()
                 const progKey = `progression:${this.connectionId}`

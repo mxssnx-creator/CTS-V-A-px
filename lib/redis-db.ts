@@ -394,10 +394,10 @@ export class InlineLocalRedis {
     // compound across multiple intervals. The handler is cheap (~ms) when
     // heap is below threshold so the extra polling is negligible.
     const CLEANUP_INTERVAL_MS = 2_000
-    // Trigger eviction at 800 MB heapUsed — well below the 4 GB V8 ceiling.
-    // With 20 symbols the heap can jump ~400 MB in a single realtime cycle so
-    // we want to start shedding with plenty of headroom before GC can't keep up.
-    const HEAP_PRESSURE_MB = 800
+    // Trigger eviction at 400 MB heapUsed — well below the 4 GB V8 ceiling.
+    // With 20 symbols the heap climbs ~800 MB in 30s; triggering at 400 MB
+    // gives the eviction pass time to reclaim before GC stalls under pressure.
+    const HEAP_PRESSURE_MB = 400
 
     // Run an immediate targeted flush at startup to clear volatile key families
     // that accumulate across hot-reload cycles (the globalThis Map persists
@@ -410,12 +410,25 @@ export class InlineLocalRedis {
         if (process.env.NODE_ENV === "development") {
           let flushed = 0
 
-          // 1. strategies:{conn}:{symbol|stage} — lpush lists written by
-          //    strategy-evaluator.ts. 20 symbols × 500 items × 2 KB = 20 MB.
-          //    storeStrategyResult() now returns early in dev, but pre-bypass
-          //    runs leave stale list keys in the Map.
+          // 1. strategies:{conn}:{symbol}:* — per-cycle set blobs (real:sets,
+          //    base:sets, main:sets) and fp:v2 fingerprint caches. Written by
+          //    strategy-coordinator.ts on every realtime cycle; dev bypasses
+          //    are throttled (every 50th cycle) or gated on NODE_ENV, but stale
+          //    keys from prior hot-reload cycles remain in the Map.
+          //    Also covers lpush lists from strategy-evaluator.ts (storeStrategyResult
+          //    now returns early in dev, but pre-bypass runs left stale list keys).
           for (const key of this.data.lists.keys()) {
             if (key.startsWith("strategies:")) { this.data.lists.delete(key); flushed++ }
+          }
+          for (const key of this.data.hashes.keys()) {
+            if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
+              this.data.hashes.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.strings.keys()) {
+            if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
+              this.data.strings.delete(key); flushed++
+            }
           }
 
           // 2. indication:{conn}:{symbol} — per-symbol indication strings/hashes
@@ -1715,7 +1728,7 @@ export async function getConnection(id: string): Promise<any | null> {
 // ops per poll per component. A short TTL (1.5s) dedupes bursts without
 // introducing user-visible staleness (all writes invalidate the cache
 // immediately via `invalidateConnectionsCache()`).
-// ────────────────────────────────────�����───────────────────────────────────────
+// ────────────────────────────────────�����───────────────────��───────────────────
 const __CONN_CACHE_TTL_MS = 1500
 let __connCache: { at: number; value: any[] } | null = null
 let __connInflight: Promise<any[]> | null = null

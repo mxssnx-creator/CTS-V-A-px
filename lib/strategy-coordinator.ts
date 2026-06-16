@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─������������ Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -2108,15 +2108,21 @@ export class StrategyCoordinator {
       const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
       await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
     }
-    try {
-      if (Object.keys(nextFpCache).length > 0) {
-        // Replace the cache atomically so deletions take effect (a Set that
-        // no longer qualifies simply isn't re-written and falls out on TTL).
-        await client.del(fpCacheKey).catch(() => {})
-        await client.hset(fpCacheKey, nextFpCache)
-        await client.expire(fpCacheKey, 300) // 5 min TTL
-      }
-    } catch { /* non-critical */ }
+    // DEV-MODE BYPASS: fpCache writes create 20 hash keys (one per symbol) every
+    // createMainSets call and replace them fully each time (del + hset). In dev the
+    // in-memory coordIndex is the source of truth; the fpCache is only used on cold
+    // restart to avoid re-processing identical fingerprints. Skip in dev.
+    if (process.env.NODE_ENV !== "development") {
+      try {
+        if (Object.keys(nextFpCache).length > 0) {
+          // Replace the cache atomically so deletions take effect (a Set that
+          // no longer qualifies simply isn't re-written and falls out on TTL).
+          await client.del(fpCacheKey).catch(() => {})
+          await client.hset(fpCacheKey, nextFpCache)
+          await client.expire(fpCacheKey, 300) // 5 min TTL
+        }
+      } catch { /* non-critical */ }
+    }
 
     // ── Main-stage aggregate metrics (all at method-body scope) ─────────────
     const mainEntriesTotal     = mainSets.reduce((s, st) => s + (st.entryCount || 0), 0)
@@ -2942,13 +2948,16 @@ export class StrategyCoordinator {
     // key list cuts this payload from ~N×2-5 KB to N×~30 bytes per symbol per cycle.
     // Readers resolve full Set objects via Base sets (one extra read, warm in LRU).
     //
-    // DEV-MODE THROTTLE: only write every 5th cycle to keep InlineLocalRedis Map
-    // growth bounded. Dashboard stats read from in-memory progression counters for
-    // the current count and only need the key list for structural queries (rare).
+    // DEV-MODE THROTTLE: only write every 50th cycle (~15s at 0.3s interval) to
+    // bound InlineLocalRedis Map growth. Each real:sets blob is ~50 KB; at 20
+    // symbols writing every 5th cycle generates ~200 KB/s heap pressure that the
+    // dev GC cannot fully reclaim. Every 50th cycle = ~20 KB/s — well below GC rate.
+    // Dashboard stats read from in-memory progression counters for the live count;
+    // the key list is only needed for structural queries which tolerate stale data.
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
     const shouldWriteRealSets =
       process.env.NODE_ENV !== "development" ||
-      (this._realSetWriteCounter = ((this._realSetWriteCounter ?? 0) + 1)) % 5 === 1
+      (this._realSetWriteCounter = ((this._realSetWriteCounter ?? 0) + 1)) % 50 === 1
     if (shouldWriteRealSets) {
       await setSettings(realKey, {
         setKeys: realSets.map((s) => s.setKey),
