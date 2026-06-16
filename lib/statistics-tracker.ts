@@ -32,11 +32,9 @@ export async function trackIndicationStats(
   // counts to progression:{connectionId}:indications_count on their cycle completion.
   // Tracking per-indication here would double-count (statement-level vs. aggregate-level).
   //
-  // DEV-MODE BYPASS: These per-indication Redis writes (type count, total count,
-  // latest blob) are called for every symbol × every indication cycle (~1/s).
-  // At 20 symbols × 4 types × 3 keys each = 240 new keys/cycle, the InlineLocalRedis
-  // Map fills 75K+ keys in minutes and OOM-kills the dev server. Skip in dev since
-  // these counters are only read by the statistics overview page (non-critical).
+  // DEV-MODE BYPASS — must be before any client calls (Promise construction fires
+  // the write synchronously in InlineLocalRedis). 20 symbols × 4 types × 3 keys
+  // = 240 keys/cycle; skip entirely in dev (reads are non-critical for engine).
   if (process.env.NODE_ENV === "development") return
   try {
     await initRedis()
@@ -82,6 +80,13 @@ export async function trackStrategyStats(
     console.warn(`[v0] [Stats] Failed to track strategy:`, e instanceof Error ? e.message : String(e))
   }
 
+  // DEV-MODE BYPASS: These per-strategy-type Redis writes (count, eval, passed,
+  // latest) are written per symbol × per strategy type × per cycle. At 20 symbols
+  // × 10 types × 5 keys each = 1000 new keys/cycle in the InlineLocalRedis Map.
+  // This is the primary source of the 58-key/20.1MB strategies:bingx-x01 family.
+  // IMPORTANT: the bypass must be BEFORE any client.incrby/set calls — Promise
+  // construction fires the write immediately in InlineLocalRedis (no lazy eval).
+  if (process.env.NODE_ENV === "development") return
   try {
     await initRedis()
     const client = getRedisClient()
@@ -109,12 +114,6 @@ export async function trackStrategyStats(
     if (passedCount > 0) {
       writes.push(client.incrby(passedKey, passedCount), client.expire(passedKey, 86400))
     }
-    // DEV-MODE BYPASS: These per-strategy-type Redis writes (count, eval, passed,
-    // latest) are written per symbol × per strategy type × per cycle. At 20 symbols
-    // × 10 types × 5 keys each = 1000 new keys/cycle in the InlineLocalRedis Map.
-    // This is the primary source of the 58-key/20.1MB strategies:bingx-x01 family
-    // seen in the eviction log. Skip in dev — reads are non-critical for engine operation.
-    if (process.env.NODE_ENV === "development") return
     await Promise.all(writes)
     // NOTE: Per-stage progression hash fields (strategies_base_total, strategies_main_total,
     // strategies_real_total, strategy_evaluated_*) are written exclusively by StrategyCoordinator

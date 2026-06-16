@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─���������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─����������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -3104,7 +3104,7 @@ export class StrategyCoordinator {
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainPFEligible)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
-        // ── CRITICAL: Persist Real Sets for Live evaluation ───────────────────��
+        // ── CRITICAL: Persist Real Sets for Live evaluation (prod only) ───────────────��
         // Bug fix: Real Sets were computed but never written, causing Live to load
         // an empty array and never fire. Now serialize the full realSets array so
         // createLiveSets can read and filter them for Live stage.
