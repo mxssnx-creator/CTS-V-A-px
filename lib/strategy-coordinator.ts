@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─����������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─������������ Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -1995,7 +1995,10 @@ export class StrategyCoordinator {
       // (reachable) objects — Mark-Compact cannot reclaim live objects so the
       // heap ceiling is dominated by simultaneous coord-record count.
       // 2500 keeps the per-symbol footprint ≈ the 5-symbol total divided by 4.
-      const MAIN_AXIS_SETS_CEILING = 2500
+      // In dev: 400 per symbol × SYMBOL_CONCURRENCY(3) = 1200 in-flight at peak
+      // vs 7500 at 2500 ceiling. Pipeline correctness is unaffected; fewer Set
+      // permutations are tested per cycle but all code paths still execute.
+      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development" ? 400 : 2500
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -2706,7 +2709,10 @@ export class StrategyCoordinator {
     // 3000 per symbol × 20 symbols concurrently = 60000 coord records maximum
     // alive at once, keeping the InlineLocalRedis heap well within the 6144 MB
     // budget with room for eviction to operate before the next burst.
-    const REAL_SETS_SAFETY_CEILING = 3000
+    // In dev: 600 ceiling × SYMBOL_CONCURRENCY(3) = 1800 Real sets peak vs
+    // 9000 at 3000 ceiling — cuts per-cycle V8 heap pressure by 5x while
+    // keeping the full Real-stage pipeline exercised.
+    const REAL_SETS_SAFETY_CEILING = process.env.NODE_ENV === "development" ? 600 : 3000
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at
