@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─�������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─��������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -648,6 +648,9 @@ export class StrategyCoordinator {
    * fire once every 500 cycles instead of on every cycle.
    */
   private _stratCycleCount = 0
+  // Dev-mode real:sets write throttle — only persists every 5th cycle to keep
+  // the InlineLocalRedis heap bounded. Initialised lazily in createRealSets.
+  private _realSetWriteCounter = 0
 
   /**
    * ── Plan-perf Tier 1: parsed-fingerprint LRU ───────────────────────
@@ -2271,6 +2274,12 @@ export class StrategyCoordinator {
     symbol: string,
     realSets: StrategySet[],
   ): Promise<void> {
+    // DEV-MODE BYPASS: pseudo_position hashes are only used by the dashboard
+    // "Positions" tile. Writing up to 3000 hashes per symbol per cycle (3 writes
+    // each = 9000 InlineLocalRedis operations per symbol) is the single largest
+    // heap allocator in the 20-symbol dev run, causing OOM at ~30s. The engine
+    // pipeline decisions use the in-memory coordIndex, not Redis pseudo_positions.
+    if (process.env.NODE_ENV === "development") return
     try {
       if (!realSets || realSets.length === 0) return
 
@@ -2915,13 +2924,22 @@ export class StrategyCoordinator {
     // authoritative source for entries/quality data. Writing only the qualifying
     // key list cuts this payload from ~N×2-5 KB to N×~30 bytes per symbol per cycle.
     // Readers resolve full Set objects via Base sets (one extra read, warm in LRU).
+    //
+    // DEV-MODE THROTTLE: only write every 5th cycle to keep InlineLocalRedis Map
+    // growth bounded. Dashboard stats read from in-memory progression counters for
+    // the current count and only need the key list for structural queries (rare).
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
-    await setSettings(realKey, {
-      setKeys: realSets.map((s) => s.setKey),
-      count:   realSets.length,
-      created: new Date(),
-      _slim:   true,
-    })
+    const shouldWriteRealSets =
+      process.env.NODE_ENV !== "development" ||
+      (this._realSetWriteCounter = ((this._realSetWriteCounter ?? 0) + 1)) % 5 === 1
+    if (shouldWriteRealSets) {
+      await setSettings(realKey, {
+        setKeys: realSets.map((s) => s.setKey),
+        count:   realSets.length,
+        created: new Date(),
+        _slim:   true,
+      })
+    }
 
     // Hoisted outside the try-block so the return statement (also outside) can see it.
     // Count of Main Sets that actually entered PF/DDT evaluation (excludes pos-count
