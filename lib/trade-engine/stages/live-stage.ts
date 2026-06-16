@@ -1069,22 +1069,34 @@ async function placeProtectionOrder(
     // timeout we return null; the next sync tick will retry, and meanwhile
     // `checkAndForceCloseOnSltpCross` provides the safety net (it triggers
     // on price independent of whether the protection order is armed).
-    const placeStop = (qty: number) =>
-      withTimeout(
-        connector.placeStopOrder(
-          symbol,
-          closeSide,
-          qty,
-          triggerPrice,
-          kind,
-          {
-            reduceOnly: true,
-            positionSide: positionDirection === "long" ? "LONG" : "SHORT",
-          },
-        ) as Promise<any>,
-        EXCHANGE_TIMEOUT_PLACE_STOP_MS,
-        `placeStopOrder(${orderLabel} ${symbol})`,
-      )
+    // ── Normalize connector throws to result objects ──────────────────────
+    // The BingX connector (and others) throw on venue rejection rather than
+    // returning { success: false }.  The 109420 / 110424 retry blocks below
+    // check `result?.error`, which is never set when a throw escapes directly
+    // to the outer catch.  By wrapping each `placeStopOrder` call in its own
+    // try-catch we guarantee all code paths reach the retry checks with a
+    // well-shaped result object.
+    const placeStop = async (qty: number): Promise<any> => {
+      try {
+        return await withTimeout(
+          connector.placeStopOrder(
+            symbol,
+            closeSide,
+            qty,
+            triggerPrice,
+            kind,
+            {
+              reduceOnly: true,
+              positionSide: positionDirection === "long" ? "LONG" : "SHORT",
+            },
+          ) as Promise<any>,
+          EXCHANGE_TIMEOUT_PLACE_STOP_MS,
+          `placeStopOrder(${orderLabel} ${symbol})`,
+        )
+      } catch (e: any) {
+        return { success: false, error: String(e?.message || e) }
+      }
+    }
 
     let result = await placeStop(effectiveQty)
 
@@ -1119,11 +1131,11 @@ async function placeProtectionOrder(
     if (!result?.success) {
       const errMsg109 = String(result?.error || "")
       if (errMsg109.includes("109420") || /position not exist/i.test(errMsg109)) {
-        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 2s before retry`)
-        await new Promise((r) => setTimeout(r, 2000))
+        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 3s before retry`)
+        await new Promise((r) => setTimeout(r, 3000))
         result = await placeStop(effectiveQty)
         if (!result?.success) {
-          console.warn(`${tag} 109420 retry also failed — reconcile will retry on next tick`)
+          console.warn(`${tag} 109420 retry also failed (error=${result?.error}) — reconcile will retry on next tick`)
         }
       }
     }
