@@ -67,7 +67,8 @@ export function resetMigrationRunState(): void {
 import { getBaseConnectionCredentials, type BaseConnectionId } from "./base-connection-credentials"
 
 interface Migration {
-  name: string
+  name?: string
+  description?: string
   version: number
   up: (client: any) => Promise<void>
   down: (client: any) => Promise<void>
