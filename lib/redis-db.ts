@@ -445,6 +445,39 @@ export class InlineLocalRedis {
             }
           }
 
+          // 2b. prehistoric:{conn}:done + prehistoric:{conn} hash —
+          //     The `:done` plain-string marker written by completePrehistoricPhase
+          //     survives hot-reloads inside globalThis (the Map is never GC'd between
+          //     Next.js HMR cycles). If it lingers from a prior session the engine sees
+          //     prehistoric as "already complete" and skips the full preprocessing pass,
+          //     so pi_history:{conn}:{symbol}:{type}:{dir} keys are never written and
+          //     createBaseSets returns 0 sets every cycle for the entire session.
+          //     Wipe both the hash AND the plain `:done` marker so every hot-reload
+          //     triggers a fresh prehistoric run. Also wipe pi_history and market_data
+          //     candle strings (stale from prior session; fresh ones are fetched on startup).
+          for (const key of this.data.strings.keys()) {
+            if (
+              key.startsWith("prehistoric:") ||
+              key.startsWith("pi_history:")   ||
+              key.startsWith("market_data:")
+            ) { this.data.strings.delete(key); flushed++ }
+          }
+          for (const key of this.data.hashes.keys()) {
+            if (
+              key.startsWith("prehistoric:") ||
+              key.startsWith("pi_history:")   ||
+              key.startsWith("market_data:")  ||
+              // progression:{conn} hash — clear to reset cycle counters so the new
+              // session doesn't inherit stale placed/filled order counts
+              key.startsWith("progression:")  ||
+              key.startsWith("realtime:")     ||
+              key.startsWith("strategies_active:")
+            ) { this.data.hashes.delete(key); flushed++ }
+          }
+          for (const key of this.data.sets.keys()) {
+            if (key.startsWith("prehistoric:")) { this.data.sets.delete(key); flushed++ }
+          }
+
           // 3. pseudo_position:{conn}:{id} + pseudo_positions:{conn} set —
           //    createPseudoPositionsFromRealSets() bypassed in dev but prior runs
           //    left 400 position hashes (0.6 MB) + membership sets.
