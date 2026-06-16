@@ -2340,32 +2340,38 @@ const migrations: Migration[] = [
       const symJson  = JSON.stringify(SYMS)
       const symCount = String(SYMS.length)
 
-      // ── 1. Write force_symbols to ALL three hashes ──────────────────────
+      // ── 1. Write force_symbols to ALL three hashes (set-if-absent for symbols) ──
       // getSymbols() priority: settings:trade_engine_state > settings:connection > connection.
-      // All three must agree so no staleness survives a hot-reload.
+      // Symbol fields use set-if-absent (hsetnx equivalent) so operator PATCHes
+      // (e.g. reducing to 15 symbols for testing) survive a subsequent restart.
+      // Non-symbol fields (volume, order, timestamps) are always written.
+      const engExisting  = (await client.hgetall(`settings:trade_engine_state:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
+      const connExisting = (await client.hgetall(`connection:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
+
+      const engSymWrites: Record<string,string> = {}
+      if (!engExisting["force_symbols"]  || engExisting["force_symbols"]  === "[]") engSymWrites["force_symbols"]  = symJson
+      if (!engExisting["active_symbols"] || engExisting["active_symbols"] === "[]") engSymWrites["active_symbols"] = symJson
+      if (!engExisting["symbols"]        || engExisting["symbols"]        === "[]") engSymWrites["symbols"]        = symJson
+      if (!engExisting["symbol_count"]   || engExisting["symbol_count"]   === "0")  engSymWrites["symbol_count"]   = symCount
+      if (!engExisting["config_set_symbols_total"]) engSymWrites["config_set_symbols_total"] = symCount
+
+      const connSymWrites: Record<string,string> = {}
+      if (!connExisting["force_symbols"]  || connExisting["force_symbols"]  === "[]") connSymWrites["force_symbols"]  = symJson
+      if (!connExisting["active_symbols"] || connExisting["active_symbols"] === "[]") connSymWrites["active_symbols"] = symJson
+      if (!connExisting["symbol_count"]   || connExisting["symbol_count"]   === "0")  connSymWrites["symbol_count"]   = symCount
+
       await Promise.all([
-        client.hset(`settings:trade_engine_state:${CONN_ID}`, {
-          active_symbols:           symJson,
-          force_symbols:            symJson,
-          symbols:                  symJson,
-          symbol_count:             symCount,
-          config_set_symbols_total: symCount,
-        }),
-        client.hset(`settings:connection:${CONN_ID}`, {
-          active_symbols: symJson,
-          force_symbols:  symJson,
-          symbol_count:   symCount,
-        }),
+        Object.keys(engSymWrites).length  > 0 ? client.hset(`settings:trade_engine_state:${CONN_ID}`, engSymWrites).catch(() => {}) : Promise.resolve(),
+        Object.keys(connSymWrites).length > 0 ? client.hset(`settings:connection:${CONN_ID}`, connSymWrites).catch(() => {})        : Promise.resolve(),
+        // Always write non-symbol fields to connection hash (volume, order, timestamp)
         client.hset(`connection:${CONN_ID}`, {
-          active_symbols:       symJson,
-          force_symbols:        symJson,
-          symbol_count:         symCount,
+          ...(Object.keys(connSymWrites).length > 0 ? connSymWrites : {}),
           live_volume_factor:   "2.2",
           preset_volume_factor: "1.0",
           symbol_order:         "volatility",
           updated_at:           now,
-        }),
-      ]).catch(() => {})
+        }).catch(() => {}),
+      ])
 
       // ── 2. app_settings — global PF thresholds + volume fallback ─────────
       await client.hset("app_settings", {

@@ -473,20 +473,33 @@ export class InlineLocalRedis {
           //    calls on startup), blowing ~200-400 MB and sometimes triggering
           //    OOM before prehistoric can complete.  Wipe them unconditionally
           //    on dev startup so each session begins with a clean slate.
+          //    NOTE: setSettings("live:position:…") prepends "settings:" so we
+          //    must clear both "live:position:*" AND "settings:live:position:*".
           for (const key of this.data.hashes.keys()) {
-            if (key.startsWith("live:position:")) {
-              this.data.hashes.delete(key); flushed++
-            }
+            if (
+              key.startsWith("live:position:") ||
+              key.startsWith("settings:live:position:")
+            ) { this.data.hashes.delete(key); flushed++ }
           }
           for (const key of this.data.lists.keys()) {
-            if (key.startsWith("live:positions:")) {
-              this.data.lists.delete(key); flushed++
-            }
+            if (
+              key.startsWith("live:positions:") ||
+              key.startsWith("settings:live:positions:")
+            ) { this.data.lists.delete(key); flushed++ }
           }
           for (const key of this.data.strings.keys()) {
-            if (key.startsWith("live:positions:") || key.startsWith("live:position:")) {
-              this.data.strings.delete(key); flushed++
-            }
+            if (
+              key.startsWith("live:positions:") ||
+              key.startsWith("live:position:")  ||
+              key.startsWith("settings:live:position:") ||
+              key.startsWith("settings:live:positions:")
+            ) { this.data.strings.delete(key); flushed++ }
+          }
+          for (const key of this.data.sets.keys()) {
+            if (
+              key.startsWith("live:positions:") ||
+              key.startsWith("settings:live:positions:")
+            ) { this.data.sets.delete(key); flushed++ }
           }
 
           if (flushed > 0) {
@@ -1938,7 +1951,7 @@ export async function getAllSettings(): Promise<Record<string, any>> {
   return settings
 }
 
-// ─────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────��─────────────────────────────
 // Canonical app-settings helpers
 //
 // The project historically drifted between two Redis hashes:
