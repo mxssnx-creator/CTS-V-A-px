@@ -1569,38 +1569,35 @@ export async function ensureCoreRedis(): Promise<void> {
  */
 export async function initRedis(): Promise<void> {
   if (isConnected) return
-  if (globalForRedis.__redis_init_promise) return globalForRedis.__redis_init_promise
 
-  globalForRedis.__redis_init_promise = (async () => {
-    await ensureCoreRedis()
-
-    // DEV ONLY — flush stale live positions on every initRedis() call.
-    //
-    // The InlineLocalRedis instance is stored on globalThis and reused across
-    // hot-reloads (the constructor — and its 500ms startup flush — only fires
-    // once per process).  On subsequent hot-reloads the same Map is reused,
-    // so the startup flush in the constructor never fires again and the 44
-    // live:position:* keys from the previous session stay in memory.
-    //
-    // These stale positions hold the dedup lock for every symbol+direction,
-    // silently preventing any new live order placement for the entire session.
-    // Flush them here so each engine Start begins with a clean position slate.
-    if (process.env.NODE_ENV === "development") {
+  // DEV ONLY — flush stale live positions on every initRedis() call.
+  //
+  // The InlineLocalRedis instance lives on globalThis.__redis_data and is
+  // reused across Next.js hot-reloads (the constructor only fires once per
+  // process). Each hot-reload resets module-level `isConnected` to false and
+  // calls initRedis() again — but __redis_init_promise is still set, so the
+  // async IIFE below is skipped.  We must flush HERE, before the promise guard,
+  // so stale live:position:* keys (44 from the previous session) and dedup
+  // locks don't carry over and silently block all new live order placement.
+  //
+  // A __redis_live_flush_token prevents double-clearing within a single module
+  // evaluation cycle (e.g. if two routes call initRedis() concurrently).
+  if (process.env.NODE_ENV === "development") {
+    const token = Date.now()
+    const g = globalForRedis as any
+    if (!g.__redis_live_flush_token || g.__redis_live_flush_token !== g.__redis_live_flush_applied) {
+      g.__redis_live_flush_applied = token
+      g.__redis_live_flush_token  = token
       try {
-        const data = (globalForRedis as any).__redis_data as typeof globalForRedis.__redis_data | undefined
+        const data = g.__redis_data as typeof globalForRedis.__redis_data | undefined
         if (data) {
           let cleared = 0
-          // live:position:* keys are written via setSettings() which prepends
-          // "settings:" — so the actual Map keys are "settings:live:position:*".
-          // The lock keys (live:lock:*) are written via client.set() directly so
-          // they have no prefix. Clear both prefixed and un-prefixed variants.
           const isLiveKey = (k: string) =>
             k.startsWith("live:position:") ||
             k.startsWith("live:positions:") ||
             k.startsWith("settings:live:position:") ||
             k.startsWith("settings:live:positions:") ||
             k.startsWith("live:lock:")
-
           for (const key of data.strings.keys()) {
             if (isLiveKey(key)) { data.strings.delete(key); cleared++ }
           }
@@ -1610,11 +1607,18 @@ export async function initRedis(): Promise<void> {
           for (const key of data.hashes.keys()) {
             if (isLiveKey(key)) { data.hashes.delete(key); cleared++ }
           }
-          console.log(`[v0] [Redis] Dev initRedis flush: cleared ${cleared} stale live position/lock keys (strings=${data.strings.size} hashes=${data.hashes.size} lists=${data.lists.size})`)
-          
+          if (cleared > 0) {
+            console.log(`[v0] [Redis] Dev initRedis flush: cleared ${cleared} stale live position/lock keys`)
+          }
         }
       } catch { /* non-fatal */ }
     }
+  }
+
+  if (globalForRedis.__redis_init_promise) return globalForRedis.__redis_init_promise
+
+  globalForRedis.__redis_init_promise = (async () => {
+    await ensureCoreRedis()
 
     if (!migrationsRan) {
       // runMigrations() calls ensureCoreRedis() internally (NOT initRedis), so
