@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─������ Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -499,13 +499,13 @@ export class StrategyCoordinator {
     maxEntriesPerSet: 250,
     // Live Sets default is now per-exchange (see setExchangeMaxLive).
     // This is a placeholder; the real value is set during init.
-    maxLiveSets: 500,
-    // Real Sets default to the safety ceiling (12000). "Unlimited" (Infinity)
+    maxLiveSets: 750,
+    // Real Sets default to the safety ceiling (20000). "Unlimited" (Infinity)
     // previously bypassed the OOM-protection ceiling because the enforcement
     // used `??` (Infinity is not nullish) — next-server was OOM-killed at the
     // 4GB heap limit during live multi-symbol runs. The evaluate path also
     // hard-clamps with Math.min as defense in depth.
-    maxRealSets: 12000,
+    maxRealSets: 20000,
     pruneStrategy: "hybrid",
   }
 
@@ -1977,7 +1977,7 @@ export class StrategyCoordinator {
       // live trading began. Cap the fan-out PER SYMBOL so memory is bounded;
       // because AXIS_PREV/AXIS_CONT are iterated ascending, the retained
       // projections are the highest-priority (smallest prev/cont) ones.
-      const MAIN_AXIS_SETS_CEILING = 6000
+      const MAIN_AXIS_SETS_CEILING = 10000
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -2673,7 +2673,7 @@ export class StrategyCoordinator {
     // pathological long tail is dropped. The ceiling is deliberately far
     // above any realistic per-symbol Set count so normal multi-symbol runs
     // are unaffected — it exists purely to keep the process from being killed.
-    const REAL_SETS_SAFETY_CEILING = 12000
+    const REAL_SETS_SAFETY_CEILING = 20000
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at

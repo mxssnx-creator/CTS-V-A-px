@@ -1939,7 +1939,7 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "32")
     },
   },
-  // ── Migration 034 — operator-spec defaults ─────────────���────────────────────
+  // ── Migration 034 — operator-spec defaults ─────────────�����────────────────────
   // Seeds the operator-directed configuration defaults for bingx-x01:
   //   • live_volume_factor = 2.2  (written to BOTH connection:{id} and
   //     connection_settings:{id} so all three priority tiers in
@@ -2036,6 +2036,79 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "33")
     },
   },
+
+  // Migration 035 — Expand bingx-x01 to 20 symbols for intense retest
+  // Adds 5 high-volume symbols on top of the 15 from migration 033.
+  // Uses force_symbols (highest-priority field in getSymbols()) so the engine
+  // cannot silently overwrite the list during startup symbol resolution.
+  {
+    name: "035-bingx-x01-force-20-symbols",
+    version: 35,
+    up: async (client: any) => {
+      await client.set("_schema_version", "35")
+
+      const SYMBOLS_20 = [
+        "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
+        "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+        "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+        "AAVEUSDT", "SUIUSDT",  "APTUSDT",  "ARBUSDT",  "OPUSDT",
+      ]
+      const CONN_ID = "bingx-x01"
+      const symJson = JSON.stringify(SYMBOLS_20)
+      const symCount = String(SYMBOLS_20.length)
+
+      await Promise.all([
+        client.hset(`connection:${CONN_ID}`, {
+          active_symbols: symJson,
+          force_symbols:  symJson,
+          symbol_count:   symCount,
+          updated_at:     new Date().toISOString(),
+        }),
+        client.hset(`settings:trade_engine_state:${CONN_ID}`, {
+          active_symbols:           symJson,
+          force_symbols:            symJson,
+          symbols:                  symJson,
+          symbol_count:             symCount,
+          config_set_symbols_total: symCount,
+        }),
+        client.hset(`settings:connection:${CONN_ID}`, {
+          active_symbols: symJson,
+          force_symbols:  symJson,
+          symbol_count:   symCount,
+        }),
+      ]).catch(() => {})
+      console.log(`[v0] Migration 035: bingx-x01 force_symbols set to 20 symbols: ${SYMBOLS_20.join(",")}`)
+
+      // Invalidate running engine's symbol cache immediately.
+      try {
+        const { getTradeEngine } = await import("@/lib/trade-engine")
+        const coordinator = getTradeEngine()
+        if (coordinator && typeof (coordinator as any).invalidateSymbolsCacheForConnection === "function") {
+          ;(coordinator as any).invalidateSymbolsCacheForConnection(CONN_ID)
+          console.log(`[v0] Migration 035: invalidated symbol cache on running engine`)
+        }
+      } catch { /* engine may not be running — safe to ignore */ }
+
+      // Stamp a fresh progression snapshot so the status API reflects 20 symbols.
+      await client.hset(`progression:${CONN_ID}`, {
+        symbol_count:                 symCount,
+        active_symbols_hash:          SYMBOLS_20.slice().sort().join("|"),
+        started_for_settings_version: new Date().toISOString(),
+        progress_settings_snapshot:   JSON.stringify({
+          symbol_count:      Number(symCount),
+          symbols_hash:      SYMBOLS_20.slice().sort().join("|"),
+          is_live_trade:     "0",
+          is_preset_trade:   "0",
+          live_volume_factor: "1",
+          connection_method: "library",
+          updated_at:        new Date().toISOString(),
+        }),
+      }).catch(() => {})
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "34")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -2058,13 +2131,14 @@ const BASE_CONNECTION_CONFIG: Array<{
   { id: "orangex-x01", name: "OrangeX Base", exchange: "orangex", credentialId: "orangex-x01", autoActive: false },
 ]
 
-// Canonical 15-symbol test list used by migration 031, migration 033, and
+// Canonical 20-symbol test list used by migration 031, migration 035, and
 // ensureBaseConnections. Declared once here to avoid drift between the three
 // call-sites that previously each contained an inline copy of the array.
 const BASE_TEST_SYMBOLS = [
   "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
   "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
   "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+  "AAVEUSDT", "SUIUSDT",  "APTUSDT",  "ARBUSDT",  "OPUSDT",
 ]
 
 async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: number; credentialsInjected: number }> {
