@@ -1055,8 +1055,8 @@ const migrations: Migration[] = [
       const SPEC_DEFAULTS: Record<string, string> = {
         prevPosMinCount: "5",   // min closed positions before historic blend activates
         prevPosWindow:   "25",  // single cumulative last-N window feeding BOTH windowed PF and DDT
-        mainEvalPosCount: "15", // Main-stage validation min position count
-        realEvalPosCount: "10", // Real-stage validation min position count
+        mainEvalPosCount: "3",  // Main-stage validation min position count (3 = bootstrap-safe; historic full-run default was 15)
+        realEvalPosCount: "3",  // Real-stage validation min position count
       }
 
       // Union of every connection id source so we don't miss disabled /
@@ -1939,7 +1939,7 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "32")
     },
   },
-  // ── Migration 034 — operator-spec defaults ─────────────�����────────────────────
+  // ── Migration 034 — operator-spec defaults ─────────────�������────────────────────
   // Seeds the operator-directed configuration defaults for bingx-x01:
   //   • live_volume_factor = 2.2  (written to BOTH connection:{id} and
   //     connection_settings:{id} so all three priority tiers in
@@ -2023,8 +2023,8 @@ const migrations: Migration[] = [
         blockVolumeRatio:     "1.0",
         blockMaxStack:        "3",
         // Eval thresholds
-        mainEvalPosCount:     "15",
-        realEvalPosCount:     "10",
+        mainEvalPosCount:     "3",
+        realEvalPosCount:     "3",
         // Entry step
         minStep:              "5",
         updated_at:           now,

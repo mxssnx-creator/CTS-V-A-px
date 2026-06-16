@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─��������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -1830,10 +1830,14 @@ export class StrategyCoordinator {
       const histCount    = baseSet.prevPos?.count ?? 0
       const setPosCount  = Math.max(liveCount, histCount)
       
-      // Check if we have sufficient history (default mainMinPos = 15)
+      // Check if we have sufficient history.
+      // mainMinPos comes from mainEvalPosCount setting (default now 3, was 15).
+      // During prehistoric bootstrap each set has only 1-5 positions — any value
+      // above that caused all base sets to be rejected. The gate still applies
+      // once a set has at least some history (histCount > 0), so sets with 0
+      // history pass through as bootstrapping candidates.
       const hasHistoricData = histCount > 0
       if (hasHistoricData && histCount < mainMinPos) {
-        // Mark as invalid with reason, but keep in map so it can be re-evaluated later
         baseSet.status = "invalid"
         baseSet.rejectionReason = `insufficient_history: ${histCount}/${mainMinPos}`
         skippedLowPos++
