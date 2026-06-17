@@ -2191,6 +2191,7 @@ const migrations: Migration[] = [
 
   {
     version: 38,
+    name: "038-maticusdt-to-polusdt",
     description: "Replace delisted MATICUSDT with POLUSDT in bingx-x01 force_symbols",
     up: async (client: any) => {
       const CONN_ID = "bingx-x01"
