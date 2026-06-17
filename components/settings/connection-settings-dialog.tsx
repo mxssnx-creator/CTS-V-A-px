@@ -488,7 +488,7 @@ export function ConnectionSettingsDialog({
   // connectionId and exchange are stable — both come from props and don't change
   // within a single dialog open. Excluding them from the dep array intentionally
   // to avoid re-triggering on every render cycle.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [connectionId, exchange])
 
   // ─────────────────────────────────────────────────────────────────
@@ -667,7 +667,7 @@ export function ConnectionSettingsDialog({
   useEffect(() => {
     if (!open) return
     fetchExchangeSymbols()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [open, exchangeKey, symbolsCfg.symbolOrder])
 
   const addSymbol = useCallback((sym: string) => {
@@ -712,7 +712,7 @@ export function ConnectionSettingsDialog({
     fetchPresets()
     // Stable stable refs — intentionally omit from dep array to avoid
     // retriggering on every render. `open` is the only signal we need.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [open])
 
   // ─────────────────────────────────────────────────────────────────

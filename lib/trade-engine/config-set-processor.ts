@@ -248,9 +248,11 @@ export class ConfigSetProcessor {
           // SADD is idempotent so a replay can't double-count.
           symbolsProcessed++
           try {
-            await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+            const added = Number(await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)) || 0
             await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
-            await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+            if (added > 0) {
+              await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+            }
             const distinctSkipProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
             await client.hset(`prehistoric:${this.connectionId}`, {
               symbols_processed: String(distinctSkipProcessed),
@@ -455,9 +457,11 @@ export class ConfigSetProcessor {
         // monotonic distinct count.
         symbolsProcessed++
         try {
-          await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+          const added = Number(await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)) || 0
           await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
-          await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+          if (added > 0) {
+            await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+          }
           const distinctErrProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
           await client.hset(`prehistoric:${this.connectionId}`, {
             symbols_processed: String(distinctErrProcessed),
