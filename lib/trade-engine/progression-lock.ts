@@ -223,7 +223,19 @@ export async function acquireProgressionLock(
   const staleAfterMs = opts.staleAfterMs ?? (LOCK_TTL_SEC * 2 * 1000)
   if (existingDecoded && Number.isFinite(existingDecoded.epoch)) {
     const age = Date.now() - existingDecoded.epoch
-    if (age > staleAfterMs) {
+    let ttl = -2
+    try {
+      ttl = typeof (client as any).ttl === "function" ? await (client as any).ttl(key(connectionId)) : -1
+    } catch {
+      ttl = -1
+    }
+    // Never steal a lock that still has a positive TTL. The lock epoch is
+    // intentionally fixed for stale-write detection, so a healthy long-running
+    // engine can have an old epoch while its heartbeat keeps extending the TTL.
+    // The old age-only check regularly broke healthy owners after ~2 minutes,
+    // causing duplicate progressions and coordinator crashes. Only heal when
+    // the key is missing/expired or has no TTL and is older than the guard.
+    if (age > staleAfterMs && ttl <= 0) {
       try {
         // ── Atomic stale-heal ──────────────────────────────────────────
         // Previous code did `DEL` then `SET NX` — two non-atomic commands

@@ -1,6 +1,6 @@
 // CRITICAL: Define totalStrategiesEvaluated globally BEFORE any other code loads
 // This fixes ReferenceError in stale closures from previous code versions
-// eslint-disable-next-line no-var
+
 declare global { var totalStrategiesEvaluated: number }
 ;(globalThis as any).totalStrategiesEvaluated = 0
 

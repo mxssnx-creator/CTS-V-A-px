@@ -213,8 +213,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           const coordinator = getGlobalTradeEngineCoordinator()
           const settings = await loadSettingsAsync()
             
-            // Start the engine directly
-            await coordinator.startEngine(resolvedId, {
+            const engineConfig = {
               connectionId: resolvedId,
               connection_name: connection.name,
               exchange: connection.exchange,
@@ -222,9 +221,22 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
+            }
+            setImmediate(() => {
+              coordinator.startEngine(resolvedId, engineConfig).catch(async (engineStartError: unknown) => {
+                console.error(`[v0] [Toggle] Background engine start failed:`, engineStartError)
+                await getRedisClient().set(`engine_is_running:${resolvedId}`, "0").catch(() => {})
+                await logProgressionEvent(
+                  resolvedId,
+                  "engine_start_failed",
+                  "error",
+                  engineStartError instanceof Error ? engineStartError.message : String(engineStartError),
+                  { connectionId: resolvedId, connectionName: connection.name, exchange: connection.exchange },
+                ).catch(() => {})
+              })
             })
             
-            console.log(`[v0] [Toggle] ✓ Engine started directly for ${connection.name}`)
+            console.log(`[v0] [Toggle] ✓ Engine start queued for ${connection.name}`)
             await logProgressionEvent(resolvedId, "engine_started_direct", "info", "Main Trade Engine started directly from enable", {
               connectionId: resolvedId,
               connectionName: connection.name,

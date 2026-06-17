@@ -1612,6 +1612,20 @@ export async function ensureCoreRedis(): Promise<void> {
  * this, and every server action / route guards on it via ensureRedisInitialized.
  */
 export async function initRedis(): Promise<void> {
+  // Next.js dev can re-evaluate this module for a newly compiled route while
+  // keeping the InlineLocalRedis data on globalThis. In that case the
+  // module-scoped `isConnected` / `migrationsRan` flags reset to false even
+  // though another module instance has already completed core init +
+  // migrations. Honour the global ready marker so route compilation does not
+  // re-run all migrations and overwrite operator-saved state (symbols,
+  // connection mode, progression snapshots) back to migration defaults.
+  if (globalForRedis.__redis_fully_connected) {
+    isConnected = true
+    coreInitialized = true
+    connectionsInitialized = true
+    migrationsRan = true
+    return
+  }
   if (isConnected) return
 
   // DEV ONLY — flush stale live positions on every initRedis() call.
@@ -1964,6 +1978,17 @@ export async function setSettings(key: string, value: any): Promise<void> {
   const client = getClient()
   const data = flattenForHmset(value)
   await client.hset(`settings:${key}`, data)
+}
+
+export async function persistNow(): Promise<boolean> {
+  const client = getClient()
+  if (typeof (client as any).persistNow === "function") {
+    return (client as any).persistNow()
+  }
+  if (typeof (client as any).saveToDisk === "function") {
+    return (client as any).saveToDisk()
+  }
+  return false
 }
 
 export async function getAllSettings(): Promise<Record<string, any>> {
@@ -3306,4 +3331,3 @@ export async function softResetWithCoordinationPreserved(): Promise<{
     buckets,
   }
 }
-

@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { updateConnection, initRedis, getConnection, getRedisClient, setSettings, getSettings } from "@/lib/redis-db"
+import { updateConnection, initRedis, getConnection, getRedisClient, setSettings, getSettings, persistNow } from "@/lib/redis-db"
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 import { getTradeEngine } from "@/lib/trade-engine"
@@ -139,18 +139,18 @@ export async function PUT(
       updated_at: new Date().toISOString(),
     }
 
-    await updateConnection(id, updated)
+    let effectiveConnection = (await updateConnection(id, updated)) || updated
 
     // Full propagation: notify + fast-path apply + recoordinate
     // (start/stop/hot-reload as the new state dictates). See
     // lib/connection-recoordinator.ts for the design rationale.
-    await recoordinateAfterSettingsChange(id, connection, updated, {
+    await recoordinateAfterSettingsChange(id, connection, effectiveConnection, {
       logTag: "PUT /settings",
     })
 
     await SystemLogger.logConnection(`Updated settings`, id, "info")
 
-    return NextResponse.json({ success: true, connection: updated })
+    return NextResponse.json({ success: true, connection: effectiveConnection })
   } catch (error) {
     console.error("[v0] [Settings] PUT error:", error)
     await SystemLogger.logError(error, "api", "PUT /api/settings/connections/[id]/settings")
@@ -217,7 +217,7 @@ export async function PATCH(
       updated_at: new Date().toISOString(),
     }
 
-    await updateConnection(id, updated)
+    let effectiveConnection = (await updateConnection(id, updated)) || updated
 
     // ── Flat eval-knob hash mirror (CRITICAL) ───────────────────────────
     // The strategy coordinator and detailed-tracking read the per-eval
@@ -434,6 +434,22 @@ export async function PATCH(
 
       if (Object.keys(flatKnobs).length > 0) {
         await getRedisClient().hset(`connection_settings:${id}`, flatKnobs)
+        const volumeConnectionPatch: Record<string, string> = {}
+        if (flatKnobs.volume_factor_live !== undefined) {
+          volumeConnectionPatch.live_volume_factor = flatKnobs.volume_factor_live
+        }
+        if (flatKnobs.volume_factor_preset !== undefined) {
+          volumeConnectionPatch.preset_volume_factor = flatKnobs.volume_factor_preset
+        }
+        if (flatKnobs.volume_factor !== undefined) {
+          volumeConnectionPatch.volume_factor = flatKnobs.volume_factor
+        }
+        if (Object.keys(volumeConnectionPatch).length > 0) {
+          effectiveConnection = (await updateConnection(id, volumeConnectionPatch)) || {
+            ...effectiveConnection,
+            ...volumeConnectionPatch,
+          }
+        }
       }
     } catch (mirrorErr) {
       console.error("[v0] [Settings] eval-knob hash mirror failed:", mirrorErr)
@@ -504,25 +520,93 @@ export async function PATCH(
 
         if (resolved.length > 0) {
           // 1. Persist as the connection's ACTIVE symbol source (what the engine reads).
-          await updateConnection(id, { active_symbols: JSON.stringify(resolved) })
+          const resolvedSymbolsJson = JSON.stringify(resolved)
+          effectiveConnection = (await updateConnection(id, {
+            active_symbols: resolvedSymbolsJson,
+            // Keep force_symbols in lock-step with the resolved selection.
+            // EngineManager.getSymbols() gives force_symbols precedence over
+            // active_symbols; leaving an older force_symbols list in place made
+            // a successful "save 12 symbols" still boot with the previous
+            // migration/admin override list.
+            force_symbols: resolvedSymbolsJson,
+            symbol_count: String(resolved.length),
+            symbol_order: order,
+          })) || { ...effectiveConnection, active_symbols: resolvedSymbolsJson, force_symbols: resolvedSymbolsJson, symbol_count: String(resolved.length), symbol_order: order }
           // 2. Mirror into trade_engine_state (the engine's primary lookup) +
           //    seed the prehistoric symbol total so the progress bar denominator
           //    matches the new selection immediately.
           const stateKey = `trade_engine_state:${id}`
           const prevState = (await getSettings(stateKey)) || {}
+          const settingsConnectionKey = `connection:${id}`
+          const prevSettingsConnection = (await getSettings(settingsConnectionKey)) || {}
           await setSettings(stateKey, {
             ...prevState,
             connection_id: id,
-            symbols: JSON.stringify(resolved),
-            active_symbols: JSON.stringify(resolved),
+            symbols: resolvedSymbolsJson,
+            active_symbols: resolvedSymbolsJson,
+            force_symbols: resolvedSymbolsJson,
             config_set_symbols_total: resolved.length,
             updated_at: new Date().toISOString(),
           })
+          await setSettings(settingsConnectionKey, {
+            ...prevSettingsConnection,
+            connection_id: id,
+            symbols: resolvedSymbolsJson,
+            active_symbols: resolvedSymbolsJson,
+            force_symbols: resolvedSymbolsJson,
+            symbol_count: resolved.length,
+            symbol_order: order,
+            updated_at: new Date().toISOString(),
+          })
+          ;(merged as Record<string, unknown>).active_symbols = resolved
+          ;(merged as Record<string, unknown>).force_symbols = resolved
+          ;(merged as Record<string, unknown>).symbol_count = resolved.length
           // 3. Invalidate the running engine's in-memory symbol cache so the
           //    change takes effect on the next tick without a restart.
           try {
             getTradeEngine()?.getEngineManager(id)?.invalidateSymbolsCache()
           } catch { /* engine may not be running yet — state above is enough */ }
+          await persistNow().catch((persistErr: unknown) => {
+            console.warn(
+              "[v0] [Settings] Persisting resolved symbols failed:",
+              persistErr instanceof Error ? persistErr.message : persistErr,
+            )
+          })
+          // Next.js dev can compile this route while another module instance is
+          // still finishing migrations. Re-assert the operator's saved symbols
+          // shortly after the response so any late migration write that raced
+          // this save cannot leave the in-memory store or snapshot on an older
+          // canonical symbol list.
+          for (const delayMs of [2_000, 6_000]) {
+            setTimeout(() => {
+              void (async () => {
+                await updateConnection(id, {
+                  active_symbols: resolvedSymbolsJson,
+                  force_symbols: resolvedSymbolsJson,
+                  symbol_count: String(resolved.length),
+                  symbol_order: order,
+                }).catch(() => null)
+                await setSettings(stateKey, {
+                  connection_id: id,
+                  symbols: resolvedSymbolsJson,
+                  active_symbols: resolvedSymbolsJson,
+                  force_symbols: resolvedSymbolsJson,
+                  config_set_symbols_total: resolved.length,
+                  updated_at: new Date().toISOString(),
+                }).catch(() => null)
+                await setSettings(settingsConnectionKey, {
+                  connection_id: id,
+                  symbols: resolvedSymbolsJson,
+                  active_symbols: resolvedSymbolsJson,
+                  force_symbols: resolvedSymbolsJson,
+                  symbol_count: resolved.length,
+                  symbol_order: order,
+                  updated_at: new Date().toISOString(),
+                }).catch(() => null)
+                await persistNow().catch(() => false)
+              })()
+            }, delayMs)
+          }
           console.log(`[v0] [Settings] Resolved ${resolved.length} symbol(s) for ${id} (order=${order}): ${resolved.join(", ")}`)
         }
       } catch (symErr) {
@@ -568,7 +652,7 @@ export async function PATCH(
     await recoordinateAfterSettingsChange(
       id,
       { ...connection, connection_settings: current },
-      { ...connection, connection_settings: merged, updated_at: updated.updated_at },
+      { ...effectiveConnection, connection_settings: merged, updated_at: effectiveConnection.updated_at || updated.updated_at },
       {
         logTag: "PATCH /settings",
         changedFieldsOverride: Object.keys(settings).length > 0 ? ["connection_settings"] : [],
