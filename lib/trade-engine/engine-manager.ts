@@ -3655,12 +3655,11 @@ export class TradeEngineManager {
    */
   /**
    * Tolerance for transient extend failures BEFORE we declare ownership
-   * lost and self-stop. With LOCK_EXTEND_INTERVAL_MS = 15s and the
-   * lock TTL = 90s we can comfortably tolerate up to 5 consecutive
-   * miss-extends (75s) before the lock would naturally expire. 3 was
-   * too tight ��� a Redis blip of ~46s would cascade-self-stop ALL
-   * engines, requiring full auto-start-sweep restart (~75s total
-   * downtime). 5 extends the survival window to 75s before self-stop.
+   * lost and self-stop. With LOCK_EXTEND_INTERVAL_MS = 30s and the
+   * lock TTL = 300s we can tolerate 5 consecutive miss-extends (~150s)
+   * without healthy engines self-stopping during slow exchange calls or
+   * dev-route recompiles. Shorter windows caused live tests to lose
+   * ownership while market/order requests were still in flight.
    */
   private extendFailuresInARow = 0
   private static readonly EXTEND_FAILURES_TOLERATED = 5

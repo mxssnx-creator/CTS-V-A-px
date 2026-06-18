@@ -22,7 +22,7 @@
  * ║  Redis schema:                                                       ║
  * ║   • Key:    engine_lock:{connectionId}                              ║
  * ║   • Value:  "{ownerToken}:{epoch}"                                   ║
- * ║   • TTL:    LOCK_TTL_SEC (60s by default). MUST be refreshed every   ║
+ * ║   • TTL:    LOCK_TTL_SEC (5 minutes by default). MUST be refreshed every   ║
  * ║             ~LOCK_TTL_SEC/3 by the lock owner; if the owner dies     ║
  * ║             without releasing the lock will expire and another       ║
  * ║             worker can take over within at most one TTL window.      ║
@@ -52,9 +52,9 @@ import crypto from "node:crypto"
 
 const LOCK_KEY_PREFIX = "engine_lock:"
 /** TTL for a freshly-acquired lock. The owner must extend before this expires. */
-export const LOCK_TTL_SEC = 60
+export const LOCK_TTL_SEC = 300
 /** Heartbeat extend cadence. Must be comfortably less than LOCK_TTL_SEC. */
-export const LOCK_EXTEND_INTERVAL_MS = 15_000
+export const LOCK_EXTEND_INTERVAL_MS = 30_000
 
 export interface LockHandle {
   /** Unique-per-acquisition identifier; an arbitrary opaque cookie. */
@@ -247,7 +247,7 @@ export async function acquireProgressionLock(
         //
         // Single `SET` (no NX guard) atomically overwrites whatever value
         // is present. By the time we reach this block the stored epoch is
-        // confirmed stale (age > 2× LOCK_TTL_SEC = 120s) — no legitimate
+        // confirmed stale (age > 2× LOCK_TTL_SEC) — no legitimate
         // owner would sit idle that long. Worst case: a parallel staleness
         // detector also fires SET; the LAST write wins via TTL extension,
         // which is harmless since all callers verified staleness.

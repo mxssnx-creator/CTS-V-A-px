@@ -346,19 +346,15 @@ export async function PATCH(
         }
       }
 
-      // ── Volume factor mirror ─���────────────────────────────────────────────
-      // VolumeCalculator reads volume_factor_live and volume_factor from the
-      // connection_settings:{id} hash. Mirror all three so per-connection
-      // volume factor saves actually reach the engine.
+      // ── Volume factor mirror ─────────────────────────────────────────────
+      // Live/Preset order sizing is operator configurable. Base pseudo
+      // positions are intentionally ratio/count based and must not expose or
+      // persist a separate "Base volume factor" knob, because the base stage
+      // never places exchange orders.
       {
         const vfl = Number((merged as Record<string, unknown>).volume_factor_live)
         if (Number.isFinite(vfl) && vfl > 0) {
           flatKnobs.volume_factor_live   = String(Math.max(0.1, Math.min(10, vfl)))
-        }
-        const vfb = Number((merged as Record<string, unknown>).volume_factor ?? (merged as Record<string, unknown>).volume_factor_base)
-        if (Number.isFinite(vfb) && vfb > 0) {
-          flatKnobs.volume_factor        = String(Math.max(0.1, Math.min(10, vfb)))
-          flatKnobs.volume_factor_base   = flatKnobs.volume_factor
         }
         const vfp = Number((merged as Record<string, unknown>).volume_factor_preset)
         if (Number.isFinite(vfp) && vfp > 0) {
@@ -640,6 +636,45 @@ export async function PATCH(
         console.warn(
           `[v0] [Settings PATCH] recoordinateForActualOne failed for ${id} (non-fatal):`,
           recoordErr instanceof Error ? recoordErr.message : String(recoordErr),
+        )
+      }
+
+      // A symbol/mode change invalidates the currently running prehistoric
+      // gates. Recoordination clears Redis state; this background restart makes
+      // the active manager actually start processing the new symbols instead of
+      // waiting for a later watchdog tick. It is intentionally queued and
+      // cooldown-protected so the settings dialog response stays fast and a
+      // double-save cannot spawn duplicate restarts.
+      try {
+        const coordinator = getTradeEngine()
+        const client = getRedisClient()
+        const restartKey = `engine_restart_cooldown:${id}`
+        const lastRestartRaw = await client.get(restartKey).catch(() => null)
+        const lastRestartMs = Number(lastRestartRaw)
+        if (
+          coordinator &&
+          typeof (coordinator as any).isEngineRunning === "function" &&
+          (coordinator as any).isEngineRunning(id) &&
+          (!Number.isFinite(lastRestartMs) || Date.now() - lastRestartMs > 2_000)
+        ) {
+          await client.set(restartKey, String(Date.now()), { EX: 5 }).catch(() => null)
+          setImmediate(() => {
+            void (async () => {
+              try {
+                await (coordinator as any).restartEngine(id)
+              } catch (restartErr) {
+                console.warn(
+                  `[v0] [Settings PATCH] background restart failed for ${id}:`,
+                  restartErr instanceof Error ? restartErr.message : String(restartErr),
+                )
+              }
+            })()
+          })
+        }
+      } catch (restartScheduleErr) {
+        console.warn(
+          `[v0] [Settings PATCH] failed to schedule symbol/mode restart for ${id}:`,
+          restartScheduleErr instanceof Error ? restartScheduleErr.message : String(restartScheduleErr),
         )
       }
     }

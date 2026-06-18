@@ -224,8 +224,13 @@ export class InlineLocalRedis {
     // "ownership loss" crashes. Check the global flag published by the
     // trade-engine coordinator; if ANY engine is active, skip the reload.
     const globalCtx = globalThis as any
-    if (globalCtx.__engine_manager_instance?.isEngineRunning) {
-      console.log(`[v0] [Redis] Snapshot reload skipped: engine running in this process`)
+    const coordinator = globalCtx.__tradeEngineCoordinator
+    const coordinatorHasEngines =
+      coordinator &&
+      typeof coordinator.getActiveEngineCount === "function" &&
+      Number(coordinator.getActiveEngineCount()) > 0
+    if (globalCtx.__engine_manager_instance?.isEngineRunning || coordinatorHasEngines) {
+      console.log(`[v0] [Redis] Snapshot reload skipped: engine/coordinator running in this process`)
       return false
     }
 
@@ -665,6 +670,10 @@ export class InlineLocalRedis {
       if (k.startsWith("live:position:"))    return true  // open/closed live positions
       if (k.startsWith("live:positions:"))   return true  // open/closed index LISTs
       if (k.startsWith("progression:"))      return true  // progression counters
+      if (/^prehistoric:[^:]+$/.test(k))     return true  // prehistoric summary hash for stats
+      if (/^prehistoric:[^:]+:symbols$/.test(k)) return true  // processed-symbol denominator set
+      if (/^prehistoric:[^:]+:done$/.test(k)) return true  // realtime gate marker
+      if (/^prehistoric:[^:]+:firstpass:done$/.test(k)) return true  // first-pass gate
       if (k.startsWith("connection:"))       return true  // exchange credentials
       if (k.startsWith("strategy_count:"))   return true  // strategy count totals
       if (k.startsWith("real_pi_acc:"))      return true  // real PI accumulation
