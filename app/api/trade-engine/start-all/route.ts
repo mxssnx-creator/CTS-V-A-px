@@ -70,11 +70,18 @@ async function handleStartAll() {
           }
         }
 
-        await coordinator.startEngine(connection.id, {
+        const engineConfig = {
           connectionId: connection.id,
           indicationInterval,
           strategyInterval,
           realtimeInterval,
+        }
+        setImmediate(() => {
+          coordinator.startEngine(connection.id, engineConfig).catch(async (error: unknown) => {
+            console.error(`[START-ALL] Background start failed for ${connection.id}:`, error)
+            await getRedisClient().set(`engine_is_running:${connection.id}`, "0").catch(() => {})
+            await SystemLogger.logError(error, "api", `Background start-all engine ${connection.id}`).catch(() => {})
+          })
         })
 
         results.push({
@@ -82,7 +89,7 @@ async function handleStartAll() {
           connectionName: connection.name,
           exchange: connection.exchange,
           success: true,
-          message: "Engine started successfully",
+          message: "Engine start queued",
         })
 
         successCount++
@@ -99,7 +106,7 @@ async function handleStartAll() {
 
     return NextResponse.json({
       success: true,
-      message: `Started ${successCount} of ${activeConnections.length} trade engines`,
+      message: `Queued ${successCount} of ${activeConnections.length} trade engines`,
       totalConnections: connections.length,
       activeConnections: activeConnections.length,
       successCount,

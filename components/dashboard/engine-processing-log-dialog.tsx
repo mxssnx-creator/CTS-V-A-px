@@ -225,7 +225,7 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
       stopPolling()
     }
     return () => stopPolling()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [open])
 
   // Re-start polling when connection changes while open
@@ -233,7 +233,7 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
     if (!open) return
     stopPolling()
     startPolling()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [activeConnectionId])
 
   useEffect(() => {

@@ -11,6 +11,45 @@ function toNumber(value: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
+function parseSymbolList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((symbol) => String(symbol).trim()).filter(Boolean)
+  }
+  if (typeof value !== "string") return []
+  const trimmed = value.trim()
+  if (!trimmed) return []
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (Array.isArray(parsed)) {
+      return parsed.map((symbol) => String(symbol).trim()).filter(Boolean)
+    }
+  } catch {
+    // Fall through to comma/newline parsing for legacy Redis fields.
+  }
+  return trimmed
+    .split(/[\n,]/)
+    .map((symbol) => symbol.trim())
+    .filter(Boolean)
+}
+
+function getConfiguredSymbolCount(connection: any, engineState: any): number {
+  const candidates = [
+    connection?.force_symbols,
+    connection?.active_symbols,
+    engineState?.force_symbols,
+    engineState?.active_symbols,
+  ]
+  for (const candidate of candidates) {
+    const symbols = parseSymbolList(candidate)
+    if (symbols.length > 0) return symbols.length
+  }
+  return Math.max(
+    toNumber(connection?.symbol_count),
+    toNumber(engineState?.symbol_count),
+    toNumber(engineState?.config_set_symbols_total),
+  )
+}
+
 /**
  * GET /api/connections/progression/[id]
  * Returns comprehensive progression data for an active connection
@@ -67,6 +106,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       globalState = {}
     }
     const isGloballyRunning = globalState?.status === "running"
+    const configuredSymbolCount = getConfiguredSymbolCount(connection, engineState)
     
      // PHASE 2 FIX: Check running flag directly from coordinator (most reliable)
      // Get current engine running state from coordinator
@@ -205,12 +245,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // Get detailed prehistoric progress tracking
     let prehistoricProgress = {
       symbolsProcessed: 0,
-      // Default to 1 until the Redis hash is read below — this prevents the
-      // progress denominator from showing "0/3" on fresh quickstarts where
-      // the operator may have chosen a single symbol. The hash field
-      // `symbols_total` (written by quickstart + engine start) overrides
-      // this as soon as it exists.
-      symbolsTotal: 1,
+      // Prefer the operator-configured symbol count so the UI never shows a
+      // stale 0/1 denominator while prehistoric hashes are being reset or
+      // rewritten during a settings-driven recoordination.
+      symbolsTotal: Math.max(configuredSymbolCount, 1),
       candlesLoaded: 0,
       candlesTotal: 0,
       indicatorsCalculated: 0,
@@ -244,12 +282,17 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
             prehistoricData.total_duration_ms || prehistoricData.duration || 0,
           )
 
-          // symbolsTotal from the hash wins over the hard-coded 3 default so
-          // multi-symbol quick-starts render the correct denominator.
+          // Use the largest known total. Redis hashes can briefly contain stale
+          // legacy values (for example 1) while a background engine start resets
+          // prehistoric progress, so the saved connection/engine symbol list is
+          // the floor for the denominator.
           const hashSymbolsTotal = Number(prehistoricData.symbols_total || 0)
-          if (hashSymbolsTotal > 0) {
-            prehistoricProgress.symbolsTotal = hashSymbolsTotal
-          }
+          prehistoricProgress.symbolsTotal = Math.max(
+            prehistoricProgress.symbolsTotal,
+            hashSymbolsTotal,
+            configuredSymbolCount,
+            processedSet.length,
+          )
 
           // symbolsProcessed — canonical source of truth, in priority order:
           //   1. Hash field `symbols_processed` (written by engine-manager /
