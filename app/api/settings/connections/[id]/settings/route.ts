@@ -437,6 +437,9 @@ export async function PATCH(
         if (flatKnobs.volume_factor_preset !== undefined) {
           volumeConnectionPatch.preset_volume_factor = flatKnobs.volume_factor_preset
         }
+        if (flatKnobs.volume_factor !== undefined) {
+          volumeConnectionPatch.volume_factor = flatKnobs.volume_factor
+        }
         if (Object.keys(volumeConnectionPatch).length > 0) {
           effectiveConnection = (await updateConnection(id, volumeConnectionPatch)) || {
             ...effectiveConnection,
