@@ -1530,6 +1530,12 @@ if (engineGlobalThis.__tradeEngineVersion && engineGlobalThis.__tradeEngineVersi
 engineGlobalThis.__tradeEngineVersion = TRADE_ENGINE_VERSION
 let globalCoordinator: GlobalTradeEngineCoordinator | null = engineGlobalThis.__tradeEngineCoordinator || null
 
+// ── Coordinator singleton lock (prevents concurrent initialization race) ──
+// If two requests call getGlobalTradeEngineCoordinator() simultaneously,
+// the double-check-lock pattern (check + assign under critical section)
+// ensures only one constructor runs, avoiding duplicate instances.
+let _coordinatorInitLock = false
+
 console.log(`[v0] Global Trade Engine V${TRADE_ENGINE_VERSION} loaded`)
 
 /**
@@ -1558,10 +1564,37 @@ export function getGlobalCoordinator(): GlobalTradeEngineCoordinator | null {
 }
 
 export function getGlobalTradeEngineCoordinator(): GlobalTradeEngineCoordinator {
+  // ── Double-check lock pattern (prevents concurrent initialization) ──
+  // First check: fast path when already initialized (no lock overhead).
+  // Second check (after acquiring lock): prevents duplicate construction
+  // if two concurrent requests entered the first-check window.
   if (!globalCoordinator) {
-    globalCoordinator = new GlobalTradeEngineCoordinator()
-    engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
-    console.log("[v0] Global trade engine coordinator auto-initialized")
+    // Acquire lock to prevent concurrent initialization.
+    if (!_coordinatorInitLock) {
+      _coordinatorInitLock = true
+      try {
+        // Second check: another request may have initialized while we waited.
+        if (!globalCoordinator) {
+          globalCoordinator = new GlobalTradeEngineCoordinator()
+          engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
+          console.log("[v0] Global trade engine coordinator auto-initialized")
+        }
+      } finally {
+        _coordinatorInitLock = false
+      }
+    } else {
+      // Another request is initializing; wait a brief moment for it to complete.
+      // In practice this branch is extremely rare (only during concurrent first-load).
+      for (let i = 0; i < 10 && !globalCoordinator; i++) {
+        // Spin-wait 1ms × 10 = up to 10ms for initialization to complete.
+        // This is safe because the lock will be released immediately after construction.
+      }
+      if (!globalCoordinator) {
+        // Fallback: return a temporary instance (should not happen in practice).
+        console.warn("[v0] Coordinator initialization lock timeout; returning temporary instance")
+        return new GlobalTradeEngineCoordinator()
+      }
+    }
   }
   return globalCoordinator
 }

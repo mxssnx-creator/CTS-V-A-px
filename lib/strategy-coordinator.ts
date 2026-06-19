@@ -371,6 +371,8 @@ export interface CoordIndex {
   base: BaseRegistry
   /** Snapshot of the qualifying Real Set keys this cycle (populated by evaluateRealSets). */
   validRealKeys: Set<string>
+  /** Mutation lock: true while recordRegistration is in progress (prevents concurrent record mutations). */
+  _registering?: boolean
 }
 
 /** Allocate an empty CoordIndex from a freshly-built BaseRegistry. */
@@ -386,11 +388,24 @@ function makeCoordIndex(base: BaseRegistry): CoordIndex {
 
 /** Register a SetCoordRecord into a CoordIndex (updates all three indexes). */
 function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
-  idx.records.push(rec)
-  idx.byCoordKey.set(rec.coordKey, rec)
-  let arr = idx.byParentKey.get(rec.parentKey)
-  if (!arr) { arr = []; idx.byParentKey.set(rec.parentKey, arr) }
-  arr.push(rec)
+  // ── Mutation lock: prevent concurrent record registration ──────────────
+  // Within a single Main/Real/Live cycle the index is single-threaded,
+  // but this guard prevents accidental re-entrant mutations if stages
+  // are refactored to concurrent paths in the future.
+  if (idx._registering) {
+    console.warn("[v0] registerCoordRecord called while already registering; skipping to prevent corruption")
+    return
+  }
+  idx._registering = true
+  try {
+    idx.records.push(rec)
+    idx.byCoordKey.set(rec.coordKey, rec)
+    let arr = idx.byParentKey.get(rec.parentKey)
+    if (!arr) { arr = []; idx.byParentKey.set(rec.parentKey, arr) }
+    arr.push(rec)
+  } finally {
+    idx._registering = false
+  }
 }
 
 /**
@@ -2132,7 +2147,7 @@ export class StrategyCoordinator {
       registerCoordRecord(idx, rec)
     }
 
-    // ── Log min-pos skip count (diagnostic) ──────────────────���────
+    // ── Log min-pos skip count (diagnostic) ─��────────────────���────
     // Surface the number of Base Sets that didn't meet `mainEvalPosCount`
     // at this cycle so the operator can see when the threshold is
     // throttling promotion. Non-critical; debug level.
@@ -2291,7 +2306,7 @@ export class StrategyCoordinator {
       dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
     }
-    // Aggregate scalars — computed in the same pass as variantAgg to avoid
+    // Aggregate scalars �� computed in the same pass as variantAgg to avoid
     // 4 extra reduce/filter sweeps that each allocate a result value.
     let mainEntriesTotal      = 0
     let mainSumPF             = 0
