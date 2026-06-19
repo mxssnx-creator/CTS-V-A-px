@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { initRedis, getConnection, updateConnection } from "@/lib/redis-db"
+import { initRedis, getConnection, updateConnection, getRedisClient } from "@/lib/redis-db"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 // POST - Add connection to active connections (set is_enabled_dashboard flag)
@@ -26,10 +26,22 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       (connection as any).is_dashboard_inserted === "1" ||
       (connection as any).is_dashboard_inserted === true
     if (alreadyInserted) {
+      const normalizedConnection = {
+        ...connection,
+        is_active_inserted: "1",
+        is_dashboard_inserted: "1",
+        is_assigned: "1",
+        // Preserve the operator's current enabled/running state. Re-adding an
+        // already visible card must never disable it or create a duplicate row.
+        is_enabled_dashboard: connection.is_enabled_dashboard ?? connection.is_active ?? "0",
+        is_active: connection.is_active ?? connection.is_enabled_dashboard ?? "0",
+        updated_at: new Date().toISOString(),
+      }
+      await updateConnection(connectionId, normalizedConnection).catch(() => null)
       return NextResponse.json({
         success: true,
-        connection,
-        message: "Connection already in active panel (no change)",
+        connection: normalizedConnection,
+        message: "Connection already in active panel (normalized aliases only)",
         alreadyActive: true,
       })
     }
@@ -69,7 +81,21 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           isTruthyFlag((updatedConnection as any).is_testnet) ||
           isTruthyFlag((updatedConnection as any).demo_mode))
       if (shouldRun) {
-        await coordinator.startMissingEngines([updatedConnection])
+        const startKey = `engine_restart_cooldown:${connectionId}`
+        const client = getRedisClient()
+        const lastStartRaw = await client.get(startKey).catch(() => null)
+        const lastStartMs = Number(lastStartRaw)
+        if (!Number.isFinite(lastStartMs) || Date.now() - lastStartMs > 2_000) {
+          await client.set(startKey, String(Date.now()), { EX: 5 }).catch(() => null)
+          setImmediate(() => {
+            coordinator.startMissingEngines([updatedConnection]).catch((startErr: unknown) => {
+              console.warn(
+                `[v0] [ActiveConnection POST] background start failed for ${connectionId}:`,
+                startErr instanceof Error ? startErr.message : String(startErr),
+              )
+            })
+          })
+        }
       }
     } catch (applyErr) {
       console.warn(

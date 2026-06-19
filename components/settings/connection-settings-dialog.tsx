@@ -241,7 +241,6 @@ export function ConnectionSettingsDialog({
     try {
       // Build current dialog state as payload — same shape as saveAll sends
       const payload = {
-        volume_factor:        overview.volumeFactorBase,
         volume_factor_live:   overview.volumeFactorLive,
         volume_factor_preset: overview.volumeFactorPreset,
         margin_mode:          overview.marginMode,
@@ -488,7 +487,7 @@ export function ConnectionSettingsDialog({
   // connectionId and exchange are stable — both come from props and don't change
   // within a single dialog open. Excluding them from the dep array intentionally
   // to avoid re-triggering on every render cycle.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [connectionId, exchange])
 
   // ─────────────────────────────────────────────────────────────────
@@ -500,7 +499,6 @@ export function ConnectionSettingsDialog({
     try {
       const payload = {
         // Overview
-        volume_factor:        overview.volumeFactorBase,
         volume_factor_live:   overview.volumeFactorLive,
         volume_factor_preset: overview.volumeFactorPreset,
         margin_mode: overview.marginMode,
@@ -667,7 +665,7 @@ export function ConnectionSettingsDialog({
   useEffect(() => {
     if (!open) return
     fetchExchangeSymbols()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [open, exchangeKey, symbolsCfg.symbolOrder])
 
   const addSymbol = useCallback((sym: string) => {
@@ -712,7 +710,7 @@ export function ConnectionSettingsDialog({
     fetchPresets()
     // Stable stable refs — intentionally omit from dep array to avoid
     // retriggering on every render. `open` is the only signal we need.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [open])
 
   // ─────────────────────────────────────────────────────────────────
@@ -721,7 +719,7 @@ export function ConnectionSettingsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl h-[90vh] overflow-hidden flex flex-col p-0 [&>button]:z-10">
+      <DialogContent className="max-w-3xl h-[90dvh] max-h-[90dvh] overflow-hidden flex flex-col p-0 [&>button]:z-10">
         {/* Header */}
         <DialogHeader className="px-5 pt-4 pb-3 border-b shrink-0">
           <div className="flex items-center gap-2">
@@ -766,7 +764,7 @@ export function ConnectionSettingsDialog({
               `overflow-hidden` on the `Tabs` parent above combined with
               `flex-1 min-h-0` here constrains the height to the remaining
               space below the TabsList. */}
-          <ScrollArea className="flex-1 min-h-0 px-5 py-4">
+          <ScrollArea className="flex-1 min-h-0 overflow-y-auto px-5 py-4">
             {loading && (
               <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-sm">
                 <Loader2 className="h-4 w-4 animate-spin" /> Loading settings…
@@ -913,7 +911,7 @@ export function ConnectionSettingsDialog({
                   <Separator className="my-1" />
 
                   {/* ── Minimal Position Step — promoted to page 1 per operator spec ─ */}
-                  <SectionHeading icon={Sparkles} title="Minimal Position-Creation Step" subtitle="Minimum step size for pseudo-position windows (Base stage). Controls which indication configs are generated — higher = fewer, smoother signals." />
+                  <SectionHeading icon={Sparkles} title="Minimal Base Pseudo Positions Range Step" subtitle="Minimum step size for Base pseudo-position windows (3–30, default 5). Higher values create fewer, smoother position ranges." />
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
                       <Label className="text-xs">Min Step (3–30)</Label>
@@ -1590,7 +1588,7 @@ function StrategyProfileEditor({
               />
               <div className="flex justify-between text-[10px] text-muted-foreground">
                 <span>100</span>
-                <span className="text-muted-foreground/60">{type === "real" ? "default 2,000" : "default 5,000"}</span>
+                <span className="text-muted-foreground/60">{type === "real" ? "default 5,000" : "default 10,000"}</span>
                 <span>50,000</span>
               </div>
             </div>

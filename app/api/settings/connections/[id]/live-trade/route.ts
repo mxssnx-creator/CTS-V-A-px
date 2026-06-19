@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { initRedis, getConnection, updateConnection } from "@/lib/redis-db"
+import { initRedis, getConnection, updateConnection, persistNow, getRedisClient } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
 import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
@@ -101,6 +101,24 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)
+    if (isLiveTrade) {
+      await getRedisClient().hset("trade_engine:global", {
+        status: "running",
+        mode: "live",
+        updated_at: new Date().toISOString(),
+      }).catch((stateErr: unknown) => {
+        console.warn(
+          "[v0] [LiveTrade] Persisting global engine intent failed:",
+          stateErr instanceof Error ? stateErr.message : stateErr,
+        )
+      })
+    }
+    await persistNow().catch((persistErr: unknown) => {
+      console.warn(
+        "[v0] [LiveTrade] Persisting live-trade flag failed:",
+        persistErr instanceof Error ? persistErr.message : persistErr,
+      )
+    })
 
     const coordinator = getGlobalTradeEngineCoordinator()
     let engineStatus: "running" | "starting" | "stopped" | "error" = "stopped"
@@ -115,9 +133,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         console.log(`[v0] [LiveTrade] Engine already running for ${connName} — flag updated, no restart`)
       } else {
         // Engine is not running — start it so the flag has an effect.
+        // Do this in the background. startEngine performs heavy market-data
+        // bootstrap work; awaiting it made the UI Live toggle and scripted
+        // 15-symbol debug flows time out even though the engine did start.
         try {
           const settings = await loadSettingsAsync()
-          await coordinator.startEngine(connectionId, {
+          const engineConfig = {
             connectionId,
             connection_name: connName,
             exchange: connection.exchange,
@@ -125,17 +146,29 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1,
             strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
             realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
+          }
+          setImmediate(() => {
+            coordinator.startEngine(connectionId, engineConfig).catch(async (err: unknown) => {
+              console.error(`[v0] [LiveTrade] Background engine start failed for ${connName}:`, err)
+              await getRedisClient().hset("trade_engine:global", {
+                status: "error",
+                error_message: err instanceof Error ? err.message : String(err),
+                updated_at: new Date().toISOString(),
+              }).catch(() => {})
+              await getRedisClient().set(`engine_is_running:${connectionId}`, "0").catch(() => {})
+              await SystemLogger.logError(err, "api", `Background start engine for ${connName}`).catch(() => {})
+            })
           })
           engineStatus = "starting"
           engineStartedNow = true
-          console.log(`[v0] [LiveTrade] Engine started for ${connName} to service live-trade flag`)
+          console.log(`[v0] [LiveTrade] Engine start queued for ${connName} to service live-trade flag`)
         } catch (err) {
-          console.error(`[v0] [LiveTrade] Failed to start engine for ${connName}:`, err)
+          console.error(`[v0] [LiveTrade] Failed to queue engine start for ${connName}:`, err)
           await SystemLogger.logError(err, "api", `Start engine for ${connName}`)
           return NextResponse.json(
             {
               success: false,
-              error: "Failed to start engine",
+              error: "Failed to queue engine start",
               details: err instanceof Error ? err.message : String(err),
             },
             { status: 500 },
