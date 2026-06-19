@@ -181,27 +181,12 @@ export function ExchangeTab({
             <Separator />
 
             <div className="space-y-4">
-              <h3 className="text-lg font-semibold">Volume Configuration</h3>
+              <h3 className="text-lg font-semibold">Position Configuration</h3>
               <p className="text-sm text-muted-foreground">
-                Configure volume factors and position calculation settings
+                Configure pseudo-position range settings. Base strategy sizing is system-internal and ratio based.
               </p>
 
               <div className="grid md:grid-cols-2 gap-6">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <Label>Base Volume Factor</Label>
-                    <span className="text-sm font-medium">{settings.base_volume_factor || 1}</span>
-                  </div>
-                  <Slider
-                    min={0.5}
-                    max={10}
-                    step={0.5}
-                    value={[settings.base_volume_factor || 1]}
-                    onValueChange={([value]) => handleSettingChange("base_volume_factor", value)}
-                  />
-                  <p className="text-xs text-muted-foreground">Position volume multiplier (0.5-10)</p>
-                </div>
-
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
                     <Label>Range Percentage (Loss Trigger)</Label>
