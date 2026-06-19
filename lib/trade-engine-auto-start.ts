@@ -10,7 +10,7 @@
 import { getGlobalTradeEngineCoordinator } from "./trade-engine"
 import { getAllConnections, getRedisClient, initRedis } from "./redis-db"
 import { loadSettingsAsync } from "./settings-storage"
-import { hasConnectionCredentials, isConnectionMainProcessing, isTruthyFlag } from "./connection-state-utils"
+import { isConnectionEligibleForEngine, isTruthyFlag } from "./connection-state-utils"
 
 let autoStartInitialized = false
 let autoStartTimer: NodeJS.Timeout | null = null
@@ -155,14 +155,14 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
           return
         }
 
-        const connectionsThatShouldBeRunning = connections.filter((c) => {
-          const isFullyEnabled = isConnectionMainProcessing(c)
-          if (!isFullyEnabled) return false
-          const hasAnyCredentials = hasConnectionCredentials(c, 5, true)
-          const isPredefined = isTruthyFlag(c.is_predefined)
-          const isTestnet = isTruthyFlag(c.is_testnet) || isTruthyFlag(c.demo_mode)
-          return hasAnyCredentials || isPredefined || isTestnet
-        })
+        // Use isConnectionEligibleForEngine which checks is_active_inserted but
+        // NOT is_enabled_dashboard.  The dashboard toggle gates live-trade/preset
+        // operations; it must not prevent the healing sweep from restarting an
+        // engine that the operator explicitly started — especially during the boot
+        // window before migration 037 seeds is_enabled_dashboard=1.
+        const connectionsThatShouldBeRunning = connections.filter((c) =>
+          isConnectionEligibleForEngine(c)
+        )
 
         // Settings load is best-effort; engines consult Redis on each tick.
         try { await loadSettingsAsync() } catch { /* non-critical */ }

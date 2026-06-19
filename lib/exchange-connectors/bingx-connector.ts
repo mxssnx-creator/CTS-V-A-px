@@ -1683,7 +1683,13 @@ export class BingXConnector extends BaseExchangeConnector {
       return { success: true }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
-      this.logError(`✗ Failed to set margin type: ${errorMsg}`)
+      // 109418 = symbol is offline/delisted — not a real error, just skip it.
+      // Any other failure is a real error worth surfacing.
+      if (/109418/.test(errorMsg) || /is offline currently/i.test(errorMsg)) {
+        this.log(`⚠ setMarginType skipped (symbol offline): ${errorMsg}`)
+      } else {
+        this.logError(`✗ Failed to set margin type: ${errorMsg}`)
+      }
       return { success: false, error: errorMsg }
     }
   }

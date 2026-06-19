@@ -202,11 +202,16 @@ export async function GET() {
         presetTotal: activeInsertedAll.length,
         presetEnabled: presetTradeEnabled,
         totalEnabled: mainConnections.length + liveTradeConnections.length + presetTradeConnections.length,
+        // Convenience aliases expected by dashboard components
+        enabledConnections: enabledBase.length,
+        activeConnections:  activeInsertedAll.length,
       },
       database: {
         status: "healthy",
         requestsPerSecond: getRedisRequestsPerSecond(),
         totalKeys,
+        heapMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        rssMB:  Math.round(process.memoryUsage().rss       / 1024 / 1024),
       },
       exchangeConnections: {
         total: insertedBaseConnections.length,

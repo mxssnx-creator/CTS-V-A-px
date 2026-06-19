@@ -624,8 +624,10 @@ function isCircuitBreakerError(payload: unknown): boolean {
   }
   return (
     /\bcode\s*=?\s*109400\b/.test(text) ||
+    /\bcode\s*=?\s*109418\b/.test(text) ||   // symbol offline / delisted
     /api orders? (?:are )?temporarily disabled/i.test(text) ||
-    /large market fluctuations/i.test(text)
+    /large market fluctuations/i.test(text) ||
+    /is offline currently/i.test(text)
   )
 }
 
@@ -1069,22 +1071,34 @@ async function placeProtectionOrder(
     // timeout we return null; the next sync tick will retry, and meanwhile
     // `checkAndForceCloseOnSltpCross` provides the safety net (it triggers
     // on price independent of whether the protection order is armed).
-    const placeStop = (qty: number) =>
-      withTimeout(
-        connector.placeStopOrder(
-          symbol,
-          closeSide,
-          qty,
-          triggerPrice,
-          kind,
-          {
-            reduceOnly: true,
-            positionSide: positionDirection === "long" ? "LONG" : "SHORT",
-          },
-        ) as Promise<any>,
-        EXCHANGE_TIMEOUT_PLACE_STOP_MS,
-        `placeStopOrder(${orderLabel} ${symbol})`,
-      )
+    // ── Normalize connector throws to result objects ──────────────────────
+    // The BingX connector (and others) throw on venue rejection rather than
+    // returning { success: false }.  The 109420 / 110424 retry blocks below
+    // check `result?.error`, which is never set when a throw escapes directly
+    // to the outer catch.  By wrapping each `placeStopOrder` call in its own
+    // try-catch we guarantee all code paths reach the retry checks with a
+    // well-shaped result object.
+    const placeStop = async (qty: number): Promise<any> => {
+      try {
+        return await withTimeout(
+          connector.placeStopOrder(
+            symbol,
+            closeSide,
+            qty,
+            triggerPrice,
+            kind,
+            {
+              reduceOnly: true,
+              positionSide: positionDirection === "long" ? "LONG" : "SHORT",
+            },
+          ) as Promise<any>,
+          EXCHANGE_TIMEOUT_PLACE_STOP_MS,
+          `placeStopOrder(${orderLabel} ${symbol})`,
+        )
+      } catch (e: any) {
+        return { success: false, error: String(e?.message || e) }
+      }
+    }
 
     let result = await placeStop(effectiveQty)
 
@@ -1105,6 +1119,25 @@ async function placeProtectionOrder(
           if (result?.success) {
             effectiveQty = availableQty
           }
+        }
+      }
+    }
+
+    // ── code=109420: "position not exist" ──────────────────────────────────
+    // BingX hedge-mode positions need a short settling period after a market
+    // order is accepted before a STOP/TP can reference them. In the
+    // unconfirmed-fill path the 2 s post-fill wait (live-stage ~line 2795)
+    // is sometimes insufficient for volatile symbols (DOGE, ADA). Retry once
+    // after an additional 2 s; reconcile will arm the order on the next tick
+    // if the retry also fails (position will have settled by then).
+    if (!result?.success) {
+      const errMsg109 = String(result?.error || "")
+      if (errMsg109.includes("109420") || /position not exist/i.test(errMsg109)) {
+        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 6s before retry`)
+        await new Promise((r) => setTimeout(r, 6000))
+        result = await placeStop(effectiveQty)
+        if (!result?.success) {
+          console.warn(`${tag} 109420 retry also failed (error=${result?.error}) — reconcile will retry on next tick`)
         }
       }
     }
@@ -1668,7 +1701,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ────────────────────────────────────────────────────────────
+// ── Main Pipeline ───�����────────────────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -2759,6 +2792,14 @@ export async function executeLivePosition(
         reason: `fill via=${fill.status}`,
         extra: { orderId: livePosition.orderId, attempts: placeAttempt },
       })
+      // BingX hedge-mode positions need a brief settling period after a
+      // market order fills before a STOP/TP_MARKET can reference them.
+      // Even when the fill is confirmed by pollOrderFill / getPosition,
+      // the exchange position registry may lag by ~1-2 s. This 2 s wait
+      // (combined with the 4 s retry inside placeProtectionOrder for
+      // code=109420) gives a total 6 s window — sufficient for all
+      // observed symbols including DOGE, ADA, and SOL.
+      await new Promise((r) => setTimeout(r, 2000))
     } else {
       // D) Final guard: fill unconfirmed but order was accepted �� treat as filled
       // with computedVolume so SL/TP can be placed. The position is "open" on the
@@ -2787,6 +2828,14 @@ export async function executeLivePosition(
         `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP will use order qty as fallback`,
         { orderId: livePosition.orderId, status: fill.status, fallbackQty: computedVolume }
       )
+      // BingX hedge-mode positions need time after market order acceptance
+      // before a STOP/TP_MARKET can reference them — 109420 "position not exist"
+      // fires if SL/TP is submitted too quickly (confirmed in DOGE/ADA/AAVE/BNB/SOL logs).
+      // BNBUSDT + SOLUSDT observed to need >14s (8s initial + 6s retry both failed),
+      // so raised to 10s here. Combined with the 6s 109420 retry inside
+      // placeProtectionOrder the total window is 10s + 6s = 16s before giving up.
+      // Reconcile arms protection on the next tick if both attempts still fail.
+      await new Promise((r) => setTimeout(r, 10000))
       await logLiveOrderFinal(orderTrace, {
         status: "placed",
         livePositionId: livePosition.id,
@@ -2831,30 +2880,39 @@ export async function executeLivePosition(
       // for that leg. A failed placement leaves it at 0, which
       // `priceDrifted(0, desired)` correctly classifies as "needs arming"
       // on the next reconcile pass.
-      const [slOrderId, tpOrderId] = await Promise.all([
-        (slPrice > 0 && !livePosition.stopLossOrderId)
-          ? placeProtectionOrder(
-              exchangeConnector,
-              realPosition.symbol,
-              sideClose,
-              livePosition.executedQuantity,
-              slPrice,
-              "StopLoss",
-              realPosition.direction,
-            )
-          : Promise.resolve(livePosition.stopLossOrderId || null),
-        (tpPrice > 0 && !livePosition.takeProfitOrderId)
-          ? placeProtectionOrder(
-              exchangeConnector,
-              realPosition.symbol,
-              sideClose,
-              livePosition.executedQuantity,
-              tpPrice,
-              "TakeProfit",
-              realPosition.direction,
-            )
-          : Promise.resolve(livePosition.takeProfitOrderId || null),
-      ])
+      // BingX hedge-mode: placing SL and TP concurrently (Promise.all) causes
+      // the second order to receive code=109420 "position not exist" while the
+      // first order is still being registered by the exchange.  Serialise SL
+      // first, wait 500 ms, then place TP.  The 500 ms gap is enough for the
+      // exchange registry to reflect the first stop order.  The existing 4 s
+      // retry inside placeProtectionOrder handles any residual 109420s.
+      const slOrderId = (slPrice > 0 && !livePosition.stopLossOrderId)
+        ? await placeProtectionOrder(
+            exchangeConnector,
+            realPosition.symbol,
+            sideClose,
+            livePosition.executedQuantity,
+            slPrice,
+            "StopLoss",
+            realPosition.direction,
+          )
+        : (livePosition.stopLossOrderId || null)
+
+      if (slPrice > 0 && tpPrice > 0 && !livePosition.takeProfitOrderId) {
+        await new Promise((r) => setTimeout(r, 500))
+      }
+
+      const tpOrderId = (tpPrice > 0 && !livePosition.takeProfitOrderId)
+        ? await placeProtectionOrder(
+            exchangeConnector,
+            realPosition.symbol,
+            sideClose,
+            livePosition.executedQuantity,
+            tpPrice,
+            "TakeProfit",
+            realPosition.direction,
+          )
+        : (livePosition.takeProfitOrderId || null)
 
       if (slOrderId) {
         livePosition.stopLossOrderId = slOrderId
@@ -3289,7 +3347,7 @@ export async function closeLivePosition(
 
           lastErrorMsg = (r && typeof r === "object" && r.error) ? String(r.error) : "invalid_response"
 
-          // ── Already-closed reconciliation ───���─────────────────────────
+          // ── Already-closed reconciliation ─��─���─────────────────────────
           // If the venue says the position is gone, we treat the close as
           // successful and stop retrying. The DB-side terminal-state
           // pipeline below still runs (PnL is computed from `closePrice`,
@@ -4110,7 +4168,7 @@ export async function reconcileLivePositions(
       errors: number
       protectionRearmed: number
     }
-    // ── Canonical-position-per-slot resolution (BUG 4) ────────────────
+    // ── Canonical-position-per-slot resolution (BUG 4) ────────��───────
     // The venue holds exactly ONE position per (symbol, direction). If
     // Redis tracks more than one open position for the same slot
     // (lock-expiry edge, restart mid-entry, or migrated legacy data),

@@ -460,7 +460,7 @@ export function ActiveConnectionCard({
         }
       }
     } catch { /* ignore corrupted data */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [connection.connectionId])
 
   useEffect(() => {
@@ -2052,7 +2052,7 @@ export function ActiveConnectionCard({
                     )}
                   </div>
                 )}
-                
+
                 {progression?.error && (
                   <p className="text-[11px] text-red-500 font-medium truncate">
                     {progression.error}

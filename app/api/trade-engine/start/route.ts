@@ -108,6 +108,41 @@ export async function POST(request: NextRequest) {
       console.warn("[v0] [Trade Engine] Coordinator worker startup warning:", engineStartError)
     }
 
+    // Sync is_enabled_dashboard + is_active_inserted flags for all connections whose
+    // engines are currently running. These flags may be stale ("0") if the engine was
+    // started by a path that bypassed toggle-dashboard (e.g. startMissingEngines on
+    // auto-restart). Without this sync the connections API always shows "Enabled: none".
+    try {
+      const { getAllConnections, updateConnection: updateConn } = await import("@/lib/redis-db")
+      const runningIds: Set<string> = new Set()
+      // The coordinator is stored at globalThis.__tradeEngineCoordinator and
+      // tracks running engines in its private `engineManagers` Map. Access it
+      // through the globalThis singleton so we always hit the live instance.
+      const liveCoord: any =
+        (globalThis as any).__tradeEngineCoordinator ?? coordinator
+      const engines: Map<string, unknown> =
+        liveCoord?.engineManagers ??
+        (coordinator as any).engineManagers ??
+        new Map()
+      for (const [connId] of engines) runningIds.add(String(connId))
+      console.log(`[v0] [Trade Engine] Flag sync: found ${runningIds.size} running engine(s): ${[...runningIds].join(", ")}`)
+      if (runningIds.size > 0) {
+        const allConns = await getAllConnections()
+        for (const conn of allConns) {
+          if (!runningIds.has(conn.id)) continue
+          const needsUpdate =
+            conn.is_enabled_dashboard !== "1" && conn.is_enabled_dashboard !== true ||
+            conn.is_active_inserted !== "1" && conn.is_active_inserted !== true
+          if (needsUpdate) {
+            await updateConn(conn.id, { is_enabled_dashboard: "1", is_active_inserted: "1" })
+            console.log(`[v0] [Trade Engine] Synced is_enabled_dashboard=1 for running engine: ${conn.id}`)
+          }
+        }
+      }
+    } catch (flagSyncErr) {
+      console.warn("[v0] [Trade Engine] Flag sync warning:", flagSyncErr instanceof Error ? flagSyncErr.message : flagSyncErr)
+    }
+
     // Auto-resume connections AND enable ALL assigned main connections
     let resumedConnections: string[] = []
     let startedConnections: string[] = []

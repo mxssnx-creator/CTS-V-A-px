@@ -224,8 +224,13 @@ export class InlineLocalRedis {
     // "ownership loss" crashes. Check the global flag published by the
     // trade-engine coordinator; if ANY engine is active, skip the reload.
     const globalCtx = globalThis as any
-    if (globalCtx.__engine_manager_instance?.isEngineRunning) {
-      console.log(`[v0] [Redis] Snapshot reload skipped: engine running in this process`)
+    const coordinator = globalCtx.__tradeEngineCoordinator
+    const coordinatorHasEngines =
+      coordinator &&
+      typeof coordinator.getActiveEngineCount === "function" &&
+      Number(coordinator.getActiveEngineCount()) > 0
+    if (globalCtx.__engine_manager_instance?.isEngineRunning || coordinatorHasEngines) {
+      console.log(`[v0] [Redis] Snapshot reload skipped: engine/coordinator running in this process`)
       return false
     }
 
@@ -390,23 +395,157 @@ export class InlineLocalRedis {
     globalCleanup.__redis_cleanup_started = true
 
     // Fire FREQUENTLY: with 20 symbols live-trading the pipeline writes ~20x
-    // more keys per second than a 5-symbol run. 4s catches bursts before they
-    // compound across multiple intervals.
-    const CLEANUP_INTERVAL_MS = 4_000
-    // Trigger eviction at 1200 MB — well below the 4 GB V8 ceiling. With 20
-    // symbols the heap can jump ~400 MB in a single realtime cycle; we need
-    // to start shedding before the jump, not after.
-    const HEAP_PRESSURE_MB = 1200
+    // more keys per second than a 5-symbol run. 2s catches bursts before they
+    // compound across multiple intervals. The handler is cheap (~ms) when
+    // heap is below threshold so the extra polling is negligible.
+    const CLEANUP_INTERVAL_MS = 2_000
+    // Trigger eviction at 800 MB heapUsed.  Real Redis clients run off-heap;
+    // 800 MB is generous for the InlineLocalRedis emulator in dev while still
+    // leaving enough room before the 4 GB V8 ceiling (--max-old-space-size=4096).
+    const HEAP_PRESSURE_MB = 800
 
-    // Run one immediate eviction pass at startup to clear any stale keys left
-    // from previous hot-reload cycles (the globalThis Map persists across
-    // Next.js module hot-reloads without a full process restart).
+    // Run an immediate targeted flush at startup to clear volatile key families
+    // that accumulate across hot-reload cycles (the globalThis Map persists
+    // between Next.js hot-reloads without a full process restart). This runs
+    // UNCONDITIONALLY in dev — even if totalKeys is low — because the OOM-
+    // causing families (strategies: lists, indication: strings, pseudo_position:
+    // hashes) can hold 20+ MB each while only occupying a few hundred key slots.
     setTimeout(() => {
       try {
+        if (process.env.NODE_ENV === "development") {
+          let flushed = 0
+
+          // 1. strategies:{conn}:{symbol}:* — per-cycle set blobs (real:sets,
+          //    base:sets, main:sets) and fp:v2 fingerprint caches. Written by
+          //    strategy-coordinator.ts on every realtime cycle; dev bypasses
+          //    are throttled (every 50th cycle) or gated on NODE_ENV, but stale
+          //    keys from prior hot-reload cycles remain in the Map.
+          //    Also covers lpush lists from strategy-evaluator.ts (storeStrategyResult
+          //    now returns early in dev, but pre-bypass runs left stale list keys).
+          for (const key of this.data.lists.keys()) {
+            if (key.startsWith("strategies:")) { this.data.lists.delete(key); flushed++ }
+          }
+          for (const key of this.data.hashes.keys()) {
+            if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
+              this.data.hashes.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.strings.keys()) {
+            if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
+              this.data.strings.delete(key); flushed++
+            }
+          }
+
+          // 2. indication:{conn}:{symbol} — per-symbol indication strings/hashes
+          //    (200 keys × ~3 KB each = 0.6 MB). Written every indication cycle;
+          //    stale copies from hot-reload cycles remain.
+          for (const key of this.data.strings.keys()) {
+            if (key.startsWith("indication:") || key.startsWith("indications:")) {
+              this.data.strings.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.hashes.keys()) {
+            if (key.startsWith("indication:") || key.startsWith("indications:")) {
+              this.data.hashes.delete(key); flushed++
+            }
+          }
+
+          // 2b. prehistoric cache-gate + progress-tracker keys only.
+          //
+          // The engine uses TWO separate keys to decide whether to re-run prehistoric:
+          //   a) `prehistoric_loaded:{conn}` (plain string "1") — the 24-h cache gate
+          //      in engine-manager.ts. If this key survives a sandbox reset / full-DB
+          //      wipe the engine skips the entire ConfigSetProcessor pass and stamps
+          //      fake completion fields with 0 candles/indicators. Wipe it so every
+          //      fresh-DB session re-runs prehistoric from scratch.
+          //   b) `prehistoric:progress:{conn}` — the PrehistoricProgressTracker hash.
+          //      Stale from prior session; wipe so the UI progress bar resets cleanly.
+          //
+          // DO NOT wipe:
+          //   - `prehistoric:{conn}` hash (is_complete, symbols_processed, etc.) —
+          //     the stats route reads this; wiping causes candlesLoaded=0 forever.
+          //   - `progression:{conn}` hash (placed_count, filled_count, cycle counters)
+          //     — live counters that must survive hot-reloads.
+          //   - `strategies_active:{conn}` — written by coordinator each cycle.
+          //   - `pi_history:*` — written by ConfigSetProcessor; must survive.
+          for (const key of this.data.strings.keys()) {
+            if (key.startsWith("prehistoric_loaded:")) {
+              this.data.strings.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.hashes.keys()) {
+            if (key.startsWith("prehistoric:progress:")) {
+              this.data.hashes.delete(key); flushed++
+            }
+          }
+
+          // 3. pseudo_position:{conn}:{id} + pseudo_positions:{conn} set —
+          //    createPseudoPositionsFromRealSets() bypassed in dev but prior runs
+          //    left 400 position hashes (0.6 MB) + membership sets.
+          for (const key of this.data.hashes.keys()) {
+            if (key.startsWith("pseudo_position:") || key.startsWith("settings:pseudo_position")) {
+              this.data.hashes.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.strings.keys()) {
+            if (key.startsWith("pseudo_position:") || key.startsWith("settings:pseudo_position")) {
+              this.data.strings.delete(key); flushed++
+            }
+          }
+          for (const key of this.data.sets.keys()) {
+            if (key.startsWith("pseudo_positions:") || key.startsWith("real_pseudo_positions:")) {
+              this.data.sets.delete(key); flushed++
+            }
+          }
+
+          // 4. live:position:{id} hashes + live:positions:{conn} lists —
+          //    In dev, live positions are real BingX orders whose orderId/SL/TP
+          //    are valid only for the session that placed them.  On hot-reload
+          //    the in-memory InlineLocalRedis is fresh but the persisted dev DB
+          //    still holds the old position hashes.  The reconcile loop then
+          //    issues exchange API calls for each stale position (×44 = 44 API
+          //    calls on startup), blowing ~200-400 MB and sometimes triggering
+          //    OOM before prehistoric can complete.  Wipe them unconditionally
+          //    on dev startup so each session begins with a clean slate.
+          //    NOTE: setSettings("live:position:…") prepends "settings:" so we
+          //    must clear both "live:position:*" AND "settings:live:position:*".
+          for (const key of this.data.hashes.keys()) {
+            if (
+              key.startsWith("live:position:") ||
+              key.startsWith("settings:live:position:")
+            ) { this.data.hashes.delete(key); flushed++ }
+          }
+          for (const key of this.data.lists.keys()) {
+            if (
+              key.startsWith("live:positions:") ||
+              key.startsWith("settings:live:positions:")
+            ) { this.data.lists.delete(key); flushed++ }
+          }
+          for (const key of this.data.strings.keys()) {
+            if (
+              key.startsWith("live:positions:") ||
+              key.startsWith("live:position:")  ||
+              key.startsWith("settings:live:position:") ||
+              key.startsWith("settings:live:positions:")
+            ) { this.data.strings.delete(key); flushed++ }
+          }
+          for (const key of this.data.sets.keys()) {
+            if (
+              key.startsWith("live:positions:") ||
+              key.startsWith("settings:live:positions:")
+            ) { this.data.sets.delete(key); flushed++ }
+          }
+
+          if (flushed > 0) {
+            console.log(`[v0] [Redis Memory] Dev startup flush: cleared ${flushed} stale volatile keys`)
+          }
+        }
+
+        // Full eviction pass for remaining pressure (covers non-dev or larger leftovers).
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         if (totalKeys > 5_000) {
-          console.log(`[v0] [Redis Memory] Startup: ${totalKeys} stale keys from hot-reload, evicting...`)
+          console.log(`[v0] [Redis Memory] Startup: ${totalKeys} stale keys after flush, evicting...`)
           this.evictOldRecords()
           ;(globalThis as any).gc?.()
           const after = this.data.strings.size + this.data.hashes.size +
@@ -421,19 +560,26 @@ export class InlineLocalRedis {
         // First, clean up expired keys
         this.cleanupExpiredKeys()
 
-        // Check memory pressure: evict if EITHER heap OR total key count is too high.
-        // RSS can be 5x higher than heapUsed due to external buffers and code segments,
-        // so we guard on key count as a proxy for RSS growth even when heapUsed is low.
-        // 20 symbols × 1000 real sets + 20 symbols × overhead = ~30K keys needed;
-        // 20000 cap adds a 33% buffer while preventing the 84K+ unbounded accumulation
-        // that causes OOM at ~5 GB RSS on the 8 GB VM.
-        const heapUsedMB = (process.memoryUsage?.().heapUsed || 0) / 1024 / 1024
+        // Check memory pressure: evict if heap, RSS, or key count is too high.
+        // heapUsed alone is insufficient — after a heavy live-trading session the GC
+        // reduces heapUsed to ~600 MB (below the 800 MB trigger) while RSS stays at
+        // 4+ GB because V8 holds committed pages for future allocation. RSS is a better
+        // proxy for true process-level memory pressure, especially on the 6 GB VM where
+        // total system RAM (RSS_all_processes) matters more than individual heap metrics.
+        const mem = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
+        const heapUsedMB = mem.heapUsed / 1024 / 1024
+        const rssMB      = mem.rss      / 1024 / 1024
+        // RSS trigger: evict when process RSS exceeds 3 GB (leaves 3 GB+ for OS/other).
+        // heapUsed trigger: evict when V8 heap exceeds 800 MB.
+        const RSS_PRESSURE_MB = 3_000
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        const MAX_TOTAL_KEYS = 20_000
-        const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
+        const MAX_TOTAL_KEYS = 8_000
+        const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || rssMB > RSS_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
         if (shouldEvict) {
-          if (heapUsedMB > HEAP_PRESSURE_MB) {
+          if (rssMB > RSS_PRESSURE_MB) {
+            console.log(`[v0] [Redis Memory] RSS at ${rssMB.toFixed(0)}MB (>${RSS_PRESSURE_MB}MB), evicting old records...`)
+          } else if (heapUsedMB > HEAP_PRESSURE_MB) {
             console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
           } else {
             console.log(`[v0] [Redis Memory] Key count at ${totalKeys} (>${MAX_TOTAL_KEYS}), evicting old records...`)
@@ -524,6 +670,10 @@ export class InlineLocalRedis {
       if (k.startsWith("live:position:"))    return true  // open/closed live positions
       if (k.startsWith("live:positions:"))   return true  // open/closed index LISTs
       if (k.startsWith("progression:"))      return true  // progression counters
+      if (/^prehistoric:[^:]+$/.test(k))     return true  // prehistoric summary hash for stats
+      if (/^prehistoric:[^:]+:symbols$/.test(k)) return true  // processed-symbol denominator set
+      if (/^prehistoric:[^:]+:done$/.test(k)) return true  // realtime gate marker
+      if (/^prehistoric:[^:]+:firstpass:done$/.test(k)) return true  // first-pass gate
       if (k.startsWith("connection:"))       return true  // exchange credentials
       if (k.startsWith("strategy_count:"))   return true  // strategy count totals
       if (k.startsWith("real_pi_acc:"))      return true  // real PI accumulation
@@ -533,6 +683,11 @@ export class InlineLocalRedis {
       if (k.startsWith("_migration"))        return true  // migration markers
       if (k.startsWith("_schema_version"))   return true  // schema version
       if (k.startsWith("market_data:"))      return true  // candle blobs (separate cap)
+      // strategies:{conn}:live:count — single small key used for dashboard display;
+      // written once per cycle (not per symbol) and must survive the strategies:* cap.
+      if (/^strategies:[^:]+:live:count$/.test(k)) return true
+      // strategies:{conn}:*:total — per-stage set counts for the dashboard.
+      if (/^strategies:[^:]+:[^:]+:total$/.test(k)) return true
       // Protect genuine operator settings but NOT transient pipeline families.
       // settings:pseudo_position* and settings:strategies* are written every
       // realtime cycle and must be subject to FIFO caps.
@@ -545,123 +700,129 @@ export class InlineLocalRedis {
       return false
     }
 
-    // 1) Hash families that grow per-cycle. Keep only the newest CAP entries
-    //    of each family (FIFO — Map preserves insertion order, so the first
-    //    entries are the oldest). config_set/pseudo_position carry a trailing
-    //    `-<nowMs>` or timestamp component, so insertion order ≈ chronological.
-    // Caps are sized for 20-symbol live trading on a 6 GB dev heap.
-    // Each cap was halved vs the 5-symbol tuning (2025-06-12) because the
-    // per-cycle write rate scales linearly with symbol count.
-    const hashFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
-      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 2000 },
-      // setSettings() prepends "settings:" so pseudo_position keys written via
-      // setSettings land as "settings:pseudo_position:*" — cap those separately.
-      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 1500 },
-      // settings:strategies:* — base:sets / real:sets blobs (main:sets skipped in dev).
-      // 80 keys × ~250KB each = 20 MB; keep only the newest 20 per connection.
-      { match: (k) => !isProtected(k) && k.startsWith("settings:strategies"), cap: 20 },
-      // strategies:{conn}:* — all sub-keys under a connection's strategy family,
-      // including stage/symbol evaluator hashes. 58 keys × ~345KB = 20 MB.
-      // These keys start with "strategies:" but NOT "settings:strategies:".
-      { match: (k) => !isProtected(k) && k.startsWith("strategies:") && !k.startsWith("strategies:all") && !k.startsWith("strategies:counter") && !k.startsWith("strategies:metadata"), cap: 100 },
-      { match: (k) => !isProtected(k) && (k.startsWith("config_set:") || k.includes(":config_set:")), cap: 1500 },
-      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":positions"), cap: 1000 },
-      { match: (k) => !isProtected(k) && k.startsWith("strategy:") && k.includes(":detail"), cap: 1000 },
-      { match: (k) => !isProtected(k) && (k.startsWith("real_stage:") || k.startsWith("realstage:")), cap: 1000 },
-      { match: (k) => !isProtected(k) && k.startsWith("indication:") && k.includes(":result"), cap: 1500 },
-      // indication:{conn}:* — per-cycle indication hashes, 200 keys per connection.
-      { match: (k) => !isProtected(k) && k.startsWith("indication:") && !k.includes(":result"), cap: 100 },
-      // prehistoric:{conn}:* — historical candle/indication replay state.
-      { match: (k) => !isProtected(k) && k.startsWith("prehistoric:"), cap: 30 },
-      { match: (k) => !isProtected(k) && k.startsWith("live_positions:") && k.includes(":history"), cap: 500 },
-    ]
-    for (const { match, cap } of hashFamilyCaps) {
-      const matching: string[] = []
-      for (const [key] of this.data.hashes.entries()) {
-        if (match(key)) matching.push(key)
-      }
-      if (matching.length > cap) {
-        // Drop the oldest (front of insertion order) down to the cap.
-        const dropCount = matching.length - cap
-        for (let i = 0; i < dropCount; i++) {
-          this.deleteKey(matching[i])
-          evicted++
-        }
-      }
+    // ── Single-pass categorisation ────────────────────────────────────────────
+    // The previous multi-pass approach iterated all keys once per family rule
+    // (13 hash rules + 9 string rules + 1 candle rule + 1 list rule = 24 passes).
+    // At 8000 keys that was 192,000 startsWith() comparisons per eviction run,
+    // every 2 seconds. The new approach iterates each store ONCE and categorises
+    // into named buckets in-place using early-exit prefix switching — O(N) total
+    // with ~8× fewer comparisons per key (average 3 prefix checks vs 24).
+    //
+    // Bucket names mirror the old family rules, so the cap values are unchanged.
+    const isDev = process.env.NODE_ENV === "development"
+
+    // Caps indexed by bucket name (shared between hash and string passes)
+    const CAPS: Record<string, number> = {
+      pseudo_position:     isDev ? 0 : 2000,
+      s_pseudo_position:   isDev ? 0 : 1500,  // settings:pseudo_position
+      strategies:          isDev ? 0 : 100,
+      s_strategies:        isDev ? 5 : 20,    // settings:strategies
+      config_set:          isDev ? 200 : 1500,
+      strategy_positions:  isDev ? 100 : 1000,
+      strategy_detail:     isDev ? 100 : 1000,
+      real_stage:          isDev ? 100 : 1000,
+      indication:          isDev ? 0 : 500,
+      indications:         isDev ? 0 : 100,
+      prehistoric:         20,
+      live_history:        isDev ? 100 : 500,
+      // string-only
+      indications_str:     isDev ? 0 : 50,
+      dedup:               isDev ? 500 : 3000,
+      candle_cache:        20,
+      candles:             20,
     }
 
-    // 2) String families (setSettings can store flat JSON as strings too).
-    const stringFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
-      { match: (k) => !isProtected(k) && k.startsWith("pseudo_position:"), cap: 2000 },
-      { match: (k) => !isProtected(k) && k.startsWith("settings:pseudo_position"), cap: 1500 },
-      { match: (k) => !isProtected(k) && k.startsWith("settings:strategies"), cap: 20 },
-      { match: (k) => !isProtected(k) && (k.includes(":exists:") || k.includes(":dedup:")), cap: 3000 },
-      { match: (k) => !isProtected(k) && k.startsWith("strategy_detail:"), cap: 1000 },
-      { match: (k) => !isProtected(k) && (k.startsWith("candle_cache:") || k.startsWith("market_data_cache:")), cap: 30 },
-    ]
-    for (const { match, cap } of stringFamilyCaps) {
-      const matching: string[] = []
-      for (const [key] of this.data.strings.entries()) {
-        if (match(key)) matching.push(key)
+    // Classify a key into a bucket name; returns null for protected/untracked keys.
+    // The switch-ladder uses fast prefix tests ordered by probability of hit —
+    // high-frequency pipeline keys first, protected-class checks last.
+    const classify = (k: string): string | null => {
+      if (isProtected(k)) return null
+      // Transient pipeline families (highest write frequency)
+      if (k.startsWith("pseudo_position:"))     return "pseudo_position"
+      if (k.startsWith("settings:pseudo_position")) return "s_pseudo_position"
+      if (k.startsWith("settings:strategies"))  return "s_strategies"
+      if (k.startsWith("strategies:")) {
+        if (k.startsWith("strategies:all") ||
+            k.startsWith("strategies:counter") ||
+            k.startsWith("strategies:metadata")) return null
+        return "strategies"
       }
-      if (matching.length > cap) {
-        const dropCount = matching.length - cap
-        for (let i = 0; i < dropCount; i++) {
-          this.deleteKey(matching[i])
-          evicted++
-        }
+      if (k.startsWith("indication:"))          return "indication"
+      if (k.startsWith("indications:"))         return "indications"
+      if (k.startsWith("config_set:") ||
+          k.includes(":config_set:"))            return "config_set"
+      if (k.startsWith("strategy:")) {
+        if (k.includes(":positions"))            return "strategy_positions"
+        if (k.includes(":detail"))               return "strategy_detail"
+        return null
       }
+      if (k.startsWith("real_stage:") ||
+          k.startsWith("realstage:"))            return "real_stage"
+      if (k.startsWith("prehistoric:"))          return "prehistoric"
+      if (k.startsWith("live_positions:") &&
+          k.includes(":history"))                return "live_history"
+      if (k.startsWith("strategy_detail:"))      return "strategy_detail"
+      if (k.startsWith("candle_cache:") ||
+          k.startsWith("market_data_cache:"))    return "candle_cache"
+      if (k.startsWith("market_data:") &&
+          k.endsWith(":candles"))                return "candles"
+      if (k.includes(":exists:") ||
+          k.includes(":dedup:"))                 return "dedup"
+      return null
     }
 
-    // 3) Candle blobs — large (~10MB each); keep a small number around.
+    // Helper: trim a bucket array to its cap and evict.
+    const trimBucket = (bucket: string[], cap: number): number => {
+      if (bucket.length <= cap) return 0
+      const drop = bucket.length - cap
+      for (let i = 0; i < drop; i++) this.deleteKey(bucket[i])
+      return drop
+    }
+
+    // ── HASH single-pass ──────────────────────────────────────────────────
+    const hashBuckets = new Map<string, string[]>()
+    for (const [key] of this.data.hashes.entries()) {
+      const bucket = classify(key)
+      if (bucket === null) continue
+      let arr = hashBuckets.get(bucket)
+      if (!arr) { arr = []; hashBuckets.set(bucket, arr) }
+      arr.push(key)
+    }
+    for (const [bucket, keys] of hashBuckets) {
+      const cap = CAPS[bucket] ?? 0
+      evicted += trimBucket(keys, cap)
+    }
+
+    // ── STRING single-pass ────────────────────────────────────────────────
+    // indications:* string blobs get a lower string cap (vs hash cap) since
+    // the blob format is larger than the hash representation.
+    const strBuckets = new Map<string, string[]>()
+    for (const [key] of this.data.strings.entries()) {
+      const bucket = classify(key)
+      if (bucket === null) continue
+      // String-specific override for indications: lower cap.
+      const strBucket = bucket === "indications" ? "indications_str" : bucket
+      let arr = strBuckets.get(strBucket)
+      if (!arr) { arr = []; strBuckets.set(strBucket, arr) }
+      arr.push(key)
+    }
+    for (const [bucket, keys] of strBuckets) {
+      const cap = CAPS[bucket] ?? 0
+      evicted += trimBucket(keys, cap)
+    }
+
+    // ── LIST single-pass ───────────────────────────────────────────────────
+    // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
-      const candleKeys: string[] = []
-      for (const [key] of this.data.strings.entries()) {
-        if (key.startsWith("market_data:") && key.endsWith(":candles")) candleKeys.push(key)
+      const listCap = isDev ? 0 : 50
+      const listKeys: string[] = []
+      for (const [key] of this.data.lists.entries()) {
+        if (!isProtected(key) && key.startsWith("strategies:")) listKeys.push(key)
       }
-      // Candles are static per session; never need more than the active symbol
-      // set. 20 is generous and prevents stale reload duplicates lingering.
-      const CANDLE_CAP = 20
-      if (candleKeys.length > CANDLE_CAP) {
-        const dropCount = candleKeys.length - CANDLE_CAP
-        for (let i = 0; i < dropCount; i++) {
-          this.deleteKey(candleKeys[i])
-          evicted++
-        }
-      }
+      evicted += trimBucket(listKeys, listCap)
     }
 
-    // 4b) List families — lpush/ltrim style lists that can grow unboundedly.
-    //     The strategy-evaluator writes per-symbol/stage StrategyResult lists;
-    //     even with ltrim(0,499) the 20-symbol × 500-item × ~2KB = 20 MB total
-    //     makes this the largest single family. Cap these lists in the eviction
-    //     by deleting the key entirely when it holds more items than needed —
-    //     the ltrim built into storeStrategyResult keeps the in-flight list
-    //     bounded, but stale keys from prior sessions grow without bound.
-    {
-      const listFamilyCaps: Array<{ prefix: string; cap: number }> = [
-        // strategies:{conn}:{symbol|stage} — StrategyResult lists written by
-        // strategy-evaluator.ts. 20 symbols × 500 items × 2 KB = 20 MB.
-        // Keep at most 50 total across the family (legacy; not used by pipeline).
-        { prefix: "strategies:", cap: 50 },
-      ]
-      for (const { prefix, cap } of listFamilyCaps) {
-        const matching: string[] = []
-        for (const [key] of this.data.lists.entries()) {
-          if (!isProtected(key) && key.startsWith(prefix)) matching.push(key)
-        }
-        if (matching.length > cap) {
-          const dropCount = matching.length - cap
-          for (let i = 0; i < dropCount; i++) {
-            this.deleteKey(matching[i])
-            evicted++
-          }
-        }
-      }
-    }
-
-    // 5) Prune oversized membership sets so smembers() can't materialise huge
-    //    arrays. These hold pseudo-position ids; trim to the newest entries.
+    // ── Membership sets — prune oversized pseudo-position id sets ─────────
     const SET_MEMBER_CAP = 4000
     for (const [key, members] of this.data.sets.entries()) {
       if (
@@ -669,14 +830,13 @@ export class InlineLocalRedis {
         members.size > SET_MEMBER_CAP
       ) {
         const arr = Array.from(members)
-        // Sets also preserve insertion order; keep the newest SET_MEMBER_CAP.
         const keep = new Set(arr.slice(arr.length - SET_MEMBER_CAP))
         this.data.sets.set(key, keep)
         evicted += arr.length - keep.size
       }
     }
 
-    if (evicted > 0) {
+    if (evicted > 10) {
       console.log(`[v0] [Redis Memory] Evicted ${evicted} old records to reduce memory pressure`)
     }
     return evicted
@@ -1391,6 +1551,17 @@ let coreInitialized = false      // core ready: client constructed + snapshot lo
 let connectionsInitialized = false
 let migrationsRan = false
 
+function isNextBuildPhase(): boolean {
+  const lifecycle = process.env.npm_lifecycle_event || ""
+  const argv = process.argv.join(" ")
+  return (
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    lifecycle === "build" ||
+    lifecycle === "vercel-build" ||
+    /\bnext(\.js)?\s+build\b/.test(argv)
+  )
+}
+
 /**
  * Ensure the CORE Redis client is ready: instance constructed, on-disk
  * snapshot loaded, and ping verified. This deliberately does NOT run
@@ -1461,7 +1632,82 @@ export async function ensureCoreRedis(): Promise<void> {
  * this, and every server action / route guards on it via ensureRedisInitialized.
  */
 export async function initRedis(): Promise<void> {
+  // Build/deploy builders import route modules while collecting page data.
+  // Runtime Redis hydration/migrations are not needed for static analysis and
+  // can exceed hosted builder deadlines (kilo.ai). Provide an empty, connected
+  // in-memory client for build-time reads and defer real migrations to runtime.
+  if (isNextBuildPhase()) {
+    if (!redisInstance) redisInstance = new InlineLocalRedis()
+    isConnected = true
+    coreInitialized = true
+    connectionsInitialized = true
+    migrationsRan = true
+    globalForRedis.__redis_snapshot_loaded = true
+    globalForRedis.__redis_fully_connected = true
+    return
+  }
+
+  // Next.js dev can re-evaluate this module for a newly compiled route while
+  // keeping the InlineLocalRedis data on globalThis. In that case the
+  // module-scoped `isConnected` / `migrationsRan` flags reset to false even
+  // though another module instance has already completed core init +
+  // migrations. Honour the global ready marker so route compilation does not
+  // re-run all migrations and overwrite operator-saved state (symbols,
+  // connection mode, progression snapshots) back to migration defaults.
+  if (globalForRedis.__redis_fully_connected) {
+    isConnected = true
+    coreInitialized = true
+    connectionsInitialized = true
+    migrationsRan = true
+    return
+  }
   if (isConnected) return
+
+  // DEV ONLY — flush stale live positions on every initRedis() call.
+  //
+  // The InlineLocalRedis instance lives on globalThis.__redis_data and is
+  // reused across Next.js hot-reloads (the constructor only fires once per
+  // process). Each hot-reload resets module-level `isConnected` to false and
+  // calls initRedis() again — but __redis_init_promise is still set, so the
+  // async IIFE below is skipped.  We must flush HERE, before the promise guard,
+  // so stale live:position:* keys (44 from the previous session) and dedup
+  // locks don't carry over and silently block all new live order placement.
+  //
+  // A __redis_live_flush_token prevents double-clearing within a single module
+  // evaluation cycle (e.g. if two routes call initRedis() concurrently).
+  if (process.env.NODE_ENV === "development") {
+    const token = Date.now()
+    const g = globalForRedis as any
+    if (!g.__redis_live_flush_token || g.__redis_live_flush_token !== g.__redis_live_flush_applied) {
+      g.__redis_live_flush_applied = token
+      g.__redis_live_flush_token  = token
+      try {
+        const data = g.__redis_data as typeof globalForRedis.__redis_data | undefined
+        if (data) {
+          let cleared = 0
+          const isLiveKey = (k: string) =>
+            k.startsWith("live:position:") ||
+            k.startsWith("live:positions:") ||
+            k.startsWith("settings:live:position:") ||
+            k.startsWith("settings:live:positions:") ||
+            k.startsWith("live:lock:")
+          for (const key of data.strings.keys()) {
+            if (isLiveKey(key)) { data.strings.delete(key); cleared++ }
+          }
+          for (const key of data.lists.keys()) {
+            if (isLiveKey(key)) { data.lists.delete(key); cleared++ }
+          }
+          for (const key of data.hashes.keys()) {
+            if (isLiveKey(key)) { data.hashes.delete(key); cleared++ }
+          }
+          if (cleared > 0) {
+            console.log(`[v0] [Redis] Dev initRedis flush: cleared ${cleared} stale live position/lock keys`)
+          }
+        }
+      } catch { /* non-fatal */ }
+    }
+  }
+
   if (globalForRedis.__redis_init_promise) return globalForRedis.__redis_init_promise
 
   globalForRedis.__redis_init_promise = (async () => {
@@ -1651,7 +1897,7 @@ export async function getConnection(id: string): Promise<any | null> {
 // ops per poll per component. A short TTL (1.5s) dedupes bursts without
 // introducing user-visible staleness (all writes invalidate the cache
 // immediately via `invalidateConnectionsCache()`).
-// ────────────────────────────────────�����───────────────────────────────────────
+// ────────────────────────────────────�������──────────────────��───────────────────
 const __CONN_CACHE_TTL_MS = 1500
 let __connCache: { at: number; value: any[] } | null = null
 let __connInflight: Promise<any[]> | null = null
@@ -1769,6 +2015,17 @@ export async function setSettings(key: string, value: any): Promise<void> {
   await client.hset(`settings:${key}`, data)
 }
 
+export async function persistNow(): Promise<boolean> {
+  const client = getClient()
+  if (typeof (client as any).persistNow === "function") {
+    return (client as any).persistNow()
+  }
+  if (typeof (client as any).saveToDisk === "function") {
+    return (client as any).saveToDisk()
+  }
+  return false
+}
+
 export async function getAllSettings(): Promise<Record<string, any>> {
   await initRedis()
   const client = getClient()
@@ -1790,7 +2047,7 @@ export async function getAllSettings(): Promise<Record<string, any>> {
   return settings
 }
 
-// ─────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────��─────────────────────────────
 // Canonical app-settings helpers
 //
 // The project historically drifted between two Redis hashes:
@@ -2675,48 +2932,49 @@ export async function storeIndications(connectionId: string, symbol: string, ind
   const mainKey = `indications:${connectionId}`
   
   try {
-    // Read existing indications
+    // Stamp new indications with metadata.
+    const ts = new Date().toISOString()
+    const newIndications = indications.map(ind => ({
+      ...ind,
+      symbol,
+      connectionId,
+      timestamp: ts,
+      configSet: getConfigurationSet(ind.type, ind.value),
+    }))
+
+    // ── Main key: read → append → trim → write ───────────────────────────
     const existingRaw = await client.get(mainKey)
     let existing: any[] = []
     if (existingRaw) {
       try {
         existing = JSON.parse(typeof existingRaw === "string" ? existingRaw : JSON.stringify(existingRaw))
         if (!Array.isArray(existing)) existing = []
-      } catch {
-        existing = []
-      }
+      } catch { existing = [] }
     }
-    
-    // Add new indications with metadata for per-config tracking
-    const newIndications = indications.map(ind => ({
-      ...ind,
-      symbol,
-      connectionId,
-      timestamp: new Date().toISOString(),
-      configSet: getConfigurationSet(ind.type, ind.value), // Track which config set this belongs to
-    }))
-    
     existing.push(...newIndications)
-    
-    // Keep only latest 2500 indications per connection (250 per symbol × 10 symbols typical)
-    if (existing.length > 2500) {
-      existing = existing.slice(-2500)
+    // Keep latest 2500 (250 per symbol × 10 symbols typical)
+    if (existing.length > 2500) existing = existing.slice(-2500)
+
+    // ── Per-type keys: group by type in ONE O(N) pass, NOT O(N²) ─────────
+    // The previous implementation called `indications.filter(i => i.type === ind.type)`
+    // inside a `for (const ind of indications)` loop — O(N²). For a batch of N
+    // indications that happens P times per second this is N × P string comparisons/s.
+    // Group once into a Map<type, indication[]> so each type key is written once.
+    const byType = new Map<string, any[]>()
+    for (const ind of newIndications) {
+      const t = ind.type as string
+      let bucket = byType.get(t)
+      if (!bucket) { bucket = []; byType.set(t, bucket) }
+      bucket.push(ind)
     }
-    
-    // Save to main key with 1-hour TTL
-    await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
-    
-    // Also maintain per-type independent sets for high-frequency lookups.
-    // Note: iterating once over unique types would be slightly more efficient,
-    // but `indications` is always a small batch (<=10), so the clarity of a
-    // per-indication pass is preferred.
-    for (const ind of indications) {
-      const typeKey = `indications:${connectionId}:${ind.type}`
-      const typeIndications = indications.filter(i => i.type === ind.type)
-      if (typeIndications.length > 0) {
-        await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
-      }
-    }
+
+    // Fan out all writes in parallel — single await instead of sequential loop.
+    await Promise.all([
+      client.set(mainKey, JSON.stringify(existing), { EX: 3600 } as any),
+      ...Array.from(byType.entries()).map(([type, typeInds]) =>
+        client.set(`indications:${connectionId}:${type}`, JSON.stringify(typeInds), { EX: 3600 } as any)
+      ),
+    ])
   } catch (error) {
     console.error(`[v0] Error storing indications for ${connectionId}:`, error)
   }
@@ -3108,4 +3366,3 @@ export async function softResetWithCoordinationPreserved(): Promise<{
     buckets,
   }
 }
-

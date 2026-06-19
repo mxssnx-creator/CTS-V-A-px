@@ -183,7 +183,7 @@ export function QuickstartOptionsBar() {
   const [loading, setLoading] = useState(false)
   const [controlOrders, setControlOrders] = useState(true)
   const [pfMin, setPfMin] = useState<ProfitFactorMin>(DEFAULT_PF_MIN)
-  const [volumeFactor, setVolumeFactor] = useState<number>(0.1)
+  const [volumeFactor, setVolumeFactor] = useState<number>(1.0)
   const [blockEnabled, setBlockEnabled] = useState(true)
   const [dcaEnabled, setDcaEnabled] = useState(false)
   // Trailing-stop master variant gate. Engine-side default is also true

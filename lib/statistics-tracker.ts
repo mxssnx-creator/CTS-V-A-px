@@ -31,6 +31,11 @@ export async function trackIndicationStats(
   // Processors (engine-manager, config-set-processor) already write aggregate
   // counts to progression:{connectionId}:indications_count on their cycle completion.
   // Tracking per-indication here would double-count (statement-level vs. aggregate-level).
+  //
+  // DEV-MODE BYPASS — must be before any client calls (Promise construction fires
+  // the write synchronously in InlineLocalRedis). 20 symbols × 4 types × 3 keys
+  // = 240 keys/cycle; skip entirely in dev (reads are non-critical for engine).
+  if (process.env.NODE_ENV === "development") return
   try {
     await initRedis()
     const client = getRedisClient()
@@ -75,6 +80,13 @@ export async function trackStrategyStats(
     console.warn(`[v0] [Stats] Failed to track strategy:`, e instanceof Error ? e.message : String(e))
   }
 
+  // DEV-MODE BYPASS: These per-strategy-type Redis writes (count, eval, passed,
+  // latest) are written per symbol × per strategy type × per cycle. At 20 symbols
+  // × 10 types × 5 keys each = 1000 new keys/cycle in the InlineLocalRedis Map.
+  // This is the primary source of the 58-key/20.1MB strategies:bingx-x01 family.
+  // IMPORTANT: the bypass must be BEFORE any client.incrby/set calls — Promise
+  // construction fires the write immediately in InlineLocalRedis (no lazy eval).
+  if (process.env.NODE_ENV === "development") return
   try {
     await initRedis()
     const client = getRedisClient()

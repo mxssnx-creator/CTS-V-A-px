@@ -252,12 +252,16 @@ export class GlobalTradeEngineCoordinator {
       // operator pressed Start, which is the explicit activation event.
       // Idempotent: repeated starts on an already-active connection are safe.
       try {
-        const { getRedisClient: _rc } = await import("@/lib/redis-db")
-        const _cl = _rc()
-        await _cl.hset(`connection:${connectionId}`, {
-          is_active_inserted:  "1",
-          is_active:           "1",
-          updated_at:          new Date().toISOString(),
+        // Use updateConnection (not raw hset) so the getAllConnections()
+        // 2-second in-memory cache is invalidated immediately. Without this,
+        // the connections API can serve stale is_enabled_dashboard="0" for up
+        // to 2 seconds after the engine starts, causing "Enabled dashboard: none"
+        // in every dashboard poll that hits within that window.
+        const { updateConnection: _uc } = await import("@/lib/redis-db")
+        await _uc(connectionId, {
+          is_active_inserted:   "1",
+          is_active:            "1",
+          is_enabled_dashboard: "1",
         })
       } catch { /* non-critical — dashboard can lag */ }
     } catch (err) {
@@ -732,6 +736,22 @@ export class GlobalTradeEngineCoordinator {
             
             await this.startEngine(connection.id, config)
             started++
+
+            // Mirror the enabled/inserted flags that toggle-dashboard writes so
+            // the connections API + system-stats-v3 show correct counts even
+            // when this code path (auto-restart after OOM) bypasses toggle-dashboard.
+            try {
+              const { updateConnection } = await import("@/lib/redis-db")
+              await updateConnection(connection.id, {
+                is_active_inserted: "1",
+                is_enabled_dashboard: "1",
+              })
+            } catch (flagErr) {
+              console.warn(
+                `[v0] [Coordinator] Could not update is_active_inserted for ${connection.id}:`,
+                flagErr instanceof Error ? flagErr.message : flagErr,
+              )
+            }
             
             await logProgressionEvent(connection.id, "engine_started", "info", "Main Trade Engine started for progression", {
               connectionId: connection.id,
