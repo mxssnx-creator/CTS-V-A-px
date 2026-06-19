@@ -27,6 +27,7 @@ import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
  *   ON while the Main engine is not yet running — in that case the engine is
  *   started so the new flag actually has an effect.
  */
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id: connectionId } = await params
   try {

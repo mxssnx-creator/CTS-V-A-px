@@ -8,6 +8,7 @@ import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { toRedisFlag } from "@/lib/boolean-utils"
 
+export const dynamic = "force-dynamic"
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }

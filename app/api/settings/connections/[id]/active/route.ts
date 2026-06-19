@@ -4,6 +4,7 @@ import { initRedis, getConnection, updateConnection } from "@/lib/redis-db"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 // POST - Add connection to active connections (set is_enabled_dashboard flag)
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

@@ -55,6 +55,7 @@ async function emitSettingsChanged(keyCount: number, changedKeys: string[]): Pro
   }
 }
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 function getDefaultSettings(): Record<string, any> {

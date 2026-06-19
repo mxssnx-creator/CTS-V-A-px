@@ -6,6 +6,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { ConnectionCoordinator } from "@/lib/connection-coordinator"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const coordinator = ConnectionCoordinator.getInstance()
