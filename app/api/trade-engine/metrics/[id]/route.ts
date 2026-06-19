@@ -6,6 +6,7 @@ import { getAllConnections, initRedis } from "@/lib/redis-db"
  * GET /api/trade-engine/metrics/[id]
  * Returns detailed engine performance metrics for a connection
  */
+export const dynamic = "force-dynamic"
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }

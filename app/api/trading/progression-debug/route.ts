@@ -5,6 +5,7 @@ import { getSettings } from "@/lib/redis-db"
  * Comprehensive engine progression status
  * Shows phase, cycles, and all relevant metrics
  */
+export const dynamic = "force-dynamic"
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url)

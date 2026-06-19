@@ -3,6 +3,7 @@ import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadConnections } from "@/lib/file-storage"
 import { SystemLogger } from "@/lib/system-logger"
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     console.log("[v0] Fetching all trade engine statuses")
