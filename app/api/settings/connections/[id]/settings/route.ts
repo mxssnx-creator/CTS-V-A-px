@@ -77,7 +77,7 @@ export async function GET(
         ].includes(k)) {
           // Store as boolean so dialog toggle/checkbox checks work correctly.
           hashSettings[k] = v === "true"
-        } else if (k === "symbols" || k === "active_symbols") {
+        } else if (k === "symbols" || k === "active_symbols" || k === "force_symbols") {
           // Symbols are stored as JSON strings in the hash.
           try { hashSettings[k] = JSON.parse(v) } catch { hashSettings[k] = v }
         } else {
@@ -264,6 +264,9 @@ export async function PATCH(
         const syms = (merged as Record<string, unknown>).symbols
         if (Array.isArray(syms) && syms.length > 0) {
           flatKnobs.symbols = JSON.stringify(syms)
+          // Also write force_symbols to the connection_settings hash so
+          // getSettings("trade_engine_state:{id}") finds the symbols
+          flatKnobs.force_symbols = JSON.stringify(syms)
         }
       }
 

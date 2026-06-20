@@ -2818,7 +2818,7 @@ export class TradeEngineManager {
         await refreshPrehistoricDone()
       }
 
-      // ── Prehistoric advisory (P0-5) ──────────────────────────────
+      // ── Prehistoric advisory (P0-5) ────────────────��─────────────
       // The realtime loop USED to hard-skip ticks until the
       // `prehistoric:{id}:done` flag flipped. That's no longer correct
       // because open pseudo positions must get mark-to-market updates
@@ -3463,6 +3463,7 @@ export class TradeEngineManager {
     if (this._symbolsCache && now - this._symbolsCachedAt < TradeEngineManager._SYMBOLS_TTL_MS) {
       try {
         // Quick check: read force_symbols from Redis to detect any external changes
+        // getSettings() automatically prepends "settings:" to the key
         const connState = await getSettings(`trade_engine_state:${this.connectionId}`)
         let forceSymbols = (connState as any)?.force_symbols
         if (typeof forceSymbols === "string") {
@@ -3493,6 +3494,7 @@ export class TradeEngineManager {
       try {
         // Fire both primary lookups concurrently so the first tick after TTL
         // expiry doesn't pay two sequential Redis round-trips.
+        // getSettings() automatically prepends "settings:" prefix to keys.
         const [connState, connSettings] = await Promise.all([
           getSettings(`trade_engine_state:${this.connectionId}`),
           getSettings(`connection:${this.connectionId}`),
