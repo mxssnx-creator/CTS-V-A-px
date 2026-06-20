@@ -617,7 +617,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ───────────────────────────────────�����������────────────
+      // ── Price tracking ───────────────────────────────────�������������────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -2126,17 +2126,19 @@ export async function GET(
         strategiesTotal: stratTotal,
         positionsOpen,
         // Sets + Positions are the canonical "continuous live progression" anchors
-        // the user relies on. These come straight from atomic hincrby writes
-        // inside StrategyCoordinator (sets) and live-stage (positions/orders).
+        // the user relies on. Read from stratDetail (which has createdSets from
+        // strategy history) rather than stratCounts (which reads from unreliable
+        // strategies_active hash that may be stale or evicted). stratDetail is
+        // the single source of truth for strategy counts.
         setsCreated: {
-          base:  stratCounts.base  || 0,
-          main:  stratCounts.main  || 0,
-          real:  stratCounts.real  || 0,
+          base:  n(stratDetail.base?.createdSets) || 0,
+          main:  n(stratDetail.main?.createdSets) || 0,
+          real:  n(stratDetail.real?.createdSets) || 0,
           // Live is the final dispatch stage (sets actually selected for order dispatch).
-          // Written per-cycle by createLiveSets into strategies_active:{conn} hash.
-          live:  stratCounts.live  || 0,
+          // Read from stratDetail.live which reflects actual dispatched sets.
+          live:  n(stratDetail.live?.createdSets) || 0,
           // `total` is the pipeline's final-stage output (Live when available, else Real).
-          total: stratCounts.live || stratCounts.real || 0,
+          total: n(stratDetail.live?.createdSets) || n(stratDetail.real?.createdSets) || 0,
         },
         positions: {
           opened:    n(progHash.live_positions_created_count),
