@@ -139,6 +139,9 @@ export async function evaluateToRealPositions(
 
       // If meets criteria, create real position
       if (evaluationScore >= minScore && ratiosMet) {
+        // Phase 1 FIX: If mainPos carries lineage from a coordinated StrategySet,
+        // propagate the sizeMultiplier and variant tags to RealPosition so the
+        // live executor receives the correct position sizing (block 1.5-2.0x, DCA 0.5x).
         const realPosition = createRealPosition(
           connectionId,
           mainPos,
@@ -155,6 +158,8 @@ export async function evaluateToRealPositions(
             evaluationScore,
           },
           resolvedMaxLeverage,
+          // Pass through variant-lineage fields from mainPos if present
+          mainPos as any // mainPos may have setKey/setVariant/sizeMultiplier fields
         )
 
         realPositions.push(realPosition)
@@ -219,6 +224,9 @@ function calculateEvaluationScore(
 
 /**
  * Create real position from main position
+ * @param variantSource Optional parent StrategySet context carrying lineage fields
+ *   (setKey, setVariant, axisWindows, sizeMultiplier). When present, these are
+ *   propagated to the RealPosition so the live executor receives correct sizing.
  */
 function createRealPosition(
   connectionId: string,
@@ -235,6 +243,8 @@ function createRealPosition(
   // ceiling instead of the previous hardcoded 10. Live-stage still applies
   // venueMax at order time; this just makes the stored signal realistic.
   maxLeverageForExchange: number = 10,
+  // Phase 1: Optional variant lineage from StrategySet
+  variantSource?: any,
 ): RealPosition {
   const riskPercentage = 0.02 // 2% risk per trade
   const riskAmount = accountBalance * riskPercentage
@@ -271,6 +281,15 @@ function createRealPosition(
     Math.max(1, maxLeverageForExchange),
   )
 
+  // Phase 1 FIX: Propagate variant lineage from parent StrategySet so the
+  // live executor receives correct position sizing (block 1.5-2.0x, DCA 0.5x).
+  // If no variantSource provided, defaults are sizeMultiplier=1.0, variant="default".
+  const sizeMultiplier = variantSource?.sizeMultiplier ?? 1.0
+  const setVariant = variantSource?.variant || variantSource?.setVariant || "default"
+  const axisWindows = variantSource?.axisWindows
+  const setKey = variantSource?.setKey
+  const parentSetKey = variantSource?.parentSetKey
+
   return {
     id: `real:${connectionId}:${mainPos.symbol}:${mainPos.direction}:${Date.now()}`,
     connectionId,
@@ -295,6 +314,14 @@ function createRealPosition(
       consistencyRatio: ratios.consistency,
     },
     status: "ready",
+    // ── Phase 1: Variant Lineage ──────────────────────────────────────
+    // Carries the StrategySet's variant type, axis windows, and size multiplier
+    // so the live executor applies correct position sizing (block/DCA scaling).
+    ...(setKey && { setKey }),
+    ...(parentSetKey && { parentSetKey }),
+    ...(setVariant && setVariant !== "default" && { setVariant: setVariant as any }),
+    ...(axisWindows && { axisWindows }),
+    sizeMultiplier,  // block=1.5, dca=0.5, default=1.0
   }
 }
 

@@ -200,7 +200,7 @@ export interface StrategySet {
    *      Base→Main filters reject it.
    *   2. evaluateRealSets uses `successRate`/`profitFactor` to TUNE
    *      `entries[].sizeMultiplier` and `leverage` per variant — the
-   *      "Real stage ��� accumulation for pos cnts sets … relying to
+   *      "Real stage accumulation for pos cnts sets … relying to
    *      their base sets configs independent" path.
    */
   prevPos?: {
@@ -209,6 +209,20 @@ export interface StrategySet {
     profitFactor: number
     avgDDT: number
   }
+
+  /**
+   * ── Phase 1: Entry Size Multiplier by Variant ─────────────────────────
+   * 
+   * Scaling factor applied to qty at live executor. Set at MAIN stage:
+   *   - block variant: 1.5–2.0x (aggressive accumulation on confirmations)
+   *   - DCA variant: 0.5x (conservative ladder averaging)
+   *   - default/trailing/pause: 1.0x (baseline)
+   * 
+   * Carried through Real → Live unchanged; live executor reads this
+   * to scale the computed qty before placement. Must be set by
+   * buildVariantSet and never undefined for block/DCA.
+   */
+  sizeMultiplier?: number
 }
 
 export interface StrategySetEntry {
@@ -1967,7 +1981,7 @@ export class StrategyCoordinator {
     // cache-miss paths populate this map so reuses still trigger fan-out.
     const defaultByBaseKey = new Map<string, StrategySet>()
 
-    // ── 2. Base/variant async processing ────────────────────────����───────────
+    // ── 2. Base/variant async processing ───────���────────────────����───────────
     // Process all baseSet × variant combinations in parallel for faster throughput.
     // Each combination calls the async buildVariantSet, which previously ran
     // sequentially. Now they all start together and resolve concurrently.
@@ -3143,7 +3157,7 @@ export class StrategyCoordinator {
     // reconciliation hook. Documented on `reconcileLivePositions` —
     // direction unchanged & magnitude grew → partial OPEN for ��; direction
     // unchanged & magnitude shrunk → partial CLOSE lowest-PF; direction
-    // flipped or flat:0 ��� close all in bucket then optionally re-open.
+    // flipped or flat:0 ����� close all in bucket then optionally re-open.
     // live_net_target tracks hedge-direction net positions for the live dispatch.
     // Skip in dev: this hset fires for every qualifying Real set on every cycle.
     // The live dispatch reads coordIndex directly; live_net_target is a prod-only
@@ -4993,6 +5007,12 @@ export class StrategyCoordinator {
     const avgDDT = sumDDT / count
     const avgCnf = sumCnf / count
 
+    // ── Size Multiplier by Variant ─────────────────────────────────────────
+    // Block entries (1.5-2.0x scaled qty), DCA entries (0.5x ladder), default (1.0x).
+    // This scalar drives the live executor's position sizing — must be set here
+    // and carried through Real-stage tuning and into RealPosition creation.
+    const baseMultiplier = profile.name === "block" ? 1.5 : profile.name === "dca" ? 0.5 : 1.0
+
     const axisWindows = ctx
       ? {
           prev:  Math.max(0, Math.min(12, ctx.prevPosCount)),
@@ -5013,6 +5033,7 @@ export class StrategyCoordinator {
       avgConfidence:   avgCnf,
       avgDrawdownTime: avgDDT,
       entryCount:      count,
+      sizeMultiplier:  baseMultiplier,  // ← Phase 1: Set base multiplier
       // EMPTY entries[] — Base entries resolved at dispatch via
       // coordIndex.base.byKey.get(parentSetKey).  Eliminates the primary
       // V8 heap driver (~80 000 object allocations per second).
