@@ -869,6 +869,9 @@ export class BingXConnector extends BaseExchangeConnector {
         if (sideMismatch && !isSpot && hedgeMode) {
           this.log("Retrying order without positionSide (detected one-way account)")
           delete params.positionSide
+          if (options.reduceOnly) {
+            params.reduceOnly = "true"
+          }
           params.timestamp = this.getTimestamp()
           const { signature: retrySig, queryString: retryQs } = this.signParams(params)
           const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}&signature=${retrySig}`
@@ -1064,6 +1067,7 @@ export class BingXConnector extends BaseExchangeConnector {
         if (sideMismatch && hedgeMode) {
           this.log("Retrying stop order without positionSide (one-way account)")
           delete params.positionSide
+          params.reduceOnly = "true"
           params.timestamp = this.getTimestamp()
           const { signature: retrySig, queryString: retryQs } = this.signParams(params)
           const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}&signature=${retrySig}`
