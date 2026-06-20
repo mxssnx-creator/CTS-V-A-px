@@ -276,6 +276,20 @@ export function QuickstartOverviewDialog() {
     return () => clearInterval(pollRef.current)
   }, [isOpen, load])
 
+  // Listen for settings changes and force immediate refresh of stats/progress
+  useEffect(() => {
+    if (!connectionId) return
+    const handleSettingsUpdated = (event: Event) => {
+      const customEvent = event as CustomEvent
+      if (customEvent.detail?.connectionId === connectionId) {
+        // Settings changed for this connection, force refresh immediately
+        load()
+      }
+    }
+    window.addEventListener("connection-settings-updated", handleSettingsUpdated)
+    return () => window.removeEventListener("connection-settings-updated", handleSettingsUpdated)
+  }, [connectionId, load])
+
   const h   = stats?.historic
   const rt  = stats?.realtime
   const bd  = stats?.breakdown
@@ -895,7 +909,7 @@ export function QuickstartOverviewDialog() {
                 </div>
                 <div
                   className="flex justify-between"
-                  title="Canonical 'total strategies' = Real-stage output. Base → Main → Real is a cascade filter of the same logical strategy — stages are NOT summed together."
+                  title="Canonical 'total strategies' = Real-stage output. Base ��� Main → Real is a cascade filter of the same logical strategy — stages are NOT summed together."
                 >
                   <span className="text-muted-foreground">Strategies (Real)</span>
                   <span className="font-medium tabular-nums">{fmt(bd?.strategies.total || 0)}</span>

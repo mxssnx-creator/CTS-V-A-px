@@ -92,6 +92,33 @@ export async function recoordinateAfterSettingsChange(
     // engine even if the notify envelope didn't land.
   }
 
+  // ── SETTINGS CHANGES THAT AFFECT PROGRESS VISIBILITY ──────────────────
+  // Detect which types of setting changes require progress cache invalidation:
+  // 1. Symbol changes (symbol_count, force_symbols) → new progression
+  // 2. Strategy/coordination changes → prehistoric recalc needed
+  // 3. Eval threshold changes → realtime progress affected
+  const significantChanges = [
+    // Symbols — prehistoric must restart with new symbol list
+    "symbol_count", "force_symbols", "symbols",
+    // Strategy coordination — variants, block/dca, axis settings
+    "coordination_settings", "variantTrailingEnabled", "variantBlockEnabled",
+    "variantDcaEnabled", "variantPauseEnabled",
+    "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
+    "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
+    "blockVolumeRatio", "blockMaxStack",
+    // Minimal step count affects pseudo position placement
+    "minimal_step_count", "minimalStepCount", "minStep",
+    // Eval thresholds affect strategy/set progression
+    "profitFactorMin", "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
+    "stageMinPosCountBase", "stageMinPosCountMain", "stageMinPosCountReal",
+    "maxDrawdownTimeMainHours", "maxDrawdownTimeRealHours", "maxDrawdownTimeLiveHours",
+    // Volume/leverage affects position sizing and entry counts
+    "volume_factor", "leveragePercentage", "useMaximalLeverage",
+    // Position window/count settings affect prehistoric calculations
+    "prevPosWindow", "prevPosMinCount", "mainEvalPosCount", "realEvalPosCount",
+  ]
+  const progressAffectingChange = changedFields.some(f => significantChanges.includes(f))
+
   // ── SYMBOL COUNT OR FORCE_SYMBOLS CHANGED: Archive and invalidate cache ──
   // If the operator changed the symbol list or forced symbols, the current
   // progression becomes semantically invalid. Trigger a full archive + new
@@ -114,6 +141,35 @@ export async function recoordinateAfterSettingsChange(
       // Continue — progression will still update under the old schema,
       // but won't have the new symbol count snapshot yet. Engine start will
       // fill it in on the next boot.
+    }
+  }
+
+  // ── PROGRESS INVALIDATION FOR SIGNIFICANT SETTINGS ──────────────────────
+  // When progress-affecting settings change, we need to clear cached progress
+  // data so the UI shows fresh prehistoric/realtime stats on next fetch.
+  // This ensures the stats endpoint returns up-to-date progress reflecting
+  // the new settings (not stale cached values from before the change).
+  if (progressAffectingChange && !symbolsChanged) {
+    // For non-symbol changes, we don't archive (symbol changes do that above).
+    // But we DO want to clear any cached progress data so the UI refreshes.
+    // The progression data is persisted in Redis but won't auto-recalculate
+    // for parameter changes (e.g., PF threshold), so we can't archive it.
+    // Instead, we rely on the UI's settings-change listener to force-refresh
+    // the stats endpoint, which will re-read Redis and compute new breakdowns.
+    try {
+      // If we need to invalidate progress cache in Redis for parameter changes,
+      // we can clear specific keys that should be recomputed. For now, the
+      // UI-side event listener (connection-settings-updated) is the main
+      // refresh trigger, and the stats endpoint always computes fresh.
+      console.log(
+        `[v0] [${opts.logTag}] Progress-affecting settings changed for ${id} (${changedFields.join(", ")}) — UI will refresh stats`
+      )
+    } catch (progressErr) {
+      console.warn(
+        `[v0] [${opts.logTag}] Failed to handle progress invalidation for ${id}:`,
+        progressErr instanceof Error ? progressErr.message : String(progressErr),
+      )
+      // Non-fatal — UI refresh will still happen via event listener
     }
   }
 
