@@ -1013,7 +1013,6 @@ return {
           // look stalled under large datasets. The live symbol list is exactly
           // the namespace that must be invalidated for the next prehistoric
           // run, so delete those bounded per-symbol interval gates directly.
-          const intervalKeys = currentSymbols.map((symbol) => `prehistoric:${connectionId}:${symbol}:processed_intervals`)
           const intervalKeys = await client.keys(`prehistoric:${connectionId}:*:processed_intervals`)
           if (intervalKeys.length > 0) {
             await client.del(...intervalKeys).catch(() => {})
