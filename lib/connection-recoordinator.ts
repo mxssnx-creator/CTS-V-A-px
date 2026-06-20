@@ -92,18 +92,19 @@ export async function recoordinateAfterSettingsChange(
     // engine even if the notify envelope didn't land.
   }
 
-  // ── SYMBOL COUNT CHANGED: Archive old progression, start fresh ──────
-  // If the operator changed the symbol list, the current progression
-  // (which has a denominator based on the OLD symbol count) becomes
-  // semantically invalid. Trigger a full archive + new progression so
-  // the UI shows progress against the CORRECT new symbol count.
-  if (changedFields.includes("symbol_count")) {
+  // ── SYMBOL COUNT OR FORCE_SYMBOLS CHANGED: Archive and invalidate cache ──
+  // If the operator changed the symbol list or forced symbols, the current
+  // progression becomes semantically invalid. Trigger a full archive + new
+  // progression so the UI shows progress against the CORRECT new symbol count.
+  // ALSO invalidate the engine's symbol cache so it re-reads from Redis immediately.
+  const symbolsChanged = changedFields.includes("symbol_count") || changedFields.includes("force_symbols")
+  if (symbolsChanged) {
     try {
       const { ProgressionStateManager } = await import("@/lib/progression-state-manager")
       const newEpoch = Date.now()
       const newSessionNum = await ProgressionStateManager.archiveAndStartNewProgression(id, newEpoch)
       console.log(
-        `[v0] [${opts.logTag}] Symbol count changed for ${id} → archived old progression, started new session ${newSessionNum}`,
+        `[v0] [${opts.logTag}] ${changedFields.includes("force_symbols") ? "Force symbols" : "Symbol count"} changed for ${id} → archived old progression, started new session ${newSessionNum}`,
       )
     } catch (archiveErr) {
       console.warn(
@@ -122,6 +123,26 @@ export async function recoordinateAfterSettingsChange(
   try {
     const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
     const coordinator = getGlobalTradeEngineCoordinator()
+
+    // ── Invalidate symbol cache if symbols changed ──────────────────────
+    // When force_symbols or active_symbols are updated, the engine's cached
+    // symbol list must be invalidated so getSymbols() re-reads from Redis
+    // immediately instead of using the 5s TTL cache.
+    if (symbolsChanged && (coordinator as any).getEngineManager) {
+      try {
+        const manager = (coordinator as any).getEngineManager(id)
+        if (manager && typeof (manager as any).invalidateSymbolCache === "function") {
+          (manager as any).invalidateSymbolCache()
+          console.log(`[v0] [${opts.logTag}] Symbol cache invalidated for ${id}`)
+        }
+      } catch (cacheErr) {
+        console.warn(
+          `[v0] [${opts.logTag}] Failed to invalidate symbol cache for ${id}:`,
+          cacheErr instanceof Error ? cacheErr.message : String(cacheErr),
+        )
+        // Non-fatal — engine will pick up the new symbols on the next 5s cache refresh
+      }
+    }
 
     // Step 2 — in-process fast-path (no-op when engine isn't running here).
     await coordinator.applyPendingChangesNow(id)

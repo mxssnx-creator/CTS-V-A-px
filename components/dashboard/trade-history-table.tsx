@@ -170,7 +170,7 @@ export function TradeHistoryTable({ trades, limit = 15, onRefresh }: TradeHistor
               <div className="grid gap-2 px-2 py-1.5 text-[10px] font-medium text-muted-foreground border-b sticky top-0 bg-background z-10"
                 style={{gridTemplateColumns: "1fr 0.7fr 0.6fr 0.8fr 0.8fr 0.7fr"}}>
                 <div className="cursor-pointer hover:text-foreground" onClick={() => handleSort("closedAt")}>
-                  Closed <SortIcon field="closedAt" className="inline h-2.5 w-2.5" />
+                  Closed <SortIcon field="closedAt" />
                 </div>
                 <div className="cursor-pointer hover:text-foreground" onClick={() => handleSort("symbol")}>Sym</div>
                 <div className="cursor-pointer hover:text-foreground" onClick={() => handleSort("direction")}>Dir</div>

@@ -3447,10 +3447,46 @@ export class TradeEngineManager {
   private _symbolsCachedAt = 0
   private static readonly _SYMBOLS_TTL_MS = 5000
 
+  // ── Invalidate symbol cache when settings change ──────────────────────────
+  // Called whenever force_symbols or active_symbols are updated by the admin
+  // API or migrations to ensure getSymbols() re-reads from Redis immediately.
+  private invalidateSymbolCache(): void {
+    this._symbolsCache = null
+    this._symbolsCachedAt = 0
+    console.log(`[v0] [Engine] Symbol cache invalidated for ${this.connectionId}`)
+  }
+
   private async getSymbols(): Promise<string[]> {
     const now = Date.now()
+    // Check if cache is still valid. Even if valid, verify that force_symbols
+    // in Redis hasn't changed — if it has, invalidate immediately.
     if (this._symbolsCache && now - this._symbolsCachedAt < TradeEngineManager._SYMBOLS_TTL_MS) {
-      return this._symbolsCache
+      try {
+        // Quick check: read force_symbols from Redis to detect any external changes
+        const connState = await getSettings(`trade_engine_state:${this.connectionId}`)
+        let forceSymbols = (connState as any)?.force_symbols
+        if (typeof forceSymbols === "string") {
+          try { forceSymbols = JSON.parse(forceSymbols) } catch { /* ignore */ }
+        }
+        
+        // If force_symbols exists but differs from cache, invalidate
+        if (Array.isArray(forceSymbols) && forceSymbols.length > 0) {
+          const sortedForce = [...forceSymbols].map(String).filter(Boolean).sort()
+          const sortedCache = [...this._symbolsCache].sort()
+          if (JSON.stringify(sortedForce) !== JSON.stringify(sortedCache)) {
+            console.log(`[v0] [getSymbols] ${this.connectionId}: force_symbols changed in Redis, invalidating cache`)
+            this.invalidateSymbolCache()
+            // Fall through to reload below
+          } else {
+            return this._symbolsCache
+          }
+        } else {
+          return this._symbolsCache
+        }
+      } catch (checkErr) {
+        // Non-fatal: check failed, use cached value anyway
+        return this._symbolsCache
+      }
     }
 
     const resolve = async (): Promise<string[]> => {
