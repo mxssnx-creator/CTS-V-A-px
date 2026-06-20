@@ -217,7 +217,7 @@ return {
           lastCycleTime: data.last_cycle_time ? new Date(data.last_cycle_time) : undefined,
           lastUpdate: new Date(data.last_update || new Date()),
           prehistoricCyclesCompleted: parseInt(data.prehistoric_cycles_completed || "0", 10),
-          prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? JSON.parse(data.prehistoric_symbols_processed) : [],
+          prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? (() => { try { return JSON.parse(data.prehistoric_symbols_processed) } catch { return [] } })() : [],
           prehistoricPhaseActive: data.prehistoric_phase_active === "true",
           prehistoricCandlesProcessed: parseInt(data.prehistoric_candles_processed || "0", 10),
           prehistoricSymbolsProcessedCount: parseInt(data.prehistoric_symbols_processed_count || "0", 10),
@@ -238,7 +238,7 @@ return {
           indicationsCount: parseInt(data.indications_count || "0", 10),
           strategiesCount: parseInt(data.strategies_count || "0", 10),
           // Uniqueness / solidity snapshot fields (captured at progression start)
-          progressSettingsSnapshot: data.progress_settings_snapshot ? JSON.parse(data.progress_settings_snapshot) : {},
+          progressSettingsSnapshot: data.progress_settings_snapshot ? (() => { try { return JSON.parse(data.progress_settings_snapshot) } catch { return {} } })() : {},
           symbolCount: data.symbol_count ? parseInt(data.symbol_count, 10) : 0,
           activeSymbolsHash: data.active_symbols_hash || "",
           startedForSettingsVersion: data.started_for_settings_version || "",

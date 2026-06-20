@@ -811,7 +811,7 @@ export class InlineLocalRedis {
       evicted += trimBucket(keys, cap)
     }
 
-    // ── LIST single-pass ───────────────────────────────────────────────────
+    // ── LIST single-pass ────────────────────────────────────────────────��──
     // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
       const listCap = isDev ? 0 : 50
@@ -1897,7 +1897,7 @@ export async function getConnection(id: string): Promise<any | null> {
 // ops per poll per component. A short TTL (1.5s) dedupes bursts without
 // introducing user-visible staleness (all writes invalidate the cache
 // immediately via `invalidateConnectionsCache()`).
-// ────────────────────────────────────�������──────────────────��───────────────────
+// ──────────────────────���─────────────�������──────────────────��───────────────────
 const __CONN_CACHE_TTL_MS = 1500
 let __connCache: { at: number; value: any[] } | null = null
 let __connInflight: Promise<any[]> | null = null
@@ -2840,9 +2840,15 @@ export async function createPosition(data: any): Promise<any> {
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
-  await client.hset(`position:${id}`, positionData)
-  // Also add to positions set for easy listing
-  await client.sadd("positions:all", id)
+  // ── Memory safety: expire positions after 30 days ──────────────────
+  // Without TTL, positions accumulate indefinitely, consuming RAM.
+  // 30 days is a reasonable retention window for trade history.
+  const POSITION_TTL_SEC = 30 * 24 * 60 * 60
+  await Promise.all([
+    client.hset(`position:${id}`, positionData),
+    client.expire(`position:${id}`, POSITION_TTL_SEC),
+    client.sadd("positions:all", id),
+  ])
   return positionData
 }
 

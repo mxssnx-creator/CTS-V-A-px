@@ -636,12 +636,36 @@ export class TradeEngineManager {
           updated_at: new Date().toISOString(),
         }
 
-        await redisClient.hset(`progression:${this.connectionId}`, {
-          symbol_count: String(symbolCount),
-          active_symbols_hash: symbolsHash,
-          started_for_settings_version: new Date().toISOString(),
-          progress_settings_snapshot: JSON.stringify(settingsSnapshot),
-        }).catch(() => {})
+        // ── Critical Write with Retry ────────────────────────────────────
+        // The progression snapshot (symbol_count, settings_version, etc.) is
+        // CRITICAL for "unique + solid" progress. If this write fails, the
+        // entire progression becomes stale and UI will show incorrect counters.
+        // Retry once before giving up.
+        let snapWriteOk = false
+        try {
+          await redisClient.hset(`progression:${this.connectionId}`, {
+            symbol_count: String(symbolCount),
+            active_symbols_hash: symbolsHash,
+            started_for_settings_version: new Date().toISOString(),
+            progress_settings_snapshot: JSON.stringify(settingsSnapshot),
+          })
+          snapWriteOk = true
+        } catch (err) {
+          console.error("[v0] [Engine] First progression snapshot write failed, retrying:", err)
+          try {
+            // Retry once with exponential backoff
+            await new Promise(r => setTimeout(r, 100))
+            await redisClient.hset(`progression:${this.connectionId}`, {
+              symbol_count: String(symbolCount),
+              active_symbols_hash: symbolsHash,
+              started_for_settings_version: new Date().toISOString(),
+              progress_settings_snapshot: JSON.stringify(settingsSnapshot),
+            })
+            snapWriteOk = true
+          } catch (retryErr) {
+            console.error("[v0] [Engine] Progression snapshot write FAILED after retry:", retryErr)
+          }
+        }
 
         console.log(
           `[v0] [Engine] Progression solidified for ${this.connectionId}: ` +
@@ -1838,7 +1862,7 @@ export class TradeEngineManager {
             runIndStratCycle(this.connectionId, symbol, "realtime", pipelineDeps).catch(async (err) => {
               const msg = err instanceof Error ? err.message : String(err)
               console.error(`[v0] [RealtimeProgression] Error for ${symbol}:`, msg)
-              // ── Inline error tracking ────────────────────────────────
+              // ── Inline error tracking ────��───────────────────────────
               // Per-symbol error counters are written to Redis from inside
               // each task's catch handler, NOT deferred to the outer
               // `failedSymbols` array. If `withCycleDeadline` fires before
