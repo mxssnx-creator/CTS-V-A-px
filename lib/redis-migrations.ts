@@ -2671,6 +2671,50 @@ const migrations: Migration[] = [
     },
   },
 
+  // ── Migration 043 ──────────────────────────────────────────────────────────
+  // Set force_symbols to XRP, LTC, BCH for testing/demo purposes
+  {
+    version: 43,
+    name: "043-set-force-symbols-to-xrp-ltc-bch",
+    description: "Update force_symbols to [XRPUSDT, LTCUSDT, BCHUSDT] for testing",
+    up: async (client: any) => {
+      await client.set("_schema_version", "43")
+      const CONN_ID = "bingx-x01"
+      const now = new Date().toISOString()
+      const NEW_SYMBOLS = ["XRPUSDT", "LTCUSDT", "BCHUSDT"]
+
+      // Update force_symbols in all three hash locations for consistency
+      await Promise.all([
+        client.hset(`connection:${CONN_ID}`, {
+          force_symbols: JSON.stringify(NEW_SYMBOLS),
+          symbol_count: String(NEW_SYMBOLS.length),
+          updated_at: now,
+        }).catch(() => {}),
+        client.hset(`settings:connection:${CONN_ID}`, {
+          force_symbols: JSON.stringify(NEW_SYMBOLS),
+          symbol_count: String(NEW_SYMBOLS.length),
+          updated_at: now,
+        }).catch(() => {}),
+        client.hset(`connection_settings:${CONN_ID}`, {
+          force_symbols: JSON.stringify(NEW_SYMBOLS),
+          symbol_count: String(NEW_SYMBOLS.length),
+          updated_at: now,
+        }).catch(() => {}),
+        // Clear prehistoric gates so the engine re-runs with the new symbols
+        client.del(`prehistoric_loaded:${CONN_ID}`).catch(() => {}),
+        client.del(`prehistoric_loaded:${CONN_ID}:verified`).catch(() => {}),
+        client.del(`prehistoric:progress:${CONN_ID}`).catch(() => {}),
+      ])
+
+      console.log(
+        `[v0] Migration 043: set ${CONN_ID} force_symbols to [${NEW_SYMBOLS.join(", ")}] and cleared prehistoric gates`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "42")
+    },
+  },
+
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

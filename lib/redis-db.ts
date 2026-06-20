@@ -811,7 +811,7 @@ export class InlineLocalRedis {
       evicted += trimBucket(keys, cap)
     }
 
-    // ── LIST single-pass ───────────────────────────────────────────────────
+    // ── LIST single-pass ────────────────────────────────────────────────��──
     // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
       const listCap = isDev ? 0 : 50
@@ -1551,6 +1551,17 @@ let coreInitialized = false      // core ready: client constructed + snapshot lo
 let connectionsInitialized = false
 let migrationsRan = false
 
+function isNextBuildPhase(): boolean {
+  const lifecycle = process.env.npm_lifecycle_event || ""
+  const argv = process.argv.join(" ")
+  return (
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    lifecycle === "build" ||
+    lifecycle === "vercel-build" ||
+    /\bnext(\.js)?\s+build\b/.test(argv)
+  )
+}
+
 /**
  * Ensure the CORE Redis client is ready: instance constructed, on-disk
  * snapshot loaded, and ping verified. This deliberately does NOT run
@@ -1621,6 +1632,21 @@ export async function ensureCoreRedis(): Promise<void> {
  * this, and every server action / route guards on it via ensureRedisInitialized.
  */
 export async function initRedis(): Promise<void> {
+  // Build/deploy builders import route modules while collecting page data.
+  // Runtime Redis hydration/migrations are not needed for static analysis and
+  // can exceed hosted builder deadlines (kilo.ai). Provide an empty, connected
+  // in-memory client for build-time reads and defer real migrations to runtime.
+  if (isNextBuildPhase()) {
+    if (!redisInstance) redisInstance = new InlineLocalRedis()
+    isConnected = true
+    coreInitialized = true
+    connectionsInitialized = true
+    migrationsRan = true
+    globalForRedis.__redis_snapshot_loaded = true
+    globalForRedis.__redis_fully_connected = true
+    return
+  }
+
   // Next.js dev can re-evaluate this module for a newly compiled route while
   // keeping the InlineLocalRedis data on globalThis. In that case the
   // module-scoped `isConnected` / `migrationsRan` flags reset to false even
@@ -1871,7 +1897,7 @@ export async function getConnection(id: string): Promise<any | null> {
 // ops per poll per component. A short TTL (1.5s) dedupes bursts without
 // introducing user-visible staleness (all writes invalidate the cache
 // immediately via `invalidateConnectionsCache()`).
-// ────────────────────────────────────�������──────────────────��───────────────────
+// ──────────────────────���─────────────�������──────────────────��───────────────────
 const __CONN_CACHE_TTL_MS = 1500
 let __connCache: { at: number; value: any[] } | null = null
 let __connInflight: Promise<any[]> | null = null
@@ -2814,9 +2840,15 @@ export async function createPosition(data: any): Promise<any> {
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
-  await client.hset(`position:${id}`, positionData)
-  // Also add to positions set for easy listing
-  await client.sadd("positions:all", id)
+  // ── Memory safety: expire positions after 30 days ──────────────────
+  // Without TTL, positions accumulate indefinitely, consuming RAM.
+  // 30 days is a reasonable retention window for trade history.
+  const POSITION_TTL_SEC = 30 * 24 * 60 * 60
+  await Promise.all([
+    client.hset(`position:${id}`, positionData),
+    client.expire(`position:${id}`, POSITION_TTL_SEC),
+    client.sadd("positions:all", id),
+  ])
   return positionData
 }
 

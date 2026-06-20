@@ -199,13 +199,16 @@ export class AutoIndicationEngine {
   } {
     const slice = prices.slice(start, end)
 
-    if (slice.length < 2) {
+    if (slice.length < 2 || !slice.every(p => Number.isFinite(p))) {
       return { trend: "neutral", volatility: 0, momentum: 0, activity: 0 }
     }
 
     // Calculate trend
     const firstPrice = slice[slice.length - 1]
     const lastPrice = slice[0]
+    if (!Number.isFinite(firstPrice) || !Number.isFinite(lastPrice) || firstPrice === 0) {
+      return { trend: "neutral", volatility: 0, momentum: 0, activity: 0 }
+    }
     const priceChange = ((lastPrice - firstPrice) / firstPrice) * 100
 
     const trend: "bullish" | "bearish" | "neutral" =
@@ -213,23 +216,33 @@ export class AutoIndicationEngine {
 
     // Calculate volatility (standard deviation)
     const avgPrice = slice.reduce((sum, p) => sum + p, 0) / slice.length
+    if (!Number.isFinite(avgPrice) || avgPrice === 0) {
+      return { trend, volatility: 0, momentum: 0, activity: 0 }
+    }
     const variance = slice.reduce((sum, p) => sum + Math.pow(p - avgPrice, 2), 0) / slice.length
     const volatility = (Math.sqrt(variance) / avgPrice) * 100
 
     // Calculate momentum (acceleration)
-    const recentCount = Math.min(Math.floor(slice.length / 3), 10)
-    const recentAvg = slice.slice(0, recentCount).reduce((sum, p) => sum + p, 0) / recentCount
-    const olderAvg = slice.slice(-recentCount).reduce((sum, p) => sum + p, 0) / recentCount
-    const momentum = ((recentAvg - olderAvg) / olderAvg) * 100
+    const recentCount = Math.max(1, Math.min(Math.floor(slice.length / 3), 10))
+    const recentSlice = slice.slice(0, recentCount)
+    const olderSlice = slice.slice(-recentCount)
+    if (recentSlice.length === 0 || olderSlice.length === 0) {
+      return { trend, volatility, momentum: 0, activity: 0 }
+    }
+    const recentAvg = recentSlice.reduce((sum, p) => sum + p, 0) / recentCount
+    const olderAvg = olderSlice.reduce((sum, p) => sum + p, 0) / recentCount
+    const momentum = olderAvg !== 0 ? ((recentAvg - olderAvg) / olderAvg) * 100 : 0
 
     // Calculate activity (total price movement)
     let totalMovement = 0
     for (let i = 1; i < slice.length; i++) {
-      totalMovement += Math.abs((slice[i - 1] - slice[i]) / slice[i])
+      if (Number.isFinite(slice[i]) && slice[i] !== 0) {
+        totalMovement += Math.abs((slice[i - 1] - slice[i]) / slice[i])
+      }
     }
     const activity = (totalMovement / slice.length) * 100
 
-    return { trend, volatility, momentum, activity }
+    return { trend, volatility: Number.isFinite(volatility) ? volatility : 0, momentum: Number.isFinite(momentum) ? momentum : 0, activity: Number.isFinite(activity) ? activity : 0 }
   }
 
   /**
@@ -239,23 +252,30 @@ export class AutoIndicationEngine {
     if (prices.length < 6) return 0
 
     // Compare recent 3 changes vs previous 3 changes
-    const recent = [
-      Math.abs((prices[0] - prices[1]) / prices[1]),
-      Math.abs((prices[1] - prices[2]) / prices[2]),
-      Math.abs((prices[2] - prices[3]) / prices[3]),
-    ]
+    const recent: number[] = []
+    for (let i = 0; i < 3; i++) {
+      if (prices[i + 1] !== 0) {
+        const val = Math.abs((prices[i] - prices[i + 1]) / prices[i + 1])
+        if (Number.isFinite(val)) recent.push(val)
+      }
+    }
 
-    const previous = [
-      Math.abs((prices[3] - prices[4]) / prices[4]),
-      Math.abs((prices[4] - prices[5]) / prices[5]),
-      Math.abs((prices[5] - prices[6]) / prices[6]),
-    ]
+    const previous: number[] = []
+    for (let i = 3; i < 6; i++) {
+      if (prices[i + 1] && prices[i + 1] !== 0) {
+        const val = Math.abs((prices[i] - prices[i + 1]) / prices[i + 1])
+        if (Number.isFinite(val)) previous.push(val)
+      }
+    }
+
+    if (recent.length === 0 || previous.length === 0) return 0
 
     const recentAvg = recent.reduce((sum, v) => sum + v, 0) / recent.length
     const previousAvg = previous.reduce((sum, v) => sum + v, 0) / previous.length
 
     // Positive = accelerating, negative = decelerating
-    return ((recentAvg - previousAvg) / previousAvg) * 100
+    const result = previousAvg !== 0 ? ((recentAvg - previousAvg) / previousAvg) * 100 : 0
+    return Number.isFinite(result) ? result : 0
   }
 
   /**
@@ -269,9 +289,10 @@ export class AutoIndicationEngine {
     let stepStrength = 0
 
     for (let i = 1; i < prices.length; i++) {
+      if (!Number.isFinite(prices[i]) || prices[i] === 0) continue
       const change = (prices[i - 1] - prices[i]) / prices[i]
 
-      if (Math.abs(change) > 0.0001) {
+      if (Number.isFinite(change) && Math.abs(change) > 0.0001) {
         // Significant step
         stepStrength += Math.abs(change)
         if (change > 0) upSteps++
@@ -281,8 +302,9 @@ export class AutoIndicationEngine {
 
     // Consistency score (more steps in one direction = stronger)
     const consistency = Math.abs(upSteps - downSteps) / prices.length
+    const result = stepStrength * consistency * 100
 
-    return stepStrength * consistency * 100
+    return Number.isFinite(result) ? result : 0
   }
 
   /**

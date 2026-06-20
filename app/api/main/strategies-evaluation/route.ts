@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server"
 import { initRedis, getAllConnections, getRedisClient } from "@/lib/redis-db"
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     await initRedis()

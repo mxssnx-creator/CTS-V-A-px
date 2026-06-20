@@ -8,6 +8,7 @@ import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { toRedisFlag } from "@/lib/boolean-utils"
 
+export const dynamic = "force-dynamic"
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -76,7 +77,7 @@ export async function GET(
         ].includes(k)) {
           // Store as boolean so dialog toggle/checkbox checks work correctly.
           hashSettings[k] = v === "true"
-        } else if (k === "symbols" || k === "active_symbols") {
+        } else if (k === "symbols" || k === "active_symbols" || k === "force_symbols") {
           // Symbols are stored as JSON strings in the hash.
           try { hashSettings[k] = JSON.parse(v) } catch { hashSettings[k] = v }
         } else {
@@ -263,6 +264,9 @@ export async function PATCH(
         const syms = (merged as Record<string, unknown>).symbols
         if (Array.isArray(syms) && syms.length > 0) {
           flatKnobs.symbols = JSON.stringify(syms)
+          // Also write force_symbols to the connection_settings hash so
+          // getSettings("trade_engine_state:{id}") finds the symbols
+          flatKnobs.force_symbols = JSON.stringify(syms)
         }
       }
 
@@ -486,11 +490,22 @@ export async function PATCH(
           : []
 
         let resolved: string[] = []
-        if (order === "manual" && manualList.length > 0) {
-          // Operator-curated list wins verbatim (still capped at count).
-          resolved = manualList.slice(0, count)
+        if (manualList.length > 0) {
+          // Operator curated an EXPLICIT symbol list — either typed manually or
+          // hand-picked from the ranked 1h-ATR auto-select table in the dialog.
+          // Honor it verbatim regardless of `symbol_order`: the order field only
+          // records which ranking method seeded the list; once the operator has
+          // explicitly chosen symbols, those win over a fresh exchange re-rank.
+          //
+          // Previously this branch required `order === "manual"`, so any curated
+          // selection made while the order was still "volatility_1h" / "volume_24h"
+          // (the common case, since the auto-select button sets order to
+          // volatility_1h) was silently discarded and the engine re-fetched the
+          // exchange top-N instead. The slider count acts only as an upper bound:
+          // truncate when the list is LONGER than count, never pad.
+          resolved = manualList.length > count ? manualList.slice(0, count) : manualList
         } else {
-          // Auto-resolve top-N by the chosen order. Call the shared resolver
+          // No explicit list — auto-resolve top-N by the chosen order. Call the shared resolver
           // DIRECTLY (no HTTP self-fetch — that fails on loopback/origin inside
           // a route handler, which is why the first cut resolved 0 symbols).
           const exchange = String((connection as Record<string, unknown>).exchange || "bingx").toLowerCase()

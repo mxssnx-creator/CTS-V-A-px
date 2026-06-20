@@ -1208,11 +1208,27 @@ export function ConnectionSettingsDialog({
                     </div>
                   </div>
 
-                  {/* Auto-resolve notice when not in manual mode */}
-                  {symbolsCfg.symbolOrder !== "manual" && (
+                  {/* Resolution notice — explicit curated list wins over auto-rank.
+                      When the operator has hand-picked symbols (manual entry or
+                      toggled from the 1h ATR table) that exact list is saved and
+                      applied verbatim, regardless of the ranking order. Only when
+                      the list is empty does the engine auto-fetch the top-N. */}
+                  {symbolsCfg.symbols.length > 0 ? (
+                    <div className="rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
+                      <span className="font-medium text-foreground">Explicit selection:</span>{" "}
+                      On save, your curated list of <span className="font-mono font-medium">{symbolsCfg.symbols.length}</span>{" "}
+                      symbol{symbolsCfg.symbols.length === 1 ? "" : "s"} is applied exactly as selected.
+                      {symbolsCfg.symbolOrder !== "manual" && (
+                        <span className="ml-1">
+                          The <span className="font-medium">{orderLabel[symbolsCfg.symbolOrder]}</span> order only seeded the ranking —
+                          it will not re-fetch and overwrite your picks.
+                        </span>
+                      )}
+                    </div>
+                  ) : symbolsCfg.symbolOrder !== "manual" ? (
                     <div className="rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
                       <span className="font-medium text-foreground">Auto-assign:</span>{" "}
-                      On save, the engine will fetch the top <span className="font-mono font-medium">{symbolsCfg.symbolCount}</span> symbols
+                      No manual override — on save the engine will fetch the top <span className="font-mono font-medium">{symbolsCfg.symbolCount}</span> symbols
                       by <span className="font-medium">{orderLabel[symbolsCfg.symbolOrder]}</span> from the exchange and apply them.
                       {availableSymbols.length > 0 && (
                         <span className="ml-1">
@@ -1220,7 +1236,7 @@ export function ConnectionSettingsDialog({
                         </span>
                       )}
                     </div>
-                  )}
+                  ) : null}
 
                   <Separator />
 

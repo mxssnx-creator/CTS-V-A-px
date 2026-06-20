@@ -101,6 +101,8 @@ export class RealtimeProcessor {
   private lastPositionsCount = -1
   /** Per-position in-flight gate to prevent concurrent processPosition calls on same ID. */
   private _inflightProcessPosition = new Set<string>()
+  /** Per-symbol streaming lock: prevents concurrent market data updates for the same symbol. */
+  private _perSymbolLocks = new Map<string, boolean>()
   private static readonly HEARTBEAT_INTERVAL_MS = 1000
 
   // ── Live-position exchange sync throttle ───────────────────────────────

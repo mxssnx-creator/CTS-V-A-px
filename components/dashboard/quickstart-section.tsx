@@ -737,7 +737,7 @@ export function QuickstartSection() {
       // Seed live state from whatever the connection already says
       setLiveTradeActive(conn.is_live_trade === "1" || conn.is_live_trade === true)
 
-      const clampedCount = Math.max(1, Math.min(10, symbolCount))
+      const clampedCount = Math.max(1, Math.min(32, symbolCount))
       addLog(
         clampedCount === 1
           ? "Fetching most volatile symbol (24h)..."
@@ -930,7 +930,7 @@ export function QuickstartSection() {
       const sc = localStorage.getItem("qs:symbolCount")
       if (sc) {
         const n = parseInt(sc, 10)
-        if (Number.isFinite(n)) setSymbolCount(Math.max(1, Math.min(10, n || 10)))
+        if (Number.isFinite(n)) setSymbolCount(Math.max(1, Math.min(32, n || 10)))
       }
       const ac = localStorage.getItem("qs:activeConnectionId")
       if (ac) {
@@ -1111,8 +1111,8 @@ export function QuickstartSection() {
               size="sm"
               variant="ghost"
               className="h-5 w-5 p-0 rounded text-xs"
-              onClick={() => setSymbolCount(c => Math.min(10, c + 1))}
-              disabled={symbolCount >= 10 || isRunning || starting}
+              onClick={() => setSymbolCount(c => Math.min(32, c + 1))}
+              disabled={symbolCount >= 32 || isRunning || starting}
               aria-label="Increase symbol count"
             >
               +
