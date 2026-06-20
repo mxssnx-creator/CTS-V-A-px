@@ -746,8 +746,8 @@ export class StrategyCoordinator {
     },
     blockVolumeRatio: 1.0,
     blockMaxStack:    3,
-    mainEvalPosCount: 15,
-    realEvalPosCount: 10,
+    mainEvalPosCount: 20,
+    realEvalPosCount: 15,
   }
   private _coordinationLoadedAt = 0
   private readonly _coordinationTtlMs = 5_000
@@ -2207,10 +2207,10 @@ export class StrategyCoordinator {
       // heap ceiling is dominated by simultaneous coord-record count.
       // 2500 keeps the per-symbol footprint ≈ the 5-symbol total divided by 4.
       // In dev: 1500 per symbol × SYMBOL_CONCURRENCY(3) = 4500 in-flight at peak.
-      // Raised from 400 so 15-symbol test sessions exercise the same code paths
-      // as prod (400 was hitting the ceiling every cycle and masking correct behaviour).
-      // Still well below the prod 2500 × 20 symbol × 6 concurrency = 300k worst-case.
-      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development" ? 1500 : 2500
+      // Increased from 1500→3500 (dev), 2500→6000 (prod) for better variant diversity.
+      // 3500 dev + 20 symbols ≈ 70k sets, manageable with proper eviction.
+      // 6000 prod × 20 symbols × 6 concurrency = 720k worst-case (acceptable with 8GB heap).
+      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development" ? 3500 : 6000
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -2535,7 +2535,7 @@ export class StrategyCoordinator {
 
       const client = getRedisClient()
       // PERFORMANCE: previous implementation looped serially with one GET
-      // per set followed by 3 sequential writes per surviving set — at N
+      // per set followed by 3 sequential writes per surviving set ��� at N
       // Real Sets per symbol per cycle that was 4N round-trips on the
       // hot path. Now: (1) fan out all dedup GETs into a single Promise.all,
       // (2) batch the 3 writes per surviving set into one Promise.all,
@@ -2972,10 +2972,10 @@ export class StrategyCoordinator {
     // 3000 per symbol × 20 symbols concurrently = 60000 coord records maximum
     // alive at once, keeping the InlineLocalRedis heap well within the 6144 MB
     // budget with room for eviction to operate before the next burst.
-    // In dev: 600 ceiling × SYMBOL_CONCURRENCY(3) = 1800 Real sets peak vs
-    // 9000 at 3000 ceiling — cuts per-cycle V8 heap pressure by 5x while
-    // keeping the full Real-stage pipeline exercised.
-    const REAL_SETS_SAFETY_CEILING = process.env.NODE_ENV === "development" ? 600 : 3000
+    // Increased from 600→1200 (dev), 3000→6500 (prod) for better tuning precision.
+    // In dev: 1200 ceiling × SYMBOL_CONCURRENCY(3) = 3600 Real sets peak, acceptable.
+    // In prod: 6500 × 20 symbols = 130k Real sets max (better strategy diversity, monitored for heap).
+    const REAL_SETS_SAFETY_CEILING = process.env.NODE_ENV === "development" ? 1200 : 6500
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at
