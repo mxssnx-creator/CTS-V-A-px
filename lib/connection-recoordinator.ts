@@ -92,6 +92,30 @@ export async function recoordinateAfterSettingsChange(
     // engine even if the notify envelope didn't land.
   }
 
+  // ── SYMBOL COUNT CHANGED: Archive old progression, start fresh ──────
+  // If the operator changed the symbol list, the current progression
+  // (which has a denominator based on the OLD symbol count) becomes
+  // semantically invalid. Trigger a full archive + new progression so
+  // the UI shows progress against the CORRECT new symbol count.
+  if (changedFields.includes("symbol_count")) {
+    try {
+      const { ProgressionStateManager } = await import("@/lib/progression-state-manager")
+      const newEpoch = Date.now()
+      const newSessionNum = await ProgressionStateManager.archiveAndStartNewProgression(id, newEpoch)
+      console.log(
+        `[v0] [${opts.logTag}] Symbol count changed for ${id} → archived old progression, started new session ${newSessionNum}`,
+      )
+    } catch (archiveErr) {
+      console.warn(
+        `[v0] [${opts.logTag}] Failed to archive progression after symbol change for ${id}:`,
+        archiveErr instanceof Error ? archiveErr.message : String(archiveErr),
+      )
+      // Continue — progression will still update under the old schema,
+      // but won't have the new symbol count snapshot yet. Engine start will
+      // fill it in on the next boot.
+    }
+  }
+
   // Steps 2 & 3 — coordinator-level actions. Bundled in one try block
   // because they all need the same `coordinator` reference, and a
   // failure to load the coordinator module fails both equivalently.
