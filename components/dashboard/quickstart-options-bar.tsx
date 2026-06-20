@@ -135,6 +135,16 @@ function clampMsc(raw: unknown): number {
   return Math.max(MSC_MIN, Math.min(MSC_MAX, Math.round(n)))
 }
 
+// Max concurrent trades — maximum number of concurrent open positions
+const MCT_MIN = 1
+const MCT_MAX = 32
+const MCT_STEP = 1
+function clampMct(raw: unknown): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 10
+  return Math.max(MCT_MIN, Math.min(MCT_MAX, Math.round(n)))
+}
+
 // ── debounce helper ────────────────────────────────────────────────────
 //
 // Returns a stable function that defers the supplied callback by `ms`
@@ -195,6 +205,7 @@ export function QuickstartOptionsBar() {
   const [pfMin, setPfMin] = useState<ProfitFactorMin>(DEFAULT_PF_MIN)
   const [volumeFactor, setVolumeFactor] = useState<number>(1.0)
   const [minimalStepCount, setMinimalStepCount] = useState<number>(3)
+  const [maxConcurrentTrades, setMaxConcurrentTrades] = useState<number>(10)
   const [blockEnabled, setBlockEnabled] = useState(true)
   const [dcaEnabled, setDcaEnabled] = useState(false)
   // Trailing-stop master variant gate. Engine-side default is also true
@@ -275,6 +286,9 @@ export function QuickstartOptionsBar() {
 
         // Minimal step count — for pseudo position placement
         setMinimalStepCount(clampMsc(settings.minimal_step_count ?? settings.minimalStepCount ?? 3))
+
+        // Max concurrent trades — limit concurrent open positions
+        setMaxConcurrentTrades(clampMct(settings.max_concurrent_trades ?? settings.maxConcurrentTrades ?? 10))
 
         // Block / DCA toggles live inside the existing coordination
         // settings block — same source the Connection Settings dialog
@@ -424,6 +438,17 @@ export function QuickstartOptionsBar() {
       setMinimalStepCount(v)
       debouncedSaveCoord({
         minimal_step_count: v,
+      })
+    },
+    [debouncedSaveCoord],
+  )
+
+  const handleMaxConcurrentTradesChange = useCallback(
+    (raw: number) => {
+      const v = clampMct(raw)
+      setMaxConcurrentTrades(v)
+      debouncedSaveCoord({
+        max_concurrent_trades: v,
       })
     },
     [debouncedSaveCoord],
@@ -639,6 +664,45 @@ export function QuickstartOptionsBar() {
                 )}
               </Tooltip>
             </div>
+
+            {/* ── Row 1.25: Max Concurrent Trades ────────────────────── */}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div
+                  className={`flex items-center gap-3 rounded-md border bg-card px-2.5 py-1.5 ${
+                    disabled ? "opacity-60" : ""
+                  }`}
+                >
+                  <TrendingUp className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold text-foreground">
+                        Max Concurrent Trades
+                      </span>
+                      <span className="text-[11px] font-bold tabular-nums text-foreground">
+                        {maxConcurrentTrades}
+                      </span>
+                    </div>
+                    <div className="text-[9px] text-muted-foreground leading-tight">
+                      Max concurrent positions · 1 – 32
+                    </div>
+                    <Slider
+                      value={[maxConcurrentTrades]}
+                      min={MCT_MIN}
+                      max={MCT_MAX}
+                      step={MCT_STEP}
+                      disabled={disabled}
+                      onValueChange={(v) => handleMaxConcurrentTradesChange(v[0])}
+                      className="mt-1"
+                      aria-label="Max concurrent trades"
+                    />
+                  </div>
+                </div>
+              </TooltipTrigger>
+              {disabled && (
+                <TooltipContent side="bottom">{disabledReason}</TooltipContent>
+              )}
+            </Tooltip>
 
             {/* ── Row 1.5: Minimal Step Count ────────────────────────── */}
             <Tooltip>
