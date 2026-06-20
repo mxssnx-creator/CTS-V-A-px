@@ -617,7 +617,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ───────────────────────────────────�������������────────────
+      // ── Price tracking ───────────────────────────────────���������������────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -2161,6 +2161,7 @@ export async function GET(
         isActive:         realtimeIsActive,
         successRate:      Math.round(successRate * 10) / 10,
         avgCycleTimeMs,
+        stageEvalPercent,
       },
 
       breakdown: {
@@ -2377,7 +2378,7 @@ export async function GET(
         overall:  variantOverall,
       },
 
-      // ── Main-stage COORDINATION snapshot ─────────────────────────────────
+      // ── Main-stage COORDINATION snapshot ────────��────────────────────────
       // Answers "is the Main stage coordinating correctly?" at a glance:
       //   • activeVariants           — names of variants gated ACTIVE this cycle
       //                                (default is always on; trailing/block/dca
