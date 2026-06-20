@@ -452,11 +452,6 @@ function coordRecordFromSet(set: StrategySet): SetCoordRecord {
 function hydrateSetView(idx: CoordIndex, rec: SetCoordRecord): StrategySet {
   if (rec._setView) return rec._setView
   const base = idx.base.byKey.get(rec.parentKey)
-/** Materialize a lightweight StrategySet view from a coord record only when a downstream consumer needs it. */
-function coordRecordToSetView(idx: CoordIndex, rec: SetCoordRecord): StrategySet | null {
-  if (rec._setView) return rec._setView
-  const base = idx.base.byKey.get(rec.parentKey)
-  if (!base) return null
   const view: StrategySet = {
     setKey:          rec.coordKey,
     parentSetKey:    rec.parentKey,
@@ -470,16 +465,6 @@ function coordRecordToSetView(idx: CoordIndex, rec: SetCoordRecord): StrategySet
     // Share Base entries by reference — never copied. Empty when the Base Set
     // is unavailable (standalone/diagnostic paths build a synthetic Base).
     entries:         base?.entries ?? [],
-    axisWindows:     rec.axisWindows ?? undefined,
-    trailingProfile: rec.trailingProfile,
-    prevPos:         rec.prevPos,
-    status:          rec.status === "pending" || rec.status === "valid_base" ? undefined : rec.status,
-    direction:       rec.direction,
-    avgProfitFactor: rec.tunedAvgPF ?? rec.avgProfitFactor,
-    avgConfidence:   rec.avgConfidence,
-    avgDrawdownTime: rec.avgDrawdownTime,
-    entryCount:      rec.entryCount,
-    entries:         [],
     status:          rec.status === "invalid" ? "invalid" : rec.status === "valid_real" ? "valid_real" : "valid_main",
     rejectionReason: rec.rejectionReason,
     ...(rec.axisWindows ? { axisWindows: rec.axisWindows } : {}),
@@ -488,6 +473,14 @@ function coordRecordToSetView(idx: CoordIndex, rec: SetCoordRecord): StrategySet
   }
   rec._setView = view
   return view
+}
+
+/** Materialize a lightweight StrategySet view from a coord record only when a downstream consumer needs it. */
+function coordRecordToSetView(idx: CoordIndex, rec: SetCoordRecord): StrategySet | null {
+  if (rec._setView) return rec._setView
+  const base = idx.base.byKey.get(rec.parentKey)
+  if (!base) return null
+  return hydrateSetView(idx, rec)
 }
 
 /**
@@ -511,7 +504,7 @@ function coordIndexFromSets(sets: StrategySet[]): CoordIndex {
   return idx
 }
 
-// ─����������������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─����������������������������������������� Position-Count Cartesian Axis Windows (operator spec) ───────────────���────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -2836,10 +2829,6 @@ export class StrategyCoordinator {
     const hedgeBuckets = new Map<string, HedgeBucket>()
     const passthrough: SetCoordRecord[] = []
     const axisPassthrough: SetCoordRecord[] = []
-    type HedgeBucket = { long: Array<StrategySet | SetCoordRecord>; short: Array<StrategySet | SetCoordRecord> }
-    const hedgeBuckets = new Map<string, HedgeBucket>()
-    const passthrough: Array<StrategySet | SetCoordRecord> = []
-    const axisPassthrough: Array<StrategySet | SetCoordRecord> = []
     let axisSetsCounted = 0
     for (const s of realSorted) {
       const dir = s.axisWindows?.direction
@@ -2852,7 +2841,6 @@ export class StrategyCoordinator {
       axisSetsCounted++
     }
     const netted: SetCoordRecord[] = []
-    const netted: Array<StrategySet | SetCoordRecord> = []
     const netTargetWrites: Record<string, string> = {}
     let netCancelled = 0
     for (const s of passthrough) {
@@ -2863,7 +2851,6 @@ export class StrategyCoordinator {
       // (handled separately via axisPassthrough).
       const outcome = aw?.outcome ?? "pos"
       const parentKey = s.parentKey
-      const parentKey = "parentKey" in s ? s.parentKey : (s.parentSetKey ?? s.setKey.split("#")[0])
       const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|p${aw?.prev ?? 0}|l${aw?.last ?? 0}|c${aw?.cont ?? 0}|o${outcome}`
       let b = hedgeBuckets.get(bucketKey)
       if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
@@ -2909,12 +2896,11 @@ export class StrategyCoordinator {
     // there are no axis sets either, keep the top-PF set per direction so the live
     // pipeline can start building position history. Future cycles will develop
     // asymmetric signals and netting will work as intended.
-    let effectiveNetted: Array<StrategySet | SetCoordRecord> = netted
+    let effectiveNetted: SetCoordRecord[] = netted
     if (netted.length === 0 && axisPassthrough.length === 0 && realSorted.length > 0) {
       const topLong  = realSorted.find((s) => (s.direction ?? "long") === "long")
       const topShort = realSorted.find((s) => s.direction === "short")
       effectiveNetted = [topLong, topShort].filter(Boolean) as SetCoordRecord[]
-      effectiveNetted = [topLong, topShort].filter(Boolean) as Array<StrategySet | SetCoordRecord>
       if (effectiveNetted.length > 0) {
         console.log(
           `[v0] [StrategyCoordinator] ${this.connectionId}:${symbol} hedge-bootstrap: ` +
@@ -2983,10 +2969,11 @@ export class StrategyCoordinator {
     // during a 5-symbol live run). The operator can LOWER the cap via
     // maxRealSets but can never exceed the ceiling.
     const realSetsCap = Math.min(this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING, REAL_SETS_SAFETY_CEILING)
-    const realRecordsOrSets = realPostHedge.slice(0, realSetsCap)
-    const realSets: StrategySet[] = coordIndex
-      ? realRecordsOrSets.map((r) => "coordKey" in r ? coordRecordToSetView(coordIndex, r) : r).filter((s): s is StrategySet => !!s)
-      : realRecordsOrSets as StrategySet[]
+    // Real Sets are kept as coord records through the entire Real stage — the
+    // tuner, accumulation ledgers, and Redis writes all read coord-record
+    // scalars. StrategySet views are only materialised later in createLiveSets
+    // for the ≤500 capped dispatch subset (via hydrateSetView).
+    const realSets: SetCoordRecord[] = realPostHedge.slice(0, realSetsCap)
     if (realPostHedge.length > realSetsCap) {
       console.warn(
         `[v0] [RealStage] ${this.connectionId}: ${realPostHedge.length} Real Sets exceeds ` +
@@ -3200,7 +3187,6 @@ export class StrategyCoordinator {
     // After the merged pos-gate + PF/DDT pass, `realQualifying` is the survivor list;
     // `skippedRealLowPos` is the count of pos-gated rejects. PF-eligible = total - pos-gated.
     const mainPFEligible = mainRecords.length - skippedRealLowPos
-    const mainPFEligible = realCandidateItems.length - skippedRealLowPos
 
     // Write Real counts to progression hash — CUMULATIVE via hincrby so the dashboard
     // doesn't oscillate with per-cycle snapshots (see matching fix in createBaseSets/createMainSets).
