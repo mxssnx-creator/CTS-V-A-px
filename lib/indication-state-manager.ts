@@ -285,9 +285,18 @@ export class IndicationStateManager {
     const pricesKey = `market_prices:${this.connectionId}:${symbol}`
     const historicalPrices = (await getSettings(pricesKey)) as any[] || []
 
-    if (historicalPrices.length < minRange + 1) return
+    if (!Array.isArray(historicalPrices) || historicalPrices.length < minRange + 1) return
 
-    const prices = historicalPrices.map((p: any) => Number.parseFloat(p.price))
+    // Filter and convert to valid numbers
+    const prices = historicalPrices
+      .map((p: any) => {
+        if (!p || typeof p !== "object") return null
+        const price = typeof p.price === "number" ? p.price : Number.parseFloat(String(p.price))
+        return Number.isFinite(price) ? price : null
+      })
+      .filter((p: number | null): p is number => p !== null)
+    
+    if (prices.length < minRange + 1) return
 
     // Process ranges with batching to avoid overwhelming the system
     const ranges = Array.from({ length: maxRange - minRange + 1 }, (_, i) => minRange + i)
@@ -330,9 +339,18 @@ export class IndicationStateManager {
     const pricesKey = `market_prices:${this.connectionId}:${symbol}`
     const historicalPrices = (await getSettings(pricesKey)) as any[] || []
 
-    if (historicalPrices.length < minRange + 1) return
+    if (!Array.isArray(historicalPrices) || historicalPrices.length < minRange + 1) return
 
-    const prices = historicalPrices.map((p: any) => Number.parseFloat(p.price))
+    // Filter and convert to valid numbers
+    const prices = historicalPrices
+      .map((p: any) => {
+        if (!p || typeof p !== "object") return null
+        const price = typeof p.price === "number" ? p.price : Number.parseFloat(String(p.price))
+        return Number.isFinite(price) ? price : null
+      })
+      .filter((p: number | null): p is number => p !== null)
+    
+    if (prices.length < minRange + 1) return
 
     // Process in batches
     const ranges = Array.from({ length: maxRange - minRange + 1 }, (_, i) => minRange + i)
@@ -410,9 +428,18 @@ export class IndicationStateManager {
     const pricesKey = `market_prices:${this.connectionId}:${symbol}`
     const historicalPrices = (await getSettings(pricesKey)) as any[] || []
 
-    if (historicalPrices.length < minRange + 1) return
+    if (!Array.isArray(historicalPrices) || historicalPrices.length < minRange + 1) return
 
-    const prices = historicalPrices.map((p: any) => Number.parseFloat(p.price))
+    // Filter and convert to valid numbers
+    const prices = historicalPrices
+      .map((p: any) => {
+        if (!p || typeof p !== "object") return null
+        const price = typeof p.price === "number" ? p.price : Number.parseFloat(String(p.price))
+        return Number.isFinite(price) ? price : null
+      })
+      .filter((p: number | null): p is number => p !== null)
+    
+    if (prices.length < minRange + 1) return
 
     // Process ranges with batching
     const ranges = Array.from({ length: maxRange - minRange + 1 }, (_, i) => minRange + i)
@@ -460,10 +487,22 @@ export class IndicationStateManager {
     const pricesKey = `market_prices:${this.connectionId}:${symbol}`
     const historicalPrices = (await getSettings(pricesKey)) as any[] || []
 
-    if (historicalPrices.length < 10) return // Need minimum data points
+    if (!Array.isArray(historicalPrices) || historicalPrices.length < 10) return // Need minimum data points
 
-    const prices = historicalPrices.slice(0, maxDataPoints).map((p: any) => Number.parseFloat(p.price))
-    const timestamps = historicalPrices.slice(0, maxDataPoints).map((p: any) => new Date(p.timestamp).getTime())
+    // Filter and convert to valid numbers with safe timestamp handling
+    const priceData = historicalPrices.slice(0, maxDataPoints)
+      .map((p: any) => {
+        if (!p || typeof p !== "object") return null
+        const price = typeof p.price === "number" ? p.price : Number.parseFloat(String(p.price))
+        const ts = p.timestamp ? new Date(p.timestamp).getTime() : null
+        return Number.isFinite(price) && ts ? { price, ts } : null
+      })
+      .filter((p: any): p is { price: number; ts: number } => p !== null)
+    
+    if (priceData.length < 10) return
+
+    const prices = priceData.map(p => p.price)
+    const timestamps = priceData.map(p => p.ts)
 
     // Activity ratios: 0.5%, 1.0%, 1.5%, 2.0%, 2.5%, 3.0%
     const activityRatios = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
