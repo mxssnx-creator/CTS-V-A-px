@@ -617,7 +617,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ───────────────────────────────────�������────────────
+      // ── Price tracking ───────────────────────────────────���������────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -2137,6 +2137,13 @@ export async function GET(
           ),
           ordersPlaced: n(progHash.live_orders_placed_count),
           ordersFilled: n(progHash.live_orders_filled_count),
+          // ── Average Position Size and Open Count ──────────────────────
+          // avgPosPerSet = total USD volume / count of positions created
+          // avgOpen = count of currently open positions / created positions
+          avgPosPerSet: performanceTiers.live.avgPosPerSet,
+          avgOpen: n(progHash.live_positions_created_count) > 0
+            ? Math.round((Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)) / n(progHash.live_positions_created_count)) * 10000) / 100
+            : 0,
         },
         isActive:         realtimeIsActive,
         successRate:      Math.round(successRate * 10) / 10,
