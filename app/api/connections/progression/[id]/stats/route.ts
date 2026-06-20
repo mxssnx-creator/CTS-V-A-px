@@ -617,7 +617,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ───────────────────────────────────���������────────────
+      // ── Price tracking ───────────────────────────────────�����������────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -1707,12 +1707,23 @@ export async function GET(
         const sym = String(pos.symbol || "").trim().toUpperCase()
         const dirRaw = String(pos.direction || "").trim().toLowerCase()
         if (!sym || !["long", "short"].includes(dirRaw)) continue
+        
+        // ── Calculate exit price from P&L ──────────────────────────────────────
+        // Since we don't have an explicit close price, derive it from realized P&L:
+        // For LONG: exitPrice = entryPrice + (pnl / qty)
+        // For SHORT: exitPrice = entryPrice - (pnl / qty)
+        let exitP = avgP
+        if (qty > 0) {
+          const pnlPerUnit = pnl / qty
+          exitP = dirRaw === "long" ? avgP + pnlPerUnit : avgP - pnlPerUnit
+        }
+        
         closedPositionsForHistory.push({
           id:       String(pos.id || ""),
           symbol:   sym,
           direction: dirRaw as "long" | "short",
           entryPrice: Math.round(avgP * 1e8) / 1e8,
-          exitPrice:  Math.round((Number(pos.closePrice ?? pos.lastPrice ?? avgP) || 0) * 1e8) / 1e8,
+          exitPrice:  Math.round(exitP * 1e8) / 1e8,
           realizedPnl: Math.round(pnl * 100) / 100,
           pnlPct,
           holdMinutes: holdMin,
