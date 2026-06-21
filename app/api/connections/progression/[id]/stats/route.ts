@@ -4,6 +4,7 @@ import { VolumeCalculator } from "@/lib/volume-calculator"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
+export const dynamicParams = true
 export const revalidate = 0
 
   function n(v: unknown): number {

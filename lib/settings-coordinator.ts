@@ -14,6 +14,13 @@ import { initRedis, getSettings, setSettings, getConnection, getRedisClient } fr
 const RESTART_REQUIRED_FIELDS = [
   "api_key", "api_secret", "exchange", "is_testnet",
   "api_type", "api_subtype", "is_enabled",
+  // Symbol and mode changes invalidate prehistoric gates, loaded interval
+  // markers, live exchange routing, and progression denominators. Treat
+  // them as one serialized restart event so the owning engine process
+  // restarts exactly once from the durable settings-change envelope instead
+  // of mixing a hot reload with a separately queued API-route restart.
+  "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
+  "is_live_trade", "is_preset_trade", "connection_method",
   "symbol_count",  // ── Symbol list changes require NEW progression ──
 ]
 

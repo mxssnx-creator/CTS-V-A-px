@@ -654,6 +654,12 @@ export async function PATCH(
         )
       }
 
+      // The durable settings-change envelope below now carries the concrete
+      // symbol/mode field names, so the engine-owning process classifies this
+      // as a serialized restart event. Do not also queue a separate route-local
+      // restart here: in production the route can run in a different worker than
+      // the engine, and the old double path raced hot-reload vs stop/start,
+      // producing duplicate progressions and stalled stats after settings saves.
       // A symbol/mode change invalidates the currently running prehistoric
       // gates. Recoordination clears Redis state; this background restart makes
       // the active manager actually start processing the new symbols instead of
@@ -705,7 +711,9 @@ export async function PATCH(
       { ...effectiveConnection, connection_settings: merged, updated_at: effectiveConnection.updated_at || updated.updated_at },
       {
         logTag: "PATCH /settings",
-        changedFieldsOverride: Object.keys(settings).length > 0 ? ["connection_settings"] : [],
+        changedFieldsOverride: Object.keys(settings).length > 0
+          ? Array.from(new Set([...Object.keys(settings), "connection_settings"]))
+          : [],
       },
     )
 

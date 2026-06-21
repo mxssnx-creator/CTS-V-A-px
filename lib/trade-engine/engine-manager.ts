@@ -1042,7 +1042,11 @@ export class TradeEngineManager {
         error: errorMsg,
         stack: error instanceof Error ? error.stack : undefined,
       })
-      // Don't throw - allow coordinator to handle the error gracefully
+      // Surface startup failure to the coordinator. Swallowing the error made
+      // callers mark the connection active/running even though all timers were
+      // cleared and the progression was already in error state, which is a
+      // production-only source of stalled/doubled progress after restarts.
+      throw error
     }
   }
 

@@ -1717,31 +1717,34 @@ export async function initRedis(): Promise<void> {
       // runMigrations() calls ensureCoreRedis() internally (NOT initRedis), so
       // there is no re-entrancy with the promise we are currently inside.
       //
-      // SAFETY: Wrap with a 35-second deadline. If a migration deadlocks
-      // (e.g. by calling initRedis() internally, which awaits THIS very
-      // promise), the race rejects after 35 s so the server becomes
-      // responsive. The underlying migration may still resolve later, but
-      // the server is unblocked. The migration runner also has its own
-      // per-migration 30-second deadline for individual migrations.
+      // SAFETY: Wrap migrations with a runtime deadline, but never mark Redis
+      // connected if the deadline/error fires. The old path swallowed the error
+      // and continued with a partially migrated schema, which is exactly how
+      // production ended up with missing progress containers, stalled counts,
+      // and zombie running flags after deploy/restart. Build-time imports are
+      // already short-circuited above, so runtime must prefer correctness and
+      // retryability over serving on an incomplete schema.
       const { runMigrations, resetMigrationRunState } = await import("@/lib/redis-migrations")
-      const MIGRATIONS_DEADLINE_MS = 35_000
+      const MIGRATIONS_DEADLINE_MS = isProductionEnvironment() ? 180_000 : 60_000
+      let migrationTimer: ReturnType<typeof setTimeout> | undefined
       try {
         await Promise.race([
           runMigrations(),
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () => reject(new Error(`runMigrations() exceeded ${MIGRATIONS_DEADLINE_MS}ms global deadline — aborting to keep server responsive`)),
+          new Promise<never>((_, reject) => {
+            migrationTimer = setTimeout(
+              () => reject(new Error(`runMigrations() exceeded ${MIGRATIONS_DEADLINE_MS}ms global deadline — retrying on next request`)),
               MIGRATIONS_DEADLINE_MS,
-            ),
-          ),
+            )
+          }),
         ])
         migrationsRan = true
       } catch (migErr) {
         console.error("[v0] [Redis] runMigrations deadline/error:", migErr instanceof Error ? migErr.message : migErr)
-        // Reset so the next cold-boot can attempt migrations again
         resetMigrationRunState()
         migrationsRan = false
-        // Do NOT rethrow — let the server start anyway with schema as-is
+        throw migErr
+      } finally {
+        if (migrationTimer) clearTimeout(migrationTimer)
       }
     }
 
@@ -2688,7 +2691,16 @@ export function isProductionEnvironment(): boolean {
 const GLOBAL_SITE_INSTANCE_KEY = "site:unique_instance"
 
 export async function ensureUniqueSiteInstance(): Promise<{ siteSessionId: string; isNew: boolean }> {
-  await initRedis()
+  // This helper is called from production migration coverage while initRedis()
+  // is already awaiting runMigrations(). Calling initRedis() again from that
+  // path deadlocks on the in-flight global init promise. During an init run the
+  // core client is already ready, so use ensureCoreRedis() and proceed; outside
+  // init we still run the full init path for normal callers.
+  if (globalForRedis.__redis_init_promise && !isConnected) {
+    await ensureCoreRedis()
+  } else {
+    await initRedis()
+  }
   const client = getRedisClient()
   if (!client) {
     return { siteSessionId: "fallback-" + Date.now(), isNew: true }
