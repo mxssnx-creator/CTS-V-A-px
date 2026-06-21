@@ -14,8 +14,8 @@ import { Loader2, AlertCircle, Lock, ExternalLink, Check, Eye, EyeOff, Zap, Chev
 import { toast } from "@/lib/simple-toast"
 import { isHTMLResponse, parseHTMLResponse, parseCloudflareError } from "@/lib/html-response-parser"
 import type { Connection } from "@/lib/db-types"
-import { 
-  CONNECTION_PREDEFINITIONS, 
+import {
+  CONNECTION_PREDEFINITIONS,
   type ConnectionPredefinition,
   EXCHANGE_API_TYPES,
   EXCHANGE_LIBRARY_PACKAGES,
@@ -49,7 +49,7 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
   const [existingConnections, setExistingConnections] = useState<string[]>([])
   const [activeTab, setActiveTab] = useState("basic")
   const [showSecrets, setShowSecrets] = useState(false)
-  
+
   const [formData, setFormData] = useState({
     name: "",
     exchange: "bybit",
@@ -83,7 +83,7 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
     if (apiTypes.length > 0 && !apiTypes.includes(formData.api_type)) {
       setFormData(prev => ({ ...prev, api_type: apiTypes[0] }))
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [formData.exchange])
 
   useEffect(() => {
@@ -102,7 +102,7 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
     // Update connection method and library based on API type and exchange
     const exchange = formData.exchange
     const availableMethods = EXCHANGE_CONNECTION_METHODS[exchange] || ["rest"]
-    
+
     // Set default connection method if current is not available
     if (!availableMethods.includes(formData.connection_method)) {
       setFormData(prev => ({ ...prev, connection_method: availableMethods[0] }))
@@ -130,7 +130,7 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
         console.error("[v0] Failed to load connections:", response.status)
         return
       }
-      
+
       let data
       try {
         data = await response.json()
@@ -138,7 +138,7 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
         console.error("[v0] Failed to parse connections response:", parseError)
         return
       }
-      
+
       const connections = Array.isArray(data) ? data : (data?.connections || [])
       const names = connections.map((c: Connection) => `${c.exchange}-${c.name}`)
       setExistingConnections(names)
@@ -239,7 +239,7 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
         console.error("[v0] JSON parse error:", parseError)
         throw new Error("Invalid response format from server")
       }
-      
+
       // Check for errors in response data
       if (data.error) {
         const errorMsg = data.error
@@ -247,17 +247,17 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
         toast.error(errorMsg)
         return
       }
-      
+
       if (!data.success) {
         const errorMsg = data.error || "Connection test failed"
         setTestLog(data.log || [`Error: ${errorMsg}`])
         toast.error(errorMsg)
         return
       }
-      
+
       // Extract and format log
       let formattedLogs = [`[${new Date().toLocaleTimeString()}] Starting connection test...\n`]
-      
+
       // Add API connection info
       formattedLogs.push(`Exchange: ${formData.exchange.toUpperCase()}\n`)
       const apiLogParts = [formData.api_type]
@@ -267,7 +267,7 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
       formattedLogs.push(`API Type: ${apiLogParts.join(" | ")}\n`)
       formattedLogs.push(`Connection: ${formData.connection_method.toUpperCase()} | Library: ${formData.connection_library}\n`)
       formattedLogs.push(`---\n`)
-      
+
       // Add response logs
       let responseLogs = data.log || []
       if (!Array.isArray(responseLogs)) {
@@ -351,20 +351,20 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
 
       if (!response.ok) {
         const error = await response.json()
-        
+
         // Handle duplicate API key error
         if (response.status === 409) {
           throw new Error(error.details || "This API key is already connected. Please remove the existing connection first.")
         }
-        
+
         throw new Error(error.message || error.details || "Failed to add connection")
       }
 
       const result = await response.json()
       const connectionId = result.id || result.connectionId
-      
+
       toast.success("Connection added successfully")
-      
+
       // Call both callbacks if provided
       if (onConnectionAdded) {
         await onConnectionAdded(connectionId)
@@ -372,7 +372,7 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
       if (onSuccess) {
         onSuccess(connectionId)
       }
-      
+
       onOpenChange(false)
       resetForm()
     } catch (error) {

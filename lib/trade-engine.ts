@@ -154,7 +154,7 @@ export class GlobalTradeEngineCoordinator {
    * Start engine for a specific connection
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
-  async startEngine(connectionId: string, config: EngineConfig): Promise<void> {
+  async startEngine(connectionId: string, config: EngineConfig): Promise<boolean> {
     // Self-heal background timers on every public entry-point — see
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
     this.ensureBackgroundTimers()
@@ -162,7 +162,7 @@ export class GlobalTradeEngineCoordinator {
     // Step 1: Check if already starting
     if (this.startingEngines.has(connectionId)) {
       console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
-      return
+      return false
     }
 
     // Step 2: Check if already running (check in-memory manager first, then Redis hint)
@@ -176,10 +176,15 @@ export class GlobalTradeEngineCoordinator {
       if (runningFlag === "true" || runningFlag === "1") {
         if (managerRunning) {
           console.log(`[v0] [STARTUP LOCK] Engine already running for ${connectionId}, skipping...`)
-          return
+          return true
         }
-        // Redis flag can become stale across crashes/restarts; clear stale state and continue startup.
-        console.warn(`[v0] [STARTUP LOCK] Stale running flag detected for ${connectionId}; continuing with startup`)
+        // Redis flag can become stale across crashes/restarts; clear stale state
+        // before continuing. Leaving it set made status endpoints report a
+        // phantom running engine while startEngine was still trying to recover,
+        // and prevented later diagnostics from distinguishing a real owner from
+        // a dead flag.
+        console.warn(`[v0] [STARTUP LOCK] Stale running flag detected for ${connectionId}; clearing and continuing with startup`)
+        await client.del(`engine_is_running:${connectionId}`).catch(() => 0)
       }
     } catch (e) {
       console.log(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)
@@ -213,7 +218,7 @@ export class GlobalTradeEngineCoordinator {
         console.warn(
           `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Skipping.`,
         )
-        return
+        return false
       }
       lockHandle = acquired.handle
       console.log(
@@ -232,6 +237,9 @@ export class GlobalTradeEngineCoordinator {
       // Step 5: Start the engine — pass the lock handle so it can
       // extend/release the slot and stamp the epoch.
       await manager.start(config, lockHandle)
+      if (!manager.isEngineRunning) {
+        throw new Error(`TradeEngine manager for ${connectionId} did not reach running state`)
+      }
       // Manager now owns the lock; clear our local reference so the
       // finally-block doesn't try to break it on success.
       lockHandle = undefined
@@ -264,6 +272,7 @@ export class GlobalTradeEngineCoordinator {
           is_enabled_dashboard: "1",
         })
       } catch { /* non-critical — dashboard can lag */ }
+      return true
     } catch (err) {
       // On startup failure, give the lock back so a retry can succeed
       // without waiting for the TTL to expire. We use force-break
@@ -734,7 +743,14 @@ export class GlobalTradeEngineCoordinator {
               realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
-            await this.startEngine(connection.id, config)
+            const didStart = await this.startEngine(connection.id, config)
+            if (!didStart) {
+              await logProgressionEvent(connection.id, "engine_start_skipped", "warning", "Coordinator start skipped - engine is already owned by another worker or starting", {
+                connectionId: connection.id,
+                engineType: "main",
+              })
+              continue
+            }
             started++
 
             // Mirror the enabled/inserted flags that toggle-dashboard writes so
@@ -843,7 +859,14 @@ export class GlobalTradeEngineCoordinator {
               realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
-            await this.startEngine(connection.id, config)
+            const didStart = await this.startEngine(connection.id, config)
+            if (!didStart) {
+              await logProgressionEvent(connection.id, "engine_start_skipped", "warning", "Coordinator start skipped - engine is already owned by another worker or starting", {
+                connectionId: connection.id,
+                engineType: "main",
+              })
+              continue
+            }
             started++
             
             await logProgressionEvent(connection.id, "engine_started", "info", "Main Trade Engine started for progression", {

@@ -258,7 +258,7 @@ export function TestDashboard() {
   useEffect(() => {
     startPolling()
     return () => stopPolling()
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
   // Auto-scroll logs
   useEffect(() => {

@@ -14,7 +14,7 @@ const _ENGINE_BUILD_VERSION = "11.0.0"
 // This allows stale closures from old code to continue without ReferenceError
 // The variable is defined but not used - new code doesn't reference it
 declare global {
-  // eslint-disable-next-line no-var
+
   var totalStrategiesEvaluated: number
 }
 if (typeof globalThis.totalStrategiesEvaluated === "undefined") {
@@ -590,6 +590,10 @@ export class TradeEngineManager {
         console.warn("[v0] [Engine] ensureJustUniqueProgression failed, falling back to archive:", ensureErr)
         this.epoch = this.lockHandle?.epoch ?? Date.now()
         await ProgressionStateManager.archiveAndStartNewProgression(this.connectionId, this.epoch).catch(() => {})
+        await getRedisClient().hset(`progression:${this.connectionId}`, {
+          engine_started: "true",
+          last_update: new Date().toISOString(),
+        }).catch(() => {})
       }
 
       // Initialize engine state
@@ -619,7 +623,7 @@ export class TradeEngineManager {
       try {
         const redisClient = getRedisClient()
         const symbolCount = symbols.length
-        const symbolsHash = symbols.sort().join("|") // simple deterministic hash
+        const symbolsHash = symbols.slice().sort().join("|") // simple deterministic hash; do not reorder runtime processing
         // Snapshot a minimal but useful slice of current connection settings
         const connData = (await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({}))) as Record<string, string>
         const settingsSnapshot = {
@@ -940,7 +944,7 @@ export class TradeEngineManager {
       // Picks up operator edits to connection settings and applies
       // them WITHOUT requiring a manual restart. See `applyPendingSettingsChange`.
       this.startSettingsWatcher()
-      
+
       // Phase 6: Boot complete. The engine is now "ready":
       //   - Cache-hit path: live_trading @ 100% (set above).
       //   - Cache-miss path: phase stays at `prehistoric_data` with live
@@ -962,7 +966,7 @@ export class TradeEngineManager {
         realtimeInterval: config.realtimeInterval,
         prehistoricCached: cacheHit,
       })
-      
+
       // Also update engine state to indicate all phases are running
       await setSettings(`trade_engine_state:${this.connectionId}`, {
         all_phases_started: true,
@@ -972,7 +976,7 @@ export class TradeEngineManager {
         live_trading_started: true,
         updated_at: new Date().toISOString(),
       })
-      
+
       await logProgressionEvent(this.connectionId, "engine_started", "info", "Trade engine fully started", {
         symbols: symbols.length,
         phases: 6,
@@ -1005,7 +1009,7 @@ export class TradeEngineManager {
       if (this.prehistoricTimer) { clearTimeout(this.prehistoricTimer); this.prehistoricTimer = undefined }
       if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = undefined }
       if (this.heartbeatTimer)   { clearInterval(this.heartbeatTimer);   this.heartbeatTimer = undefined }
-      
+
       await this.updateProgressionPhase("error", 0, errorMsg)
       await this.updateEngineState("error", errorMsg)
       await this.setRunningFlag(false)
@@ -1014,7 +1018,11 @@ export class TradeEngineManager {
         error: errorMsg,
         stack: error instanceof Error ? error.stack : undefined,
       })
-      // Don't throw - allow coordinator to handle the error gracefully
+      // Surface startup failure to the coordinator. Swallowing the error made
+      // callers mark the connection active/running even though all timers were
+      // cleared and the progression was already in error state, which is a
+      // production-only source of stalled/doubled progress after restarts.
+      throw error
     }
   }
 
@@ -1417,7 +1425,7 @@ export class TradeEngineManager {
         indicationConfigs: configInitResult.indications,
         strategyConfigs: configInitResult.strategies,
       })
-      
+
       // Process prehistoric data: only missing ranges, step by timeframe interval
       const processingResult = await configProcessor.processPrehistoricData(
         symbols,
@@ -1551,7 +1559,7 @@ export class TradeEngineManager {
       await logProgressionEvent(this.connectionId, "prehistoric_error", "error", "Prehistoric processing failed", {
         error: error instanceof Error ? error.message : String(error),
       })
-      
+
       try {
         await setSettings(`trade_engine_state:${this.connectionId}`, {
           prehistoric_data_loaded: false,
@@ -1559,7 +1567,7 @@ export class TradeEngineManager {
           updated_at: new Date().toISOString(),
         })
       } catch { /* ignore */ }
-      
+
       console.log("[v0] [Prehistoric] Proceeding with realtime processing despite prehistoric failure")
     }
   }
@@ -1699,7 +1707,7 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
-      
+
       // Check pause state before executing cycle (cached, 1 s TTL)
       try {
         if (await isGloballyPausedCached()) {
@@ -1710,7 +1718,7 @@ export class TradeEngineManager {
       } catch (err) {
         // Ignore Redis errors - continue with cycle
       }
-      
+
       const startTime = Date.now()
       // Local abort flag — when true, the finally block will NOT schedule the next cycle.
       let aborted = false
@@ -2184,7 +2192,7 @@ export class TradeEngineManager {
     return
     // The original loop body below is unreachable — preserved only as
     // a reference for the legacy behaviour. Safe to delete in a follow-up.
-    // eslint-disable-next-line @typescript-eslint/no-unreachable-code-error
+
     let cycleCount = 0
     let totalDuration = 0
     let errorCount = 0
@@ -2238,7 +2246,7 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
-      
+
       // Check pause state before executing cycle (cached, 1 s TTL)
       try {
         if (await isGloballyPausedCached()) {
@@ -2249,7 +2257,7 @@ export class TradeEngineManager {
       } catch (err) {
         // Ignore Redis errors - continue with cycle
       }
-      
+
       const startTime = Date.now()
       let producedStrategies = false
 
@@ -2308,7 +2316,7 @@ export class TradeEngineManager {
         const evaluatedThisCycle = strategyResults.reduce((sum: number, result: any) => sum + (result?.strategiesEvaluated || 0), 0)
         const liveReadyThisCycle = strategyResults.reduce((sum: number, result: any) => sum + (result?.liveReady || 0), 0)
         producedStrategies = evaluatedThisCycle > 0
-        
+
         // Defensive: handle stale closures from HMR
         try {
           totalStrategiesEvaluated += evaluatedThisCycle
@@ -2705,7 +2713,7 @@ export class TradeEngineManager {
     }
     return
     // ── Legacy body preserved as unreachable reference ───────────────────
-    // eslint-disable-next-line @typescript-eslint/no-unreachable-code-error
+
     let cycleCount_legacy = 0
     void cycleCount_legacy
     let cycleCount2 = 0
@@ -3375,7 +3383,7 @@ export class TradeEngineManager {
     if (cycleCount < 20) {
       return "healthy"
     }
-    
+
     // Very relaxed thresholds - only unhealthy if totally failing
     if (successRate < 30 || lastCycleDuration > threshold * 10) {
       return "unhealthy"
@@ -3446,7 +3454,7 @@ export class TradeEngineManager {
           }
           if (Array.isArray(forceSymbols) && forceSymbols.length > 0) {
             console.log(`[v0] [getSymbols] ${this.connectionId}: using force_symbols (${forceSymbols.length} symbols from migration/admin override)`)
-            return forceSymbols
+            return forceSymbols.map(String).filter(Boolean)
           }
 
           // ── Secondary: self-written symbols from previous engine start ─────
@@ -3458,16 +3466,19 @@ export class TradeEngineManager {
           if (typeof connSymbols === "string") {
             try { connSymbols = JSON.parse(connSymbols) } catch { /* ignore */ }
           }
-          if (Array.isArray(connSymbols) && connSymbols.length > 0) return connSymbols
+          if (Array.isArray(connSymbols) && connSymbols.length > 0) return connSymbols.map(String).filter(Boolean)
         }
 
         if (connSettings && typeof connSettings === "object") {
-          const symbolsField = (connSettings as any).active_symbols || (connSettings as any).symbols
+          const symbolsField =
+            (connSettings as any).force_symbols ||
+            (connSettings as any).active_symbols ||
+            (connSettings as any).symbols
           let symbols = symbolsField
           if (typeof symbols === "string") {
             try { symbols = JSON.parse(symbols) } catch { /* ignore */ }
           }
-          if (Array.isArray(symbols) && symbols.length > 0) return symbols
+          if (Array.isArray(symbols) && symbols.length > 0) return symbols.map(String).filter(Boolean)
         }
 
         // Global main-symbols fallback — the UI stores these as fields on
@@ -3480,7 +3491,7 @@ export class TradeEngineManager {
         const useMainSymbols = appSettings?.useMainSymbols === true || appSettings?.useMainSymbols === "true" || appSettings?.useMainSymbols === "1"
         if (useMainSymbols === true) {
           const mainSymbols = appSettings?.mainSymbols
-          if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols
+          if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols.map(String).filter(Boolean)
         }
 
         return ["DRIFTUSDT"]
@@ -3521,7 +3532,7 @@ export class TradeEngineManager {
         updated_at: new Date().toISOString(),
         last_indication_run: new Date().toISOString(),
       })
-      
+
       console.log(`[v0] [Engine State] Updated ${stateKey}: status=${status}`)
     } catch (error) {
       console.error("[v0] Failed to update engine state:", error)
@@ -3533,8 +3544,8 @@ export class TradeEngineManager {
    * Phases: idle -> initializing -> prehistoric_data -> indications -> strategies -> realtime -> live_trading
    */
   async updateProgressionPhase(
-    phase: string, 
-    progress: number, 
+    phase: string,
+    progress: number,
     detail: string,
     subProgress?: { current: number; total: number; item?: string }
   ): Promise<void> {
@@ -3550,14 +3561,14 @@ export class TradeEngineManager {
         connection_id: this.connectionId,
         updated_at: new Date().toISOString(),
       }
-      
+
       await setSettings(key, progressionData)
-      
+
       // Log progression update with full details
-      const msg = subProgress && subProgress.total > 0 
+      const msg = subProgress && subProgress.total > 0
         ? `${detail} (${subProgress.current}/${subProgress.total}${subProgress.item ? ` - ${subProgress.item}` : ""})`
         : detail
-      
+
       console.log(`[v0] [Progression] ${this.connectionId}: ${phase} @ ${progress}% - ${msg}`)
     } catch (error) {
       console.error("[v0] Failed to update progression phase:", error)
@@ -3648,12 +3659,11 @@ export class TradeEngineManager {
    */
   /**
    * Tolerance for transient extend failures BEFORE we declare ownership
-   * lost and self-stop. With LOCK_EXTEND_INTERVAL_MS = 15s and the
-   * lock TTL = 90s we can comfortably tolerate up to 5 consecutive
-   * miss-extends (75s) before the lock would naturally expire. 3 was
-   * too tight ��� a Redis blip of ~46s would cascade-self-stop ALL
-   * engines, requiring full auto-start-sweep restart (~75s total
-   * downtime). 5 extends the survival window to 75s before self-stop.
+   * lost and self-stop. With LOCK_EXTEND_INTERVAL_MS = 30s and the
+   * lock TTL = 300s we can tolerate 5 consecutive miss-extends (~150s)
+   * without healthy engines self-stopping during slow exchange calls or
+   * dev-route recompiles. Shorter windows caused live tests to lose
+   * ownership while market/order requests were still in flight.
    */
   private extendFailuresInARow = 0
   private static readonly EXTEND_FAILURES_TOLERATED = 5
