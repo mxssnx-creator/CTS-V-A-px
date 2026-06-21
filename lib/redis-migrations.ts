@@ -2502,21 +2502,6 @@ const migrations: Migration[] = [
         : parseSyms(connExisting.force_symbols).length > 0 ? parseSyms(connExisting.force_symbols)
         : parseSyms(connExisting.active_symbols).length > 0 ? parseSyms(connExisting.active_symbols)
         : SYMS
-      const parseSyms = (raw: string | null | undefined): string[] => {
-        if (!raw) return []
-        try {
-          const parsed = JSON.parse(raw)
-          return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string" && s.length > 0) : []
-        } catch {
-          return raw.split(",").map((s: string) => s.trim()).filter(Boolean)
-        }
-      }
-      const progressSyms =
-        parseSyms(engExisting.force_symbols).length > 0 ? parseSyms(engExisting.force_symbols)
-        : parseSyms(engExisting.active_symbols).length > 0 ? parseSyms(engExisting.active_symbols)
-        : parseSyms(connExisting.force_symbols).length > 0 ? parseSyms(connExisting.force_symbols)
-        : parseSyms(connExisting.active_symbols).length > 0 ? parseSyms(connExisting.active_symbols)
-        : SYMS
       const progressSymCount = String(progressSyms.length)
       const progressSymHash = progressSyms.slice().sort().join("|")
 

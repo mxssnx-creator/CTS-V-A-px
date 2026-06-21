@@ -136,8 +136,8 @@ export class RealtimeProcessor {
   private lastLiveSyncStartedAt = 0
   private lastLiveSyncCompletedAt = 0
   private liveSyncInFlight = false
-  private static readonly LIVE_SYNC_INTERVAL_MS = 200
-  private static readonly LIVE_SYNC_PAUSE_MS = 50
+  private static readonly LIVE_SYNC_INTERVAL_MS = 120
+  private static readonly LIVE_SYNC_PAUSE_MS = 30
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
