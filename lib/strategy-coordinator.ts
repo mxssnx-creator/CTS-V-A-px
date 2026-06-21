@@ -2453,9 +2453,6 @@ export class StrategyCoordinator {
       const mainCount = mainRecords.length
 
       const writes: Promise<any>[] = [
-        client.hset(redisKey, "strategies_main_current", String(n)),
-        client.hset(mainDetailKey, {
-          created_sets:      String(n),
         client.hset(redisKey, "strategies_main_current", String(mainCount)),
         client.hset(mainDetailKey, {
           created_sets:      String(mainCount),
@@ -2465,10 +2462,6 @@ export class StrategyCoordinator {
           entries_total:     String(mainEntriesTotal),
           entries_count:     String(mainEntriesTotal),
           axis_sets:         String(axisSetsAdded),
-          evaluated:         String(n),
-          passed_sets:       String(n),
-          pass_rate:         String(passRatioMain.toFixed(4)),
-          count_pos_eval:    String(n),
           evaluated:         String(mainCount),
           passed_sets:       String(mainCount),
           pass_rate:         String(passRatioMain.toFixed(4)),
@@ -2477,12 +2470,6 @@ export class StrategyCoordinator {
           sets_with_open_positions: String(mainRunningNow),
           sets_progressing:         String(mainProgressing),
           updated_at:        String(Date.now()),
-          [`s:${symbol}:created`]:    String(n),
-          [`s:${symbol}:entries`]:    String(mainEntriesTotal),
-          [`s:${symbol}:running`]:    String(mainRunningNow),
-          [`s:${symbol}:progressing`]: String(mainProgressing),
-          [`s:${symbol}:passed`]:     String(n),
-          [`s:${symbol}:evaluated`]:  String(n),
           [`s:${symbol}:created`]:    String(mainCount),
           [`s:${symbol}:entries`]:    String(mainEntriesTotal),
           [`s:${symbol}:running`]:    String(mainRunningNow),
@@ -2500,8 +2487,6 @@ export class StrategyCoordinator {
           pass_rate:   String(passRatioMain.toFixed(4)),
           [`s:${symbol}:passed`]: String(baseSets.length),
         }).catch(() => {}),
-        client.set(`strategies:${this.connectionId}:main:count`, String(n)),
-        client.set(`strategies:${this.connectionId}:main:evaluated`, String(n)),
         client.set(`strategies:${this.connectionId}:main:count`, String(mainCount)),
         client.set(`strategies:${this.connectionId}:main:evaluated`, String(mainCount)),
         client.set(`strategies:${this.connectionId}:base:passed`, String(baseSets.length)),
@@ -2509,7 +2494,6 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:base:passed`, 86400),
       ]
-      if (n > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", n))
       if (mainCount > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", mainCount))
       if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", baseSets.length))
 
@@ -2558,8 +2542,9 @@ export class StrategyCoordinator {
         writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
       }
 
-      await Promise.all(writes)
-    } catch { /* non-critical — Redis write failure should not kill strategy flow */ }
+      try {
+        await Promise.all(writes)
+      } catch { /* non-critical — Redis write failure should not kill strategy flow */ }
 
     return {
       result: {
