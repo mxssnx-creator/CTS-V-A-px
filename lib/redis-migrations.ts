@@ -2505,6 +2505,25 @@ const migrations: Migration[] = [
       const progressSymCount = String(progressSyms.length)
       const progressSymHash = progressSyms.slice().sort().join("|")
 
+
+      const parseSyms = (raw: string | null | undefined): string[] => {
+        if (!raw) return []
+        try {
+          const parsed = JSON.parse(raw)
+          return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string" && s.length > 0) : []
+        } catch {
+          return raw.split(",").map((s: string) => s.trim()).filter(Boolean)
+        }
+      }
+      const progressSyms =
+        parseSyms(engExisting.force_symbols).length > 0 ? parseSyms(engExisting.force_symbols)
+        : parseSyms(engExisting.active_symbols).length > 0 ? parseSyms(engExisting.active_symbols)
+        : parseSyms(connExisting.force_symbols).length > 0 ? parseSyms(connExisting.force_symbols)
+        : parseSyms(connExisting.active_symbols).length > 0 ? parseSyms(connExisting.active_symbols)
+        : SYMS
+      const progressSymCount = String(progressSyms.length)
+      const progressSymHash = progressSyms.slice().sort().join("|")
+
       // ── 4. Progression snapshot so status API reflects actual symbols ─────
       await client.hset(`progression:${CONN_ID}`, {
         symbol_count:                 progressSymCount,
@@ -2755,6 +2774,43 @@ const migrations: Migration[] = [
       }
 
       console.log(`[v0] Migration 043: aligned symbol state and prehistoric denominators for ${repaired} connection(s)`)
+  // Set force_symbols to XRP, LTC, BCH for testing/demo purposes
+  {
+    version: 43,
+    name: "043-set-force-symbols-to-xrp-ltc-bch",
+    description: "Update force_symbols to [XRPUSDT, LTCUSDT, BCHUSDT] for testing",
+    up: async (client: any) => {
+      await client.set("_schema_version", "43")
+      const CONN_ID = "bingx-x01"
+      const now = new Date().toISOString()
+      const NEW_SYMBOLS = ["XRPUSDT", "LTCUSDT", "BCHUSDT"]
+
+      // Update force_symbols in all three hash locations for consistency
+      await Promise.all([
+        client.hset(`connection:${CONN_ID}`, {
+          force_symbols: JSON.stringify(NEW_SYMBOLS),
+          symbol_count: String(NEW_SYMBOLS.length),
+          updated_at: now,
+        }).catch(() => {}),
+        client.hset(`settings:connection:${CONN_ID}`, {
+          force_symbols: JSON.stringify(NEW_SYMBOLS),
+          symbol_count: String(NEW_SYMBOLS.length),
+          updated_at: now,
+        }).catch(() => {}),
+        client.hset(`connection_settings:${CONN_ID}`, {
+          force_symbols: JSON.stringify(NEW_SYMBOLS),
+          symbol_count: String(NEW_SYMBOLS.length),
+          updated_at: now,
+        }).catch(() => {}),
+        // Clear prehistoric gates so the engine re-runs with the new symbols
+        client.del(`prehistoric_loaded:${CONN_ID}`).catch(() => {}),
+        client.del(`prehistoric_loaded:${CONN_ID}:verified`).catch(() => {}),
+        client.del(`prehistoric:progress:${CONN_ID}`).catch(() => {}),
+      ])
+
+      console.log(
+        `[v0] Migration 043: set ${CONN_ID} force_symbols to [${NEW_SYMBOLS.join(", ")}] and cleared prehistoric gates`,
+      )
     },
     down: async (client: any) => {
       await client.set("_schema_version", "42")

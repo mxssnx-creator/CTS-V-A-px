@@ -3,6 +3,7 @@ import { initRedis, getRedisClient, flushAll } from "@/lib/redis-db"
 import { runMigrations, resetMigrationRunState } from "@/lib/redis-migrations"
 import { stopAllProgressionsBeforeReset } from "@/lib/db-reset-helper"
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 export async function POST() {

@@ -21,6 +21,7 @@ const RESTART_REQUIRED_FIELDS = [
   // of mixing a hot reload with a separately queued API-route restart.
   "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
   "is_live_trade", "is_preset_trade", "connection_method",
+  "symbol_count",  // ── Symbol list changes require NEW progression ──
 ]
 
 // Fields that can be hot-reloaded without restart
@@ -200,6 +201,7 @@ export async function getChangeCounter(connectionId: string): Promise<number> {
 
 /**
  * Compute which fields changed between two connection objects.
+ * Handles nested fields like force_symbols within connection_settings.
  */
 export function detectChangedFields(
   previous: Record<string, unknown>,
@@ -215,6 +217,16 @@ export function detectChangedFields(
     if (prevVal !== newVal) {
       changed.push(key)
     }
+  }
+  
+  // ── Symbol count changes need special handling ──────────────────────
+  // force_symbols is nested within connection_settings, so a change to it
+  // won't appear in the top-level allKeys. Compare symbol counts explicitly:
+  // if they differ, it's a progression-level change (not just strategy reload).
+  const prevSymbols = previous.force_symbols as string[] | undefined || []
+  const updatedSymbols = updated.force_symbols as string[] | undefined || []
+  if ((prevSymbols || []).length !== (updatedSymbols || []).length) {
+    changed.push("symbol_count")  // Mark as a distinct "symbol count changed" signal
   }
   
   return changed

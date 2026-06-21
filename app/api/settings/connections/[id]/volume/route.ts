@@ -41,6 +41,7 @@ function clampFactor(raw: unknown): number | null {
   return Math.max(FACTOR_MIN, Math.min(FACTOR_MAX, n))
 }
 
+export const dynamic = "force-dynamic"
 export async function GET(_request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   try {

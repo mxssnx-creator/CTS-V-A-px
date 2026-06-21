@@ -126,6 +126,7 @@ async function handleStartAll() {
   }
 }
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   return handleStartAll()
 }

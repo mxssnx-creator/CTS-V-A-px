@@ -699,7 +699,7 @@ async function pollOrderFill(
   if (!orderId) {
     return { filled: false, filledQty: 0, filledPrice: 0, status: "pending" }
   }
-  const intervals = [100, 200, 350, 600]
+  const intervals = [50, 150, 300, 500]
   const deadline = Date.now() + timeoutMs
   let lastStatus = "pending"
   let pollIdx = 0
@@ -1133,8 +1133,8 @@ async function placeProtectionOrder(
     if (!result?.success) {
       const errMsg109 = String(result?.error || "")
       if (errMsg109.includes("109420") || /position not exist/i.test(errMsg109)) {
-        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 6s before retry`)
-        await new Promise((r) => setTimeout(r, 6000))
+        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 3s before retry`)
+        await new Promise((r) => setTimeout(r, 3000))
         result = await placeStop(effectiveQty)
         if (!result?.success) {
           console.warn(`${tag} 109420 retry also failed (error=${result?.error}) — reconcile will retry on next tick`)
@@ -1701,7 +1701,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ───�����────────────────────────────────────────────────────────
+// ── Main Pipeline ───�������────────────────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -2799,7 +2799,7 @@ export async function executeLivePosition(
       // (combined with the 4 s retry inside placeProtectionOrder for
       // code=109420) gives a total 6 s window — sufficient for all
       // observed symbols including DOGE, ADA, and SOL.
-      await new Promise((r) => setTimeout(r, 2000))
+      await new Promise((r) => setTimeout(r, 1000))
     } else {
       // D) Final guard: fill unconfirmed but order was accepted �� treat as filled
       // with computedVolume so SL/TP can be placed. The position is "open" on the
@@ -2832,10 +2832,10 @@ export async function executeLivePosition(
       // before a STOP/TP_MARKET can reference them — 109420 "position not exist"
       // fires if SL/TP is submitted too quickly (confirmed in DOGE/ADA/AAVE/BNB/SOL logs).
       // BNBUSDT + SOLUSDT observed to need >14s (8s initial + 6s retry both failed),
-      // so raised to 10s here. Combined with the 6s 109420 retry inside
-      // placeProtectionOrder the total window is 10s + 6s = 16s before giving up.
+      // so raised to 5s here. Combined with the 3s 109420 retry inside
+      // placeProtectionOrder the total window is 5s + 3s = 8s before giving up.
       // Reconcile arms protection on the next tick if both attempts still fail.
-      await new Promise((r) => setTimeout(r, 10000))
+      await new Promise((r) => setTimeout(r, 5000))
       await logLiveOrderFinal(orderTrace, {
         status: "placed",
         livePositionId: livePosition.id,

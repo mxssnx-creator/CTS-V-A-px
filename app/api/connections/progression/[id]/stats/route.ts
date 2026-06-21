@@ -618,7 +618,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ───────────────────────────────────�������────────────
+      // ── Price tracking ───────────────────────────────────���������������────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -1708,12 +1708,23 @@ export async function GET(
         const sym = String(pos.symbol || "").trim().toUpperCase()
         const dirRaw = String(pos.direction || "").trim().toLowerCase()
         if (!sym || !["long", "short"].includes(dirRaw)) continue
+        
+        // ── Calculate exit price from P&L ──────────────────────────────────────
+        // Since we don't have an explicit close price, derive it from realized P&L:
+        // For LONG: exitPrice = entryPrice + (pnl / qty)
+        // For SHORT: exitPrice = entryPrice - (pnl / qty)
+        let exitP = avgP
+        if (qty > 0) {
+          const pnlPerUnit = pnl / qty
+          exitP = dirRaw === "long" ? avgP + pnlPerUnit : avgP - pnlPerUnit
+        }
+        
         closedPositionsForHistory.push({
           id:       String(pos.id || ""),
           symbol:   sym,
           direction: dirRaw as "long" | "short",
           entryPrice: Math.round(avgP * 1e8) / 1e8,
-          exitPrice:  Math.round((Number(pos.closePrice ?? pos.lastPrice ?? avgP) || 0) * 1e8) / 1e8,
+          exitPrice:  Math.round(exitP * 1e8) / 1e8,
           realizedPnl: Math.round(pnl * 100) / 100,
           pnlPct,
           holdMinutes: holdMin,
@@ -2116,17 +2127,19 @@ export async function GET(
         strategiesTotal: stratTotal,
         positionsOpen,
         // Sets + Positions are the canonical "continuous live progression" anchors
-        // the user relies on. These come straight from atomic hincrby writes
-        // inside StrategyCoordinator (sets) and live-stage (positions/orders).
+        // the user relies on. Read from stratDetail (which has createdSets from
+        // strategy history) rather than stratCounts (which reads from unreliable
+        // strategies_active hash that may be stale or evicted). stratDetail is
+        // the single source of truth for strategy counts.
         setsCreated: {
-          base:  stratCounts.base  || 0,
-          main:  stratCounts.main  || 0,
-          real:  stratCounts.real  || 0,
+          base:  n(stratDetail.base?.createdSets) || 0,
+          main:  n(stratDetail.main?.createdSets) || 0,
+          real:  n(stratDetail.real?.createdSets) || 0,
           // Live is the final dispatch stage (sets actually selected for order dispatch).
-          // Written per-cycle by createLiveSets into strategies_active:{conn} hash.
-          live:  stratCounts.live  || 0,
+          // Read from stratDetail.live which reflects actual dispatched sets.
+          live:  n(stratDetail.live?.createdSets) || 0,
           // `total` is the pipeline's final-stage output (Live when available, else Real).
-          total: stratCounts.live || stratCounts.real || 0,
+          total: n(stratDetail.live?.createdSets) || n(stratDetail.real?.createdSets) || 0,
         },
         positions: {
           opened:    n(progHash.live_positions_created_count),
@@ -2138,10 +2151,18 @@ export async function GET(
           ),
           ordersPlaced: n(progHash.live_orders_placed_count),
           ordersFilled: n(progHash.live_orders_filled_count),
+          // ── Average Position Size and Open Count ──────────────────────
+          // avgPosPerSet = total USD volume / count of positions created
+          // avgOpen = count of currently open positions / created positions
+          avgPosPerSet: performanceTiers.live.avgPosPerSet,
+          avgOpen: n(progHash.live_positions_created_count) > 0
+            ? Math.round((Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)) / n(progHash.live_positions_created_count)) * 10000) / 100
+            : 0,
         },
         isActive:         realtimeIsActive,
         successRate:      Math.round(successRate * 10) / 10,
         avgCycleTimeMs,
+        stageEvalPercent,
       },
 
       breakdown: {
@@ -2358,7 +2379,7 @@ export async function GET(
         overall:  variantOverall,
       },
 
-      // ── Main-stage COORDINATION snapshot ─────────────────────────────────
+      // ── Main-stage COORDINATION snapshot ────────��────────────────────────
       // Answers "is the Main stage coordinating correctly?" at a glance:
       //   • activeVariants           — names of variants gated ACTIVE this cycle
       //                                (default is always on; trailing/block/dca
