@@ -169,6 +169,18 @@ interface LiveStats {
   historicAvgProfitFactor: number
   historicAvgProfitFactorCount: number
   executedPositions: number
+  // detailed prehistoric progress
+  historicDetailsPercent?: { symbols: number; candles: number; indicators: number }
+  historicPerSymbolProgress?: Array<{
+    symbol: string
+    status: 'pending' | 'processing' | 'complete' | 'error' | 'unknown'
+    candlesLoaded: number
+    indicatorsCalculated: number
+    startedAt: number | null
+    completedAt: number | null
+    errorMessage: string | null
+  }>
+  realtimeGatingStatus?: { isGated: boolean; reason: string | null; firstRealtimeCycleAt: number | null }
   // realtime
   indicationCycles: number
   strategyCycles: number
@@ -310,6 +322,9 @@ const EMPTY_STATS: LiveStats = {
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
   realAverages: null,
   stageEvalPercent: null,
+  historicDetailsPercent: { symbols: 0, candles: 0, indicators: 0 },
+  historicPerSymbolProgress: [],
+  realtimeGatingStatus: { isGated: false, reason: null, firstRealtimeCycleAt: null },
 }
 
 function fmt(n: number): string {
@@ -591,6 +606,16 @@ export function QuickstartSection() {
         // Real-stage rolling averages and stage cascade eval percentages.
         // Both arrive from the /stats endpoint already computed.
         realAverages:     s.realAverages     ?? null,
+        // Detailed prehistoric progress with per-symbol breakdown and percentages
+        historicDetailsPercent: s.historic?.details 
+          ? {
+              symbols: s.historic.details.symbolsProcessedPercent || 0,
+              candles: s.historic.details.candlesLoadedPercent || 0,
+              indicators: s.historic.details.indicatorsCalculatedPercent || 0,
+            }
+          : { symbols: 0, candles: 0, indicators: 0 },
+        historicPerSymbolProgress: s.historic?.details?.perSymbolProgress || [],
+        realtimeGatingStatus: s.realtimeGatingStatus || { isGated: false, reason: null, firstRealtimeCycleAt: null },
         stageEvalPercent: s.stageEvalPercent ?? null,
       })
       // Persist stats to sessionStorage so a page reload can restore the last
@@ -667,11 +692,14 @@ export function QuickstartSection() {
   useEffect(() => {
     clearInterval(pollRef.current)
     fetchStats()
-    // Always poll: fast (3s) when expanded or running, slower (10s) otherwise
-    const interval = (expanded || isRunning) ? 3000 : 10000
+    // Poll at 500ms during prehistoric processing for real-time progress updates,
+    // else: fast (3s) when expanded or running, slower (10s) otherwise
+    const interval = (!stats.historicComplete && stats.historicSymbolsTotal > 0) 
+      ? 500  // Prehistoric processing: 500ms for per-symbol progress tracking
+      : (expanded || isRunning) ? 3000 : 10000
     pollRef.current = setInterval(() => fetchStats(true), interval)
     return () => clearInterval(pollRef.current)
-  }, [expanded, isRunning, fetchStats])
+  }, [expanded, isRunning, fetchStats, stats.historicComplete, stats.historicSymbolsTotal])
 
   // ── Poll indication config-counts (settings-derived, slow cadence) ────────
   // 60s when expanded, 5min otherwise. This endpoint only changes when the
