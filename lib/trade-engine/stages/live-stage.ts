@@ -1701,7 +1701,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ───�������────────────────────────────────────────────────────────
+// ── Main Pipeline ───��������────────────────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -2222,7 +2222,7 @@ export async function executeLivePosition(
       )
     }
 
-    // ── Step 3: Volume calculation ──────────────��──────────────────────────
+    // ── Step 3: Volume calculation ──────────────��────────────���─────────────
     // POLICY: minimum volume is ALWAYS enforced �� we never reject a live
     // order for "qty too small". If the calculator returns null or a
     // non-positive quantity (e.g. balance fetch failed, NaN math) we
@@ -4502,12 +4502,13 @@ export async function reconcileLivePositions(
 
     // ── Bounded-concurrency streaming pool ───────────��───────────────
     // Streaming (not batch) pool so a slow exchange call on one
-    // position never blocks the next 7 from starting. Concurrency 8
-    // is well below the 50/min order-rate ceiling on every venue we
-    // support and well above the typical sweep size, so the limit
-    // virtually never bites in practice — it exists purely as a
-    // backstop against a pathological burst.
-    const LIVE_RECONCILE_CONCURRENCY = 8
+    // position never blocks the next from starting. Concurrency 12
+    // keeps the faster (120 ms) sweep able to heal/close a larger open
+    // book within a single pass while staying well below the 50/min
+    // order-rate ceiling on every venue we support — orders only fire
+    // on positions that actually need a heal/close, not every sweep, so
+    // the limit exists purely as a backstop against a pathological burst.
+    const LIVE_RECONCILE_CONCURRENCY = 12
     const queue = openPositions.slice()
     const runners: Promise<void>[] = []
     const aggregate = (d: PosDelta) => {
