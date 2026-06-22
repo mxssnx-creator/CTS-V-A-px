@@ -827,13 +827,6 @@ export class TradeEngineManager {
         this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
       }
 
-      // Mark engine as running BEFORE starting the self-scheduling processor
-      // loops. The new setTimeout-based loops check `this.isRunning` at the
-      // start of every tick, and the first tick fires at 0 ms — if the flag is
-      // still false at that moment the loop aborts and never re-schedules,
-      // leaving strategy/indication stats stuck at zero.
-      this.isRunning = true
-
       // ── Cache-hit fast path: arm live processors IMMEDIATELY ──────────
       // `cacheHit` was computed and verified earlier (production self-heal
       // checks done flags + is_complete + PF sample). When true, the one-time
@@ -848,6 +841,14 @@ export class TradeEngineManager {
         this.startStrategyProcessor(config.strategyInterval)
         this.startRealtimeProcessor(config.realtimeInterval)
       }
+
+      // CRITICAL: Mark engine as running AFTER processors are armed (cache-hit path)
+      // or after starting background load (non-cache-hit path below). The setTimeout-based
+      // loops check `this.isRunning` at the start of every tick; if false when a tick
+      // fires, it aborts and never reschedules, leaving stats stuck at zero.
+      // In cache-hit path, processors are already armed above, so setting this flag now
+      // allows their first tick to fire. In non-cache-hit path, arm is called below.
+      this.isRunning = true
 
       // ── Spec contract (prehistoric → realtime ordering) ─────────────────
       // All three live processors (indication / strategy / realtime) are
@@ -1719,6 +1720,7 @@ export class TradeEngineManager {
     // scheduler never blocks on Redis I/O. Flips true once prehistoric is done.
     let prehistoricDoneFlag = false
     let prehistoricDoneCheckedAt = 0
+    const engineStartTime = Date.now()
     const refreshPrehistoricDone = async () => {
       try {
         const client = getRedisClient()
@@ -1807,13 +1809,34 @@ export class TradeEngineManager {
         // Stay silent until the `:done` flag flips — `producedIndications`
         // remains false so scheduleNext re-polls quickly via the empty-cycle
         // backoff (capped at 1s) rather than churning.
-        if (!prehistoricDoneFlag) {
+        const elapsedSinceBoot = Date.now() - engineStartTime
+        const prehistoricStalled = elapsedSinceBoot > 60000 // 60s safety valve
+        if (!prehistoricDoneFlag && !prehistoricStalled) {
           // Force a fresh flag read on every gated tick (cheap single-key
           // GET) so we flip to productive within one tick of prehistoric
           // completing, not up to 3s later.
           await refreshPrehistoricDone()
           if (!prehistoricDoneFlag) {
             return
+          }
+        }
+        
+        if (prehistoricStalled && !prehistoricDoneFlag) {
+          // SAFETY VALVE: 60s passed, prehistoric hasn't signaled done.
+          // Either it stalled, crashed, or is slower than expected.
+          // Force the :done flag and proceed to realtime to prevent
+          // engine from hanging forever. Log the condition.
+          console.error(
+            `[v0] [SAFETY VALVE] Prehistoric stalled >60s for ${connId}, ` +
+            `forcing realtime start and marking prehistoric done`
+          )
+          prehistoricDoneFlag = true
+          const client = getRedisClient()
+          try {
+            await client.set(`prehistoric:${connId}:done`, "1")
+            await client.expire(`prehistoric:${connId}:done`, 86400)
+          } catch (e) {
+            console.error(`[v0] Failed to write safety valve done flag: ${e}`)
           }
         }
 

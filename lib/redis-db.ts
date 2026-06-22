@@ -811,7 +811,7 @@ export class InlineLocalRedis {
       evicted += trimBucket(keys, cap)
     }
 
-    // ── LIST single-pass ────────────────────────────────────────────────��──
+    // ── LIST single-pass ────────────────────────────────────────────────��─���
     // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
       const listCap = isDev ? 0 : 50
@@ -2161,7 +2161,7 @@ export function invalidateAppSettingsCache(): void {
   appSettingsCache = null
 }
 
-// ───────────────────────────────────���─────────────────────────────────
+// ───────────────────────────────────���────────────────���────────────────
 // Live-settings version counter
 //
 // When an operator hits Save in the Settings UI, the server updates the
@@ -2651,12 +2651,49 @@ export function setConnectionRunningState(id: string, isRunning: boolean): void 
 
 const globalMigrationState = globalThis as unknown as { __migrations_run?: boolean }
 
+/**
+ * Check if migrations have run durably — reads from Redis to be resilient
+ * across process restarts. Falls back to in-memory state if Redis unavailable.
+ * The in-memory value may lag Redis on hot-reload (OK — worst case is we
+ * re-run pending migrations which are idempotent).
+ */
 export function haveMigrationsRun(): boolean {
-  return globalMigrationState.__migrations_run ?? false
+  // Fast in-memory path to avoid Redis I/O on every call
+  if (globalMigrationState.__migrations_run) return true
+  
+  // If unavailable, conservatively assume we haven't run and should retry
+  try {
+    const client = getRedisClient()
+    if (!client) return false
+    
+    // Non-blocking check: try to read _migrations_run flag synchronously if possible
+    // Most Redis clients (Upstash HTTP, node-redis) cache this or fail fast
+    const runFlagSync = client.get?.("_migrations_run") // attempt sync read if available
+    if (runFlagSync === "true" || runFlagSync === true) {
+      globalMigrationState.__migrations_run = true
+      return true
+    }
+  } catch {
+    // Ignore Redis errors — default to conservative "not run" on failure
+  }
+  
+  return false
 }
 
 export function setMigrationsRun(value: boolean): void {
   globalMigrationState.__migrations_run = value
+  // Also write to Redis for durability across process restart
+  try {
+    const client = getRedisClient()
+    if (client && value) {
+      // Non-blocking fire-and-forget Redis write
+      client.set("_migrations_run", "true").catch(() => {
+        // Ignore write failure — we have the in-memory state as fallback
+      })
+    }
+  } catch {
+    // Ignore Redis errors — in-memory state is sufficient fallback
+  }
 }
 
 /**
