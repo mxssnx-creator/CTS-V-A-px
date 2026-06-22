@@ -147,6 +147,7 @@ export async function GET(
       strategyDetailBaseHashRaw,
       strategyDetailMainHashRaw,
       strategyDetailRealHashRaw,
+      symbolProgressHashRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -185,6 +186,9 @@ export async function GET(
       client.hgetall(`strategy_detail:${connectionId}:main`).catch(() => null),
       // Per-symbol strategy detail for the Real stage (performance tier source).
       client.hgetall(`strategy_detail:${connectionId}:real`).catch(() => null),
+      // Per-symbol prehistoric progress from tracker (symbol → progress JSON).
+      // Used to render detailed per-symbol completion status in UI.
+      client.hgetall(`prehistoric:${connectionId}:symbol_progress`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
@@ -618,7 +622,7 @@ export async function GET(
       leverage: number
       marginType: "cross" | "isolated"
       marginUsd: number               // volumeUsd / leverage — actual capital at risk
-      // ── Price tracking ───────────────────────────────────���������������────────────
+      // ── Price tracking ───────────────────────��───────────���������������────────────
       entryPrice: number
       markPrice: number
       liquidationPrice: number        // from exchange sync (critical safety info)
@@ -2068,6 +2072,45 @@ export async function GET(
         avgProfitFactorCount:   prehistoricMeta.historicAvgProfitFactorCount,
         executedPositions:      n(progHash.live_positions_created_count),
 
+        // Detailed progress percentages for real-time UI feedback
+        details: {
+          symbolsProcessedPercent: historicSymbolsTotal > 0 
+            ? Math.round((historicSymbolsProcessed / historicSymbolsTotal) * 10000) / 100 
+            : 0,
+          candlesLoadedPercent: historicCandlesLoaded > 0 ? 100 : 0,
+          indicatorsCalculatedPercent: historicIndicatorsCalculated > 0 ? 100 : 0,
+          
+          // Per-symbol breakdown from tracker: array of {symbol, status, candlesLoaded, indicatorsCalculated, startedAt, completedAt}
+          perSymbolProgress: (() => {
+            const symbolProgressHash = symbolProgressHashRaw || {}
+            const symbols = Object.keys(symbolProgressHash).sort()
+            return symbols.map(sym => {
+              try {
+                const data = JSON.parse(symbolProgressHash[sym])
+                return {
+                  symbol: sym,
+                  status: data.status || 'pending',  // pending|processing|complete|error
+                  candlesLoaded: data.candlesLoaded || 0,
+                  indicatorsCalculated: data.indicatorsCalculated || 0,
+                  startedAt: data.startedAt || null,
+                  completedAt: data.completedAt || null,
+                  errorMessage: data.errorMessage || null,
+                }
+              } catch {
+                return {
+                  symbol: sym,
+                  status: 'unknown',
+                  candlesLoaded: 0,
+                  indicatorsCalculated: 0,
+                  startedAt: null,
+                  completedAt: null,
+                  errorMessage: null,
+                }
+              }
+            })
+          })(),
+        },
+
         // Prehistoric-processing churn counters — tick every time the engine spins
         // through its evaluation loop, incl. idle/warmup ticks. Kept here so the UI
         // can hide them from the primary live-progression display while still
@@ -2078,6 +2121,14 @@ export async function GET(
         },
       },
 
+
+      realtimeGatingStatus: {
+        isGated: !historicIsComplete,
+        reason: !historicIsComplete 
+          ? `Prehistoric incomplete: ${historicSymbolsProcessed}/${historicSymbolsTotal} symbols (${historicProgressPercent.toFixed(1)}%)`
+          : null,
+        firstRealtimeCycleAt: historicIsComplete ? (realtimeHash.first_realtime_cycle_at || Date.now()) : null,
+      },
 
       realtime: {
         indicationCycles: realtimeIndicationCycles,
