@@ -69,8 +69,31 @@ export function TradeHistoryTable({ trades, limit = 15, onRefresh }: TradeHistor
       : <ArrowDown className="h-3 w-3 ml-1" />
   }
 
+  // Dedupe trades by id. The server's tradeHistory payload can carry the same
+  // closed position twice (e.g. an "adopted" exchange position that is also
+  // tracked in Redis), which produced duplicate React keys at render → React
+  // duplicates/omits children inconsistently between server and client
+  // (hydration error #418). Keep the most-recently-closed copy per id and let
+  // entries with an empty id fall back to a positional key so none are dropped.
+  const dedupedTrades = useMemo(() => {
+    const out: TradeHistoryRow[] = []
+    const seen = new Map<string, number>()
+    for (const t of trades) {
+      const id = t.id || ""
+      if (!id) { out.push(t); continue }
+      const idx = seen.get(id)
+      if (idx === undefined) {
+        seen.set(id, out.length)
+        out.push(t)
+      } else if ((t.closedAt || 0) >= (out[idx].closedAt || 0)) {
+        out[idx] = t
+      }
+    }
+    return out
+  }, [trades])
+
   const filtered = useMemo(() => {
-    let list = [...trades]
+    let list = [...dedupedTrades]
     if (directionFilter !== "all") list = list.filter((t) => t.direction === directionFilter)
     if (search.trim()) {
       const q = search.trim().toUpperCase()
@@ -92,11 +115,11 @@ export function TradeHistoryTable({ trades, limit = 15, onRefresh }: TradeHistor
       return sortDir === "asc" ? (va > vb ? 1 : -1) : (va < vb ? 1 : -1)
     })
     return list.slice(0, limit)
-  }, [trades, sortField, sortDir, search, directionFilter, limit])
+  }, [dedupedTrades, sortField, sortDir, search, directionFilter, limit])
 
-  const wins   = trades.filter((t) => t.realizedPnl > 0).length
-  const losses = trades.filter((t) => t.realizedPnl < 0).length
-  const totalPnl = trades.reduce((s, t) => s + t.realizedPnl, 0)
+  const wins   = dedupedTrades.filter((t) => t.realizedPnl > 0).length
+  const losses = dedupedTrades.filter((t) => t.realizedPnl < 0).length
+  const totalPnl = dedupedTrades.reduce((s, t) => s + t.realizedPnl, 0)
 
   const fmtTime = (ts: number) =>
     ts > 0 ? new Date(ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"
@@ -180,11 +203,11 @@ export function TradeHistoryTable({ trades, limit = 15, onRefresh }: TradeHistor
               </div>
 
               {/* Data rows */}
-              {filtered.map((trade) => {
+              {filtered.map((trade, i) => {
                 const isWin = trade.realizedPnl >= 0
                 return (
                   <div
-                    key={trade.id}
+                    key={trade.id ? `${trade.id}#${i}` : `trade-${i}`}
                     className="grid gap-2 px-2 py-1.5 text-[10px] hover:bg-muted/40 rounded transition-colors items-center"
                     style={{gridTemplateColumns: "1fr 0.7fr 0.6fr 0.8fr 0.8fr 0.7fr"}}
                   >

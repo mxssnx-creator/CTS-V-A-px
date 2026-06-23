@@ -2760,6 +2760,82 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "42")
     },
   },
+  {
+    version: 44,
+    name: "044-initialize-production-progression-tracking",
+    description: "Ensure progression counters and stats are initialized for production mode",
+    up: async (client: any) => {
+      await client.set("_schema_version", "44")
+      const now = new Date().toISOString()
+      
+      // Initialize progression tracking structures for all known connections
+      const connectionIds = new Set<string>([
+        ...((await client.smembers("connections").catch(() => [])) || []),
+        ...((await client.smembers("connections:main:enabled").catch(() => [])) || []),
+        "bingx-x01", // Ensure primary connection is always set up
+      ].map(String).filter(Boolean))
+
+      let initialized = 0
+      for (const connId of connectionIds) {
+        try {
+          // Initialize progression tracking hash
+          const progressionKey = `progression:${connId}`
+          const existingProg = await client.hgetall(progressionKey).catch(() => ({}))
+          
+          // Only initialize if not already set
+          if (!existingProg || Object.keys(existingProg || {}).length === 0) {
+            await client.hset(progressionKey, {
+              prehistoric_passed: "0",
+              prehistoric_failed: "0",
+              prehistoric_placed: "0",
+              prehistoric_filled: "0",
+              prehistoric_canceled: "0",
+              prehistoric_rejected: "0",
+              prehistoric_errored: "0",
+              real_evaluated: "0",
+              real_passed: "0",
+              real_placed: "0",
+              real_filled: "0",
+              live_evaluated: "0",
+              live_passed: "0",
+              live_placed: "0",
+              live_filled: "0",
+              candlesLoaded: "0",
+              indicatorsComputed: "0",
+              configSetsCreated: "0",
+              initialized_at: now,
+              updated_at: now,
+            })
+            
+            // Set TTL to never expire (production uses indefinite progression)
+            await client.persist(progressionKey).catch(() => {})
+          }
+
+          // Initialize strategies_active hash if not present
+          const strategiesKey = `strategies_active:${connId}`
+          const existingStrat = await client.hgetall(strategiesKey).catch(() => ({}))
+          
+          if (!existingStrat || Object.keys(existingStrat || {}).length === 0) {
+            // Initialize empty for now; coordinator will populate on first cycle
+            await client.hset(strategiesKey, {
+              "_initialized": now,
+            })
+            // Set TTL to 10 minutes; coordinator refreshes every cycle
+            await client.expire(strategiesKey, 600).catch(() => {})
+          }
+
+          initialized++
+        } catch (err: any) {
+          console.warn(`[v0] Migration 044: failed to initialize ${connId}: ${err?.message}`)
+        }
+      }
+
+      console.log(`[v0] Migration 044: initialized progression tracking for ${initialized} connection(s)`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "43")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -2846,7 +2922,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     const { apiKey, apiSecret } = getBaseConnectionCredentials(cfg.credentialId)
     const hasRealCredentials = apiKey.length > 10 && apiSecret.length > 10
 
-    // ── OPERATOR-STATE PRESERVATION CONTRACT ──────────────────────────
+    // ── OPERATOR-STATE PRESERVATION CONTRACT ��─────────────────────────
     // Bug being fixed (operator report): "after removing main connections,
     // it's getting re-added by some procedure".
     //

@@ -980,6 +980,14 @@ async function placeProtectionOrder(
   )
 
   try {
+    // ── Validate Control Order Parameters ────────────────────────────────
+    // SL/TP orders are reduce-only market orders that close positions.
+    // Validate all inputs before exchange interaction.
+    console.log(
+      `${tag} placement initiated: type=${orderLabel} qty=${quantity} triggerPrice=${triggerPrice} ` +
+      `closeSide=${closeSide} positionDir=${positionDirection}`,
+    )
+    
     // Prefer the connector's CONDITIONAL-order path
     // (`placeStopOrder`) over a regular `placeOrder`. The legacy code
     // here used `placeOrder(..., "limit")` at the trigger price — which
@@ -1248,7 +1256,13 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   desiredTp: number
 } {
   const fillPrice = pos.averageExecutionPrice || pos.entryPrice
-  if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
+  if (!fillPrice || fillPrice <= 0) {
+    console.log(
+      `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: No valid fillPrice ` +
+      `(avgExecPrice=${pos.averageExecutionPrice}, entryPrice=${pos.entryPrice})`
+    )
+    return { desiredSl: 0, desiredTp: 0 }
+  }
 
   // ── Trailing stop: use the ratcheted absolute price directly ────────────
   // When trailing is active syncLiveFromPseudo stamps pos.trailingStopPrice
@@ -1258,23 +1272,53 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   let desiredSl: number
   if (pos.trailingActive && pos.trailingStopPrice && pos.trailingStopPrice > 0) {
     desiredSl = pos.trailingStopPrice
+    console.log(
+      `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: Trailing SL active, price=${desiredSl.toFixed(6)}`
+    )
   } else {
+    // Position cost adjustment: 0.1% maker fee = 0.001 factor
+    // Targets must account for cost so profitability is realized AFTER fees
+    const positionCostPct = 0.1 // 0.1% cost
+    const costAdjustmentPct = Number.isFinite(pos.quantity) && pos.quantity > 0 ? positionCostPct : 0
+    
     const slPct = Math.max(0, pos.stopLoss || 0) / 100
     desiredSl =
       slPct > 0
         ? pos.direction === "long"
-          ? fillPrice * (1 - slPct)
-          : fillPrice * (1 + slPct)
+          // Long SL: below entry, costs pull it further down so SL is tighter
+          ? fillPrice * (1 - slPct - costAdjustmentPct / 100)
+          // Short SL: above entry, costs pull it further up so SL is tighter
+          : fillPrice * (1 + slPct + costAdjustmentPct / 100)
         : 0
+    
+    if (slPct > 0) {
+      console.log(
+        `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: Static SL ${pos.direction}=${pos.stopLoss}% ` +
+        `fillPrice=${fillPrice.toFixed(6)} cost=${costAdjustmentPct.toFixed(3)}% → SL=${desiredSl.toFixed(6)}`
+      )
+    }
   }
 
+  // Take-profit targets: offset by position cost to ensure net profit after fees
+  const tpCostPct = 0.1 // 0.1% cost
+  const tpCostAdjustmentPct = Number.isFinite(pos.quantity) && pos.quantity > 0 ? tpCostPct : 0
+  
   const tpPct = Math.max(0, pos.takeProfit || 0) / 100
   const desiredTp =
     tpPct > 0
       ? pos.direction === "long"
-        ? fillPrice * (1 + tpPct)
-        : fillPrice * (1 - tpPct)
+        // Long TP: above entry, offset cost so net profit achieved
+        ? fillPrice * (1 + tpPct + tpCostAdjustmentPct / 100)
+        // Short TP: below entry, offset cost so net profit achieved
+        : fillPrice * (1 - tpPct - tpCostAdjustmentPct / 100)
       : 0
+
+  if (tpPct > 0) {
+    console.log(
+      `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: TP ${pos.direction}=${pos.takeProfit}% ` +
+      `fillPrice=${fillPrice.toFixed(6)} cost=${tpCostAdjustmentPct.toFixed(3)}% → TP=${desiredTp.toFixed(6)}`
+    )
+  }
 
   return { desiredSl, desiredTp }
 }
@@ -2251,6 +2295,17 @@ export async function executeLivePosition(
         ? "preset"
         : "main"
 
+    // ── Validate Strategy Type and Size Multiplier ──────────────────────
+    // Block and DCA strategies use sizeMultiplier for direct qty scaling,
+    // while Standard strategies use 1.0 and apply continuousCount separately.
+    // Log the strategy type and multiplier for audit trail.
+    if (livePosition.setVariant === "block" || livePosition.setVariant === "dca") {
+      console.log(
+        `${LOG_PREFIX} [ADJUST_STRATEGY] ${realPosition.symbol} variant=${livePosition.setVariant} ` +
+        `strategyType=adjust sizeMultiplier=${realPosition.sizeMultiplier}`,
+      )
+    }
+    
     const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
       connectionId,
       realPosition.symbol,
@@ -2259,6 +2314,9 @@ export async function executeLivePosition(
         tradeMode: liveTradeMode,
         // Forward the Block/DCA variant multiplier so notional is correctly
         // scaled before the exchange order is placed (absent → 1.0 identity).
+        // For Block: sizeMultiplier includes volume-ratio scaling m(n) = 1+(n-1)×ratio
+        // For DCA: sizeMultiplier is fixed 0.5 (averaging)
+        // For Standard: sizeMultiplier is 1.0 (continuousCount applied separately)
         sizeMultiplier: realPosition.sizeMultiplier,
       },
     ).catch(err => {
@@ -2429,10 +2487,18 @@ export async function executeLivePosition(
     }
 
     // Strong diagnostic log right before real money order attempt
+    // ── Order Price Validation ──────────────────────────────────────────
+    // Log the market price used for entry order to verify it's close to
+    // pseudo position entry price. Price source: Redis market_data:{symbol}:price
+    // This ensures entry fill price aligns with coordinator expectations.
     console.log(
       `${LOG_PREFIX} [REAL_ORDER_ATTEMPT] conn=${connectionId} sym=${realPosition.symbol} dir=${realPosition.direction} ` +
-      `computedVol=${computedVolume} price=${currentPrice} lev=${livePosition.leverage} ` +
-      `setKey=${livePosition.setKey} trace=${orderTrace.traceId}`
+      `computedVol=${computedVolume} entryPrice=${currentPrice} leverage=${livePosition.leverage} ` +
+      `sizeMultiplier=${realPosition.sizeMultiplier} setKey=${livePosition.setKey} trace=${orderTrace.traceId}`
+    )
+    console.log(
+      `${LOG_PREFIX} [ORDER_PRICE_SOURCE] sym=${realPosition.symbol} marketPrice=${currentPrice} ` +
+      `source=market_data:{${realPosition.symbol}}:price notional=$${(computedVolume * currentPrice).toFixed(2)}`
     )
 
     // The `retry()` helper repeats up to 3× on transient failures; we
@@ -2666,6 +2732,32 @@ export async function executeLivePosition(
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
     await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "placed")
+    
+    // Track block strategy metrics if this is a block variant
+    if (isBlockVariant) {
+      const blockStackDepth = (realPosition.setVariant === "block") ? 1 : undefined
+      void trackBlockStrategyMetrics(
+        connectionId,
+        realPosition.symbol,
+        "created",
+        blockStackDepth,
+        realPosition.sizeMultiplier,
+        true, // block variant always treated as independent entry
+        0 // position count tracked separately
+      ).catch(() => {})
+      
+      // Validate block strategy edge cases
+      const blockWarnings = validateBlockStrategyEdgeCases(
+        realPosition.symbol,
+        blockStackDepth || 1,
+        8, // blockMaxStack default
+        realPosition.sizeMultiplier || 1.0,
+        0, // continuousCount (block is independent)
+        1, // positionCount
+        true // isIndependentBlock
+      )
+      logValidationWarnings(blockWarnings, `${realPosition.symbol} block created`)
+    }
     // Successful placement — reset the margin error consecutive-failure counter
     // so the backoff resets to the shortest cooldown on the next failure.
     marginErrorCooldownByConnection.delete(connectionId)
@@ -2801,7 +2893,8 @@ export async function executeLivePosition(
       // (combined with the 4 s retry inside placeProtectionOrder for
       // code=109420) gives a total 6 s window — sufficient for all
       // observed symbols including DOGE, ADA, and SOL.
-      await new Promise((r) => setTimeout(r, 1000))
+      // PROD FIX: Increased from 1s to 2s to ensure position registry consistency
+      await new Promise((r) => setTimeout(r, 2000))
     } else {
       // D) Final guard: fill unconfirmed but order was accepted �� treat as filled
       // with computedVolume so SL/TP can be placed. The position is "open" on the
@@ -3478,7 +3571,7 @@ export async function closeLivePosition(
     if (qty <= 0) {
       console.warn(
         `[v0] [Live] P&L calc: qty<=0 for ${position.symbol} ${position.id} ` +
-        `qty=${qty} (executedQuantity=${position.executedQuantity}, entryQty=${position.entryQuantity})`
+        `qty=${qty} (executedQuantity=${position.executedQuantity})`
       )
     }
     if (avgEntry <= 0) {

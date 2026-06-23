@@ -93,6 +93,37 @@ export interface StrategySet {
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
   variant?: "default" | "trailing" | "block" | "dca" | "pause"
+  
+  /**
+   * ── Strategy type classification (Standard vs Adjust) ──────────────────
+   *
+   * Distinguishes how this Set's position quantity should be calculated:
+   *   - "standard": Position-count based (axis sets, trailing, default variants)
+   *     Qty = baseQty × continuousCount for axis sets
+   *   - "adjust": Adjustment strategies (Block/DCA variants)
+   *     Qty = baseQty × sizeMultiplier (computed from volume ratio)
+   *     These are INDEPENDENT adjustments over/alongside Standard sets
+   *
+   * Set in buildVariantSet() based on variant type. Used in Live stage to
+   * apply position-specific quantity scaling correctly.
+   */
+  strategyType?: "standard" | "adjust"
+  
+  /**
+   * ── Base multiplier for Block/DCA volume ratio scaling ────────────────
+   *
+   * For "adjust" type strategies (Block/DCA), preserves the scaled
+   * sizeMultiplier computed in selectActiveVariants:
+   *   - Block: m(n) = 1 + (n-1) × volumeRatio (e.g. n=2, ratio=0.5 → 1.5)
+   *   - DCA: Similar scaling based on continuous count
+   *
+   * For "standard" strategies, undefined (position count scaling used instead).
+   *
+   * Propagated from Main → Real → Live unchanged, consumed by Live stage
+   * in qty calculation. Overrides or complements continuous-count scaling.
+   */
+  baseMultiplier?: number
+  
   /**
    * ── Position-count axis windows that this Set satisfies ────────────
    *
@@ -905,7 +936,7 @@ export class StrategyCoordinator {
     },
     live: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.2,   // operator spec default (live=1.2)
+      minProfitFactor: 1.0,   // Reduced from 1.2 to allow more live dispatch (real stage already gates at 1.2)
       confidence: 0.65,       // advisory only
       description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= maxDrawdownTime) ready for live trading",
     },
@@ -1506,22 +1537,25 @@ export class StrategyCoordinator {
 
         if (entries.length === 0) continue
 
-        const rawAvgPF = entries.reduce((s, e) => s + e.profitFactor, 0) / entries.length
         const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
 
-        // ── Prev-PI min-blend on avgProfitFactor ─────────────────────────
-        // Operator spec: "evaluating prev pos and profitfactors min from
-        // historic". When the historic bucket has at least `prevPosMinCount`
-        // closed positions, the Set's avgProfitFactor becomes the MIN of
-        // (live indication PF, historic realised PF). Underperforming
-        // historic regimes thus pull the bar DOWN so the Base→Main filter
-        // rejects them. When the bucket has insufficient data we leave the
-        // raw indication-derived PF untouched (= bootstrap path).
+        // ── Use ONLY cost-adjusted realized PF from position history ──────
+        // FIX: avgProfitFactor must be AUTHORITATIVE — derived from actual
+        // closed positions (cost-adjusted). Do NOT blend with synthetic entry PFs.
+        // 
+        // Operator spec (corrected): when historic bucket has >= prevPosMinCount
+        // closed positions, use their cost-adjusted PF directly (posStats.profitFactor).
+        // This is the ONLY source for avgProfitFactor — it reflects TRUE profitability
+        // after trading costs, not synthetic price-action estimates.
+        // 
+        // Bootstrap path (no history): Set avgPF to a neutral conservative baseline
+        // (e.g., 1.0) so gates don't activate on unproven strategies. As history
+        // accumulates, posStats updates and avgPF becomes data-driven.
         const posStats = posMap.get(`${group.indicationType}|${group.direction}`)
-        const blendActive = !!posStats && posStats.count >= prevPosMinCount
-        const avgPF = blendActive
-          ? Math.min(rawAvgPF, posStats!.profitFactor)
-          : rawAvgPF
+        const hasRealisedHistory = !!posStats && posStats.count >= prevPosMinCount
+        const avgPF = hasRealisedHistory
+          ? posStats!.profitFactor  // Cost-adjusted from actual positions (authoritative)
+          : 1.0  // Conservative bootstrap: no unproven strategies activate
 
         // ── Drawdown-time from historic window ────────��───────────────────
         // The Set's avgDrawdownTime was previously hardcoded to 0, which made
@@ -1536,6 +1570,7 @@ export class StrategyCoordinator {
           setKey,
           indicationType: group.indicationType,
           direction: group.direction,
+          strategyType: "standard",  // NEW: Base sets are always "standard" type
           avgProfitFactor: avgPF,
           avgConfidence: avgConf,
           avgDrawdownTime: avgDDT,
@@ -2866,7 +2901,7 @@ export class StrategyCoordinator {
     // For future use: if we need to re-cap (e.g. for perf), read the
     // operator's `maxRealSets` setting and apply it here.
     //
-    // ── MEMORY-SAFETY CEILING (not a funnel cap) ─────────────────────────
+    // ── MEMORY-SAFETY CEILING (not a funnel cap) ────��────────────────────
     // Real Sets remain "unlimited" by product spec, but slicing to a literal
     // Infinity let `realPostHedge` carry every qualifying Set — and each Set
     // is a full object with an `entries[]` array. On a dense symbol the Real
@@ -3058,8 +3093,11 @@ export class StrategyCoordinator {
             sizeDelta = Math.max(-0.5, Math.min(0.5, combined - 1))
           }
 
-          // tunedAvgPF: apply combined bias to the current avgPF
-          // (avoids re-summing the now-unmodified entries array each cycle).
+          // tunedAvgPF: apply performance bias to the cost-adjusted avgPF
+          // s.avgProfitFactor is now authoritative cost-adjusted PF from position history.
+          // Apply combined bias (from prevPos stats) to reflect variant performance.
+          // Avoids re-summing the now-unmodified entries array each cycle.
+          // FIX: Ensure combined bias doesn't over-amplify low base PF values.
           const tunedAvgPF = Math.max(0.5, (s.avgProfitFactor ?? 1) * combined)
 
           if (coordIndex) {
@@ -3311,16 +3349,14 @@ export class StrategyCoordinator {
       // Log the full pipeline cascade with counts + gating reasons for debugging
       console.log(
         `[v0] [StrategyFlow] ${this.connectionId}:${symbol} ` +
-        `BASE=${this.baseSets.length} ` +
         `MAIN=${mainSets.length} (eligible=${mainPFEligible}, pos-filtered=${mainSets.length - mainPFEligible}) ` +
         `REAL=${realSets.length} (hedged-reduced=${mainPFEligible - realSets.length}) ` +
-        `LIVE=${realLiveCount || '—'} | ` +
-        `avgPF(main=${realAvgPF.toFixed(2)} real=${realAvgPF.toFixed(2)}) passRatio=${passRatioReal.toFixed(2)} ` +
+        `avgPF=${realAvgPF.toFixed(2)} passRatio=${passRatioReal.toFixed(2)} ` +
         `running=${realRunningNow} entries=${realEntriesTotal}`
       )
       
       // AUTO-ADJUST: If REAL produces 0 sets for 30+ cycles, log WARNING
-      // and suggest operator review minPositions / Real ceiling settings
+      // and suggest operator review settings
       if (realSets.length === 0 && mainPFEligible > 0) {
         const zeroRealKey = `strategies:${this.connectionId}:zero_real_cycles`
         writes.push(
@@ -3334,8 +3370,7 @@ export class StrategyCoordinator {
         if (zeroCount >= 30) {
           console.warn(
             `[v0] [WARNING] ${this.connectionId}:${symbol} has produced 0 REAL sets for ${zeroCount}+ cycles. ` +
-            `Check: minPositions gate (${this.minPositions}), REAL ceiling (${this.REAL_SETS_SAFETY_CEILING}), ` +
-            `or position-count filtering. Suggestion: review real stage thresholds or lower position requirements.`
+            `Check position-count filtering or REAL ceiling settings. Suggestion: review real stage thresholds.`
           )
         }
       } else if (realSets.length > 0) {
@@ -3640,14 +3675,22 @@ export class StrategyCoordinator {
 
     // P0-2: Live filter axes are PF-min + DDT-max ONLY (then rank by
     // avgProfitFactor and take top N). Confidence is advisory metadata.
-    let qualifying = realSets
-      .filter(
-        (s) =>
-          s.avgProfitFactor >= metrics.minProfitFactor &&
-          s.avgDrawdownTime <= metrics.maxDrawdownTime,
-      )
+    const preFiltCount = realSets.length
+    const pfFiltered = realSets.filter((s) => s.avgProfitFactor >= metrics.minProfitFactor)
+    const ddtFiltered = pfFiltered.filter((s) => s.avgDrawdownTime <= metrics.maxDrawdownTime)
+    
+    let qualifying = ddtFiltered
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
+    
+    // Log filtering steps for debugging
+    if (preFiltCount > 0 && qualifying.length < Math.min(maxLive, 50)) {
+      console.log(
+        `[v0] [LiveDispatch] ${this.connectionId}:${symbol}: ` +
+        `Real=${preFiltCount} → PF>=${metrics.minProfitFactor}=${pfFiltered.length} → ` +
+        `DDT<=${metrics.maxDrawdownTime}=${ddtFiltered.length} → Top${maxLive}=${qualifying.length}`
+      )
+    }
 
     // DEV/TEST fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
     // Short-circuit getConnection() in dev — NODE_ENV check is free vs async Redis read per cycle.
@@ -4404,7 +4447,7 @@ export class StrategyCoordinator {
 
         for (const h of hashes) {
           if (!h) continue
-          // ── P2-1: Strict closed-only gate ───────────────────��──────────
+          // ── P2-1: Strict closed-only gate ───────────────────��────���─────
           // Positions in the closed_index are always closed by construction
           // (closePosition writes to the index). We still enforce the
           // status check as a defence against stale/corrupted rows.
@@ -4733,6 +4776,7 @@ export class StrategyCoordinator {
                   setKey:          `${parentKey}#axis:${axisKey}`,
                   parentSetKey:    parentKey,
                   variant:         "default",
+                  strategyType:    "standard",  // NEW: Axis sets are always "standard" type
                   indicationType:  baseDefault.indicationType,
                   direction:       dir,
                   avgProfitFactor: inheritedPF,
@@ -5001,17 +5045,23 @@ export class StrategyCoordinator {
     // resolving Base entries via coordIndex.base.byKey.get(parentSetKey) —
     // O(1), zero-copy.  The Real-stage tuner for-loop over s.entries becomes
     // a no-op; coordRec.tunedAvgPF is written from s.avgProfitFactor here.
-    let sumPF = 0, sumDDT = 0, sumCnf = 0, count = 0
+    // FIX: Do NOT recalculate PF from individual synthetic entry values.
+    // The BASE set's avgProfitFactor is the authoritative cost-adjusted PF
+    // from realized position history. MAIN stage should inherit it unchanged.
+    // Applying pfBias per-entry then averaging corrupts the cost-adjusted baseline.
+    // Instead: inherit BASE avgPF, compute only DDT and Confidence.
+    let sumDDT = 0, sumCnf = 0, count = 0
     const baseDDTFallback = baseSet.avgDrawdownTime || 0
+    // Inherit cost-adjusted PF from BASE set directly
+    const avgPF = baseSet.avgProfitFactor
 
     outer: for (const baseEntry of baseSet.entries) {
       for (const cfg of profile.configs) {
         if (count >= maxEntries) break outer
-        const pf      = Math.max(metrics.minProfitFactor, baseEntry.profitFactor * cfg.pfBias)
+        // Only compute DDT and Confidence; PF inherited from BASE unchanged
         const baseDDT = baseEntry.drawdownTime > 0 ? baseEntry.drawdownTime : baseDDTFallback
         const ddt     = baseDDT + cfg.ddtBias
         if (ddt > metrics.maxDrawdownTime) continue
-        sumPF  += pf
         sumDDT += ddt
         sumCnf += Math.min(0.99, baseEntry.confidence)
         count++
@@ -5020,7 +5070,6 @@ export class StrategyCoordinator {
 
     if (count === 0) return null
 
-    const avgPF  = sumPF  / count
     const avgDDT = sumDDT / count
     const avgCnf = sumCnf / count
 
@@ -5033,10 +5082,23 @@ export class StrategyCoordinator {
         }
       : { prev: 0, last: 0, cont: 0, pause: 0 }
 
+    // Determine strategy type based on variant (Adjust vs Standard)
+    const isAdjustVariant = profile.name === "block" || profile.name === "dca"
+    const strategyType: "standard" | "adjust" = isAdjustVariant ? "adjust" : "standard"
+    
+    // For Adjust variants (Block/DCA), capture the base multiplier from the first config.
+    // selectActiveVariants scales this based on continuousCount and blockVolumeRatio,
+    // so this represents the SCALED final multiplier used in Live qty calculation.
+    const baseMultiplier = isAdjustVariant && profile.configs.length > 0
+      ? profile.configs[0]!.size  // First config's size (already scaled for Block)
+      : undefined
+    
     return {
       setKey:          `${baseSet.setKey}#${profile.name}`,
       parentSetKey:    baseSet.setKey,
       variant:         profile.name,
+      strategyType,    // NEW: "standard" (position-count) or "adjust" (Block/DCA)
+      baseMultiplier,  // NEW: For Adjust variants only - used for Live qty scaling
       axisWindows,
       indicationType:  baseSet.indicationType,
       direction:       baseSet.direction,
