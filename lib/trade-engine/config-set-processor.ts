@@ -1003,6 +1003,10 @@ export class ConfigSetProcessor {
                   direction,
                   pnl: resultPct,
                   drawdownMinutes,
+                  // Prehistoric backtest positions don't track quantity,
+                  // so position cost is not available. Live positions in
+                  // pseudo-position-manager pass both entryPrice and quantity.
+                  entryPrice: p.entry_price,
                   pipeline,
                 })
               }

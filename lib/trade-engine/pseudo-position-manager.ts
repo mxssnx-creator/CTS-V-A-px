@@ -680,6 +680,8 @@ export class PseudoPositionManager {
           direction: directionRaw,
           pnl,
           drawdownMinutes,
+          entryPrice,  // For cost-adjusted PF calculation
+          quantity,    // For cost-adjusted PF calculation
           pipeline,
         })
       } catch (posErr) {

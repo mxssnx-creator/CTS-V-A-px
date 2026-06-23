@@ -353,7 +353,19 @@ export class AutoIndicationEngine {
     const winningTrades = positions.filter((p: any) => p.profit > 0).length
     const totalProfit = positions.reduce((sum: number, p: any) => sum + Math.max(0, p.profit || 0), 0)
     const totalLoss = Math.abs(positions.reduce((sum: number, p: any) => sum + Math.min(0, p.profit || 0), 0))
-    const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : 0
+    
+    // Cost-adjusted PF: totalProfit / (totalLoss + totalPositionCosts)
+    // Position cost = entry_price × quantity × 0.001 (0.1% maker fee)
+    const totalPositionCosts = positions.reduce((sum: number, p: any) => {
+      if (Number.isFinite(p.entry_price) && Number.isFinite(p.quantity) && 
+          p.entry_price > 0 && p.quantity > 0) {
+        return sum + (p.entry_price * p.quantity * 0.001)
+      }
+      return sum
+    }, 0)
+    
+    const adjustedDenominator = totalLoss + totalPositionCosts
+    const profitFactor = adjustedDenominator > 0 ? totalProfit / adjustedDenominator : 0
     const successRate = winningTrades / totalTrades
     const lastDrawdownPosition = positions.filter((p: any) => p.profit < 0).pop()
     const drawdownTime = lastDrawdownPosition

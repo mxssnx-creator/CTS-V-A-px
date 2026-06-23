@@ -1276,34 +1276,47 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
       `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: Trailing SL active, price=${desiredSl.toFixed(6)}`
     )
   } else {
+    // Position cost adjustment: 0.1% maker fee = 0.001 factor
+    // Targets must account for cost so profitability is realized AFTER fees
+    const positionCostPct = 0.1 // 0.1% cost
+    const costAdjustmentPct = Number.isFinite(pos.quantity) && pos.quantity > 0 ? positionCostPct : 0
+    
     const slPct = Math.max(0, pos.stopLoss || 0) / 100
     desiredSl =
       slPct > 0
         ? pos.direction === "long"
-          ? fillPrice * (1 - slPct)
-          : fillPrice * (1 + slPct)
+          // Long SL: below entry, costs pull it further down so SL is tighter
+          ? fillPrice * (1 - slPct - costAdjustmentPct / 100)
+          // Short SL: above entry, costs pull it further up so SL is tighter
+          : fillPrice * (1 + slPct + costAdjustmentPct / 100)
         : 0
     
     if (slPct > 0) {
       console.log(
         `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: Static SL ${pos.direction}=${pos.stopLoss}% ` +
-        `fillPrice=${fillPrice.toFixed(6)} → SL=${desiredSl.toFixed(6)}`
+        `fillPrice=${fillPrice.toFixed(6)} cost=${costAdjustmentPct.toFixed(3)}% → SL=${desiredSl.toFixed(6)}`
       )
     }
   }
 
+  // Take-profit targets: offset by position cost to ensure net profit after fees
+  const tpCostPct = 0.1 // 0.1% cost
+  const tpCostAdjustmentPct = Number.isFinite(pos.quantity) && pos.quantity > 0 ? tpCostPct : 0
+  
   const tpPct = Math.max(0, pos.takeProfit || 0) / 100
   const desiredTp =
     tpPct > 0
       ? pos.direction === "long"
-        ? fillPrice * (1 + tpPct)
-        : fillPrice * (1 - tpPct)
+        // Long TP: above entry, offset cost so net profit achieved
+        ? fillPrice * (1 + tpPct + tpCostAdjustmentPct / 100)
+        // Short TP: below entry, offset cost so net profit achieved
+        : fillPrice * (1 - tpPct - tpCostAdjustmentPct / 100)
       : 0
 
   if (tpPct > 0) {
     console.log(
       `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: TP ${pos.direction}=${pos.takeProfit}% ` +
-      `fillPrice=${fillPrice.toFixed(6)} → TP=${desiredTp.toFixed(6)}`
+      `fillPrice=${fillPrice.toFixed(6)} cost=${tpCostAdjustmentPct.toFixed(3)}% → TP=${desiredTp.toFixed(6)}`
     )
   }
 
