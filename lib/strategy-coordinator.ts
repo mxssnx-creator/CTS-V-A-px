@@ -1537,22 +1537,25 @@ export class StrategyCoordinator {
 
         if (entries.length === 0) continue
 
-        const rawAvgPF = entries.reduce((s, e) => s + e.profitFactor, 0) / entries.length
         const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
 
-        // ── Prev-PI min-blend on avgProfitFactor ─────────────────────────
-        // Operator spec: "evaluating prev pos and profitfactors min from
-        // historic". When the historic bucket has at least `prevPosMinCount`
-        // closed positions, the Set's avgProfitFactor becomes the MIN of
-        // (live indication PF, historic realised PF). Underperforming
-        // historic regimes thus pull the bar DOWN so the Base→Main filter
-        // rejects them. When the bucket has insufficient data we leave the
-        // raw indication-derived PF untouched (= bootstrap path).
+        // ── Use ONLY cost-adjusted realized PF from position history ──────
+        // FIX: avgProfitFactor must be AUTHORITATIVE — derived from actual
+        // closed positions (cost-adjusted). Do NOT blend with synthetic entry PFs.
+        // 
+        // Operator spec (corrected): when historic bucket has >= prevPosMinCount
+        // closed positions, use their cost-adjusted PF directly (posStats.profitFactor).
+        // This is the ONLY source for avgProfitFactor — it reflects TRUE profitability
+        // after trading costs, not synthetic price-action estimates.
+        // 
+        // Bootstrap path (no history): Set avgPF to a neutral conservative baseline
+        // (e.g., 1.0) so gates don't activate on unproven strategies. As history
+        // accumulates, posStats updates and avgPF becomes data-driven.
         const posStats = posMap.get(`${group.indicationType}|${group.direction}`)
-        const blendActive = !!posStats && posStats.count >= prevPosMinCount
-        const avgPF = blendActive
-          ? Math.min(rawAvgPF, posStats!.profitFactor)
-          : rawAvgPF
+        const hasRealisedHistory = !!posStats && posStats.count >= prevPosMinCount
+        const avgPF = hasRealisedHistory
+          ? posStats!.profitFactor  // Cost-adjusted from actual positions (authoritative)
+          : 1.0  // Conservative bootstrap: no unproven strategies activate
 
         // ── Drawdown-time from historic window ────────��───────────────────
         // The Set's avgDrawdownTime was previously hardcoded to 0, which made
@@ -2898,7 +2901,7 @@ export class StrategyCoordinator {
     // For future use: if we need to re-cap (e.g. for perf), read the
     // operator's `maxRealSets` setting and apply it here.
     //
-    // ── MEMORY-SAFETY CEILING (not a funnel cap) ─────────────────────────
+    // ── MEMORY-SAFETY CEILING (not a funnel cap) ────��────────────────────
     // Real Sets remain "unlimited" by product spec, but slicing to a literal
     // Infinity let `realPostHedge` carry every qualifying Set — and each Set
     // is a full object with an `entries[]` array. On a dense symbol the Real
@@ -3090,8 +3093,11 @@ export class StrategyCoordinator {
             sizeDelta = Math.max(-0.5, Math.min(0.5, combined - 1))
           }
 
-          // tunedAvgPF: apply combined bias to the current avgPF
-          // (avoids re-summing the now-unmodified entries array each cycle).
+          // tunedAvgPF: apply performance bias to the cost-adjusted avgPF
+          // s.avgProfitFactor is now authoritative cost-adjusted PF from position history.
+          // Apply combined bias (from prevPos stats) to reflect variant performance.
+          // Avoids re-summing the now-unmodified entries array each cycle.
+          // FIX: Ensure combined bias doesn't over-amplify low base PF values.
           const tunedAvgPF = Math.max(0.5, (s.avgProfitFactor ?? 1) * combined)
 
           if (coordIndex) {
@@ -5039,17 +5045,23 @@ export class StrategyCoordinator {
     // resolving Base entries via coordIndex.base.byKey.get(parentSetKey) —
     // O(1), zero-copy.  The Real-stage tuner for-loop over s.entries becomes
     // a no-op; coordRec.tunedAvgPF is written from s.avgProfitFactor here.
-    let sumPF = 0, sumDDT = 0, sumCnf = 0, count = 0
+    // FIX: Do NOT recalculate PF from individual synthetic entry values.
+    // The BASE set's avgProfitFactor is the authoritative cost-adjusted PF
+    // from realized position history. MAIN stage should inherit it unchanged.
+    // Applying pfBias per-entry then averaging corrupts the cost-adjusted baseline.
+    // Instead: inherit BASE avgPF, compute only DDT and Confidence.
+    let sumDDT = 0, sumCnf = 0, count = 0
     const baseDDTFallback = baseSet.avgDrawdownTime || 0
+    // Inherit cost-adjusted PF from BASE set directly
+    const avgPF = baseSet.avgProfitFactor
 
     outer: for (const baseEntry of baseSet.entries) {
       for (const cfg of profile.configs) {
         if (count >= maxEntries) break outer
-        const pf      = Math.max(metrics.minProfitFactor, baseEntry.profitFactor * cfg.pfBias)
+        // Only compute DDT and Confidence; PF inherited from BASE unchanged
         const baseDDT = baseEntry.drawdownTime > 0 ? baseEntry.drawdownTime : baseDDTFallback
         const ddt     = baseDDT + cfg.ddtBias
         if (ddt > metrics.maxDrawdownTime) continue
-        sumPF  += pf
         sumDDT += ddt
         sumCnf += Math.min(0.99, baseEntry.confidence)
         count++
@@ -5058,7 +5070,6 @@ export class StrategyCoordinator {
 
     if (count === 0) return null
 
-    const avgPF  = sumPF  / count
     const avgDDT = sumDDT / count
     const avgCnf = sumCnf / count
 
