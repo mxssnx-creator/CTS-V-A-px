@@ -281,10 +281,18 @@ function createRealPosition(
     Math.max(1, maxLeverageForExchange),
   )
 
-  // Phase 1 FIX: Propagate variant lineage from parent StrategySet so the
-  // live executor receives correct position sizing (block 1.5-2.0x, DCA 0.5x).
-  // If no variantSource provided, defaults are sizeMultiplier=1.0, variant="default".
-  const sizeMultiplier = variantSource?.sizeMultiplier ?? 1.0
+  // Phase 2 FIX: Propagate variant lineage and strategy type from parent StrategySet
+  // so the live executor receives correct position sizing.
+  // - For "adjust" type (Block/DCA): Use baseMultiplier (volume-ratio scaled)
+  //   block: m(n) = 1 + (n-1) × ratio (typically 1.5-2.0 after scaling)
+  //   dca: reduced size (typically 0.5)
+  // - For "standard" type: Use 1.0 (position-count scaling applied separately)
+  // If no variantSource provided, defaults are sizeMultiplier=1.0, type="standard".
+  const strategyType = variantSource?.strategyType ?? "standard"
+  const sizeMultiplier = 
+    strategyType === "adjust" && variantSource?.baseMultiplier
+      ? variantSource.baseMultiplier  // Block/DCA: use computed volume-ratio scaled multiplier
+      : 1.0  // Standard: use 1.0, continuousCount scaling applied separately
   const setVariant = variantSource?.variant || variantSource?.setVariant || "default"
   const axisWindows = variantSource?.axisWindows
   const setKey = variantSource?.setKey
@@ -314,14 +322,25 @@ function createRealPosition(
       consistencyRatio: ratios.consistency,
     },
     status: "ready",
-    // ── Phase 1: Variant Lineage ──────────────────────────────────────
-    // Carries the StrategySet's variant type, axis windows, and size multiplier
-    // so the live executor applies correct position sizing (block/DCA scaling).
+    // ── Phase 2: Variant Lineage & Strategy Type ──────────────────────────
+    // Carries the StrategySet's variant type, strategy classification, axis windows,
+    // and size multiplier so the live executor applies correct position sizing.
+    // 
+    // Strategy types:
+    //   - "standard": Position-count based (axis sets, default/trailing/pause)
+    //     Qty applies continuousCount scaling in Live stage
+    //   - "adjust": Adjustment strategies (Block/DCA)
+    //     Qty applies baseMultiplier (volume-ratio scaled) directly
+    //
+    // For "adjust" type: sizeMultiplier already includes vol-ratio scaling:
+    //   block: m(n) = 1 + (n-1) × volumeRatio (typically 1.5-2.0)
+    //   dca: 0.5 (reduced averaging entries)
+    // For "standard" type: sizeMultiplier=1.0, continuousCount scaling applied separately
     ...(setKey && { setKey }),
     ...(parentSetKey && { parentSetKey }),
     ...(setVariant && setVariant !== "default" && { setVariant: setVariant as any }),
     ...(axisWindows && { axisWindows }),
-    sizeMultiplier,  // block=1.5, dca=0.5, default=1.0
+    sizeMultiplier,
   }
 }
 

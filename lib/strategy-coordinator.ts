@@ -93,6 +93,37 @@ export interface StrategySet {
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
   variant?: "default" | "trailing" | "block" | "dca" | "pause"
+  
+  /**
+   * ── Strategy type classification (Standard vs Adjust) ──────────────────
+   *
+   * Distinguishes how this Set's position quantity should be calculated:
+   *   - "standard": Position-count based (axis sets, trailing, default variants)
+   *     Qty = baseQty × continuousCount for axis sets
+   *   - "adjust": Adjustment strategies (Block/DCA variants)
+   *     Qty = baseQty × sizeMultiplier (computed from volume ratio)
+   *     These are INDEPENDENT adjustments over/alongside Standard sets
+   *
+   * Set in buildVariantSet() based on variant type. Used in Live stage to
+   * apply position-specific quantity scaling correctly.
+   */
+  strategyType?: "standard" | "adjust"
+  
+  /**
+   * ── Base multiplier for Block/DCA volume ratio scaling ────────────────
+   *
+   * For "adjust" type strategies (Block/DCA), preserves the scaled
+   * sizeMultiplier computed in selectActiveVariants:
+   *   - Block: m(n) = 1 + (n-1) × volumeRatio (e.g. n=2, ratio=0.5 → 1.5)
+   *   - DCA: Similar scaling based on continuous count
+   *
+   * For "standard" strategies, undefined (position count scaling used instead).
+   *
+   * Propagated from Main → Real → Live unchanged, consumed by Live stage
+   * in qty calculation. Overrides or complements continuous-count scaling.
+   */
+  baseMultiplier?: number
+  
   /**
    * ── Position-count axis windows that this Set satisfies ────────────
    *
@@ -1536,6 +1567,7 @@ export class StrategyCoordinator {
           setKey,
           indicationType: group.indicationType,
           direction: group.direction,
+          strategyType: "standard",  // NEW: Base sets are always "standard" type
           avgProfitFactor: avgPF,
           avgConfidence: avgConf,
           avgDrawdownTime: avgDDT,
@@ -4738,6 +4770,7 @@ export class StrategyCoordinator {
                   setKey:          `${parentKey}#axis:${axisKey}`,
                   parentSetKey:    parentKey,
                   variant:         "default",
+                  strategyType:    "standard",  // NEW: Axis sets are always "standard" type
                   indicationType:  baseDefault.indicationType,
                   direction:       dir,
                   avgProfitFactor: inheritedPF,
@@ -5038,10 +5071,23 @@ export class StrategyCoordinator {
         }
       : { prev: 0, last: 0, cont: 0, pause: 0 }
 
+    // Determine strategy type based on variant (Adjust vs Standard)
+    const isAdjustVariant = profile.name === "block" || profile.name === "dca"
+    const strategyType: "standard" | "adjust" = isAdjustVariant ? "adjust" : "standard"
+    
+    // For Adjust variants (Block/DCA), capture the base multiplier from the first config.
+    // selectActiveVariants scales this based on continuousCount and blockVolumeRatio,
+    // so this represents the SCALED final multiplier used in Live qty calculation.
+    const baseMultiplier = isAdjustVariant && profile.configs.length > 0
+      ? profile.configs[0]!.size  // First config's size (already scaled for Block)
+      : undefined
+    
     return {
       setKey:          `${baseSet.setKey}#${profile.name}`,
       parentSetKey:    baseSet.setKey,
       variant:         profile.name,
+      strategyType,    // NEW: "standard" (position-count) or "adjust" (Block/DCA)
+      baseMultiplier,  // NEW: For Adjust variants only - used for Live qty scaling
       axisWindows,
       indicationType:  baseSet.indicationType,
       direction:       baseSet.direction,
