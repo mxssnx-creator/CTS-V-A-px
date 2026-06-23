@@ -2759,6 +2759,9 @@ export async function GET(
           const wins   = n(progHash.live_wins_count)
           return closed > 0 ? Math.round((wins / closed) * 1000) / 10 : 0
         })(),
+        // P&L from closed positions
+        totalPnl:     Math.round(((liveClosedSumPnl ?? 0) || 0) * 100) / 100,
+        avgPnl:       liveClosedCount > 0 ? Math.round((((liveClosedSumPnl ?? 0) || 0) / liveClosedCount) * 100) / 100 : 0,
         // Per-symbol/direction order counters — folds the
         // `live_orders_by_symbol:{id}` HGETALL into an array of
         // `{ symbol, long: { placed, filled }, short: { placed, filled } }`
