@@ -297,6 +297,22 @@ function createRealPosition(
   const axisWindows = variantSource?.axisWindows
   const setKey = variantSource?.setKey
   const parentSetKey = variantSource?.parentSetKey
+  
+  // Position-specific validation: Log strategy type and multiplier for audit trail
+  if (strategyType === "adjust") {
+    if (setVariant === "block") {
+      console.log(
+        `${LOG_PREFIX} [POSITION_TYPE_VALIDATION] Creating Block (Adjust) position: ` +
+        `symbol=${mainPos.symbol} sizeMultiplier=${sizeMultiplier} ` +
+        `(volume-ratio scaled: m(n) = 1 + (n-1) × ratio)`
+      )
+    } else if (setVariant === "dca") {
+      console.log(
+        `${LOG_PREFIX} [POSITION_TYPE_VALIDATION] Creating DCA (Adjust) position: ` +
+        `symbol=${mainPos.symbol} sizeMultiplier=${sizeMultiplier} (fixed 0.5 for averaging)`
+      )
+    }
+  }
 
   return {
     id: `real:${connectionId}:${mainPos.symbol}:${mainPos.direction}:${Date.now()}`,

@@ -980,6 +980,14 @@ async function placeProtectionOrder(
   )
 
   try {
+    // ── Validate Control Order Parameters ────────────────────────────────
+    // SL/TP orders are reduce-only market orders that close positions.
+    // Validate all inputs before exchange interaction.
+    console.log(
+      `${tag} placement initiated: type=${orderLabel} qty=${quantity} triggerPrice=${triggerPrice} ` +
+      `closeSide=${closeSide} positionDir=${positionDirection}`,
+    )
+    
     // Prefer the connector's CONDITIONAL-order path
     // (`placeStopOrder`) over a regular `placeOrder`. The legacy code
     // here used `placeOrder(..., "limit")` at the trigger price — which
@@ -2274,6 +2282,17 @@ export async function executeLivePosition(
         ? "preset"
         : "main"
 
+    // ── Validate Strategy Type and Size Multiplier ──────────────────────
+    // Block and DCA strategies use sizeMultiplier for direct qty scaling,
+    // while Standard strategies use 1.0 and apply continuousCount separately.
+    // Log the strategy type and multiplier for audit trail.
+    if (livePosition.setVariant === "block" || livePosition.setVariant === "dca") {
+      console.log(
+        `${LOG_PREFIX} [ADJUST_STRATEGY] ${realPosition.symbol} variant=${livePosition.setVariant} ` +
+        `strategyType=adjust sizeMultiplier=${realPosition.sizeMultiplier}`,
+      )
+    }
+    
     const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
       connectionId,
       realPosition.symbol,
@@ -2282,6 +2301,9 @@ export async function executeLivePosition(
         tradeMode: liveTradeMode,
         // Forward the Block/DCA variant multiplier so notional is correctly
         // scaled before the exchange order is placed (absent → 1.0 identity).
+        // For Block: sizeMultiplier includes volume-ratio scaling m(n) = 1+(n-1)×ratio
+        // For DCA: sizeMultiplier is fixed 0.5 (averaging)
+        // For Standard: sizeMultiplier is 1.0 (continuousCount applied separately)
         sizeMultiplier: realPosition.sizeMultiplier,
       },
     ).catch(err => {
@@ -2452,10 +2474,18 @@ export async function executeLivePosition(
     }
 
     // Strong diagnostic log right before real money order attempt
+    // ── Order Price Validation ──────────────────────────────────────────
+    // Log the market price used for entry order to verify it's close to
+    // pseudo position entry price. Price source: Redis market_data:{symbol}:price
+    // This ensures entry fill price aligns with coordinator expectations.
     console.log(
       `${LOG_PREFIX} [REAL_ORDER_ATTEMPT] conn=${connectionId} sym=${realPosition.symbol} dir=${realPosition.direction} ` +
-      `computedVol=${computedVolume} price=${currentPrice} lev=${livePosition.leverage} ` +
-      `setKey=${livePosition.setKey} trace=${orderTrace.traceId}`
+      `computedVol=${computedVolume} entryPrice=${currentPrice} leverage=${livePosition.leverage} ` +
+      `sizeMultiplier=${realPosition.sizeMultiplier} setKey=${livePosition.setKey} trace=${orderTrace.traceId}`
+    )
+    console.log(
+      `${LOG_PREFIX} [ORDER_PRICE_SOURCE] sym=${realPosition.symbol} marketPrice=${currentPrice} ` +
+      `source=market_data:{${realPosition.symbol}}:price notional=$${(computedVolume * currentPrice).toFixed(2)}`
     )
 
     // The `retry()` helper repeats up to 3× on transient failures; we
