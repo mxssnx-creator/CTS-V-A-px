@@ -905,7 +905,7 @@ export class StrategyCoordinator {
     },
     live: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.2,   // operator spec default (live=1.2)
+      minProfitFactor: 1.0,   // Reduced from 1.2 to allow more live dispatch (real stage already gates at 1.2)
       confidence: 0.65,       // advisory only
       description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= maxDrawdownTime) ready for live trading",
     },

@@ -1690,13 +1690,13 @@ export async function GET(
       const closedParsed = sharedClosedParsed
       liveClosedCount = closedParsed.length
       liveClosedCountForPf = closedParsed.length
-      const closedEval = evaluateClosedBatch(closedParsed)
-      liveClosedSumPnl         = closedEval.sumPnl
-      liveClosedSumGrossProfit = closedEval.sumGrossProfit
-      liveClosedSumGrossLoss   = closedEval.sumGrossLoss
-      liveClosedSumHoldMs      = closedEval.sumHoldMs
-      liveClosedRoeAcc         = closedEval.sumRoe
-      liveClosedHoldMinutes    = closedEval.sumHoldMs / 60_000
+      const closedEval = evaluateClosedBatch(closedParsed) || { sumPnl: 0, sumGrossProfit: 0, sumGrossLoss: 0, sumHoldMs: 0, sumVolumeUsd: 0, sumRoe: 0, count: 0 }
+      liveClosedSumPnl         = closedEval.sumPnl ?? 0
+      liveClosedSumGrossProfit = closedEval.sumGrossProfit ?? 0
+      liveClosedSumGrossLoss   = closedEval.sumGrossLoss ?? 0
+      liveClosedSumHoldMs      = closedEval.sumHoldMs ?? 0
+      liveClosedRoeAcc         = closedEval.sumRoe ?? 0
+      liveClosedHoldMinutes    = (closedEval.sumHoldMs ?? 0) / 60_000
       liveClosedWins           = closedParsed.filter((p: Record<string, any>) => (Number(p.realizedPnL ?? 0) || 0) > 0).length
 
       // Build per-position history rows (cap at 500 for response payload)
@@ -2860,8 +2860,8 @@ export async function GET(
             : 0,
           winRate:         liveWinRate,
           sharpe:          performanceTiers.live?.sharpe || 0,
-          totalPnl:        Math.round(liveClosedSumPnl * 100) / 100,
-          avgPnl:          liveClosedCount > 0 ? Math.round((liveClosedSumPnl / liveClosedCount) * 100) / 100 : 0,
+          totalPnl:        Math.round(((liveClosedSumPnl ?? 0) || 0) * 100) / 100,
+          avgPnl:          liveClosedCount > 0 ? Math.round((((liveClosedSumPnl ?? 0) || 0) / liveClosedCount) * 100) / 100 : 0,
           totalCreated:    n(progHash.live_positions_created_count),
           totalClosed:     n(progHash.live_positions_closed_count),
           totalRunning:    Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)),
