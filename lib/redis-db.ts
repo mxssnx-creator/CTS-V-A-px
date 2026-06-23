@@ -2370,9 +2370,14 @@ export async function savePosition(position: any): Promise<void> {
     // Terminal => move from open index -> closed archive idempotently
     if (position.status === "closed") {
       try {
-        // Remove any existing entries from open list, then push to closed list
+        // Remove any existing entries from open list
         await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
-        await client.lpush(`live:positions:${connId}:closed`, id).catch(() => 0)
+        // Check if already in closed list to avoid duplicates
+        const alreadyClosed = await client.lpos(`live:positions:${connId}:closed`, id).catch(() => null)
+        if (!alreadyClosed) {
+          // Only add if not already present
+          await client.lpush(`live:positions:${connId}:closed`, id).catch(() => 0)
+        }
         // Mark moved so closeLivePosition can detect duplicate increments
         await client.set(`live:positions:${connId}:moved:${id}`, String(Date.now())).catch(() => null)
         await client.expire(`live:positions:${connId}:moved:${id}`, 60 * 60).catch(() => 0)
