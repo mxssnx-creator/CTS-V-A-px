@@ -1082,6 +1082,12 @@ export async function GET(
     const stratTypes = ["base", "main", "real", "live"] as const
     const stratCounts: Record<string, number> = {}
     const stratEvaluated: Record<string, number> = {}
+    // [DEBUG] Log strategies_active snapshot for diagnostics
+    if (Object.keys(stratActiveHash || {}).length === 0) {
+      console.log(`[stats-route] ${connectionId}: strategies_active hash is EMPTY - coordinator may not have run`)
+    } else {
+      console.log(`[stats-route] ${connectionId}: strategies_active has ${Object.keys(stratActiveHash || {}).length} fields`)
+    }
     await Promise.all(
       stratTypes.map(async (type) => {
         // Prefer the cross-symbol sum from strategies_active hash (already computed above).
@@ -1103,6 +1109,9 @@ export async function GET(
         stratCounts[type] = fromActive > 0 ? fromActive
                           : fromKey   > 0 ? fromKey
                           : 0
+        if (stratCounts[type] === 0) {
+          console.log(`[stats-route] ${connectionId}: ${type} count = 0 (fromActive=${fromActive}, fromKey=${fromKey})`)
+        }
         // Prefer cross-symbol activeStratEvaluated (from strategies_active hash
         // `:evaluated` suffix fields) so the denominator matches stratCounts[type]
         // scope. Do NOT fall back to the standalone `strategies:{id}:{type}:evaluated`
@@ -1139,7 +1148,7 @@ export async function GET(
     //
     // We surface these alongside the stage-level detail so the dashboard can
     // show "Avg PF / Avg DDT per variant" over the lifetime of the run.
-    // ���─ PAUSE VARIANT ────────────────────────────────────────────────
+    // ���─ PAUSE VARIANT ───────────────────────────────────────────��────
     // The Real stage and StrategyCoordinator both write a 5th variant
     // bucket — `pause` — for entries placed under the global pause-axis
     // ratio config. The previous `variantKeys` list dropped this row so
@@ -2958,7 +2967,7 @@ export async function GET(
         },
       },
 
-      // ── TRADE HISTORY ────────────────────────────────────────────────────────
+      // ── TRADE HISTORY ──���─────────────────────────────────────────────────────
       // Up to 500 most-recently-closed live exchange positions with full row-level
       // detail. Sorted newest-first. Drives the TradeHistoryTable component.
       tradeHistory: tradeHistory.map((pos) => ({
