@@ -2666,6 +2666,32 @@ export async function executeLivePosition(
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
     await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "placed")
+    
+    // Track block strategy metrics if this is a block variant
+    if (isBlockVariant) {
+      const blockStackDepth = (realPosition.setVariant === "block") ? 1 : undefined
+      void trackBlockStrategyMetrics(
+        connectionId,
+        realPosition.symbol,
+        "created",
+        blockStackDepth,
+        realPosition.sizeMultiplier,
+        true, // block variant always treated as independent entry
+        0 // position count tracked separately
+      ).catch(() => {})
+      
+      // Validate block strategy edge cases
+      const blockWarnings = validateBlockStrategyEdgeCases(
+        realPosition.symbol,
+        blockStackDepth || 1,
+        8, // blockMaxStack default
+        realPosition.sizeMultiplier || 1.0,
+        0, // continuousCount (block is independent)
+        1, // positionCount
+        true // isIndependentBlock
+      )
+      logValidationWarnings(blockWarnings, `${realPosition.symbol} block created`)
+    }
     // Successful placement — reset the margin error consecutive-failure counter
     // so the backoff resets to the shortest cooldown on the next failure.
     marginErrorCooldownByConnection.delete(connectionId)
@@ -3478,7 +3504,7 @@ export async function closeLivePosition(
     if (qty <= 0) {
       console.warn(
         `[v0] [Live] P&L calc: qty<=0 for ${position.symbol} ${position.id} ` +
-        `qty=${qty} (executedQuantity=${position.executedQuantity}, entryQty=${position.entryQuantity})`
+        `qty=${qty} (executedQuantity=${position.executedQuantity})`
       )
     }
     if (avgEntry <= 0) {

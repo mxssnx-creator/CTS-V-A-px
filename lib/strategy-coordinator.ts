@@ -3311,16 +3311,14 @@ export class StrategyCoordinator {
       // Log the full pipeline cascade with counts + gating reasons for debugging
       console.log(
         `[v0] [StrategyFlow] ${this.connectionId}:${symbol} ` +
-        `BASE=${this.baseSets.length} ` +
         `MAIN=${mainSets.length} (eligible=${mainPFEligible}, pos-filtered=${mainSets.length - mainPFEligible}) ` +
         `REAL=${realSets.length} (hedged-reduced=${mainPFEligible - realSets.length}) ` +
-        `LIVE=${realLiveCount || '—'} | ` +
-        `avgPF(main=${realAvgPF.toFixed(2)} real=${realAvgPF.toFixed(2)}) passRatio=${passRatioReal.toFixed(2)} ` +
+        `avgPF=${realAvgPF.toFixed(2)} passRatio=${passRatioReal.toFixed(2)} ` +
         `running=${realRunningNow} entries=${realEntriesTotal}`
       )
       
       // AUTO-ADJUST: If REAL produces 0 sets for 30+ cycles, log WARNING
-      // and suggest operator review minPositions / Real ceiling settings
+      // and suggest operator review settings
       if (realSets.length === 0 && mainPFEligible > 0) {
         const zeroRealKey = `strategies:${this.connectionId}:zero_real_cycles`
         writes.push(
@@ -3334,8 +3332,7 @@ export class StrategyCoordinator {
         if (zeroCount >= 30) {
           console.warn(
             `[v0] [WARNING] ${this.connectionId}:${symbol} has produced 0 REAL sets for ${zeroCount}+ cycles. ` +
-            `Check: minPositions gate (${this.minPositions}), REAL ceiling (${this.REAL_SETS_SAFETY_CEILING}), ` +
-            `or position-count filtering. Suggestion: review real stage thresholds or lower position requirements.`
+            `Check position-count filtering or REAL ceiling settings. Suggestion: review real stage thresholds.`
           )
         }
       } else if (realSets.length > 0) {
@@ -4404,7 +4401,7 @@ export class StrategyCoordinator {
 
         for (const h of hashes) {
           if (!h) continue
-          // ── P2-1: Strict closed-only gate ───────────────────��──────────
+          // ── P2-1: Strict closed-only gate ───────────────────��────���─────
           // Positions in the closed_index are always closed by construction
           // (closePosition writes to the index). We still enforce the
           // status check as a defence against stale/corrupted rows.

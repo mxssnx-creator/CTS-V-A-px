@@ -205,12 +205,14 @@ export async function trackTrailingStopMetrics(
       client.expire(latestKey, 3600),
     ]
     
-    // Track per-symbol ratchet distance average
+    // Track per-symbol ratchet distance average (store as string for compatibility)
     if (operation === "ratcheted" && ratchetDistance !== undefined) {
       const ratchetKey = `trailing:${connectionId}:${symbol}:ratchet_distance_sum`
       const ratchetCountKey = `trailing:${connectionId}:${symbol}:ratchet_count`
+      const currentSum = await client.get(ratchetKey).catch(() => "0")
+      const newSum = (parseFloat(String(currentSum || "0")) || 0) + ratchetDistance
       writes.push(
-        client.incrbyfloat(ratchetKey, ratchetDistance),
+        client.set(ratchetKey, String(newSum)),
         client.expire(ratchetKey, 86400),
         client.incr(ratchetCountKey),
         client.expire(ratchetCountKey, 86400)
@@ -275,22 +277,23 @@ export async function trackBlockStrategyMetrics(
     // Track per-symbol stack depth max
     if (operation === "stacked" && blockStackDepth !== undefined) {
       const stackKey = `block:${connectionId}:${symbol}:max_stack_depth`
-      writes.push(
-        client.getex(stackKey, { EX: 86400 }).then(v => {
-          const current = parseInt(v || "0")
-          if (blockStackDepth > current) {
-            return client.set(stackKey, String(blockStackDepth))
-          }
-        })
-      )
+      const current = parseInt(String(await client.get(stackKey).catch(() => "0")) || "0")
+      if (blockStackDepth > current) {
+        writes.push(
+          client.set(stackKey, String(blockStackDepth)),
+          client.expire(stackKey, 86400)
+        )
+      }
     }
     
-    // Track size multiplier average
+    // Track size multiplier average (store as string for compatibility)
     if (sizeMultiplier !== undefined) {
       const sizeKey = `block:${connectionId}:${symbol}:size_multiplier_sum`
       const sizeCountKey = `block:${connectionId}:${symbol}:size_count`
+      const currentSum = await client.get(sizeKey).catch(() => "0")
+      const newSum = (parseFloat(String(currentSum || "0")) || 0) + sizeMultiplier
       writes.push(
-        client.incrbyfloat(sizeKey, sizeMultiplier),
+        client.set(sizeKey, String(newSum)),
         client.expire(sizeKey, 86400),
         client.incr(sizeCountKey),
         client.expire(sizeCountKey, 86400)
