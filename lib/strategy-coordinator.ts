@@ -3637,14 +3637,22 @@ export class StrategyCoordinator {
 
     // P0-2: Live filter axes are PF-min + DDT-max ONLY (then rank by
     // avgProfitFactor and take top N). Confidence is advisory metadata.
-    let qualifying = realSets
-      .filter(
-        (s) =>
-          s.avgProfitFactor >= metrics.minProfitFactor &&
-          s.avgDrawdownTime <= metrics.maxDrawdownTime,
-      )
+    const preFiltCount = realSets.length
+    const pfFiltered = realSets.filter((s) => s.avgProfitFactor >= metrics.minProfitFactor)
+    const ddtFiltered = pfFiltered.filter((s) => s.avgDrawdownTime <= metrics.maxDrawdownTime)
+    
+    let qualifying = ddtFiltered
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
+    
+    // Log filtering steps for debugging
+    if (preFiltCount > 0 && qualifying.length < Math.min(maxLive, 50)) {
+      console.log(
+        `[v0] [LiveDispatch] ${this.connectionId}:${symbol}: ` +
+        `Real=${preFiltCount} → PF>=${metrics.minProfitFactor}=${pfFiltered.length} → ` +
+        `DDT<=${metrics.maxDrawdownTime}=${ddtFiltered.length} → Top${maxLive}=${qualifying.length}`
+      )
+    }
 
     // DEV/TEST fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
     // Short-circuit getConnection() in dev — NODE_ENV check is free vs async Redis read per cycle.

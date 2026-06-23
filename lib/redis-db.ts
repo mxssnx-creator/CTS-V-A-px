@@ -399,10 +399,10 @@ export class InlineLocalRedis {
     // compound across multiple intervals. The handler is cheap (~ms) when
     // heap is below threshold so the extra polling is negligible.
     const CLEANUP_INTERVAL_MS = 2_000
-    // Trigger eviction at 800 MB heapUsed.  Real Redis clients run off-heap;
-    // 800 MB is generous for the InlineLocalRedis emulator in dev while still
-    // leaving enough room before the 4 GB V8 ceiling (--max-old-space-size=4096).
-    const HEAP_PRESSURE_MB = 800
+    // Trigger eviction at 600 MB heapUsed (reduced from 800).  Real Redis clients run off-heap;
+    // Lower threshold prevents OOM crashes during sustained live trading with 15+ symbols.
+    // This gives 3.4 GB of headroom before the 4 GB V8 ceiling (--max-old-space-size=4096).
+    const HEAP_PRESSURE_MB = 600
 
     // Run an immediate targeted flush at startup to clear volatile key families
     // that accumulate across hot-reload cycles (the globalThis Map persists
@@ -571,7 +571,7 @@ export class InlineLocalRedis {
         const rssMB      = mem.rss      / 1024 / 1024
         // RSS trigger: evict when process RSS exceeds 3 GB (leaves 3 GB+ for OS/other).
         // heapUsed trigger: evict when V8 heap exceeds 800 MB.
-        const RSS_PRESSURE_MB = 3_000
+    const RSS_PRESSURE_MB      = 2_500 // Reduced from 3000 to trigger eviction earlier and prevent OOM
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         const MAX_TOTAL_KEYS = 8_000
@@ -811,7 +811,7 @@ export class InlineLocalRedis {
       evicted += trimBucket(keys, cap)
     }
 
-    // ── LIST single-pass ────────────────────────────────────────────────��─���
+    // ── LIST single-pass ────────────────────────────────────────────────��─�����
     // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
       const listCap = isDev ? 0 : 50
@@ -2161,7 +2161,7 @@ export function invalidateAppSettingsCache(): void {
   appSettingsCache = null
 }
 
-// ───────────────────────────────────���────────────────���────────────────
+// ───────────────────────────────────���──────────────���─���────────────────
 // Live-settings version counter
 //
 // When an operator hits Save in the Settings UI, the server updates the
