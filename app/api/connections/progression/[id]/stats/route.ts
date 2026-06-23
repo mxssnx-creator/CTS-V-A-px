@@ -1957,10 +1957,10 @@ export async function GET(
       }
     })()
 
-    const phase    = ep?.phase || "unknown"
-    const progress = n(ep?.progress)
-    const message  = ep?.detail || ep?.message || ""
-    const lastUpdate = progHash.last_update || realtimeHash.last_cycle_at || new Date().toISOString()
+    const phase    = ep?.phase ?? "unknown"  // Explicitly use nullish coalesce
+    const progress = n(ep?.progress) ?? 0
+    const message  = ep?.detail ?? ep?.message ?? ""
+    const lastUpdate = progHash.last_update ?? realtimeHash.last_cycle_at ?? new Date().toISOString()
 
     let redisDbEntries = 0
     try { redisDbEntries = await client.dbSize() } catch { /* non-critical */ }
@@ -2126,8 +2126,8 @@ export async function GET(
         isGated: !historicIsComplete,
         reason: !historicIsComplete 
           ? `Prehistoric incomplete: ${historicSymbolsProcessed}/${historicSymbolsTotal} symbols (${historicProgressPercent.toFixed(1)}%)`
-          : null,
-        firstRealtimeCycleAt: historicIsComplete ? (realtimeHash.first_realtime_cycle_at || Date.now()) : null,
+          : "Ready for live trading",  // Changed from null to descriptive string
+        firstRealtimeCycleAt: historicIsComplete ? (realtimeHash.first_realtime_cycle_at || Date.now()) : null,  // null is OK here when gated
       },
 
       realtime: {
