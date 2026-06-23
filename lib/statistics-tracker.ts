@@ -162,3 +162,143 @@ export async function getStrategyStats(connectionId: string, hoursBack: number =
     return []
   }
 }
+
+/**
+ * Track trailing stop metrics - called when trailing stops are created/ratcheted/closed
+ * Records operation type, symbol, ratchet distance, and price movement
+ */
+export async function trackTrailingStopMetrics(
+  connectionId: string,
+  symbol: string,
+  operation: "created" | "ratcheted" | "closed",
+  ratchetDistance?: number,
+  priceMovement?: number,
+  stopPrice?: number
+): Promise<void> {
+  // DEV-MODE BYPASS — trailing metrics are non-critical for engine operation
+  if (process.env.NODE_ENV === "development") return
+  
+  try {
+    await initRedis()
+    const client = getRedisClient()
+
+    const operationCountKey = `trailing:${connectionId}:${operation}:count`
+    const totalCountKey = `trailing:${connectionId}:count`
+    const latestKey = `trailing:${connectionId}:${symbol}:latest`
+
+    const writes: Promise<any>[] = [
+      client.incr(operationCountKey),
+      client.expire(operationCountKey, 86400),
+      client.incr(totalCountKey),
+      client.expire(totalCountKey, 86400),
+      client.set(
+        latestKey,
+        JSON.stringify({ 
+          symbol, 
+          operation, 
+          ratchetDistance, 
+          priceMovement, 
+          stopPrice,
+          timestamp: Date.now() 
+        })
+      ),
+      client.expire(latestKey, 3600),
+    ]
+    
+    // Track per-symbol ratchet distance average
+    if (operation === "ratcheted" && ratchetDistance !== undefined) {
+      const ratchetKey = `trailing:${connectionId}:${symbol}:ratchet_distance_sum`
+      const ratchetCountKey = `trailing:${connectionId}:${symbol}:ratchet_count`
+      writes.push(
+        client.incrbyfloat(ratchetKey, ratchetDistance),
+        client.expire(ratchetKey, 86400),
+        client.incr(ratchetCountKey),
+        client.expire(ratchetCountKey, 86400)
+      )
+    }
+    
+    await Promise.all(writes)
+  } catch (e) {
+    console.error(`[v0] [Stats] Failed to track trailing stop metrics in Redis:`, e instanceof Error ? e.message : String(e))
+  }
+}
+
+/**
+ * Track block strategy metrics - called when blocks are created/filled/stacked
+ * Records block type, stack depth, size multiplier, and position count
+ */
+export async function trackBlockStrategyMetrics(
+  connectionId: string,
+  symbol: string,
+  operation: "created" | "filled" | "stacked" | "closed",
+  blockStackDepth?: number,
+  sizeMultiplier?: number,
+  isIndependent?: boolean,
+  positionCount?: number
+): Promise<void> {
+  // DEV-MODE BYPASS — block metrics are non-critical for engine operation
+  if (process.env.NODE_ENV === "development") return
+  
+  try {
+    await initRedis()
+    const client = getRedisClient()
+
+    const operationCountKey = `block:${connectionId}:${operation}:count`
+    const totalCountKey = `block:${connectionId}:count`
+    const independentKey = isIndependent 
+      ? `block:${connectionId}:independent:count` 
+      : `block:${connectionId}:addon:count`
+    const latestKey = `block:${connectionId}:${symbol}:latest`
+
+    const writes: Promise<any>[] = [
+      client.incr(operationCountKey),
+      client.expire(operationCountKey, 86400),
+      client.incr(totalCountKey),
+      client.expire(totalCountKey, 86400),
+      client.incr(independentKey),
+      client.expire(independentKey, 86400),
+      client.set(
+        latestKey,
+        JSON.stringify({ 
+          symbol, 
+          operation, 
+          blockStackDepth,
+          sizeMultiplier,
+          isIndependent,
+          positionCount,
+          timestamp: Date.now() 
+        })
+      ),
+      client.expire(latestKey, 3600),
+    ]
+    
+    // Track per-symbol stack depth max
+    if (operation === "stacked" && blockStackDepth !== undefined) {
+      const stackKey = `block:${connectionId}:${symbol}:max_stack_depth`
+      writes.push(
+        client.getex(stackKey, { EX: 86400 }).then(v => {
+          const current = parseInt(v || "0")
+          if (blockStackDepth > current) {
+            return client.set(stackKey, String(blockStackDepth))
+          }
+        })
+      )
+    }
+    
+    // Track size multiplier average
+    if (sizeMultiplier !== undefined) {
+      const sizeKey = `block:${connectionId}:${symbol}:size_multiplier_sum`
+      const sizeCountKey = `block:${connectionId}:${symbol}:size_count`
+      writes.push(
+        client.incrbyfloat(sizeKey, sizeMultiplier),
+        client.expire(sizeKey, 86400),
+        client.incr(sizeCountKey),
+        client.expire(sizeCountKey, 86400)
+      )
+    }
+    
+    await Promise.all(writes)
+  } catch (e) {
+    console.error(`[v0] [Stats] Failed to track block strategy metrics in Redis:`, e instanceof Error ? e.message : String(e))
+  }
+}

@@ -2652,32 +2652,14 @@ export function setConnectionRunningState(id: string, isRunning: boolean): void 
 const globalMigrationState = globalThis as unknown as { __migrations_run?: boolean }
 
 /**
- * Check if migrations have run durably — reads from Redis to be resilient
- * across process restarts. Falls back to in-memory state if Redis unavailable.
- * The in-memory value may lag Redis on hot-reload (OK — worst case is we
- * re-run pending migrations which are idempotent).
+ * Check if migrations have run — uses in-memory state. Returns true if we've
+ * already cached that migrations ran; false otherwise.
+ * The actual durability check (reading Redis) happens during runMigrations,
+ * which compares Redis schema_version against code's max. The in-memory state
+ * here just avoids re-running migrations multiple times in the same process.
  */
 export function haveMigrationsRun(): boolean {
-  // Fast in-memory path to avoid Redis I/O on every call
-  if (globalMigrationState.__migrations_run) return true
-  
-  // If unavailable, conservatively assume we haven't run and should retry
-  try {
-    const client = getRedisClient()
-    if (!client) return false
-    
-    // Non-blocking check: try to read _migrations_run flag synchronously if possible
-    // Most Redis clients (Upstash HTTP, node-redis) cache this or fail fast
-    const runFlagSync = client.get?.("_migrations_run") // attempt sync read if available
-    if (runFlagSync === "true" || runFlagSync === true) {
-      globalMigrationState.__migrations_run = true
-      return true
-    }
-  } catch {
-    // Ignore Redis errors — default to conservative "not run" on failure
-  }
-  
-  return false
+  return globalMigrationState.__migrations_run ?? false
 }
 
 export function setMigrationsRun(value: boolean): void {

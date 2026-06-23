@@ -646,7 +646,7 @@ export class StrategyCoordinator {
       pause:    true,
     },
     blockVolumeRatio: 1.0,
-    blockMaxStack:    3,
+    blockMaxStack:    8, // Use all block slots by default (operator can reduce down to 2)
     mainEvalPosCount: 15,
     realEvalPosCount: 10,
   }
@@ -1150,7 +1150,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ── Per-Base Stage Threshold Loader ───────────────────────────────────
+  // ── Per-Base Stage Threshold Loader ─────────────────────��─────────────
   // Reads stageMinPosCount{Base/Main/Real} from operator settings and
   // snaps to the 5-step grid. Already written into _pfThresholdsLoadedAt
   // TTL by loadAppPFThresholds() — separate this from the validate methods
@@ -1523,7 +1523,7 @@ export class StrategyCoordinator {
           ? Math.min(rawAvgPF, posStats!.profitFactor)
           : rawAvgPF
 
-        // ── Drawdown-time from historic window ────────────────────────────
+        // ── Drawdown-time from historic window ────────��───────────────────
         // The Set's avgDrawdownTime was previously hardcoded to 0, which made
         // the Main/Real DDT gate a dead no-op (a `> maxDrawdownTime` test can
         // never fire against 0). We now seed it from the windowed historic
@@ -3306,6 +3306,42 @@ export class StrategyCoordinator {
       // strategies_real_evaluated = Main Sets that entered REAL (input count).
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
       if (mainPFEligible > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", mainPFEligible))
+      
+      // ── COMPREHENSIVE STAGE LOGGING ──
+      // Log the full pipeline cascade with counts + gating reasons for debugging
+      console.log(
+        `[v0] [StrategyFlow] ${this.connectionId}:${symbol} ` +
+        `BASE=${this.baseSets.length} ` +
+        `MAIN=${mainSets.length} (eligible=${mainPFEligible}, pos-filtered=${mainSets.length - mainPFEligible}) ` +
+        `REAL=${realSets.length} (hedged-reduced=${mainPFEligible - realSets.length}) ` +
+        `LIVE=${realLiveCount || '—'} | ` +
+        `avgPF(main=${realAvgPF.toFixed(2)} real=${realAvgPF.toFixed(2)}) passRatio=${passRatioReal.toFixed(2)} ` +
+        `running=${realRunningNow} entries=${realEntriesTotal}`
+      )
+      
+      // AUTO-ADJUST: If REAL produces 0 sets for 30+ cycles, log WARNING
+      // and suggest operator review minPositions / Real ceiling settings
+      if (realSets.length === 0 && mainPFEligible > 0) {
+        const zeroRealKey = `strategies:${this.connectionId}:zero_real_cycles`
+        writes.push(
+          client.incr(zeroRealKey),
+          client.expire(zeroRealKey, 3600) // reset after 1h
+        )
+        
+        // Read zero-cycle count and log if it exceeds threshold
+        const zeroRealCount = await client.get(zeroRealKey).catch(() => null)
+        const zeroCount = parseInt(String(zeroRealCount || 0))
+        if (zeroCount >= 30) {
+          console.warn(
+            `[v0] [WARNING] ${this.connectionId}:${symbol} has produced 0 REAL sets for ${zeroCount}+ cycles. ` +
+            `Check: minPositions gate (${this.minPositions}), REAL ceiling (${this.REAL_SETS_SAFETY_CEILING}), ` +
+            `or position-count filtering. Suggestion: review real stage thresholds or lower position requirements.`
+          )
+        }
+      } else if (realSets.length > 0) {
+        // Reset zero counter once we get output
+        writes.push(client.del(`strategies:${this.connectionId}:zero_real_cycles`))
+      }
 
       // ── ACTIVE-NOW snapshot for Real stage ──────────────────────────
       // Mirrors the Base/Main pattern. The dashboard reads this hash and
@@ -4823,12 +4859,19 @@ export class StrategyCoordinator {
       },
       {
         name: "block",
-        // ── Block gate: ≥1 open pos on this symbol, capped by stack ─────
+        // ── Block gate: enabled for add-ons (≥1 open) AND independent init ─
         //
-        // The cap (`blockMaxStack`) is operator-controlled (defaults to 3
-        // for spec parity). At `n = blockMaxStack` the gate closes —
-        // preventing unbounded add-on stacking on a single symbol.
-        gate: (c) => c.continuousCount >= 1 && c.continuousCount < this._coordinationSettings.blockMaxStack,
+        // Block fires in two modes:
+        //   1. Add-ons: when ≥1 open position (continuousCount >= 1), 
+        //      scaled by vol-ratio and capped at blockMaxStack
+        //   2. Independent: when no open positions (continuousCount == 0),
+        //      allows first block entry without requiring prior position
+        //
+        // The cap (`blockMaxStack`) is operator-controlled (defaults to 8
+        // to use all block slots; operator can reduce down to 2). At 
+        // `n = blockMaxStack` for add-ons OR `n >= 1` for independent, 
+        // the gate closes to prevent unbounded stacking.
+        gate: (c) => c.continuousCount < this._coordinationSettings.blockMaxStack,
         // ── Block sub-configs ─ size is the *base* multiplier that
         // `selectActiveVariants` THEN scales by `(1 + (n−1)×ratio)` at
         // evaluation time so the live position count and the operator's

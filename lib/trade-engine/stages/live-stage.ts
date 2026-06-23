@@ -25,6 +25,8 @@
 import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 import { nanoid } from "@/lib/trade-engine/pseudo-position-manager"
 import { getVenueMinQty } from "@/lib/exchange-min-qty"
+import { trackBlockStrategyMetrics } from "@/lib/statistics-tracker"
+import { validateBlockStrategyEdgeCases, logValidationWarnings } from "@/lib/validation-guards"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { SystemLogger } from "@/lib/system-logger"
@@ -1701,7 +1703,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ───��������────────────────────────────────────────────────────────
+// ── Main Pipeline ───����������────────────────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -2222,7 +2224,7 @@ export async function executeLivePosition(
       )
     }
 
-    // ── Step 3: Volume calculation ──────────────��────────────���─────────────
+    // ── Step 3: Volume calculation ──────────────��──────────���─���─────────────
     // POLICY: minimum volume is ALWAYS enforced �� we never reject a live
     // order for "qty too small". If the calculator returns null or a
     // non-positive quantity (e.g. balance fetch failed, NaN math) we
@@ -2332,7 +2334,7 @@ export async function executeLivePosition(
     // round-trip off every live entry. Both still complete BEFORE the
     // order is placed, so the venue sees consistent margin semantics
     // for the order. Errors are captured per-call and logged
-    // independently — a failure in one does NOT skip the other.
+    // independently �� a failure in one does NOT skip the other.
     const marginTypeSetting = (connSettings.margin_type as "cross" | "isolated") || "cross"
     livePosition.marginType = marginTypeSetting
 
@@ -3471,6 +3473,26 @@ export async function closeLivePosition(
     // ── 3. Compute realized PnL & ROI (margin-based to match exchange ROE) ──
     const qty = position.executedQuantity || 0
     const avgEntry = position.averageExecutionPrice || position.entryPrice || 0
+    
+    // VALIDATION: Check for missing price data that would result in negative/invalid P&L
+    if (qty <= 0) {
+      console.warn(
+        `[v0] [Live] P&L calc: qty<=0 for ${position.symbol} ${position.id} ` +
+        `qty=${qty} (executedQuantity=${position.executedQuantity}, entryQty=${position.entryQuantity})`
+      )
+    }
+    if (avgEntry <= 0) {
+      console.warn(
+        `[v0] [Live] P&L calc: avgEntry<=0 for ${position.symbol} ${position.id} ` +
+        `(averageExecutionPrice=${position.averageExecutionPrice}, entryPrice=${position.entryPrice})`
+      )
+    }
+    if (closePrice <= 0) {
+      console.warn(
+        `[v0] [Live] P&L calc: closePrice<=0 for ${position.symbol} ${position.id} closePrice=${closePrice}`
+      )
+    }
+    
     const pnl =
       qty > 0 && avgEntry > 0 && closePrice > 0
         ? qty *
