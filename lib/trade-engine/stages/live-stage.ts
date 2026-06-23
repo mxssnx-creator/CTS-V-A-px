@@ -25,6 +25,8 @@
 import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 import { nanoid } from "@/lib/trade-engine/pseudo-position-manager"
 import { getVenueMinQty } from "@/lib/exchange-min-qty"
+import { trackBlockStrategyMetrics } from "@/lib/statistics-tracker"
+import { validateBlockStrategyEdgeCases, logValidationWarnings } from "@/lib/validation-guards"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { SystemLogger } from "@/lib/system-logger"
@@ -1701,7 +1703,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ───���������────────────────────────────────────────────────────────
+// ── Main Pipeline ───����������────────────────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -2222,7 +2224,7 @@ export async function executeLivePosition(
       )
     }
 
-    // ── Step 3: Volume calculation ──────────────��────────────���─────────────
+    // ── Step 3: Volume calculation ──────────────��──────────���─���─────────────
     // POLICY: minimum volume is ALWAYS enforced �� we never reject a live
     // order for "qty too small". If the calculator returns null or a
     // non-positive quantity (e.g. balance fetch failed, NaN math) we
