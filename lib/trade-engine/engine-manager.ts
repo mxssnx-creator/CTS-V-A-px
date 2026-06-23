@@ -204,6 +204,7 @@ import {
   releaseProgressionLock,
   type LockHandle,
 } from "./progression-lock"
+import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 
 /**
  * Per-symbol fan-out concurrency cap.
@@ -1504,7 +1505,7 @@ export class TradeEngineManager {
       // prehistoric completion in its event stream. The PHASE itself is
       // advanced to `live_trading @ 100%` by the caller
       // (`loadPrehistoricDataInBackground.then(...)`) after this function
-      // resolves — keeping the phase write co-located with the cache-key
+      // resolves �� keeping the phase write co-located with the cache-key
       // write and the `engine_ready` state flip for atomic transition.
       try {
         await logProgressionEvent(
@@ -1923,6 +1924,25 @@ export class TradeEngineManager {
           `Engine ${this.connectionId} realtime-progression`,
         )
 
+        // ── CRITICAL FIX: Aggregate strategies via global coordinator ──────
+        // After all per-symbol indications and strategies are processed,
+        // invoke the coordinator to aggregate them into BASE/MAIN/REAL/LIVE
+        // strategy sets. WITHOUT this call, strategies never propagate beyond
+        // symbol level, resulting in zero strategy counts at all stages.
+        // This was the root cause of all strategy counts being 0.
+        try {
+          const coordinator = getGlobalTradeEngineCoordinator()
+          if (coordinator) {
+            await coordinator.coordinateForActualOne(this.connectionId, symbols)
+            // coordResult contains aggregated counts that are now persisted to Redis
+            // and visible via the stats API.
+          }
+        } catch (err) {
+          console.error(`[v0] [Realtime] Coordinator aggregation failed for ${this.connectionId}:`, err)
+          // Continue cycle even if coordination fails — strategy processor errors
+          // are tracked separately and should not block live trading.
+        }
+
         // Synthesize indication-result shape from the pipeline results
         // so the existing telemetry block below works unchanged. The
         // pipeline returns indication counts but not the full indication
@@ -2245,7 +2265,7 @@ export class TradeEngineManager {
     let errorCount = 0
     let totalStrategiesEvaluated = 0
 
-    // Adaptive idle backoff — same strategy as the indication processor.
+    // Adaptive idle backoff ��� same strategy as the indication processor.
     const MAX_IDLE_PAUSE_MS = 1000
     let consecutiveEmptyCycles = 0
     const connId = this.connectionId
