@@ -1248,7 +1248,13 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   desiredTp: number
 } {
   const fillPrice = pos.averageExecutionPrice || pos.entryPrice
-  if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
+  if (!fillPrice || fillPrice <= 0) {
+    console.log(
+      `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: No valid fillPrice ` +
+      `(avgExecPrice=${pos.averageExecutionPrice}, entryPrice=${pos.entryPrice})`
+    )
+    return { desiredSl: 0, desiredTp: 0 }
+  }
 
   // ── Trailing stop: use the ratcheted absolute price directly ────────────
   // When trailing is active syncLiveFromPseudo stamps pos.trailingStopPrice
@@ -1258,6 +1264,9 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   let desiredSl: number
   if (pos.trailingActive && pos.trailingStopPrice && pos.trailingStopPrice > 0) {
     desiredSl = pos.trailingStopPrice
+    console.log(
+      `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: Trailing SL active, price=${desiredSl.toFixed(6)}`
+    )
   } else {
     const slPct = Math.max(0, pos.stopLoss || 0) / 100
     desiredSl =
@@ -1266,6 +1275,13 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
           ? fillPrice * (1 - slPct)
           : fillPrice * (1 + slPct)
         : 0
+    
+    if (slPct > 0) {
+      console.log(
+        `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: Static SL ${pos.direction}=${pos.stopLoss}% ` +
+        `fillPrice=${fillPrice.toFixed(6)} → SL=${desiredSl.toFixed(6)}`
+      )
+    }
   }
 
   const tpPct = Math.max(0, pos.takeProfit || 0) / 100
@@ -1275,6 +1291,13 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
         ? fillPrice * (1 + tpPct)
         : fillPrice * (1 - tpPct)
       : 0
+
+  if (tpPct > 0) {
+    console.log(
+      `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: TP ${pos.direction}=${pos.takeProfit}% ` +
+      `fillPrice=${fillPrice.toFixed(6)} → TP=${desiredTp.toFixed(6)}`
+    )
+  }
 
   return { desiredSl, desiredTp }
 }
@@ -2827,7 +2850,8 @@ export async function executeLivePosition(
       // (combined with the 4 s retry inside placeProtectionOrder for
       // code=109420) gives a total 6 s window — sufficient for all
       // observed symbols including DOGE, ADA, and SOL.
-      await new Promise((r) => setTimeout(r, 1000))
+      // PROD FIX: Increased from 1s to 2s to ensure position registry consistency
+      await new Promise((r) => setTimeout(r, 2000))
     } else {
       // D) Final guard: fill unconfirmed but order was accepted �� treat as filled
       // with computedVolume so SL/TP can be placed. The position is "open" on the
