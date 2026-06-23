@@ -1488,7 +1488,7 @@ export function StatisticsOverviewV2() {
             <div className="space-y-1">
               {stats.livePositions.slice(0, 8).map((lp, i) => (
                 // Composite key (id + index) is collision-proof even if the
-                // upstream dedupe is ever bypassed by a new data path.
+                // server payload ever carries the same position id twice.
                 <ExchangePositionRow key={lp.id ? `${lp.id}#${i}` : `pos-${i}`} lp={lp} />
               ))}
               {stats.livePositions.length > 8 && (
