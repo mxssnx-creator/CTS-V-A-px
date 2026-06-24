@@ -860,9 +860,11 @@ export class StrategyCoordinator {
   // values gate the AVERAGE-PF of an already-built Set into the next
   // stage. Conceptually the operator wants ONE Base PF knob — so we
   // load the same `baseProfitFactor` into both fields.
-  // Operator spec defaults: base=1.0, main=1.2, real=1.2, live=1.2
-  // These are fallbacks used when no operator setting is found in Redis.
-  private PF_BASE_MIN = 1.0    // Minimum to enter BASE set
+  // Operator spec defaults: base=0.2 (allows realistic indications),
+  // main=1.2, real=1.2, live=1.2. These are fallbacks used when no operator
+  // setting is found in Redis. BASE accepts low PF to bootstrap from actual
+  // market data; downstream stages filter with stricter gates.
+  private PF_BASE_MIN = 0.2    // Minimum to enter BASE set (was 1.0)
   private PF_MAIN_MIN = 1.2    // Base sets must have avgPF >= 1.2 to enter MAIN
   private PF_REAL_MIN = 1.2    // Main sets must have avgPF >= 1.2 to enter REAL
   private PF_LIVE_MIN = 1.2    // Real sets must have avgPF >= 1.2 to enter LIVE
@@ -995,9 +997,12 @@ export class StrategyCoordinator {
         if (!Number.isFinite(n) || n < 0) return fallback
         return Math.max(0, Math.min(5, n))
       }
-      // Operator spec: base=1.0, main/real/live=1.2 as the fallback when
-      // the operator has never touched the PF sliders.
-      const basePF = clamp(s.baseProfitFactor, 1.0)
+      // Operator spec: base=0.2 (was 1.0, but indications from realtime have
+      // realistic PF ~0.24 from backtesting, so BASE gate must allow them),
+      // main/real/live=1.2 as the fallback when the operator has never touched
+      // the PF sliders. This allows BASE to build from actual indications,
+      // then downstream stages (MAIN/REAL/LIVE) apply their own 1.2+ gates.
+      const basePF = clamp(s.baseProfitFactor, 0.2)
       const mainPF = clamp(s.mainProfitFactor, 1.2)
       const realPF = clamp(s.realProfitFactor, 1.2)
       const livePF = clamp(s.liveProfitFactor, 1.2)
