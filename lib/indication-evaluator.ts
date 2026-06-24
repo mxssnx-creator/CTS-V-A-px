@@ -233,7 +233,7 @@ export class IndicationEvaluator {
     // NOTE: Dev-mode bypass was removed. Indications MUST be stored to Redis so
     // getIndications() can retrieve them for the strategy processor. Without this,
     // strategy processor falls back to synthetic indications, preventing real
-    // indication-based strategy creation.
+    // indication-based strategy creation. (Triggering HMR reload)
     try {
       const client = getRedisClient()
       
