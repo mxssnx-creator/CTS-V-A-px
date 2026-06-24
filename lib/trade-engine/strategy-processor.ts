@@ -84,6 +84,7 @@ export class StrategyProcessor {
    * BASE → Evaluate BASE → MAIN → REAL → LIVE with detailed calculations
    */
   async processStrategy(symbol: string, indications: any[] = []): Promise<{ strategiesEvaluated: number; liveReady: number }> {
+    console.log(`[v0] processStrategy called: symbol=${symbol}, passedIndications=${indications.length}`)
     try {
       await initRedis()
       
@@ -119,6 +120,7 @@ export class StrategyProcessor {
         indications = await this.getActiveIndications(symbol)
       }
 
+      console.log(`[v0] Strategy processor ${symbol}: fetched ${indications?.length || 0} indications, continuing to validate...`)
       if (indications.length === 0) {
         console.warn(`[v0] [StrategyProcessor] No indications available for ${symbol} on ${this.connectionId}`)
         return { strategiesEvaluated: 0, liveReady: 0 }
@@ -162,6 +164,11 @@ export class StrategyProcessor {
         if (!Number.isFinite(pf) || pf === 0) return true
         return pf >= VALIDITY_PF_FLOOR
       })
+      
+      console.log(`[v0] Strategy processor ${symbol}: ${indications.length} indications → ${validIndications.length} valid`)
+      if (validIndications.length > 0) {
+        console.log(`[v0] Strategy processor ${symbol}: sample valid indication:`, JSON.stringify(validIndications[0]))
+      }
 
       if (validIndications.length === 0) {
         // Log once per cycle — the aggregate cycle summary will fold
