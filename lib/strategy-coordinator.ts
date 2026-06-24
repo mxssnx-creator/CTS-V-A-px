@@ -1239,17 +1239,6 @@ export class StrategyCoordinator {
     const results: StrategyEvaluation[] = []
     this._stratCycleCount++
 
-    // TEMP DEBUG: marker at entry to confirm executeStrategyFlow is reached
-    try {
-      const dbgClient = getRedisClient()
-      await dbgClient.hset(`debug:strategyflow:${this.connectionId}`, {
-        [`${symbol}:ENTERED`]: String(Date.now()),
-        [`${symbol}:enteredIndications`]: String(indications?.length || 0),
-        [`${symbol}:isPrehistoric`]: String(isPrehistoric),
-      })
-      await dbgClient.expire(`debug:strategyflow:${this.connectionId}`, 600)
-    } catch { /* non-critical */ }
-
     try {
       // ── Hydrate PF thresholds + Coordination settings + stage thresholds + normalise ─
       await Promise.all([
@@ -1288,19 +1277,6 @@ export class StrategyCoordinator {
       // STAGE 1: BASE — one Set per (indication_type × direction)
       const { result: baseResult, sets: baseSets, coordIndex } = await this.createBaseSets(symbol, indications)
       results.push(baseResult)
-
-      // TEMP DEBUG: persist a marker to Redis so we can see what BASE produced
-      try {
-        const dbgClient = getRedisClient()
-        await dbgClient.hset(`debug:strategyflow:${this.connectionId}`, {
-          [`${symbol}:indicationsIn`]: String(indications?.length || 0),
-          [`${symbol}:baseSetsOut`]: String(baseSets?.length || 0),
-          [`${symbol}:pfBaseMin`]: String(this.PF_BASE_MIN),
-          [`${symbol}:indSample`]: JSON.stringify((indications || []).slice(0, 1).map((i: any) => ({ t: i.type, pf: i.profitFactor, c: i.confidence, d: i.metadata?.direction }))),
-          [`${symbol}:ts`]: String(Date.now()),
-        })
-        await dbgClient.expire(`debug:strategyflow:${this.connectionId}`, 600)
-      } catch { /* non-critical */ }
 
       // STAGE 2: MAIN — validate Base Sets AND create additional related
       // variant Sets (Default / Trailing / Block / DCA) gated by posCtx.
@@ -1586,9 +1562,19 @@ export class StrategyCoordinator {
         // accumulates, posStats updates and avgPF becomes data-driven.
         const posStats = posMap.get(`${group.indicationType}|${group.direction}`)
         const hasRealisedHistory = !!posStats && posStats.count >= prevPosMinCount
+        // Bootstrap PF: when no realised position history exists yet, derive the
+        // Set's avgProfitFactor from the indication signal (the average entry PF)
+        // rather than a flat 1.0. A flat 1.0 can NEVER pass the Main gate
+        // (PF_MAIN_MIN = 1.2), which created a permanent bootstrap deadlock:
+        // no Set could progress to trade, so no realised history could ever
+        // accumulate to flip `hasRealisedHistory` true. Using the indication's
+        // own PF lets genuinely strong signals (PF >= gate) progress while weak
+        // ones are still filtered. Once real closed-position history exists,
+        // the authoritative cost-adjusted PF (posStats.profitFactor) takes over.
+        const bootstrapPF = entries.reduce((s, e) => s + (e.profitFactor || 0), 0) / entries.length
         const avgPF = hasRealisedHistory
           ? posStats!.profitFactor  // Cost-adjusted from actual positions (authoritative)
-          : 1.0  // Conservative bootstrap: no unproven strategies activate
+          : (Number.isFinite(bootstrapPF) && bootstrapPF > 0 ? bootstrapPF : 1.0)
 
         // ── Drawdown-time from historic window ────────��───────────────────
         // The Set's avgDrawdownTime was previously hardcoded to 0, which made
@@ -1597,7 +1583,7 @@ export class StrategyCoordinator {
         // mean drawdown minutes (avgDDT) once the bucket has enough samples.
         // Without sufficient history we leave it 0 (= "no DDT signal yet",
         // gate stays open — bootstrap path), matching the PF-blend bootstrap.
-        const avgDDT = blendActive ? posStats!.avgDDT : 0
+        const avgDDT = hasRealisedHistory ? posStats!.avgDDT : 0
 
         const set: StrategySet = {
           setKey,
