@@ -19,6 +19,20 @@ export async function GET(request: NextRequest) {
       const data = await client.hgetall(hashKey).catch(() => null)
       return NextResponse.json({ hashKey, data: data || {}, fieldCount: data ? Object.keys(data).length : 0 })
     }
+
+    // TEMP DEBUG: inspect an arbitrary string key via ?key=<key>
+    const strKey = request.nextUrl.searchParams.get("key")
+    if (strKey) {
+      const value = await client.get(strKey).catch(() => null)
+      return NextResponse.json({ strKey, value })
+    }
+
+    // TEMP DEBUG: list keys matching ?keys=<pattern>
+    const keysPattern = request.nextUrl.searchParams.get("keys")
+    if (keysPattern) {
+      const matched = await client.keys(keysPattern).catch(() => [])
+      return NextResponse.json({ keysPattern, count: matched.length, keys: matched.slice(0, 100) })
+    }
     
     // Get all connection IDs from Redis
     const connIds = await client.smembers("connections")

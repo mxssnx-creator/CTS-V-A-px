@@ -2339,6 +2339,17 @@ export class TradeEngineManager {
         }
 
         const symbols = await this.getSymbols()
+        // TEMP DEBUG: record symbol count + done flag in the strategy loop
+        try {
+          const dbgClient = getRedisClient()
+          await dbgClient.hset(`debug:stratloop:${this.connectionId}`, {
+            symbolsLen: String(symbols?.length || 0),
+            doneFlag: String(prehistoricDoneFlag),
+            ts: String(Date.now()),
+            firstSymbols: JSON.stringify((symbols || []).slice(0, 5)),
+          })
+          await dbgClient.expire(`debug:stratloop:${this.connectionId}`, 600)
+        } catch { /* non-critical */ }
         // Per-cycle deadline — see `withCycleDeadline` rationale at the
         // top of this file. Guards against a single hung
         // `processStrategy(symbol)` blocking the entire strategy loop.
@@ -3868,7 +3879,7 @@ export class TradeEngineManager {
 
   // ───���─────────────────────────────────────────────────���──────────────
   //  Live settings reload
-  // ────────────────���───────────────────────────────────────────────────
+  // ────��───────────���───────────────────────────────────────────────────
 
   /**
    * Starts the per-connection settings watcher (3s poll). Cheap: a
