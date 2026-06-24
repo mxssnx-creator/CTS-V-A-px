@@ -1743,8 +1743,14 @@ export class StrategyCoordinator {
       if (this._stratCycleCount % 500 === 1) {
         writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
       }
-      await Promise.all(writes)
-    } catch { /* non-critical */ }
+      try {
+        await Promise.all(writes)
+      } catch (err: any) {
+        console.error(`[v0] [Coordinator] Error writing base stage counts to Redis:`, err?.message)
+      }
+    } catch (err: any) {
+      console.error(`[v0] [Coordinator] Error in createBaseSets for ${symbol}:`, err?.message)
+    }
 
     // ── Build BaseRegistry + seed CoordIndex for downstream stages ───────
     // This is the SINGLE allocation point for base data. All downstream stages
@@ -2437,8 +2443,14 @@ export class StrategyCoordinator {
         writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
       }
 
-      await Promise.all(writes)
-    } catch { /* non-critical — Redis write failure should not kill strategy flow */ }
+      try {
+        await Promise.all(writes)
+      } catch (err: any) {
+        console.error(`[v0] [Coordinator] Error writing main stage counts to Redis:`, err?.message)
+      }
+    } catch (err: any) {
+      console.error(`[v0] [Coordinator] Error in createMainSets for ${symbol}:`, err?.message)
+    }
 
     return {
       result: {
@@ -3542,7 +3554,11 @@ export class StrategyCoordinator {
         writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
       }
 
-      await Promise.all(writes)
+      try {
+        await Promise.all(writes)
+      } catch (err: any) {
+        console.error(`[v0] [Coordinator] Error writing real stage counts to Redis:`, err?.message)
+      }
 
       // Second pass — derive averages from freshly-incremented counters
       // so the stats API can read them without recomputing.
@@ -3900,8 +3916,12 @@ export class StrategyCoordinator {
         // `set` with EX in a single command avoids the separate expire round-trip.
         client.set(liveCountKey, String(qualifying.length), { EX: 86400 } as any),
         ...liveVariantWrites,
-      ])
-    } catch { /* non-critical */ }
+      ]).catch((err: any) => {
+        console.error(`[v0] [Coordinator] Error writing live stage counts to Redis:`, err?.message)
+      })
+    } catch (err: any) {
+      console.error(`[v0] [Coordinator] Error in createLiveSets for ${symbol}:`, err?.message)
+    }
 
     // Pre-fetch the current market price ONCE so both the live exchange dispatch
     // and the pseudo-position creation below share the same price without
