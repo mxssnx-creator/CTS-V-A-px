@@ -1591,9 +1591,14 @@ export async function GET(
       const avgHoldMin  = countSampled > 0 ? (sumHoldMs / countSampled) / 60_000 : 0
       const avgPnl      = countSampled > 0 ? sumPnl / countSampled : 0
       const avgRoi      = countSampled > 0 ? sumRoi / countSampled : 0
+      // Profit Factor: ratio of gross profit to gross loss.
+      // When sumGrossLoss = 0:
+      //   - If sumGrossProfit > 0: all trades were winners → PF = Infinity (represented as null for JSON)
+      //   - If sumGrossProfit = 0: no closed positions → PF = 0
+      // This avoids the misleading hardcoded 999 value that was used before.
       const profitFactor = sumGrossLoss > 0
         ? sumGrossProfit / sumGrossLoss
-        : sumGrossProfit > 0 ? 999 : 0
+        : sumGrossProfit > 0 ? Number.POSITIVE_INFINITY : 0
       const passRate   = livePlaced > 0 ? liveFilled / livePlaced : 0
       const winRate    = liveClosed > 0 ? liveWins / liveClosed : 0
       const avgPosSize = liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
@@ -1602,7 +1607,9 @@ export async function GET(
         // Same shape as base/main/real so the UI can reuse its row renderer:
         avgPosPerSet:        Math.round(avgPosSize * 100) / 100,        // avg position notional (USD)
         createdSets:         liveCreated,                               // positions actually created on exchange
-        avgProfitFactor:     Math.round(profitFactor * 1000) / 1000,    // PF from realised PnL
+        // Handle Infinity case: when all trades are winners, PF is Infinity.
+        // Store as null for JSON serialization, UI handles display.
+        avgProfitFactor:     !isFinite(profitFactor) ? null : Math.round(profitFactor * 1000) / 1000,    // PF from realised PnL
         avgProcessingTimeMs: 0,                                         // not tracked for live — handled inline
         avgPosEvalReal:      Math.round(avgRoi * 10000) / 10000,        // avg ROI fraction
         countPosEval:        countSampled,
