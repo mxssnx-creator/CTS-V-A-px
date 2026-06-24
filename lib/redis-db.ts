@@ -422,10 +422,16 @@ export class InlineLocalRedis {
           //    keys from prior hot-reload cycles remain in the Map.
           //    Also covers lpush lists from strategy-evaluator.ts (storeStrategyResult
           //    now returns early in dev, but pre-bypass runs left stale list keys).
+          //    
+          //    PRESERVE: strategies_active:{conn} — coordinator current counts
+          //    (per-symbol per-stage). This hash is read by the stats API every
+          //    second and must survive hot-reloads.
           for (const key of this.data.lists.keys()) {
             if (key.startsWith("strategies:")) { this.data.lists.delete(key); flushed++ }
           }
           for (const key of this.data.hashes.keys()) {
+            // Preserve strategies_active hash — it contains live coordinator counts
+            if (key.startsWith("strategies_active:")) continue
             if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
               this.data.hashes.delete(key); flushed++
             }
@@ -811,7 +817,7 @@ export class InlineLocalRedis {
       evicted += trimBucket(keys, cap)
     }
 
-    // ── LIST single-pass ────────────��───────────────────────────────────��─�����
+    // ── LIST single-pass ────────────��────────���──────────────────────────��─�����
     // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
       const listCap = isDev ? 0 : 50
