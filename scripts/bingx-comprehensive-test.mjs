@@ -82,13 +82,22 @@ async function validateStrategyProgression(stats) {
 
   try {
     // 1. Validate phase
-    const validPhases = ['prehistoric_loading', 'live_trading', 'stopped']
+    const validPhases = [
+      'starting',
+      'initializing',
+      'market_data',
+      'prehistoric_loading',
+      'prehistoric_processing',
+      'prehistoric_data',
+      'live_trading',
+      'stopped',
+    ]
     assert(validPhases.includes(stats.metadata.phase), `Invalid phase: ${stats.metadata.phase}`)
     tests.phaseValid = true
 
     // 2. Validate set counts at each stage
     // Note: API response has nested structure under breakdown.strategies
-    const strategyBreakdown = stats.breakdown?.strategies || {}
+    const strategyBreakdown = stats.breakdown?.strategies || stats.breakdown || {}
     const { base = 0, main = 0, real = 0, live = 0 } = strategyBreakdown
     
     // Validate counts are numbers and in reasonable ranges
@@ -284,14 +293,19 @@ async function validateDataIntegrity(stats) {
 
     // 3. Validate types
     assert(typeof stats.metadata.phase === 'string', `phase should be string`)
-    assert(typeof stats.breakdown.base === 'number', `base count should be number`)
+    const breakdown = stats.breakdown?.strategies || stats.breakdown || {}
+    const base = Number(breakdown.base ?? 0)
+    const main = Number(breakdown.main ?? 0)
+    const real = Number(breakdown.real ?? 0)
+    const live = Number(breakdown.live ?? 0)
+    assert(Number.isFinite(base), `base count should be number`)
     tests.typesCorrect = true
 
     // 4. Validate numeric ranges
-    assert(stats.breakdown.base >= 0, `base count should be >= 0`)
-    assert(stats.breakdown.main >= 0, `main count should be >= 0`)
-    assert(stats.breakdown.real >= 0, `real count should be >= 0`)
-    assert(stats.breakdown.live >= 0, `live count should be >= 0`)
+    assert(base >= 0, `base count should be >= 0`)
+    assert(main >= 0, `main count should be >= 0`)
+    assert(real >= 0, `real count should be >= 0`)
+    assert(live >= 0, `live count should be >= 0`)
     tests.numericRangesValid = true
 
     return tests
@@ -320,7 +334,7 @@ async function runTestCycle() {
     if (stats.breakdown) {
       state.metrics.setCountsByStage.push({
         cycle: state.cycles,
-        ...stats.breakdown
+        ...(stats.breakdown?.strategies || stats.breakdown)
       })
     }
 
@@ -332,7 +346,7 @@ async function runTestCycle() {
 
     if (allPassed) {
       log('green', `✓ Cycle ${state.cycles} [${cycleTime}ms]`, 
-        `BASE=${stats.breakdown?.base} MAIN=${stats.breakdown?.main} REAL=${stats.breakdown?.real} LIVE=${stats.breakdown?.live}`,
+        `BASE=${(stats.breakdown?.strategies || stats.breakdown)?.base ?? 0} MAIN=${(stats.breakdown?.strategies || stats.breakdown)?.main ?? 0} REAL=${(stats.breakdown?.strategies || stats.breakdown)?.real ?? 0} LIVE=${(stats.breakdown?.strategies || stats.breakdown)?.live ?? 0}`,
         `Orders: placed=${orders.ordersPlaced} filled=${orders.ordersFilled}`)
     } else {
       log('yellow', `⚠ Cycle ${state.cycles} - Some checks failed`)

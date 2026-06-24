@@ -41,8 +41,10 @@ export const dynamic = "force-dynamic"
 const API_VERSION = API_VERSIONS.tradeEngine
 const LOG_PREFIX = `[v0] [QuickStart] ${API_VERSION}`
 
-// Default trading symbol (single symbol for quickstart - DRIFTUSDT for live testing)
+// Default fallback symbol. Normal quickstart auto-picks up to MAX_QUICKSTART_SYMBOLS by volatility.
 const DEFAULT_SYMBOLS = ["DRIFTUSDT"]
+const MAX_QUICKSTART_SYMBOLS = 32
+const QUICKSTART_LIVE_VOLUME_FACTOR = "0.1"
 
 /**
  * POST /api/trade-engine/quick-start
@@ -210,7 +212,7 @@ export async function POST(request: Request) {
           apiKey: connection.api_key,
           apiSecret: connection.api_secret,
           apiPassphrase: connection.api_passphrase || "",
-          isTestnet: false,
+          isTestnet: connection.is_testnet === true || connection.is_testnet === "1" || connection.is_testnet === "true",
           apiType: connection.api_type || "perpetual_futures",
         })
         
@@ -277,20 +279,18 @@ export async function POST(request: Request) {
       symbols = [rawSymbols]
     }
     // requestedCount controls the eventual auto-pick count when no
-    // explicit symbols are provided. Quickstart still picks 1 today,
-    // but we accept `body.symbolCount` so a future caller can request N
-    // without forcing array construction. Bound to [1, 50] to defend
-    // against accidental absurd values.
-    // Operator spec: quickstart supports up to 32 symbols, default 15.
-    let requestedCount = 15
+    // explicit symbols are provided. Operator live-test mode should exercise
+    // the maximum symbol fan-out by default while still bounding accidental
+    // absurd values.
+    let requestedCount = MAX_QUICKSTART_SYMBOLS
     if (typeof rawSymbols === "number" && Number.isFinite(rawSymbols) && rawSymbols > 0) {
-      requestedCount = Math.max(1, Math.min(32, Math.floor(rawSymbols)))
+      requestedCount = Math.max(1, Math.min(MAX_QUICKSTART_SYMBOLS, Math.floor(rawSymbols)))
     } else if (
       typeof body.symbolCount === "number" &&
       Number.isFinite(body.symbolCount) &&
       body.symbolCount > 0
     ) {
-      requestedCount = Math.max(1, Math.min(32, Math.floor(body.symbolCount)))
+      requestedCount = Math.max(1, Math.min(MAX_QUICKSTART_SYMBOLS, Math.floor(body.symbolCount)))
     }
     // The auto-pick branches honour `requestedCount` so a caller that
     // posts `{ symbolCount: 2 }` (or `symbols: 2`) gets two symbols, not
@@ -342,7 +342,7 @@ export async function POST(request: Request) {
         const connector = await createExchangeConnector(exchangeName, {
           apiKey: connection.api_key,
           apiSecret: connection.api_secret,
-          isTestnet: false,
+          isTestnet: connection.is_testnet === true || connection.is_testnet === "1" || connection.is_testnet === "true",
         })
         if (typeof connector.getTopSymbols === "function") {
           const topSymbols = await connector.getTopSymbols(requestedCount)
@@ -412,9 +412,10 @@ export async function POST(request: Request) {
        is_active: "1",
        is_live_trade: "1",
        active_symbols: JSON.stringify(symbols),
-       // Operator spec: volume factor 2.2 for quickstart (moderate live exposure).
-       // Previously 0.1 (exchange minimum) — updated per operator directive.
-       live_volume_factor: "2.2",
+       // Lowest-volume live testing: force the per-connection factor to the
+       // VolumeCalculator minimum. The calculator then clamps each pair up to
+       // that exchange symbol's legal minimum notional/quantity.
+       live_volume_factor: QUICKSTART_LIVE_VOLUME_FACTOR,
        // Symbol ordering: operator spec is volatility_1h for quickstart.
        symbol_order: "volatility_1h",
        symbol_count: String(symbols.length),
@@ -425,7 +426,7 @@ export async function POST(request: Request) {
      }
      
      await updateConnection(connectionId, updated)
-     console.log(`${LOG_PREFIX}: [3/4] Connection state updated (assigned+enabled, live_volume_factor=0.1 → exchange-minimum orders).`)
+     console.log(`${LOG_PREFIX}: [3/4] Connection state updated (assigned+enabled, live_volume_factor=${QUICKSTART_LIVE_VOLUME_FACTOR} → exchange-minimum orders).`)
      // Surface the minimal-volume policy in the progression log so the
      // operator can confirm in the UI exactly which sizing knob was
      // applied. Helpful when debugging "why are my orders so small?".
@@ -433,9 +434,9 @@ export async function POST(request: Request) {
        connectionId,
        "quickstart_minimal_volume",
        "info",
-       "QuickStart applied minimal-volume policy: live_volume_factor=0.1 (exchange-minimum orders)",
+       `QuickStart applied minimal-volume policy: live_volume_factor=${QUICKSTART_LIVE_VOLUME_FACTOR} (exchange-minimum orders)`,
        {
-         live_volume_factor: "0.1",
+         live_volume_factor: QUICKSTART_LIVE_VOLUME_FACTOR,
          note:
            "Per-connection override. Order size will be clamped UP to the per-pair exchange minimum (or the universal $5 notional floor). Adjust via Settings → Connection → Live Volume Factor (0.1×–10×) when ready to scale.",
        },
@@ -447,14 +448,15 @@ export async function POST(request: Request) {
     // to the hard-coded "3" when the historical phase reports progress.
     // Also reset the processed counter to 0 so progress starts correctly.
     // Operator-spec defaults for quickstart: base PF=1.0, main/real PF=1.2,
-    // trailing on, block on, dca off, control orders on, VF 2.2, volatility_1h.
+    // trailing on, block on, dca off, control orders on, minimum live volume, volatility_1h.
     // These are persisted to connection_settings so the engine reads them on the
     // first tick instead of using its compiled defaults.
     const { getRedisClient: _gsClient } = await import("@/lib/redis-db")
     const _gsc = _gsClient()
     await _gsc.hset(`connection_settings:${connectionId}`, {
       // Volume factor
-      volume_factor_live:   "2.2",
+      volume_factor_live:   QUICKSTART_LIVE_VOLUME_FACTOR,
+      live_volume_factor:   QUICKSTART_LIVE_VOLUME_FACTOR,
       volume_factor_preset: "1.0",
       // Symbol order
       symbol_order: "volatility_1h",

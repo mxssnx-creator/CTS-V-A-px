@@ -41,7 +41,11 @@ const FALLBACK: Record<string, string> = {
 const SAFE_MAJORS = [
   "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
   "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
-  "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+  "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "POLUSDT",
+  "WIFUSDT",  "1000PEPEUSDT", "SUIUSDT", "OPUSDT", "ARBUSDT",
+  "APTUSDT",  "FILUSDT",  "BCHUSDT",  "TRXUSDT", "ETCUSDT",
+  "AAVEUSDT", "INJUSDT",  "SEIUSDT",  "TIAUSDT", "WLDUSDT",
+  "JUPUSDT",  "ORDIUSDT",
 ]
 
 export function normaliseSort(raw: string | null | undefined): SortKey {

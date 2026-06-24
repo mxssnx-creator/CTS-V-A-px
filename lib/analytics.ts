@@ -1,4 +1,5 @@
 import type { TradingPosition } from "./trading"
+import { resolvePositionCostNotional } from "./tp-sl-ratio"
 
 export interface AnalyticsFilter {
   symbols: string[]
@@ -286,15 +287,11 @@ export class AnalyticsEngine {
     const grossProfit = positions.filter((p) => p.profit_loss > 0).reduce((sum, p) => sum + p.profit_loss, 0)
     const grossLoss = Math.abs(positions.filter((p) => p.profit_loss < 0).reduce((sum, p) => sum + p.profit_loss, 0))
     
-    // Cost-adjusted PF: totalWinPnL / (totalLossPnL + totalPositionCosts)
-    // Position cost = entry_price × quantity × 0.001 (0.1% maker fee)
-    const totalPositionCosts = positions.reduce((sum, p) => {
-      if (Number.isFinite(p.entry_price) && Number.isFinite(p.quantity) && 
-          p.entry_price > 0 && p.quantity > 0) {
-        return sum + (p.entry_price * p.quantity * 0.001)
-      }
-      return sum
-    }, 0)
+    // Cost-adjusted PF: totalWinPnL / (totalLossPnL + totalPositionCosts).
+    // Prefer entry_price × quantity when present; fall back to the stored
+    // notional volume. `stoploss_ratio` is TP-relative elsewhere and is not a
+    // quantity proxy.
+    const totalPositionCosts = positions.reduce((sum, p) => sum + resolvePositionCostNotional(p) * 0.001, 0)
     
     const adjustedDenominator = grossLoss + totalPositionCosts
     return adjustedDenominator > 0 ? grossProfit / adjustedDenominator : grossProfit > 0 ? 2 : 0

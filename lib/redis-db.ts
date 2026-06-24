@@ -1289,6 +1289,19 @@ export class InlineLocalRedis {
   }
 
   /**
+   * Return the zero-based index of the first matching list element, or null.
+   * Mirrors Redis LPOS for the subset of behavior used by live position
+   * archive deduplication.
+   */
+  async lpos(key: string, value: string): Promise<number | null> {
+    if (this.isExpired(key)) return null
+    const list = this.data.lists.get(key)
+    if (!list || list.length === 0) return null
+    const index = list.indexOf(value)
+    return index >= 0 ? index : null
+  }
+
+  /**
    * Pop and return the first element of the list at `key`. Returns null when
    * the list is empty or missing. Added for parity with `lpush`/`rpush` so
    * upstream callers that move items between queues don't blow up.
@@ -2368,12 +2381,45 @@ export async function savePosition(position: any): Promise<void> {
       await client.set(liveKey, JSON.stringify(position))
     }
 
-    const connId = position.connectionId || position.connection_id || "unknown"
-    if (!connId || connId === "unknown") {
-      return
-    }
+	    const connId = position.connectionId || position.connection_id || "unknown"
+	    if (!connId || connId === "unknown") {
+	      return
+	    }
 
-    // Terminal => move from open index -> closed archive idempotently
+	    // Maintain lightweight reverse indexes for exchange/client tracking IDs.
+	    // Live reconciliation and operator diagnostics can resolve a venue order
+	    // back to the exact system-owned LivePosition without relying only on
+	    // symbol+direction matching (which is ambiguous during restarts,
+	    // accumulation, or hedge-mode long+short coexistence).
+	    try {
+	      const exchangeData = position.exchangeData || {}
+	      const trackingIds = new Set<string>()
+	      for (const candidate of [
+	        position.trackingId,
+	        position.exchangeTrackingId,
+	        position.clientOrderId,
+	        exchangeData.trackingId,
+	        exchangeData.exchangeTrackingId,
+	        exchangeData.clientOrderId,
+	      ]) {
+	        if (candidate != null && String(candidate).length > 0) trackingIds.add(String(candidate))
+	      }
+	      if (Array.isArray(exchangeData.clientOrderIds)) {
+	        for (const entry of exchangeData.clientOrderIds) {
+	          const clientOrderId = entry?.clientOrderId ?? entry?.id
+	          if (clientOrderId != null && String(clientOrderId).length > 0) trackingIds.add(String(clientOrderId))
+	        }
+	      }
+	      for (const trackingId of trackingIds) {
+	        const key = `live:position:tracking:${connId}:${trackingId}`
+	        await client.set(key, id).catch(() => null)
+	        await client.expire(key, 7 * 24 * 60 * 60).catch(() => 0)
+	      }
+	    } catch {
+	      // best-effort diagnostics/reconciliation index
+	    }
+
+	    // Terminal => move from open index -> closed archive idempotently
     if (position.status === "closed") {
       try {
         // Remove any existing entries from open list
