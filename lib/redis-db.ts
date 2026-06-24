@@ -422,10 +422,16 @@ export class InlineLocalRedis {
           //    keys from prior hot-reload cycles remain in the Map.
           //    Also covers lpush lists from strategy-evaluator.ts (storeStrategyResult
           //    now returns early in dev, but pre-bypass runs left stale list keys).
+          //    
+          //    PRESERVE: strategies_active:{conn} — coordinator current counts
+          //    (per-symbol per-stage). This hash is read by the stats API every
+          //    second and must survive hot-reloads.
           for (const key of this.data.lists.keys()) {
             if (key.startsWith("strategies:")) { this.data.lists.delete(key); flushed++ }
           }
           for (const key of this.data.hashes.keys()) {
+            // Preserve strategies_active hash — it contains live coordinator counts
+            if (key.startsWith("strategies_active:")) continue
             if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
               this.data.hashes.delete(key); flushed++
             }
@@ -811,7 +817,7 @@ export class InlineLocalRedis {
       evicted += trimBucket(keys, cap)
     }
 
-    // ── LIST single-pass ────────────��───────────────────────────────────��─�����
+    // ── LIST single-pass ────────────��────────���──────────────────────────��─�����
     // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
       const listCap = isDev ? 0 : 50
@@ -2370,9 +2376,14 @@ export async function savePosition(position: any): Promise<void> {
     // Terminal => move from open index -> closed archive idempotently
     if (position.status === "closed") {
       try {
-        // Remove any existing entries from open list, then push to closed list
+        // Remove any existing entries from open list
         await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
-        await client.lpush(`live:positions:${connId}:closed`, id).catch(() => 0)
+        // Check if already in closed list to avoid duplicates
+        const alreadyClosed = await client.lpos(`live:positions:${connId}:closed`, id).catch(() => null)
+        if (!alreadyClosed) {
+          // Only add if not already present
+          await client.lpush(`live:positions:${connId}:closed`, id).catch(() => 0)
+        }
         // Mark moved so closeLivePosition can detect duplicate increments
         await client.set(`live:positions:${connId}:moved:${id}`, String(Date.now())).catch(() => null)
         await client.expire(`live:positions:${connId}:moved:${id}`, 60 * 60).catch(() => 0)

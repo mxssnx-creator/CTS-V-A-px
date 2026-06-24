@@ -1933,9 +1933,14 @@ export class TradeEngineManager {
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
           if (coordinator) {
-            await coordinator.coordinateForActualOne(this.connectionId, symbols)
+            // DEBUG: Log coordinator invocation
+            console.log(`[v0] [Realtime] Invoking coordinator.coordinateForActualOne for ${this.connectionId} with ${symbols.length} symbols`)
+            const coordResult = await coordinator.coordinateForActualOne(this.connectionId, symbols)
+            console.log(`[v0] [Realtime] Coordinator completed for ${this.connectionId}, result=${coordResult ? 'returned' : 'null'}`)
             // coordResult contains aggregated counts that are now persisted to Redis
             // and visible via the stats API.
+          } else {
+            console.warn(`[v0] [Realtime] WARNING: getGlobalTradeEngineCoordinator() returned null for ${this.connectionId}`)
           }
         } catch (err) {
           console.error(`[v0] [Realtime] Coordinator aggregation failed for ${this.connectionId}:`, err)
