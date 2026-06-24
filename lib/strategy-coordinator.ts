@@ -1239,6 +1239,17 @@ export class StrategyCoordinator {
     const results: StrategyEvaluation[] = []
     this._stratCycleCount++
 
+    // TEMP DEBUG: marker at entry to confirm executeStrategyFlow is reached
+    try {
+      const dbgClient = getRedisClient()
+      await dbgClient.hset(`debug:strategyflow:${this.connectionId}`, {
+        [`${symbol}:ENTERED`]: String(Date.now()),
+        [`${symbol}:enteredIndications`]: String(indications?.length || 0),
+        [`${symbol}:isPrehistoric`]: String(isPrehistoric),
+      })
+      await dbgClient.expire(`debug:strategyflow:${this.connectionId}`, 600)
+    } catch { /* non-critical */ }
+
     try {
       // ── Hydrate PF thresholds + Coordination settings + stage thresholds + normalise ─
       await Promise.all([
@@ -1277,6 +1288,19 @@ export class StrategyCoordinator {
       // STAGE 1: BASE — one Set per (indication_type × direction)
       const { result: baseResult, sets: baseSets, coordIndex } = await this.createBaseSets(symbol, indications)
       results.push(baseResult)
+
+      // TEMP DEBUG: persist a marker to Redis so we can see what BASE produced
+      try {
+        const dbgClient = getRedisClient()
+        await dbgClient.hset(`debug:strategyflow:${this.connectionId}`, {
+          [`${symbol}:indicationsIn`]: String(indications?.length || 0),
+          [`${symbol}:baseSetsOut`]: String(baseSets?.length || 0),
+          [`${symbol}:pfBaseMin`]: String(this.PF_BASE_MIN),
+          [`${symbol}:indSample`]: JSON.stringify((indications || []).slice(0, 1).map((i: any) => ({ t: i.type, pf: i.profitFactor, c: i.confidence, d: i.metadata?.direction }))),
+          [`${symbol}:ts`]: String(Date.now()),
+        })
+        await dbgClient.expire(`debug:strategyflow:${this.connectionId}`, 600)
+      } catch { /* non-critical */ }
 
       // STAGE 2: MAIN — validate Base Sets AND create additional related
       // variant Sets (Default / Trailing / Block / DCA) gated by posCtx.

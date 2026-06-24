@@ -86,6 +86,16 @@ export class StrategyProcessor {
   async processStrategy(symbol: string, indications: any[] = []): Promise<{ strategiesEvaluated: number; liveReady: number }> {
     try {
       await initRedis()
+
+      // TEMP DEBUG: marker confirming processStrategy is invoked per-symbol
+      try {
+        const dbgClient = getRedisClient()
+        await dbgClient.hset(`debug:procstrategy:${this.connectionId}`, {
+          [`${symbol}:called`]: String(Date.now()),
+          [`${symbol}:passedIn`]: String(indications?.length || 0),
+        })
+        await dbgClient.expire(`debug:procstrategy:${this.connectionId}`, 600)
+      } catch { /* non-critical */ }
       
       // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
       // When user updates connection settings via UI, a dirty flag is set.
@@ -119,14 +129,22 @@ export class StrategyProcessor {
         indications = await this.getActiveIndications(symbol)
       }
 
+      // TEMP DEBUG: record indications retrieved
+      try {
+        const dbgClient = getRedisClient()
+        await dbgClient.hset(`debug:procstrategy:${this.connectionId}`, {
+          [`${symbol}:afterRetrieve`]: String(indications?.length || 0),
+        })
+      } catch { /* non-critical */ }
+
       if (indications.length === 0) {
+        try {
+          const dbgClient = getRedisClient()
+          await dbgClient.hset(`debug:procstrategy:${this.connectionId}`, { [`${symbol}:GATE`]: "no_indications" })
+        } catch { /* non-critical */ }
         console.log(`[v0] [StrategyProcessor] No indications for ${symbol}/${this.connectionId}`)
         return { strategiesEvaluated: 0, liveReady: 0 }
       }
-      
-      console.log(`[v0] [StrategyProcessor] ${symbol}: ${indications.length} indications retrieved`)
-      const sample = indications[0]
-      console.log(`[v0] [StrategyProcessor] sample indication:`, {type: sample?.type, symbol: sample?.symbol, pf: sample?.profitFactor, conf: sample?.confidence})
 
       // ── P0-1: Indication-correctness gate ─────────────────────────────
       // Spec: *"indications calcs for each Type and config coord possibility
@@ -167,7 +185,19 @@ export class StrategyProcessor {
         return pf >= VALIDITY_PF_FLOOR
       })
 
+      // TEMP DEBUG: record valid indications count
+      try {
+        const dbgClient = getRedisClient()
+        await dbgClient.hset(`debug:procstrategy:${this.connectionId}`, {
+          [`${symbol}:validInd`]: String(validIndications.length),
+        })
+      } catch { /* non-critical */ }
+
       if (validIndications.length === 0) {
+        try {
+          const dbgClient = getRedisClient()
+          await dbgClient.hset(`debug:procstrategy:${this.connectionId}`, { [`${symbol}:GATE`]: "no_valid_indications" })
+        } catch { /* non-critical */ }
         // Log once per cycle — the aggregate cycle summary will fold
         // these together without flooding the stream.
         await logProgressionEvent(

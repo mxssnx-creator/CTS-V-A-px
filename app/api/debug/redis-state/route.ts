@@ -1,16 +1,23 @@
-import { NextResponse } from "next/server"
+import { type NextRequest, NextResponse } from "next/server"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
     await initRedis()
     const client = getRedisClient()
     
     if (!client) {
       return NextResponse.json({ error: "Redis client not available" }, { status: 500 })
+    }
+
+    // TEMP DEBUG: inspect an arbitrary hash key via ?hash=<key>
+    const hashKey = request.nextUrl.searchParams.get("hash")
+    if (hashKey) {
+      const data = await client.hgetall(hashKey).catch(() => null)
+      return NextResponse.json({ hashKey, data: data || {}, fieldCount: data ? Object.keys(data).length : 0 })
     }
     
     // Get all connection IDs from Redis
