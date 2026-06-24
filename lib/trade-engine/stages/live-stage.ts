@@ -1542,6 +1542,10 @@ async function updateProtectionOrders(
 
   // ── Stop-Loss + Take-Profit legs: parallelised cancel-then-replace ──
   //
+  // OPTIMIZATION: Attempt batch placement for SL+TP to reduce API calls.
+  // If batch placement succeeds, skip the individual parallel calls.
+  // Falls back to parallel individual placement if batching unavailable.
+  //
   // Latency contract: control orders MUST arm "instantly" — the operator
   // explicitly called this out. The original implementation processed
   // SL then TP sequentially, so a fresh promotion paid up to 4 venue
@@ -1553,6 +1557,71 @@ async function updateProtectionOrders(
   // preserved (so the duplicate-reduceOnly race the original guard
   // prevents cannot reappear). Each leg only ever mutates its own
   // position fields, so there is no cross-leg write contention.
+  
+  // Attempt batch placement first if both legs need placing
+  if (
+    connector.batchPlaceOrders &&
+    desiredSl > 0 && !pos.stopLossOrderId &&
+    desiredTp > 0 && !pos.takeProfitOrderId &&
+    pos.executedQuantity > 0
+  ) {
+    try {
+      const batchResult = await connector.batchPlaceOrders([
+        {
+          symbol: pos.symbol,
+          side: closeSide,
+          type: "market",
+          quantity: effectiveQty,
+          options: {
+            stopPrice: desiredSl,
+            reduceOnly: true,
+            positionSide: pos.direction,
+            orderType: "STOP_MARKET",
+          }
+        },
+        {
+          symbol: pos.symbol,
+          side: closeSide,
+          type: "market",
+          quantity: effectiveQty,
+          options: {
+            takePrice: desiredTp,
+            reduceOnly: true,
+            positionSide: pos.direction,
+            orderType: "TAKE_PROFIT_MARKET",
+          }
+        }
+      ]).catch(() => null)
+      
+      if (batchResult?.success && batchResult.orders?.length === 2) {
+        const slId = batchResult.orders[0]?.orderId
+        const tpId = batchResult.orders[1]?.orderId
+        if (slId) {
+          pos.stopLossOrderId = slId
+          pos.stopLossPrice = desiredSl
+          pos.stopLossLastArmedAt = Date.now()
+          result.changed = true
+          result.slPlaced = true
+        }
+        if (tpId) {
+          pos.takeProfitOrderId = tpId
+          pos.takeProfitPrice = desiredTp
+          pos.takeProfitLastArmedAt = Date.now()
+          result.changed = true
+          result.tpPlaced = true
+        }
+        if (result.slPlaced || result.tpPlaced) {
+          pos.protectionArmedQuantity = effectiveQty
+        }
+        // Skip the individual parallel leg processing below
+        return result
+      }
+    } catch (batchErr) {
+      // Fall through to individual parallel placement
+      console.warn(`${LOG_PREFIX} [batch] SL+TP batch placement failed:`, batchErr instanceof Error ? batchErr.message : String(batchErr))
+    }
+  }
+  
   const slLeg = (async () => {
     if (desiredSl <= 0 && pos.stopLossOrderId) {
       // SL was turned off — yank the existing order. Hard cancel
@@ -2975,39 +3044,82 @@ export async function executeLivePosition(
       // for that leg. A failed placement leaves it at 0, which
       // `priceDrifted(0, desired)` correctly classifies as "needs arming"
       // on the next reconcile pass.
-      // BingX hedge-mode: placing SL and TP concurrently (Promise.all) causes
-      // the second order to receive code=109420 "position not exist" while the
-      // first order is still being registered by the exchange.  Serialise SL
-      // first, wait 500 ms, then place TP.  The 500 ms gap is enough for the
-      // exchange registry to reflect the first stop order.  The existing 4 s
-      // retry inside placeProtectionOrder handles any residual 109420s.
-      const slOrderId = (slPrice > 0 && !livePosition.stopLossOrderId)
-        ? await placeProtectionOrder(
-            exchangeConnector,
-            realPosition.symbol,
-            sideClose,
-            livePosition.executedQuantity,
-            slPrice,
-            "StopLoss",
-            realPosition.direction,
-          )
-        : (livePosition.stopLossOrderId || null)
-
-      if (slPrice > 0 && tpPrice > 0 && !livePosition.takeProfitOrderId) {
-        await new Promise((r) => setTimeout(r, 500))
+      // OPTIMIZATION: Batch SL and TP placement to reduce API calls.
+      // Instead of sequential placement (SL → wait 500ms → TP),
+      // attempt batch placement first if the connector supports it.
+      // Falls back to individual sequential calls if batching unavailable.
+      let slOrderId: string | null = null
+      let tpOrderId: string | null = null
+      
+      // Try batch placement if both legs needed
+      if (slPrice > 0 && tpPrice > 0 && !livePosition.stopLossOrderId && !livePosition.takeProfitOrderId) {
+        try {
+          if (exchangeConnector.batchPlaceOrders) {
+            const batchResult = await exchangeConnector.batchPlaceOrders([
+              {
+                symbol: realPosition.symbol,
+                side: sideClose,
+                type: "market",
+                quantity: livePosition.executedQuantity,
+                options: {
+                  stopPrice: slPrice,
+                  reduceOnly: true,
+                  positionSide: realPosition.direction,
+                  orderType: "STOP_MARKET",
+                }
+              },
+              {
+                symbol: realPosition.symbol,
+                side: sideClose,
+                type: "market",
+                quantity: livePosition.executedQuantity,
+                options: {
+                  takePrice: tpPrice,
+                  reduceOnly: true,
+                  positionSide: realPosition.direction,
+                  orderType: "TAKE_PROFIT_MARKET",
+                }
+              }
+            ])
+            if (batchResult.success && batchResult.orders?.length === 2) {
+              slOrderId = batchResult.orders[0]?.orderId || null
+              tpOrderId = batchResult.orders[1]?.orderId || null
+              console.log(`${LOG_PREFIX} [batch] SL+TP placed together for ${realPosition.symbol}`)
+            }
+          }
+        } catch (batchErr) {
+          console.warn(`${LOG_PREFIX} [batch] SL+TP batch placement failed, falling back to sequential:`, batchErr instanceof Error ? batchErr.message : String(batchErr))
+        }
       }
-
-      const tpOrderId = (tpPrice > 0 && !livePosition.takeProfitOrderId)
-        ? await placeProtectionOrder(
-            exchangeConnector,
-            realPosition.symbol,
-            sideClose,
-            livePosition.executedQuantity,
-            tpPrice,
-            "TakeProfit",
-            realPosition.direction,
-          )
-        : (livePosition.takeProfitOrderId || null)
+      
+      // Fall back to individual sequential placement if batch unavailable or failed
+      if (!slOrderId && slPrice > 0 && !livePosition.stopLossOrderId) {
+        slOrderId = await placeProtectionOrder(
+          exchangeConnector,
+          realPosition.symbol,
+          sideClose,
+          livePosition.executedQuantity,
+          slPrice,
+          "StopLoss",
+          realPosition.direction,
+        ) || null
+      }
+      
+      if (!tpOrderId && tpPrice > 0 && !livePosition.takeProfitOrderId) {
+        // Only wait if we placed SL individually (not via batch)
+        if (slOrderId && !livePosition.stopLossOrderId) {
+          await new Promise((r) => setTimeout(r, 500))
+        }
+        tpOrderId = await placeProtectionOrder(
+          exchangeConnector,
+          realPosition.symbol,
+          sideClose,
+          livePosition.executedQuantity,
+          tpPrice,
+          "TakeProfit",
+          realPosition.direction,
+        ) || null
+      }
 
       if (slOrderId) {
         livePosition.stopLossOrderId = slOrderId
