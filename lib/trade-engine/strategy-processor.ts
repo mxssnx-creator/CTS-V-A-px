@@ -120,9 +120,13 @@ export class StrategyProcessor {
       }
 
       if (indications.length === 0) {
-        console.warn(`[v0] [StrategyProcessor] No indications available for ${symbol} on ${this.connectionId}`)
+        console.log(`[v0] [StrategyProcessor] No indications for ${symbol}/${this.connectionId}`)
         return { strategiesEvaluated: 0, liveReady: 0 }
       }
+      
+      console.log(`[v0] [StrategyProcessor] ${symbol}: ${indications.length} indications retrieved`)
+      const sample = indications[0]
+      console.log(`[v0] [StrategyProcessor] sample indication:`, {type: sample?.type, symbol: sample?.symbol, pf: sample?.profitFactor, conf: sample?.confidence})
 
       // ── P0-1: Indication-correctness gate ─────────────────────────────
       // Spec: *"indications calcs for each Type and config coord possibility
