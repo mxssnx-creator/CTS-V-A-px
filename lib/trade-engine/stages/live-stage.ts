@@ -5194,6 +5194,16 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                 String(exPos.marginType ?? "isolated").toLowerCase().includes("cross") ? "cross" : "isolated"
 
               const adoptedId = `live:${connectionId}:adopted:${sym}:${direction}:${Date.now()}:${nanoid(8)}`
+              // Calculate PnL for adopted position (use exchange unrealizedPnL if available, else calculate)
+              const exchangeUnrealizedPnL = parseFloat(String(exPos.unrealizedProfit ?? exPos.unrealizedPnl ?? "0")) || 0
+              const priceDiff = direction === "long" ? markPrice - entryPrice : entryPrice - markPrice
+              const calculatedUnrealizedPnL = priceDiff * size
+              const unrealizedPnL = exchangeUnrealizedPnL !== 0 ? exchangeUnrealizedPnL : calculatedUnrealizedPnL
+              const lev = Math.max(1, leverage || 1)
+              const notionalForRoi = entryPrice * size
+              const marginForRoi = notionalForRoi > 0 ? notionalForRoi / lev : 0
+              const unrealizedRoi = marginForRoi > 0 ? (unrealizedPnL / marginForRoi) * 100 : 0
+
               const adopted: LivePosition = {
                 id: adoptedId,
                 connectionId,
@@ -5214,6 +5224,8 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                 assignedTakeProfit: defaultTpPct,
                 status: "open", // exchange confirms the fill — start in "open"
                 statusReason: "adopted_from_exchange",
+                unrealizedPnL: Math.round(unrealizedPnL * 100) / 100,
+                unrealizedRoi: Math.round(unrealizedRoi * 100) / 100,
                 fills: [
                   {
                     timestamp: Date.now(),
@@ -5226,7 +5238,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                 exchangeData: {
                   markPrice,
                   liquidationPrice: parseFloat(String(exPos.liquidationPrice ?? "0")) || undefined,
-                  unrealizedPnL: parseFloat(String(exPos.unrealizedProfit ?? exPos.unrealizedPnl ?? "0")) || undefined,
+                  unrealizedPnL: unrealizedPnL,
                   syncedAt: Date.now(),
                 },
                 progression: [
@@ -5357,12 +5369,30 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           const markPrice = parseFloat(String(exchangePos.markPrice ?? exchangePos.indexPrice ?? exchangePos.lastPrice ?? "0")) || 0
           const liqPrice  = parseFloat(String(exchangePos.liquidationPrice ?? exchangePos.liqPrice ?? "0")) || 0
           const uPnl      = parseFloat(String(exchangePos.unrealizedProfit ?? exchangePos.unrealisedPnl ?? exchangePos.unrealizedPnl ?? "0")) || 0
+          
+          // Calculate or use exchange-provided unrealizedPnL for position display
+          const finalUPnL = uPnl !== 0 ? uPnl : position.unrealizedPnL || 0
+          const avgEntryPrice = position.averageExecutionPrice || position.entryPrice || 0
+          const qty = position.executedQuantity || 0
+          if (avgEntryPrice > 0 && qty > 0 && markPrice > 0) {
+            const calculatedUPnL = qty * (position.direction === "long" ? markPrice - avgEntryPrice : avgEntryPrice - markPrice)
+            position.unrealizedPnL = Math.round(calculatedUPnL * 100) / 100
+            
+            // Also calculate ROI for continuous display
+            const lev = Math.max(1, position.leverage || 1)
+            const notional = avgEntryPrice * qty
+            const margin = notional > 0 ? notional / lev : 0
+            if (margin > 0) {
+              position.unrealizedRoi = Math.round((position.unrealizedPnL / margin) * 100 * 100) / 100
+            }
+          }
+          
           position.exchangeData = {
             ...position.exchangeData,
             marginType: (exchangePos as any).marginType,
             markPrice: markPrice || position.exchangeData?.markPrice,
             liquidationPrice: liqPrice || position.exchangeData?.liquidationPrice,
-            unrealizedPnL: uPnl || position.exchangeData?.unrealizedPnL,
+            unrealizedPnL: finalUPnL,
             syncedAt: Date.now(),
           }
           position.updatedAt = Date.now()
