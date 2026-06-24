@@ -46,6 +46,7 @@
  */
 
 import { getRedisClient } from "@/lib/redis-db"
+import { resolvePositionCostNotional } from "@/lib/tp-sl-ratio"
 
 // ── Constants ──────────────────────────────────────────────────────────
 const TTL_SECONDS = 90 * 24 * 60 * 60 // 90 days — the run window we care about
@@ -220,10 +221,7 @@ export function recordPosClosed(input: RecordPosClosedInput): void {
   
   // Position cost calculation: entry price × quantity × 0.001 (0.1% maker fee)
   // Used as adjustment factor in PF denominator so PF reflects cost-adjusted returns
-  const positionCost = 
-    Number.isFinite(entryPrice) && Number.isFinite(quantity) && entryPrice > 0 && quantity > 0
-      ? entryPrice * quantity * 0.001
-      : 0
+  const positionCost = resolvePositionCostNotional({ entry_price: entryPrice, quantity }) * 0.001
 
   // Scaled integer fields so every increment is a single atomic hincrby.
   // We round-down on the way in and divide on the way out — small per-

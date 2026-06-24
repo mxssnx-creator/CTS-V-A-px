@@ -51,6 +51,7 @@ const LOG_PREFIX = "[v0] [LivePositionStage]"
 // stalling the full sync for multiple seconds on a flaky call.
 const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  =  4_000  // was 10 s
 const EXCHANGE_TIMEOUT_PLACE_STOP_MS    =  5_000  // was 15 s
+const EXCHANGE_TIMEOUT_PLACE_ENTRY_MS   =  8_000  // market entries must never block a realtime cycle
 const EXCHANGE_TIMEOUT_GET_POSITIONS_MS =  4_000  // was 10 s
 const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  3_000  // was 10 s
 
@@ -76,6 +77,8 @@ interface LivePosition {
   marginType: "cross" | "isolated"
   unrealized_pnl?: number
   unrealized_pnl_percent?: number
+  unrealizedPnL?: number
+  unrealizedRoi?: number
   markPrice?: number
   liquidationPrice?: number
   realizedPnL?: number
@@ -205,6 +208,29 @@ async function incrementOrdersBySymbol(connectionId: string, symbol: string, sid
     /* best-effort */
   }
 }
+
+function makeExchangeClientOrderId(trackingBase: string | undefined, suffix: string): string | undefined {
+  if (!trackingBase) return undefined
+  const safeBase = String(trackingBase).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32)
+  const safeSuffix = String(suffix || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 7)
+  const id = `${safeBase}${safeSuffix ? `-${safeSuffix}` : ""}`.slice(0, 40)
+  return id || undefined
+}
+
+function rememberExchangeClientOrderId(position: LivePosition, clientOrderId: string | undefined, kind: string): void {
+  if (!clientOrderId) return
+  const exchangeData = {
+    ...(position.exchangeData || {}),
+  } as Record<string, unknown>
+  const existing = Array.isArray(exchangeData.clientOrderIds)
+    ? exchangeData.clientOrderIds as Array<Record<string, unknown>>
+    : []
+  if (!existing.some((entry) => entry?.clientOrderId === clientOrderId)) {
+    existing.push({ clientOrderId, kind, timestamp: Date.now() })
+  }
+  exchangeData.clientOrderIds = existing.slice(-20)
+  position.exchangeData = exchangeData
+}
 async function tryAcquireLock(connId: string, symbol: string, direction: string): Promise<string | null> {
   const { getRedisClient } = await import("@/lib/redis-db")
   const client = getRedisClient()
@@ -316,17 +342,20 @@ async function accumulateIntoLivePosition(connId: string, existing: LivePosition
       return existing
     }
 
-    // ── Place the real market order for the added size ──────────────────
-    let orderRes: any = null
-    try {
-      orderRes = await connector.placeOrder(
-        symbol,
-        exchangeSide,
-        addQty,
-        undefined,
-        "market",
-        { positionSide: direction === "long" ? "LONG" : "SHORT" },
-      )
+	    // ── Place the real market order for the added size ──────────────────
+	    let orderRes: any = null
+	    const trackingBase = String(existing.exchangeData?.trackingId || existing.exchangeData?.exchangeTrackingId || existing.id)
+	    const clientOrderId = makeExchangeClientOrderId(trackingBase, `acc${(existing.accumulatedSetKeys?.length || 0) + 1}`)
+	    rememberExchangeClientOrderId(existing, clientOrderId, "accumulation-entry")
+	    try {
+	      orderRes = await connector.placeOrder(
+	        symbol,
+	        exchangeSide,
+	        addQty,
+	        undefined,
+	        "market",
+	        { positionSide: direction === "long" ? "LONG" : "SHORT", clientOrderId },
+	      )
     } catch (err) {
       pushStep(existing, "accumulate_order_error", false, err instanceof Error ? err.message : String(err))
       await savePosition(existing)
@@ -508,6 +537,16 @@ async function retry<T>(
         )
         return result
       }
+      // A market-entry timeout has UNKNOWN exchange state: the venue request
+      // may still be accepted after our local timeout fires. Retrying the same
+      // entry can therefore double-open live exposure. Stop immediately and let
+      // the exchange-position sync reconcile any late order/position.
+      if (isUnknownOrderStateError(result)) {
+        console.warn(
+          `${LOG_PREFIX} ${label} timed out with unknown order state — not retrying to avoid duplicate live orders`,
+        )
+        return result
+      }
     } catch (err) {
       console.error(`${LOG_PREFIX} ${label} attempt ${attempt}/${maxAttempts} error:`, err)
       // Thrown error variant — check the same predicates.
@@ -519,6 +558,10 @@ async function retry<T>(
       }
       if (isMinOrderSizeError(err)) {
         console.warn(`${LOG_PREFIX} ${label} min-order-size error — stopping retry loop`)
+        return { success: false, error: err instanceof Error ? err.message : String(err) } as unknown as T
+      }
+      if (isUnknownOrderStateError(err)) {
+        console.warn(`${LOG_PREFIX} ${label} timed out with unknown order state — stopping retry loop`)
         return { success: false, error: err instanceof Error ? err.message : String(err) } as unknown as T
       }
       lastResult = undefined as unknown as T
@@ -651,6 +694,20 @@ function isMinOrderSizeError(payload: unknown): boolean {
     text = String(payload)
   }
   return /\bcode\s*=?\s*101400\b/.test(text) || /minimum order amount/i.test(text)
+}
+
+function isUnknownOrderStateError(payload: unknown): boolean {
+  if (!payload) return false
+  let text = ""
+  if (typeof payload === "string") text = payload
+  else if (payload instanceof Error) text = payload.message
+  else if (typeof payload === "object") {
+    text = String((payload as Record<string, unknown>).error ?? (payload as Record<string, unknown>).message ?? "")
+  } else {
+    text = String(payload)
+  }
+  const lc = text.toLowerCase()
+  return lc.includes("timeout after") && lc.includes("placeentryorder")
 }
 
 /**
@@ -963,6 +1020,7 @@ async function placeProtectionOrder(
   triggerPrice: number,
   orderLabel: "StopLoss" | "TakeProfit",
   positionDirection: "long" | "short",
+  trackingBase?: string,
 ): Promise<string | null> {
   // ── Structured trace context ────────────────────────────────────────
   // Every protection-order placement gets a single multi-field log line
@@ -975,8 +1033,13 @@ async function placeProtectionOrder(
   //      failure line includes the venue error verbatim)
   const tag = `${LOG_PREFIX} [${orderLabel}] ${symbol}`
   const placeStart = Date.now()
+  const clientOrderId = makeExchangeClientOrderId(
+    trackingBase,
+    orderLabel === "StopLoss" ? "sl" : "tp",
+  )
   console.log(
-    `${tag} placement requested: dir=${positionDirection} closeSide=${closeSide} qty=${quantity} trigger=${triggerPrice}`,
+    `${tag} placement requested: dir=${positionDirection} closeSide=${closeSide} qty=${quantity} trigger=${triggerPrice}` +
+    `${clientOrderId ? ` clientOrderId=${clientOrderId}` : ""}`,
   )
 
   try {
@@ -1100,6 +1163,7 @@ async function placeProtectionOrder(
             {
               reduceOnly: true,
               positionSide: positionDirection === "long" ? "LONG" : "SHORT",
+              clientOrderId,
             },
           ) as Promise<any>,
           EXCHANGE_TIMEOUT_PLACE_STOP_MS,
@@ -1221,21 +1285,22 @@ async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> 
       // echo from the connector could mask a genuinely-missing real orderId and
       // suppress liveness-based re-arming of a gone SL/TP order.
       const realId = o?.id ?? o?.orderId ?? o?.orderID
-      if (realId != null && String(realId).length > 0) {
-        set.add(String(realId))
-        // Also add the secondary form so both "1234" and "orderId:1234" styles
-        // that different connectors might store on the position are matched.
-        if (o?.orderId != null && String(o.orderId) !== String(realId)) set.add(String(o.orderId))
-        if (o?.id     != null && String(o.id)      !== String(realId)) set.add(String(o.id))
-      } else {
-        // No real numeric ID — fall back to the client-supplied fields.
-        const fallback = o?.clientOrderId ?? o?.client_oid
-        if (fallback != null) {
-          const s = String(fallback)
-          if (s.length > 0) set.add(s)
-        }
-      }
-    }
+	      if (realId != null && String(realId).length > 0) {
+	        set.add(String(realId))
+	        // Also add the secondary form so both "1234" and "orderId:1234" styles
+	        // that different connectors might store on the position are matched.
+	        if (o?.orderId != null && String(o.orderId) !== String(realId)) set.add(String(o.orderId))
+	        if (o?.id     != null && String(o.id)      !== String(realId)) set.add(String(o.id))
+	      }
+	      // Always include the client-supplied tracking fields too.  Some
+	      // venues echo both a numeric orderId and clientOrderId; positions may
+	      // temporarily hold either during timeout/reconciliation windows.
+	      const fallback = o?.clientOrderId ?? o?.client_order_id ?? o?.client_oid
+	      if (fallback != null) {
+	        const s = String(fallback)
+	        if (s.length > 0) set.add(s)
+	      }
+	    }
     return set
   } catch (err) {
     console.warn(
@@ -1276,47 +1341,41 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
       `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: Trailing SL active, price=${desiredSl.toFixed(6)}`
     )
   } else {
-    // Position cost adjustment: 0.1% maker fee = 0.001 factor
-    // Targets must account for cost so profitability is realized AFTER fees
-    const positionCostPct = 0.1 // 0.1% cost
-    const costAdjustmentPct = Number.isFinite(pos.quantity) && pos.quantity > 0 ? positionCostPct : 0
-    
+    // Control orders must mirror the strategy's configured price bands exactly.
+    // Position costs/fees are accounted for in PF/statistics calculations; adding
+    // an extra fee offset here made the exchange orders disagree with the Real
+    // stage percentages and with the proactive cross-check below. That mismatch
+    // was especially visible on small live tests where a "2% TP / 1% SL" became
+    // "2.1% TP / 1.1% SL" on the venue and the UI/stats could not reconcile the
+    // live result back to the originating Real Set.
     const slPct = Math.max(0, pos.stopLoss || 0) / 100
     desiredSl =
       slPct > 0
         ? pos.direction === "long"
-          // Long SL: below entry, costs pull it further down so SL is tighter
-          ? fillPrice * (1 - slPct - costAdjustmentPct / 100)
-          // Short SL: above entry, costs pull it further up so SL is tighter
-          : fillPrice * (1 + slPct + costAdjustmentPct / 100)
+          ? fillPrice * (1 - slPct)
+          : fillPrice * (1 + slPct)
         : 0
     
     if (slPct > 0) {
       console.log(
         `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: Static SL ${pos.direction}=${pos.stopLoss}% ` +
-        `fillPrice=${fillPrice.toFixed(6)} cost=${costAdjustmentPct.toFixed(3)}% → SL=${desiredSl.toFixed(6)}`
+        `fillPrice=${fillPrice.toFixed(6)} → SL=${desiredSl.toFixed(6)}`
       )
     }
   }
 
-  // Take-profit targets: offset by position cost to ensure net profit after fees
-  const tpCostPct = 0.1 // 0.1% cost
-  const tpCostAdjustmentPct = Number.isFinite(pos.quantity) && pos.quantity > 0 ? tpCostPct : 0
-  
   const tpPct = Math.max(0, pos.takeProfit || 0) / 100
   const desiredTp =
     tpPct > 0
       ? pos.direction === "long"
-        // Long TP: above entry, offset cost so net profit achieved
-        ? fillPrice * (1 + tpPct + tpCostAdjustmentPct / 100)
-        // Short TP: below entry, offset cost so net profit achieved
-        : fillPrice * (1 - tpPct - tpCostAdjustmentPct / 100)
+        ? fillPrice * (1 + tpPct)
+        : fillPrice * (1 - tpPct)
       : 0
 
   if (tpPct > 0) {
     console.log(
       `[v0] [ControlOrder] ${pos.symbol} ${pos.id}: TP ${pos.direction}=${pos.takeProfit}% ` +
-      `fillPrice=${fillPrice.toFixed(6)} cost=${tpCostAdjustmentPct.toFixed(3)}% → TP=${desiredTp.toFixed(6)}`
+      `fillPrice=${fillPrice.toFixed(6)} → TP=${desiredTp.toFixed(6)}`
     )
   }
 
@@ -1558,70 +1617,6 @@ async function updateProtectionOrders(
   // prevents cannot reappear). Each leg only ever mutates its own
   // position fields, so there is no cross-leg write contention.
   
-  // Attempt batch placement first if both legs need placing
-  if (
-    connector.batchPlaceOrders &&
-    desiredSl > 0 && !pos.stopLossOrderId &&
-    desiredTp > 0 && !pos.takeProfitOrderId &&
-    pos.executedQuantity > 0
-  ) {
-    try {
-      const batchResult = await connector.batchPlaceOrders([
-        {
-          symbol: pos.symbol,
-          side: closeSide,
-          type: "market",
-          quantity: effectiveQty,
-          options: {
-            stopPrice: desiredSl,
-            reduceOnly: true,
-            positionSide: pos.direction,
-            orderType: "STOP_MARKET",
-          }
-        },
-        {
-          symbol: pos.symbol,
-          side: closeSide,
-          type: "market",
-          quantity: effectiveQty,
-          options: {
-            takePrice: desiredTp,
-            reduceOnly: true,
-            positionSide: pos.direction,
-            orderType: "TAKE_PROFIT_MARKET",
-          }
-        }
-      ]).catch(() => null)
-      
-      if (batchResult?.success && batchResult.orders?.length === 2) {
-        const slId = batchResult.orders[0]?.orderId
-        const tpId = batchResult.orders[1]?.orderId
-        if (slId) {
-          pos.stopLossOrderId = slId
-          pos.stopLossPrice = desiredSl
-          pos.stopLossLastArmedAt = Date.now()
-          result.changed = true
-          result.slPlaced = true
-        }
-        if (tpId) {
-          pos.takeProfitOrderId = tpId
-          pos.takeProfitPrice = desiredTp
-          pos.takeProfitLastArmedAt = Date.now()
-          result.changed = true
-          result.tpPlaced = true
-        }
-        if (result.slPlaced || result.tpPlaced) {
-          pos.protectionArmedQuantity = effectiveQty
-        }
-        // Skip the individual parallel leg processing below
-        return result
-      }
-    } catch (batchErr) {
-      // Fall through to individual parallel placement
-      console.warn(`${LOG_PREFIX} [batch] SL+TP batch placement failed:`, batchErr instanceof Error ? batchErr.message : String(batchErr))
-    }
-  }
-  
   const slLeg = (async () => {
     if (desiredSl <= 0 && pos.stopLossOrderId) {
       // SL was turned off — yank the existing order. Hard cancel
@@ -1684,6 +1679,12 @@ async function updateProtectionOrders(
         }
       }
       if (oldGone) {
+        const trackingBase = String(pos.exchangeData?.trackingId || pos.exchangeData?.exchangeTrackingId || pos.id)
+        rememberExchangeClientOrderId(
+          pos,
+          makeExchangeClientOrderId(trackingBase, "sl"),
+          "protection-stop-loss",
+        )
         const id = await placeProtectionOrder(
           connector,
           pos.symbol,
@@ -1692,6 +1693,7 @@ async function updateProtectionOrders(
           desiredSl,
           "StopLoss",
           pos.direction!,
+          trackingBase,
         )
         // Only treat the leg as "armed at desiredSl" when we actually
         // have a confirmed order id. Setting stopLossPrice = desiredSl
@@ -1746,6 +1748,12 @@ async function updateProtectionOrders(
         }
       }
       if (oldGone) {
+        const trackingBase = String(pos.exchangeData?.trackingId || pos.exchangeData?.exchangeTrackingId || pos.id)
+        rememberExchangeClientOrderId(
+          pos,
+          makeExchangeClientOrderId(trackingBase, "tp"),
+          "protection-take-profit",
+        )
         const id = await placeProtectionOrder(
           connector,
           pos.symbol,
@@ -1754,6 +1762,7 @@ async function updateProtectionOrders(
           desiredTp,
           "TakeProfit",
           pos.direction!,
+          trackingBase,
         )
         if (id) {
           pos.takeProfitOrderId = id
@@ -2514,6 +2523,15 @@ export async function executeLivePosition(
       direction: realPosition.direction,
       exchangeSide,
     })
+    livePosition.exchangeData = {
+      ...(livePosition.exchangeData || {}),
+      trackingId: orderTrace.exchangeTrackingId,
+      exchangeTrackingId: orderTrace.exchangeTrackingId,
+      traceId: orderTrace.traceId,
+      connectionTrackingId: `${connectionId}:${orderTrace.exchangeTrackingId}`,
+      realPositionId: realPosition.id,
+      strategySetKey: livePosition.setKey,
+    }
 
     console.log(
       `${LOG_PREFIX} EXECUTING REAL: ${realPosition.symbol} ${realPosition.direction} → ${exchangeSide} qty=${computedVolume.toFixed(
@@ -2578,7 +2596,9 @@ export async function executeLivePosition(
     let orderResult: any = await retry(
       async () => {
         placeAttempt += 1
-        const { raw } = await withLiveOrderLogging(
+        const clientOrderId = makeExchangeClientOrderId(orderTrace.exchangeTrackingId, `p${placeAttempt}`)
+        rememberExchangeClientOrderId(livePosition, clientOrderId, "entry-primary")
+        const { raw, summary } = await withLiveOrderLogging(
           orderTrace,
           {
             quantity: computedVolume,
@@ -2586,24 +2606,29 @@ export async function executeLivePosition(
             leverage: livePosition.leverage,
             marginType: livePosition.marginType ?? "unknown",
             orderType: "market",
-            options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+            options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT", clientOrderId },
             strategySetKey: livePosition.setKey,
             realPositionId: realPosition.id,
             attempt: placeAttempt,
             label: "primary",
           },
-          () => exchangeConnector.placeOrder(
-            realPosition.symbol,
-            exchangeSide,
-            computedVolume,
-            undefined,
-            "market",
-            {
-              positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
-            },
+          () => withTimeout<Record<string, any>>(
+            exchangeConnector.placeOrder(
+              realPosition.symbol,
+              exchangeSide,
+              computedVolume,
+              undefined,
+              "market",
+              {
+                positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
+                clientOrderId,
+              },
+            ),
+            EXCHANGE_TIMEOUT_PLACE_ENTRY_MS,
+            `placeEntryOrder(${realPosition.symbol})`,
           ),
         )
-        return raw
+        return raw ?? summary
       },
       (r: any) => !!r?.success && !!(r.orderId || r.id),
       "placeOrder"
@@ -2630,7 +2655,9 @@ export async function executeLivePosition(
         const retryResult: any = await retry(
           async () => {
             placeAttempt += 1
-            const { raw } = await withLiveOrderLogging(
+            const clientOrderId = makeExchangeClientOrderId(orderTrace.exchangeTrackingId, `lh${placeAttempt}`)
+            rememberExchangeClientOrderId(livePosition, clientOrderId, "entry-leverage-halved")
+            const { raw, summary } = await withLiveOrderLogging(
               orderTrace,
               {
                 quantity: computedVolume,
@@ -2638,22 +2665,26 @@ export async function executeLivePosition(
                 leverage: reducedLev,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
-                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT", clientOrderId },
                 strategySetKey: livePosition.setKey,
                 realPositionId: realPosition.id,
                 attempt: placeAttempt,
                 label: "leverage-halved",
               },
-              () => exchangeConnector.placeOrder(
-                realPosition.symbol,
-                exchangeSide,
-                computedVolume,
-                undefined,
-                "market",
-                { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+              () => withTimeout<Record<string, any>>(
+                exchangeConnector.placeOrder(
+                  realPosition.symbol,
+                  exchangeSide,
+                  computedVolume,
+                  undefined,
+                  "market",
+                  { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT", clientOrderId },
+                ),
+                EXCHANGE_TIMEOUT_PLACE_ENTRY_MS,
+                `placeEntryOrderReducedLev(${realPosition.symbol})`,
               ),
             )
-            return raw
+            return raw ?? summary
           },
           (r: any) => !!r?.success && !!(r.orderId || r.id),
           "placeOrder-reducedLev",
@@ -2710,6 +2741,8 @@ export async function executeLivePosition(
               }
             } catch { /* non-critical */ }
             placeAttempt += 1
+            const clientOrderId = makeExchangeClientOrderId(orderTrace.exchangeTrackingId, `mn${placeAttempt}`)
+            rememberExchangeClientOrderId(livePosition, clientOrderId, "entry-min-notional")
             const minResult: any = await withLiveOrderLogging(
               orderTrace,
               {
@@ -2718,24 +2751,31 @@ export async function executeLivePosition(
                 leverage: 1,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
-                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT", clientOrderId },
                 strategySetKey: livePosition.setKey,
                 realPositionId: realPosition.id,
                 attempt: placeAttempt,
                 label: "min-notional-lev1",
               },
               async () => {
-                const r = await exchangeConnector.placeOrder(
-                  realPosition.symbol,
-                  exchangeSide,
-                  minQtyForSymbol,
-                  undefined,
-                  "market",
-                  { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                const r = await withTimeout<Record<string, any>>(
+                  exchangeConnector.placeOrder(
+                    realPosition.symbol,
+                    exchangeSide,
+                    minQtyForSymbol,
+                    undefined,
+                    "market",
+                    { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT", clientOrderId },
+                  ),
+                  EXCHANGE_TIMEOUT_PLACE_ENTRY_MS,
+                  `placeEntryOrderMinNotional(${realPosition.symbol})`,
                 )
                 return r
               },
-            ).then(({ raw }) => raw).catch(() => null)
+            ).then(({ raw, summary }) => raw ?? summary).catch((err) => ({
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+            }))
             if (minResult?.success && (minResult.orderId || minResult.id)) {
               livePosition.leverage = 1
               computedVolume = minQtyForSymbol
@@ -2795,6 +2835,8 @@ export async function executeLivePosition(
         } catch { /* non-critical */ }
 
         placeAttempt += 1
+        const clientOrderId = makeExchangeClientOrderId(orderTrace.exchangeTrackingId, `ms${placeAttempt}`)
+        rememberExchangeClientOrderId(livePosition, clientOrderId, "entry-min-size")
         const minSizeResult: any = await withLiveOrderLogging(
           orderTrace,
           {
@@ -2803,21 +2845,28 @@ export async function executeLivePosition(
             leverage: livePosition.leverage,
             marginType: livePosition.marginType ?? "unknown",
             orderType: "market",
-            options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+            options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT", clientOrderId },
             strategySetKey: livePosition.setKey,
             realPositionId: realPosition.id,
             attempt: placeAttempt,
             label: "min-order-size-101400",
           },
-          () => exchangeConnector.placeOrder(
-            realPosition.symbol,
-            exchangeSide,
-            correctedQty,
-            undefined,
-            "market",
-            { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+          () => withTimeout<Record<string, any>>(
+            exchangeConnector.placeOrder(
+              realPosition.symbol,
+              exchangeSide,
+              correctedQty,
+              undefined,
+              "market",
+              { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT", clientOrderId },
+            ),
+            EXCHANGE_TIMEOUT_PLACE_ENTRY_MS,
+            `placeEntryOrderMinSize(${realPosition.symbol})`,
           ),
-        ).then(({ raw }) => raw).catch(() => null)
+        ).then(({ raw, summary }) => raw ?? summary).catch((err) => ({
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        }))
 
         if (minSizeResult?.success && (minSizeResult.orderId || minSizeResult.id)) {
           computedVolume = correctedQty
@@ -2864,7 +2913,59 @@ export async function executeLivePosition(
       return livePosition
     }
 
+    // A failed entry response must not fall through into the "placed" path.
+    // This is especially important for local entry timeouts: the HTTP request
+    // can still complete at the venue after our timeout fires, so retry() stops
+    // immediately to avoid duplicate exposure.  Until a later exchange sync can
+    // confirm/adopt the late order or position, keep the local record pending
+    // and do not increment placed counters or arm control orders from a guessed
+    // quantity.
+    if (!orderResult?.success || !(orderResult.orderId || orderResult.id)) {
+      const unknownState = isUnknownOrderStateError(orderResult)
+      livePosition.status = unknownState ? "pending" : "rejected"
+      livePosition.statusReason = unknownState
+        ? `Entry order state unknown after exchange timeout for ${realPosition.symbol}; awaiting reconciliation`
+        : `Entry order rejected for ${realPosition.symbol}: ${orderResult?.error ?? "missing order id"}`
+      pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      if (!unknownState) {
+        await incrementMetric(connectionId, "live_orders_failed_count")
+        await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      }
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        unknownState ? "warning" : "error",
+        livePosition.statusReason,
+        {
+          symbol: realPosition.symbol,
+          direction: realPosition.direction,
+          error: orderResult?.error,
+          code: orderResult?.errorCode ?? orderResult?.code,
+          attempts: placeAttempt,
+        },
+      ).catch(() => {})
+      await logLiveOrderFinal(orderTrace, {
+        status: unknownState ? "error" : "rejected",
+        livePositionId: livePosition.id,
+        reason: livePosition.statusReason,
+        extra: {
+          errorCode: orderResult?.errorCode ?? orderResult?.code,
+          error: orderResult?.error,
+          attempts: placeAttempt,
+          awaitingReconcile: unknownState,
+        },
+      })
+      return livePosition
+    }
+
     livePosition.orderId = orderResult.orderId || orderResult.id
+    livePosition.exchangeData = {
+      ...(livePosition.exchangeData || {}),
+      exchangeOrderId: livePosition.orderId,
+      acceptedClientOrderId: orderResult.clientOrderId ?? orderResult.client_order_id ?? orderResult.client_oid,
+      orderAcceptedAt: Date.now(),
+    }
     livePosition.status = "placed"
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
@@ -3123,6 +3224,10 @@ export async function executeLivePosition(
       if (slPrice > 0 && tpPrice > 0 && !livePosition.stopLossOrderId && !livePosition.takeProfitOrderId) {
         try {
           if (exchangeConnector.batchPlaceOrders) {
+            const slClientOrderId = makeExchangeClientOrderId(String(livePosition.exchangeData?.trackingId || livePosition.id), "sl")
+            const tpClientOrderId = makeExchangeClientOrderId(String(livePosition.exchangeData?.trackingId || livePosition.id), "tp")
+            rememberExchangeClientOrderId(livePosition, slClientOrderId, "protection-stop-loss")
+            rememberExchangeClientOrderId(livePosition, tpClientOrderId, "protection-take-profit")
             const batchResult = await exchangeConnector.batchPlaceOrders([
               {
                 symbol: realPosition.symbol,
@@ -3131,11 +3236,12 @@ export async function executeLivePosition(
                 quantity: livePosition.executedQuantity,
                 options: {
                   stopPrice: slPrice,
-                  reduceOnly: true,
-                  positionSide: realPosition.direction,
-                  orderType: "STOP_MARKET",
-                }
-              },
+	                  reduceOnly: true,
+	                  positionSide: realPosition.direction,
+	                  orderType: "STOP_MARKET",
+	                  clientOrderId: slClientOrderId,
+	                }
+	              },
               {
                 symbol: realPosition.symbol,
                 side: sideClose,
@@ -3143,11 +3249,12 @@ export async function executeLivePosition(
                 quantity: livePosition.executedQuantity,
                 options: {
                   takePrice: tpPrice,
-                  reduceOnly: true,
-                  positionSide: realPosition.direction,
-                  orderType: "TAKE_PROFIT_MARKET",
-                }
-              }
+	                  reduceOnly: true,
+	                  positionSide: realPosition.direction,
+	                  orderType: "TAKE_PROFIT_MARKET",
+	                  clientOrderId: tpClientOrderId,
+	                }
+	              }
             ])
             if (batchResult.success && batchResult.orders?.length === 2) {
               slOrderId = batchResult.orders[0]?.orderId || null
@@ -3162,6 +3269,12 @@ export async function executeLivePosition(
       
       // Fall back to individual sequential placement if batch unavailable or failed
       if (!slOrderId && slPrice > 0 && !livePosition.stopLossOrderId) {
+        const trackingBase = String(livePosition.exchangeData?.trackingId || livePosition.exchangeData?.exchangeTrackingId || livePosition.id)
+        rememberExchangeClientOrderId(
+          livePosition,
+          makeExchangeClientOrderId(trackingBase, "sl"),
+          "protection-stop-loss",
+        )
         slOrderId = await placeProtectionOrder(
           exchangeConnector,
           realPosition.symbol,
@@ -3170,6 +3283,7 @@ export async function executeLivePosition(
           slPrice,
           "StopLoss",
           realPosition.direction,
+          trackingBase,
         ) || null
       }
       
@@ -3178,6 +3292,12 @@ export async function executeLivePosition(
         if (slOrderId && !livePosition.stopLossOrderId) {
           await new Promise((r) => setTimeout(r, 500))
         }
+        const trackingBase = String(livePosition.exchangeData?.trackingId || livePosition.exchangeData?.exchangeTrackingId || livePosition.id)
+        rememberExchangeClientOrderId(
+          livePosition,
+          makeExchangeClientOrderId(trackingBase, "tp"),
+          "protection-take-profit",
+        )
         tpOrderId = await placeProtectionOrder(
           exchangeConnector,
           realPosition.symbol,
@@ -3186,6 +3306,7 @@ export async function executeLivePosition(
           tpPrice,
           "TakeProfit",
           realPosition.direction,
+          trackingBase,
         ) || null
       }
 
@@ -4094,35 +4215,12 @@ async function checkAndForceCloseOnSltpCross(
   // confirmed filled yet; skip until it is.
   if (!fillPrice || fillPrice <= 0) return null
 
-  // ── Trailing stop: honour the ratcheted absolute price ─────────────────
-  // When trailing is active syncLiveFromPseudo has stamped trailingStopPrice
-  // onto the position. Using that absolute price means the proactive force-close
-  // fires at the RATCHETED level — not the static origin level that the
-  // percentage anchor would compute. Without this fix a trailing stop that
-  // ratcheted from, say, 2% below entry to 0.5% below entry would NEVER
-  // trigger the proactive close (the static 2% level is never reached while
-  // in profit), letting the position blow through the ratcheted stop if the
-  // exchange order somehow failed to fire.
-  let desiredSl: number
-  if (pos.trailingActive && pos.trailingStopPrice && pos.trailingStopPrice > 0) {
-    desiredSl = pos.trailingStopPrice
-  } else {
-    const slPct = Math.max(0, pos.stopLoss || 0) / 100
-    desiredSl =
-      slPct > 0
-        ? pos.direction === "long"
-          ? fillPrice * (1 - slPct)
-          : fillPrice * (1 + slPct)
-        : 0
-  }
-
-  const tpPct = Math.max(0, pos.takeProfit || 0) / 100
-  const desiredTp =
-    tpPct > 0
-      ? pos.direction === "long"
-        ? fillPrice * (1 + tpPct)
-        : fillPrice * (1 - tpPct)
-      : 0
+  // Use the exact same pure helper as exchange control-order placement. Keeping
+  // the venue order prices and the proactive software close thresholds on a
+  // single code path prevents the "control order says one price but system close
+  // / UI says another" drift that caused live results not to match Real-stage
+  // percentages.
+  const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
 
   // Nothing to evaluate if neither protection band is configured.
   if (desiredSl <= 0 && desiredTp <= 0) return null
@@ -5261,7 +5359,15 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               const marginType: "cross" | "isolated" =
                 String(exPos.marginType ?? "isolated").toLowerCase().includes("cross") ? "cross" : "isolated"
 
-              const adoptedId = `live:${connectionId}:adopted:${sym}:${direction}:${Date.now()}:${nanoid(8)}`
+	              const adoptedId = `live:${connectionId}:adopted:${sym}:${direction}:${Date.now()}:${nanoid(8)}`
+	              const adoptedTrackingId = String(
+	                exPos.clientOrderId ??
+	                (exPos as any).client_order_id ??
+	                (exPos as any).client_oid ??
+	                exPos.orderId ??
+	                (exPos as any).orderID ??
+	                adoptedId,
+	              )
               // Calculate PnL for adopted position (use exchange unrealizedPnL if available, else calculate)
               const exchangeUnrealizedPnL = parseFloat(String(exPos.unrealizedProfit ?? exPos.unrealizedPnl ?? "0")) || 0
               const priceDiff = direction === "long" ? markPrice - entryPrice : entryPrice - markPrice
@@ -5303,8 +5409,12 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                     feeAsset: "",
                   },
                 ],
-                exchangeData: {
-                  markPrice,
+	                exchangeData: {
+	                  trackingId: adoptedTrackingId,
+	                  exchangeTrackingId: adoptedTrackingId,
+	                  exchangeOrderId: exPos.orderId ?? (exPos as any).orderID ?? undefined,
+	                  clientOrderId: exPos.clientOrderId ?? (exPos as any).client_order_id ?? (exPos as any).client_oid ?? undefined,
+	                  markPrice,
                   liquidationPrice: parseFloat(String(exPos.liquidationPrice ?? "0")) || undefined,
                   unrealizedPnL: unrealizedPnL,
                   syncedAt: Date.now(),
