@@ -860,9 +860,11 @@ export class StrategyCoordinator {
   // values gate the AVERAGE-PF of an already-built Set into the next
   // stage. Conceptually the operator wants ONE Base PF knob — so we
   // load the same `baseProfitFactor` into both fields.
-  // Operator spec defaults: base=1.0, main=1.2, real=1.2, live=1.2
-  // These are fallbacks used when no operator setting is found in Redis.
-  private PF_BASE_MIN = 1.0    // Minimum to enter BASE set
+  // Operator spec defaults: base=0.2 (allows realistic indications),
+  // main=1.2, real=1.2, live=1.2. These are fallbacks used when no operator
+  // setting is found in Redis. BASE accepts low PF to bootstrap from actual
+  // market data; downstream stages filter with stricter gates.
+  private PF_BASE_MIN = 0.2    // Minimum to enter BASE set (was 1.0)
   private PF_MAIN_MIN = 1.2    // Base sets must have avgPF >= 1.2 to enter MAIN
   private PF_REAL_MIN = 1.2    // Main sets must have avgPF >= 1.2 to enter REAL
   private PF_LIVE_MIN = 1.2    // Real sets must have avgPF >= 1.2 to enter LIVE
@@ -995,9 +997,12 @@ export class StrategyCoordinator {
         if (!Number.isFinite(n) || n < 0) return fallback
         return Math.max(0, Math.min(5, n))
       }
-      // Operator spec: base=1.0, main/real/live=1.2 as the fallback when
-      // the operator has never touched the PF sliders.
-      const basePF = clamp(s.baseProfitFactor, 1.0)
+      // Operator spec: base=0.2 (was 1.0, but indications from realtime have
+      // realistic PF ~0.24 from backtesting, so BASE gate must allow them),
+      // main/real/live=1.2 as the fallback when the operator has never touched
+      // the PF sliders. This allows BASE to build from actual indications,
+      // then downstream stages (MAIN/REAL/LIVE) apply their own 1.2+ gates.
+      const basePF = clamp(s.baseProfitFactor, 0.2)
       const mainPF = clamp(s.mainProfitFactor, 1.2)
       const realPF = clamp(s.realProfitFactor, 1.2)
       const livePF = clamp(s.liveProfitFactor, 1.2)
@@ -1521,7 +1526,12 @@ export class StrategyCoordinator {
           const rawPF = parseFloat(String(ind.profitFactor ?? ind.profit_factor ?? 0))
           const pfFromPF = Number.isFinite(rawPF) && rawPF > 0 ? rawPF : conf * 2
           const pf = pfFromPF
-          if (pf < this.PF_BASE_MIN) continue
+          if (pf < this.PF_BASE_MIN) {
+            if (entryIdx === 0 && group.indications.length === 1) {
+              console.log(`[v0] [BASE] ${symbol}: indication filtered by PF gate - pf=${pf.toFixed(2)} < min=${this.PF_BASE_MIN}, type=${ind.type}`)
+            }
+            continue
+          }
 
           entries.push({
             id: `${setKey}-${entryIdx}`,
@@ -1535,8 +1545,12 @@ export class StrategyCoordinator {
           entryIdx++
         }
 
-        if (entries.length === 0) continue
+        if (entries.length === 0) {
+          console.log(`[v0] [BASE] ${symbol}: 0 entries passed PF gate for ${setKey}`)
+          continue
+        }
 
+        console.log(`[v0] [BASE] ${symbol}: created ${entries.length} entries for ${setKey}`)
         const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
 
         // ── Use ONLY cost-adjusted realized PF from position history ──────
@@ -2755,7 +2769,7 @@ export class StrategyCoordinator {
       ).catch(() => {})
     }
 
-    // ── PRIORITY SORT in-place ────────────────────────────────────────────
+    // ── PRIORITY SORT in-place ─────────���──────────────────────────────────
     // Sort the collected qualifying refs by avgProfitFactor descending so
     // downstream stages (hedge-net, Real cap, Live dispatch) always see the
     // highest-quality Sets first. In-place sort avoids the spread-copy.
@@ -2903,7 +2917,7 @@ export class StrategyCoordinator {
     // Resolve the cap with this precedence:
     //   1. Operator-set `maxRealSets` in Settings → System (Redis app_settings)
     //   2. Per-instance config override (if any caller passed one)
-    // ── Real Sets cap ─────────────────────────────────────────────���──
+    // ── Real Sets cap ──────────────────────────────��──────────────���──
     // Per-spec: Strategies (Real Sets) are unlimited. Previously we
     // clamped to `maxRealSets` (default 12000); now we pass all
     // qualifying Real Sets to the Live stage. The operator still gates

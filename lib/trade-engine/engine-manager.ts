@@ -1924,29 +1924,11 @@ export class TradeEngineManager {
           `Engine ${this.connectionId} realtime-progression`,
         )
 
-        // ── CRITICAL FIX: Aggregate strategies via global coordinator ──────
-        // After all per-symbol indications and strategies are processed,
-        // invoke the coordinator to aggregate them into BASE/MAIN/REAL/LIVE
-        // strategy sets. WITHOUT this call, strategies never propagate beyond
-        // symbol level, resulting in zero strategy counts at all stages.
-        // This was the root cause of all strategy counts being 0.
-        try {
-          const coordinator = getGlobalTradeEngineCoordinator()
-          if (coordinator) {
-            // DEBUG: Log coordinator invocation
-            console.log(`[v0] [Realtime] Invoking coordinator.coordinateForActualOne for ${this.connectionId} with ${symbols.length} symbols`)
-            const coordResult = await coordinator.coordinateForActualOne(this.connectionId, symbols)
-            console.log(`[v0] [Realtime] Coordinator completed for ${this.connectionId}, result=${coordResult ? 'returned' : 'null'}`)
-            // coordResult contains aggregated counts that are now persisted to Redis
-            // and visible via the stats API.
-          } else {
-            console.warn(`[v0] [Realtime] WARNING: getGlobalTradeEngineCoordinator() returned null for ${this.connectionId}`)
-          }
-        } catch (err) {
-          console.error(`[v0] [Realtime] Coordinator aggregation failed for ${this.connectionId}:`, err)
-          // Continue cycle even if coordination fails — strategy processor errors
-          // are tracked separately and should not block live trading.
-        }
+        // NOTE: Coordinator is invoked per-symbol by the strategy processor
+        // (strategy-processor.ts line 252) during indication processing.
+        // No separate aggregation call needed — the per-symbol execution
+        // already produces BASE/MAIN/REAL/LIVE sets that persist to Redis
+        // and are visible via the stats API.
 
         // Synthesize indication-result shape from the pipeline results
         // so the existing telemetry block below works unchanged. The
