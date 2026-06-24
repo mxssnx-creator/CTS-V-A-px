@@ -1899,7 +1899,7 @@ export async function getConnection(id: string): Promise<any | null> {
   return parseHash(hash)
 }
 
-// ────────────────────────────────────────────────────────��───────────────────
+// ──────────�����─────────────────────────────────────────────��───────────────────
 // PERF: in-memory TTL cache for `getAllConnections`.
 // The dashboard polls every ~8s and each active card fans out multiple
 // per-connection requests. Without this cache we issue N KEYS + N HGETALL
@@ -2898,75 +2898,64 @@ export async function getIndications(connectionId?: string, symbol?: string): Pr
   const client = getRedisClient()
   const indications: any[] = []
   
-  // First, try to get from the main key directly (storeIndications saves here)
-  if (connectionId) {
-    const mainKey = `indications:${connectionId}`
-    try {
-      const mainData = await client.get(mainKey)
-      if (mainData) {
-        const parsed = typeof mainData === "string" ? JSON.parse(mainData) : mainData
-        const arr = Array.isArray(parsed) ? parsed : [parsed]
-        
-        // Filter by symbol if provided
-        if (symbol) {
-          const filtered = arr.filter((ind: any) => ind.symbol === symbol)
-          if (filtered.length > 0) {
-            return filtered
+  try {
+    // Indications are stored as Redis lists at: indications:{connectionId}:{symbol}
+    // If symbol is provided, fetch directly from that list
+    if (connectionId && symbol) {
+      const listKey = `indications:${connectionId}:${symbol}`
+      const listData = await client.lrange(listKey, 0, 499) // Get last 500
+      if (listData && listData.length > 0) {
+        for (const item of listData) {
+          try {
+            const parsed = typeof item === "string" ? JSON.parse(item) : item
+            indications.push(parsed)
+          } catch (e) {
+            // Skip malformed entries
           }
-        } else {
-          return arr
         }
+        return indications
       }
-    } catch (e) {
-      console.warn(`[v0] Error reading main indication key ${mainKey}:`, e)
     }
-  }
-  
-  // Fallback: search with pattern matching
-  let pattern: string
-  if (connectionId && symbol) {
-    pattern = `indications:${connectionId}:${symbol}:*`
-  } else if (connectionId) {
-    pattern = `indications:${connectionId}:*`
-  } else if (symbol) {
-    pattern = `indication:${symbol}:*`
-  } else {
-    pattern = `indications:*`
-  }
-  
-  const keys = await client.keys(pattern)
-  
-  for (const key of keys) {
-    try {
-      const stringData = await client.get(key)
-      if (stringData) {
-        try {
-          const parsed = typeof stringData === "string" ? JSON.parse(stringData) : stringData
-          const arr = Array.isArray(parsed) ? parsed : [parsed]
-          indications.push(...arr)
-        } catch (e) {
-          console.warn(`[v0] Failed to parse indication key ${key}:`, e)
+    
+    // If no symbol specified, collect from all symbol lists for this connection
+    if (connectionId) {
+      const pattern = `indications:${connectionId}:*`
+      const keys = await client.keys(pattern)
+      
+      for (const key of keys) {
+        // Only process keys that are symbol-specific lists: indications:{connectionId}:{symbol}
+        // Skip auxiliary keys: indications:{connectionId}:{symbol}:type, :latest, etc.
+        // Pattern: key should end after symbol, no more colons
+        const keyPattern = /^indications:[^:]+:[^:]+$/
+        const isSymbolKey = keyPattern.test(key) && !key.includes(":type:") && !key.includes(":latest:")
+        
+        if (isSymbolKey) {
+          // This is a symbol-specific list, fetch with LRANGE
+          const listData = await client.lrange(key, 0, 499)
+          if (listData && listData.length > 0) {
+            for (const item of listData) {
+              try {
+                const parsed = typeof item === "string" ? JSON.parse(item) : item
+                indications.push(parsed)
+              } catch (e) {
+                // Skip malformed entries
+              }
+            }
+          }
         }
-        continue
       }
       
-      const hashData = await client.hgetall(key)
-      if (hashData && Object.keys(hashData).length > 0) {
-        // Parse numeric fields from string — hgetall always returns strings
-        const parsed: Record<string, any> = { id: key.replace(/^indications?:/, ""), ...hashData }
-        if (typeof parsed.confidence === "string")    parsed.confidence    = parseFloat(parsed.confidence)
-        if (typeof parsed.profitFactor === "string")  parsed.profitFactor  = parseFloat(parsed.profitFactor)
-        if (typeof parsed.profit_factor === "string") parsed.profit_factor = parseFloat(parsed.profit_factor)
-        if (typeof parsed.value === "string")         parsed.value         = parseFloat(parsed.value)
-        if (typeof parsed.timestamp === "string")     parsed.timestamp     = parseInt(parsed.timestamp, 10)
-        indications.push(parsed)
+      if (indications.length > 0) {
+        return indications
       }
-    } catch (e) {
-      console.warn(`[v0] Error reading indication key ${key}:`, e)
     }
+    
+    // Final fallback: no indications found
+    return []
+  } catch (e) {
+    console.warn(`[v0] Error reading indications for ${connectionId}/${symbol}:`, e)
+    return []
   }
-  
-  return indications
 }
 
 /**

@@ -2620,7 +2620,7 @@ export class TradeEngineManager {
       if (!this.isRunning) return
       const cycleStart = Date.now()
 
-      // ── Single-flight guard ─────────────────────────────────────────
+      // ── Single-flight guard ───────��─────────────────────────────────
       // A slow exchange REST round-trip can outlast the configured
       // interval; we MUST NOT queue overlapping syncs (they would race
       // on the same per-position Redis state).
@@ -3868,7 +3868,7 @@ export class TradeEngineManager {
 
   // ───���─────────────────────────────────────────────────���──────────────
   //  Live settings reload
-  // ────────────────���───────────────────────────────────────────────────
+  // ────��───────────���───────────────────────────────────────────────────
 
   /**
    * Starts the per-connection settings watcher (3s poll). Cheap: a

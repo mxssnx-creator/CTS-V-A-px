@@ -2766,6 +2766,74 @@ export async function executeLivePosition(
       }
     }
 
+    // ── Minimum-order-size auto-correction (101400) ──────────────────────
+    // BingX rejects with code=101400 "The minimum order amount is N SYMBOL."
+    // when the computed quantity is below the per-pair minimum (common for
+    // low-priced coins where a $5 notional yields a sub-minimum qty). The
+    // calculated volume can NEVER pass on its own, so the order fails every
+    // cycle forever. Parse the required minimum from the error message, retry
+    // ONCE at that quantity, and persist it to `settings:trading_pair:{sym}`
+    // so the volume calculator respects it on subsequent cycles.
+    if (!orderResult?.success && isMinOrderSizeError(orderResult)) {
+      const requiredMin = extractMinOrderQty(orderResult)
+      if (requiredMin && requiredMin > computedVolume) {
+        // Round up slightly to clear any precision rounding on the venue side.
+        const correctedQty = requiredMin
+        console.warn(
+          `${LOG_PREFIX} 101400 on ${realPosition.symbol} — computed qty=${computedVolume.toFixed(8)} ` +
+          `below exchange minimum=${requiredMin}. Retrying at minimum and persisting min_order_size.`,
+        )
+        // Persist the discovered minimum for future cycles (best-effort).
+        try {
+          const redisClient = getRedisClient()
+          if (redisClient) {
+            await redisClient.hset(`settings:trading_pair:${realPosition.symbol}`, {
+              min_order_size: String(requiredMin),
+              min_order_size_updated: String(Date.now()),
+            })
+          }
+        } catch { /* non-critical */ }
+
+        placeAttempt += 1
+        const minSizeResult: any = await withLiveOrderLogging(
+          orderTrace,
+          {
+            quantity: correctedQty,
+            price: currentPrice,
+            leverage: livePosition.leverage,
+            marginType: livePosition.marginType ?? "unknown",
+            orderType: "market",
+            options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+            strategySetKey: livePosition.setKey,
+            realPositionId: realPosition.id,
+            attempt: placeAttempt,
+            label: "min-order-size-101400",
+          },
+          () => exchangeConnector.placeOrder(
+            realPosition.symbol,
+            exchangeSide,
+            correctedQty,
+            undefined,
+            "market",
+            { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+          ),
+        ).then(({ raw }) => raw).catch(() => null)
+
+        if (minSizeResult?.success && (minSizeResult.orderId || minSizeResult.id)) {
+          computedVolume = correctedQty
+          orderResult = minSizeResult
+          console.log(
+            `${LOG_PREFIX} Entry succeeded after 101400 min-size correction for ${realPosition.symbol} (qty=${correctedQty})`,
+          )
+        } else {
+          console.warn(
+            `${LOG_PREFIX} 101400 min-size retry also failed for ${realPosition.symbol} — will self-heal next cycle via stored min_order_size`,
+          )
+          orderResult = minSizeResult ?? orderResult
+        }
+      }
+    }
+
     // ── Exchange circuit-breaker (109400) detection ────���──────────────
     // Code 109400 = exchange temporarily halted API trading for this
     // symbol due to volatility. This is NOT a margin issue — record a
@@ -5194,6 +5262,16 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                 String(exPos.marginType ?? "isolated").toLowerCase().includes("cross") ? "cross" : "isolated"
 
               const adoptedId = `live:${connectionId}:adopted:${sym}:${direction}:${Date.now()}:${nanoid(8)}`
+              // Calculate PnL for adopted position (use exchange unrealizedPnL if available, else calculate)
+              const exchangeUnrealizedPnL = parseFloat(String(exPos.unrealizedProfit ?? exPos.unrealizedPnl ?? "0")) || 0
+              const priceDiff = direction === "long" ? markPrice - entryPrice : entryPrice - markPrice
+              const calculatedUnrealizedPnL = priceDiff * size
+              const unrealizedPnL = exchangeUnrealizedPnL !== 0 ? exchangeUnrealizedPnL : calculatedUnrealizedPnL
+              const lev = Math.max(1, leverage || 1)
+              const notionalForRoi = entryPrice * size
+              const marginForRoi = notionalForRoi > 0 ? notionalForRoi / lev : 0
+              const unrealizedRoi = marginForRoi > 0 ? (unrealizedPnL / marginForRoi) * 100 : 0
+
               const adopted: LivePosition = {
                 id: adoptedId,
                 connectionId,
@@ -5214,6 +5292,8 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                 assignedTakeProfit: defaultTpPct,
                 status: "open", // exchange confirms the fill — start in "open"
                 statusReason: "adopted_from_exchange",
+                unrealizedPnL: Math.round(unrealizedPnL * 100) / 100,
+                unrealizedRoi: Math.round(unrealizedRoi * 100) / 100,
                 fills: [
                   {
                     timestamp: Date.now(),
@@ -5226,7 +5306,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                 exchangeData: {
                   markPrice,
                   liquidationPrice: parseFloat(String(exPos.liquidationPrice ?? "0")) || undefined,
-                  unrealizedPnL: parseFloat(String(exPos.unrealizedProfit ?? exPos.unrealizedPnl ?? "0")) || undefined,
+                  unrealizedPnL: unrealizedPnL,
                   syncedAt: Date.now(),
                 },
                 progression: [
@@ -5357,12 +5437,30 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           const markPrice = parseFloat(String(exchangePos.markPrice ?? exchangePos.indexPrice ?? exchangePos.lastPrice ?? "0")) || 0
           const liqPrice  = parseFloat(String(exchangePos.liquidationPrice ?? exchangePos.liqPrice ?? "0")) || 0
           const uPnl      = parseFloat(String(exchangePos.unrealizedProfit ?? exchangePos.unrealisedPnl ?? exchangePos.unrealizedPnl ?? "0")) || 0
+          
+          // Calculate or use exchange-provided unrealizedPnL for position display
+          const finalUPnL = uPnl !== 0 ? uPnl : position.unrealizedPnL || 0
+          const avgEntryPrice = position.averageExecutionPrice || position.entryPrice || 0
+          const qty = position.executedQuantity || 0
+          if (avgEntryPrice > 0 && qty > 0 && markPrice > 0) {
+            const calculatedUPnL = qty * (position.direction === "long" ? markPrice - avgEntryPrice : avgEntryPrice - markPrice)
+            position.unrealizedPnL = Math.round(calculatedUPnL * 100) / 100
+            
+            // Also calculate ROI for continuous display
+            const lev = Math.max(1, position.leverage || 1)
+            const notional = avgEntryPrice * qty
+            const margin = notional > 0 ? notional / lev : 0
+            if (margin > 0) {
+              position.unrealizedRoi = Math.round((position.unrealizedPnL / margin) * 100 * 100) / 100
+            }
+          }
+          
           position.exchangeData = {
             ...position.exchangeData,
             marginType: (exchangePos as any).marginType,
             markPrice: markPrice || position.exchangeData?.markPrice,
             liquidationPrice: liqPrice || position.exchangeData?.liquidationPrice,
-            unrealizedPnL: uPnl || position.exchangeData?.unrealizedPnL,
+            unrealizedPnL: finalUPnL,
             syncedAt: Date.now(),
           }
           position.updatedAt = Date.now()
@@ -5513,7 +5611,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           }
         }
 
-        // ── Stuck-in-placed detection ���────────────────────────────────
+        // ── Stuck-in-placed detection �����────────────────────────────────
         // A position in `placed` status with no executed qty has its
         // entry order resting on the exchange book unfilled. The SL/TP
         // cross check skips `placed` positions silently, so without

@@ -1527,9 +1527,6 @@ export class StrategyCoordinator {
           const pfFromPF = Number.isFinite(rawPF) && rawPF > 0 ? rawPF : conf * 2
           const pf = pfFromPF
           if (pf < this.PF_BASE_MIN) {
-            if (entryIdx === 0 && group.indications.length === 1) {
-              console.log(`[v0] [BASE] ${symbol}: indication filtered by PF gate - pf=${pf.toFixed(2)} < min=${this.PF_BASE_MIN}, type=${ind.type}`)
-            }
             continue
           }
 
@@ -1546,11 +1543,9 @@ export class StrategyCoordinator {
         }
 
         if (entries.length === 0) {
-          console.log(`[v0] [BASE] ${symbol}: 0 entries passed PF gate for ${setKey}`)
           continue
         }
 
-        console.log(`[v0] [BASE] ${symbol}: created ${entries.length} entries for ${setKey}`)
         const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
 
         // ── Use ONLY cost-adjusted realized PF from position history ──────
@@ -1567,9 +1562,19 @@ export class StrategyCoordinator {
         // accumulates, posStats updates and avgPF becomes data-driven.
         const posStats = posMap.get(`${group.indicationType}|${group.direction}`)
         const hasRealisedHistory = !!posStats && posStats.count >= prevPosMinCount
+        // Bootstrap PF: when no realised position history exists yet, derive the
+        // Set's avgProfitFactor from the indication signal (the average entry PF)
+        // rather than a flat 1.0. A flat 1.0 can NEVER pass the Main gate
+        // (PF_MAIN_MIN = 1.2), which created a permanent bootstrap deadlock:
+        // no Set could progress to trade, so no realised history could ever
+        // accumulate to flip `hasRealisedHistory` true. Using the indication's
+        // own PF lets genuinely strong signals (PF >= gate) progress while weak
+        // ones are still filtered. Once real closed-position history exists,
+        // the authoritative cost-adjusted PF (posStats.profitFactor) takes over.
+        const bootstrapPF = entries.reduce((s, e) => s + (e.profitFactor || 0), 0) / entries.length
         const avgPF = hasRealisedHistory
           ? posStats!.profitFactor  // Cost-adjusted from actual positions (authoritative)
-          : 1.0  // Conservative bootstrap: no unproven strategies activate
+          : (Number.isFinite(bootstrapPF) && bootstrapPF > 0 ? bootstrapPF : 1.0)
 
         // ── Drawdown-time from historic window ────────��───────────────────
         // The Set's avgDrawdownTime was previously hardcoded to 0, which made
@@ -1578,7 +1583,7 @@ export class StrategyCoordinator {
         // mean drawdown minutes (avgDDT) once the bucket has enough samples.
         // Without sufficient history we leave it 0 (= "no DDT signal yet",
         // gate stays open — bootstrap path), matching the PF-blend bootstrap.
-        const avgDDT = blendActive ? posStats!.avgDDT : 0
+        const avgDDT = hasRealisedHistory ? posStats!.avgDDT : 0
 
         const set: StrategySet = {
           setKey,
