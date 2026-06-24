@@ -1899,7 +1899,7 @@ export async function getConnection(id: string): Promise<any | null> {
   return parseHash(hash)
 }
 
-// ──────────���─────────────────────────────────────────────��───────────────────
+// ──────────�����─────────────────────────────────────────────��───────────────────
 // PERF: in-memory TTL cache for `getAllConnections`.
 // The dashboard polls every ~8s and each active card fans out multiple
 // per-connection requests. Without this cache we issue N KEYS + N HGETALL
@@ -2923,11 +2923,14 @@ export async function getIndications(connectionId?: string, symbol?: string): Pr
       const keys = await client.keys(pattern)
       
       for (const key of keys) {
-        // Skip type/latest keys, only get symbol keys (no colons after symbol)
-        // Pattern: indications:{connectionId}:{symbol}
-        // Skip: indications:{connectionId}:{symbol}:*, indications:{connectionId}:type, etc.
-        if (key.match(/indications:[^:]+:[^:]+$/) || key.includes(":latest:") || key.includes(":type:")) {
-          // This is likely a symbol-specific list, try LRANGE
+        // Only process keys that are symbol-specific lists: indications:{connectionId}:{symbol}
+        // Skip auxiliary keys: indications:{connectionId}:{symbol}:type, :latest, etc.
+        // Pattern: key should end after symbol, no more colons
+        const keyPattern = /^indications:[^:]+:[^:]+$/
+        const isSymbolKey = keyPattern.test(key) && !key.includes(":type:") && !key.includes(":latest:")
+        
+        if (isSymbolKey) {
+          // This is a symbol-specific list, fetch with LRANGE
           const listData = await client.lrange(key, 0, 499)
           if (listData && listData.length > 0) {
             for (const item of listData) {
