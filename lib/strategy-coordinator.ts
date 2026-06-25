@@ -640,6 +640,7 @@ function deriveProtectionFromProfitFactor(
   costBufferPct = 0,
 ): ProfitFactorProtection {
   const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
+  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.02
   const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
   const normalizedCostBufferPct = Number.isFinite(costBufferPct) && costBufferPct > 0 ? costBufferPct : 0
   // Tie SL to the actual position-cost budget, then apply variant scaling.
@@ -3815,6 +3816,7 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.live
     let maxLive = this.config.maxLiveSets || 500
+    let livePositionCostPct = 0.02
     let livePositionCostPct = 0.1
     let liveExecutionCosts: LiveExecutionCostProfile = resolveLiveExecutionCostProfile("unknown", {})
     const dispatchSelected: LiveDispatchDecision[] = []
