@@ -3886,6 +3886,80 @@ export class StrategyCoordinator {
     // The real pipeline now produces qualifying sets reliably (REAL bootstrap relaxes
     // minProfitFactor to 0.75 on first run), so this workaround is no longer needed.
 
+    const liveDispatchCycleAt = new Date().toISOString()
+    const writeLiveDispatchSnapshot = async (snapshot: {
+      cycleAt: string
+      symbol: string
+      connectionId: string
+      qualifiedSets: string[]
+      dispatchSelected: string[]
+      dispatchSuppressed: string[]
+      suppressionCounts: Record<string, number>
+      placed?: number
+      filled?: number
+      rejected?: number
+      errored?: number
+    }) => {
+      try {
+        const client = getRedisClient()
+        const payload = JSON.stringify(snapshot)
+        await Promise.all([
+          client.hset(`realtime:${this.connectionId}`, {
+            live_dispatch_latest: payload,
+            [`live_dispatch_latest:${symbol}`]: payload,
+          }),
+          client.set(`realtime:${this.connectionId}:liveDispatch:latest`, payload, { EX: 600 } as any),
+          client.set(`realtime:${this.connectionId}:liveDispatch:${symbol}:latest`, payload, { EX: 600 } as any),
+        ])
+      } catch { /* non-critical visibility snapshot */ }
+    }
+
+    const selectLiveDispatchSets = (sets: StrategySet[]) => {
+      const dispatchSets: StrategySet[] = []
+      const dispatchSuppressed: string[] = []
+      const suppressionCounts: Record<string, number> = {}
+      let sawNewLong  = false
+      let sawNewShort = false
+      let sawBlockLong  = false
+      let sawBlockShort = false
+      let sawDcaLong    = false
+      let sawDcaShort   = false
+      for (const s of sets) {
+        const isBlock = s.variant === "block"
+        const isDca   = s.variant === "dca"
+        const isNew   = !isBlock && !isDca // default / trailing / pause
+        const bucket = `${isBlock ? "block" : isDca ? "dca" : "new"}:${s.direction}`
+        let selected = false
+        if (s.direction === "long") {
+          if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true; selected = true }
+          if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true; selected = true }
+          if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true; selected = true }
+        } else {
+          if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true; selected = true }
+          if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true; selected = true }
+          if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true; selected = true }
+        }
+        if (!selected) {
+          dispatchSuppressed.push(s.setKey)
+          suppressionCounts[bucket] = (suppressionCounts[bucket] || 0) + 1
+        }
+      }
+      return { dispatchSets, dispatchSuppressed, suppressionCounts }
+    }
+
+    const liveDispatchSelection = selectLiveDispatchSets(qualifying)
+    const baseLiveDispatchSnapshot = {
+      cycleAt: liveDispatchCycleAt,
+      symbol,
+      connectionId: this.connectionId,
+      qualifiedSets: qualifying.map((s) => s.setKey),
+      dispatchSelected: liveDispatchSelection.dispatchSets.map((s) => s.setKey),
+      dispatchSuppressed: liveDispatchSelection.dispatchSuppressed,
+      suppressionCounts: liveDispatchSelection.suppressionCounts,
+    }
+
+    await writeLiveDispatchSnapshot(baseLiveDispatchSnapshot)
+
     if (qualifying.length > 0) {
       try {
         // Use getConnection() as authoritative source — it reads connection:{id} hash via parseHash
@@ -3934,30 +4008,7 @@ export class StrategyCoordinator {
             // Without this rule, block/dca sets targeting e.g. long were
             // always dropped because `sawLong=true` was already set by the
             // default set, meaning block strategy NEVER dispatched.
-            const dispatchSets: StrategySet[] = []
-            {
-              let sawNewLong  = false
-              let sawNewShort = false
-              let sawBlockLong  = false
-              let sawBlockShort = false
-              let sawDcaLong    = false
-              let sawDcaShort   = false
-              for (const s of qualifying) {
-                const isBlock = s.variant === "block"
-                const isDca   = s.variant === "dca"
-                const isNew   = !isBlock && !isDca // default / trailing / pause
-                if (s.direction === "long") {
-                  if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
-                  if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
-                  if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
-                } else {
-                  if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
-                  if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
-                  if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
-                }
-                if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
-              }
-            }
+            const dispatchSets = liveDispatchSelection.dispatchSets
 
             let placed = 0
             let filled = 0
@@ -4112,6 +4163,14 @@ export class StrategyCoordinator {
                 `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} errored=${errored} (throttled)`
               )
             }
+
+            await writeLiveDispatchSnapshot({
+              ...baseLiveDispatchSnapshot,
+              placed,
+              filled,
+              rejected,
+              errored,
+            })
           } else {
             console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: live_trade=true but connector not available`)
           }
