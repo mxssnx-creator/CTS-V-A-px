@@ -32,6 +32,7 @@ import { VolumeCalculator } from "@/lib/volume-calculator"
 import { SystemLogger } from "@/lib/system-logger"
 import type { RealPosition } from "./real-stage"
 import { getEngineTimings } from "@/lib/engine-timings"
+import { aggregateLastXClosedPositions, type ClosedPositionLike } from "@/lib/trade-engine/closed-position-aggregation"
 import { withTimeout } from "@/lib/async-safety"
 import { getMaxLeverageForExchange } from "@/lib/leverage-policy"
 import {
@@ -4193,30 +4194,26 @@ export async function calculateLivePositionStats(
       p => p.status === "open" || p.status === "filled" || p.status === "partially_filled"
     )
 
-    let totalPnL = 0
-    let winCount = 0
-    for (const pos of closed) {
+    const closedWithExit = closed.map((pos) => {
       const lastStep = pos.progression?.find(s => s.step === "close")
       const exitPx = lastStep ? parseFloat(lastStep.details?.split("@ ")[1] || "0") : 0
-      if (exitPx > 0 && pos.averageExecutionPrice > 0) {
-        const pnl = Math.round(
-          pos.executedQuantity *
-          (pos.direction === "long"
-            ? exitPx - pos.averageExecutionPrice
-            : pos.averageExecutionPrice - exitPx) * 100
-        ) / 100
-        totalPnL = Math.round((totalPnL + pnl) * 100) / 100
-        if (pnl > 0) winCount++
-      }
-    }
+      return exitPx > 0 ? { ...pos, closePrice: exitPx } : pos
+    })
+    const lastX = aggregateLastXClosedPositions(closedWithExit as ClosedPositionLike[], closedWithExit.length)
+    const totalPnL = closedWithExit.reduce((sum, pos) => {
+      const storedPnl = Number(pos.realizedPnL)
+      const stepPnl = Number(pos.progression?.find(s => s.step === "close")?.details?.match(/pnl=([-0-9.]+)/)?.[1])
+      const pnl = Number.isFinite(storedPnl) ? storedPnl : Number.isFinite(stepPnl) ? stepPnl : 0
+      return Math.round((sum + pnl) * 100) / 100
+    }, 0)
 
     return {
       totalFilled: allPositions.filter(p => p.status === "filled" || p.status === "open").length,
       totalOpen: open.length,
       totalClosed: closed.length,
       totalPnL,
-      averageROI: closed.length > 0 ? Math.round((totalPnL / closed.length) * 100) / 100 : 0,
-      winRate: closed.length > 0 ? Math.round((winCount / closed.length) * 100) / 100 : 0,
+      averageROI: lastX.avgSignedR,
+      winRate: lastX.winRate,
     }
   } catch (err) {
     console.error(`${LOG_PREFIX} Error calculating stats:`, err)

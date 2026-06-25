@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { initRedis, getRedisClient, getSettings, getConnection, getAppSettings } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
+import { aggregateLastXClosedPositions, type LastXClosedPositionAggregation } from "@/lib/trade-engine/closed-position-aggregation"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -1820,11 +1821,18 @@ export async function GET(
       const liveFilled    = n(progHash.live_orders_filled_count)
       const liveCreated   = n(progHash.live_positions_created_count)
       const liveClosed    = n(progHash.live_positions_closed_count)
-      const liveWins      = n(progHash.live_wins_count)
       const liveVolumeUsd = n(progHash.live_volume_usd_total)
 
       // Derive stratDetail.live metrics from the shared parsed array
       // (first 200 entries mirror the old lrange(0, 199) behaviour).
+      const sampledClosed = sharedClosedParsed.slice(0, 200)
+      const closedEval = evaluateClosedBatch(sampledClosed)
+      const lastXClosed = aggregateLastXClosedPositions(sampledClosed, sampledClosed.length)
+      const sumPnl = closedEval.sumPnl
+      const avgHoldMin = closedEval.count > 0 ? (closedEval.sumHoldMs / closedEval.count) / 60_000 : 0
+      const avgPnl = closedEval.count > 0 ? sumPnl / closedEval.count : 0
+      const avgRoi = lastXClosed.avgSignedR
+      const profitFactor = lastXClosed.profitFactor
       let sumPnl = 0
       let sumGrossProfit = 0
       let sumGrossLoss = 0
@@ -1860,7 +1868,6 @@ export async function GET(
         ? sumGrossProfit / sumGrossLoss
         : sumGrossProfit > 0 ? Number.POSITIVE_INFINITY : 0
       const passRate   = livePlaced > 0 ? liveFilled / livePlaced : 0
-      const winRate    = liveClosed > 0 ? liveWins / liveClosed : 0
       const avgPosSize = liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
 
       const liveInputSets = stratCounts.real || n(progHash.strategies_real_current) || n(progHash.strategies_real_total) || 0
@@ -1878,7 +1885,7 @@ export async function GET(
         avgProfitFactor:     !isFinite(profitFactor) ? null : Math.round(profitFactor * 1000) / 1000,    // PF from realised PnL
         avgProcessingTimeMs: 0,                                         // not tracked for live — handled inline
         avgPosEvalReal:      Math.round(avgRoi * 10000) / 10000,        // avg ROI fraction
-        countPosEval:        countSampled,
+        countPosEval:        lastXClosed.count,
         avgDrawdownTime:     Math.round(avgHoldMin * 10) / 10,          // avg hold time in minutes
         inputSets: liveInputSets,
         evaluatedSets: liveEvaluatedSets,
@@ -1891,9 +1898,13 @@ export async function GET(
         passed:    liveOutputSets,
         failed:    Math.max(0, liveEvaluatedSets - liveOutputSets),
         // Live-exclusive fields for richer UI display:
-        winRate:        Math.round(winRate * 1000) / 10,
+        winRate:        lastXClosed.winRate,
         totalPnl:       Math.round(sumPnl * 100) / 100,
         avgPnl:         Math.round(avgPnl * 100) / 100,
+        avgSignedR:     lastXClosed.avgSignedR,
+        avgPositiveR:   lastXClosed.avgPositiveR,
+        avgNegativeR:   lastXClosed.avgNegativeR,
+        netR:           lastXClosed.netR,
         openPositions:  Math.max(0, liveCreated - liveClosed),
         volumeUsdTotal: Math.round(liveVolumeUsd * 100) / 100,
       }
@@ -1974,17 +1985,9 @@ export async function GET(
     // Parallelise: fetch closed IDs + scan open live positions for unrealised
     // PnL, then fan-out per-archive GETs.
     let liveClosedCount = 0
-    let liveClosedWins = 0
     let liveClosedSumPnl = 0
-    let liveClosedSumGrossProfit = 0
-    let liveClosedSumGrossLoss = 0
-    let liveClosedSumHoldMs = 0
-    let liveClosedCountForPf = 0
-    let liveClosedSumPnlForPf = 0
-    let liveClosedSumGrossProfitForPf = 0
-    let liveClosedSumGrossLossForPf = 0
-    let liveClosedRoeAcc = 0
     let liveClosedHoldMinutes = 0
+    let liveClosedAgg: LastXClosedPositionAggregation = aggregateLastXClosedPositions([], 0)
     const closedPositionsForHistory: Array<{
       id: string
       symbol: string
@@ -2007,6 +2010,10 @@ export async function GET(
       // already holds all 500 entries (fetched once above).
       const closedParsed = sharedClosedParsed
       liveClosedCount = closedParsed.length
+      const closedEval = evaluateClosedBatch(closedParsed)
+      liveClosedAgg            = aggregateLastXClosedPositions(closedParsed, closedParsed.length)
+      liveClosedSumPnl         = closedEval.sumPnl
+      liveClosedHoldMinutes    = closedEval.sumHoldMs / 60_000
       liveClosedCountForPf = closedParsed.length
       
       // SOURCE VERIFICATION: All P&L aggregation is from real exchange closed positions only
@@ -2146,12 +2153,9 @@ export async function GET(
     const mainWinRateProxy  = mainSpecPerf.aggregated.totalCreated  > 0 ? Math.min(100, Math.round((mainSpecPerf.aggregated.totalRunning  / mainSpecPerf.aggregated.totalCreated) * 1000) / 10) : 0
     const realWinRateProxy  = realSpecPerf.aggregated.totalCreated  > 0 ? Math.min(100, Math.round((realSpecPerf.aggregated.totalRunning  / realSpecPerf.aggregated.totalCreated) * 1000) / 10) : 0
 
-    const liveProfitFactor  = liveClosedSumGrossLoss > 0
-      ? Math.round((liveClosedSumGrossProfit / liveClosedSumGrossLoss) * 1000) / 1000
-      : liveClosedSumGrossProfit > 0 ? 999 : 0
+    const liveProfitFactor  = liveClosedAgg.profitFactor
     const liveAvgHoldMin    = liveClosedCount > 0 ? Math.round(liveClosedHoldMinutes / liveClosedCount * 10) / 10 : 0
-    const liveWinRate       = liveClosedCount > 0 ? Math.round((liveClosedWins / liveClosedCount) * 1000) / 10 : 0
-    const liveAvgRoe        = liveClosedCount > 0 ? Math.round((liveClosedRoeAcc / liveClosedCount) * 10000) / 100 : 0
+    const liveWinRate       = liveClosedAgg.winRate
 
     // Sharpe estimate for base/main/real — use DDT as a volatility proxy if no
     // per-position returns are available at these pipeline stages (they're
@@ -2193,6 +2197,10 @@ export async function GET(
           : 0,
         totalPnl:        Math.round(liveClosedSumPnl * 100) / 100,
         winRate:         liveWinRate,
+        avgSignedR:      liveClosedAgg.avgSignedR,
+        avgPositiveR:    liveClosedAgg.avgPositiveR,
+        avgNegativeR:    liveClosedAgg.avgNegativeR,
+        netR:            liveClosedAgg.netR,
         sharpe:          0, // computed from closed-archive returns below
         isExecution:     true,
       },
@@ -3267,6 +3275,10 @@ export async function GET(
             ? n(progHash.live_volume_usd_total) / n(progHash.live_positions_created_count)
             : 0,
           winRate:         liveWinRate,
+          avgSignedR:      liveClosedAgg.avgSignedR,
+          avgPositiveR:    liveClosedAgg.avgPositiveR,
+          avgNegativeR:    liveClosedAgg.avgNegativeR,
+          netR:            liveClosedAgg.netR,
           sharpe:          performanceTiers.live?.sharpe || 0,
           totalPnl:        Math.round(((liveClosedSumPnl ?? 0) || 0) * 100) / 100,
           avgPnl:          liveClosedCount > 0 ? Math.round((((liveClosedSumPnl ?? 0) || 0) / liveClosedCount) * 100) / 100 : 0,
