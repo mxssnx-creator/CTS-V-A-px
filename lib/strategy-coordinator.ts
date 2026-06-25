@@ -4384,6 +4384,7 @@ export class StrategyCoordinator {
       dispatchSelected,
       dispatchSuppressed,
       dispatchSuppressedKeys,
+      dispatchSuppressedReasons,
     } = this.preselectLiveDispatchSets(qualifying)
 
     console.log(
@@ -4393,6 +4394,7 @@ export class StrategyCoordinator {
         dispatchSelected,
         dispatchSuppressed,
         dispatchSuppressedKeys,
+        dispatchSuppressedReasons,
       },
     )
 
@@ -4690,6 +4692,9 @@ export class StrategyCoordinator {
           // live:evaluated = Real Sets that entered Live selection (= candidates)
           [`${symbol}:live:evaluated`]: String(realSets.length),
           [`${symbol}:live:candidates`]: String(qualifying.length),
+          // live:evaluated = Real Sets that entered Live selection (= candidates)
+          [`${symbol}:live:evaluated`]: String(realSets.length),
+          [`${symbol}:live:candidates`]: String(qualifying.length),
           generation,
           epoch: generation,
           [`${symbol}:live:generation`]: generation,
@@ -4719,6 +4724,21 @@ export class StrategyCoordinator {
           pass_rate:         String(passRatioLive.toFixed(4)),
           live_candidates:   String(qualifying.length),
           dispatch_candidates: String(qualifying.length),
+          dispatchSelected: String(dispatchSelected),
+          dispatchSuppressed: String(dispatchSuppressed),
+          dispatch_selected: String(dispatchSelected),
+          dispatch_suppressed: String(dispatchSuppressed),
+          dispatch_suppressed_keys: dispatchSuppressedKeys.join(","),
+          dispatch_suppressed_reasons: JSON.stringify(dispatchSuppressedReasons),
+          candidate_avg_profit_factor: String(candidateAvgPF.toFixed(4)),
+          candidate_avg_drawdown_time: String(Math.round(candidateAvgDDT)),
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
+          // `qualifying` is the Live candidate pool after PF/DDT/maxLive.
+          // `dispatchSets` is the subset selected to actually run after
+          // per-direction/variant preselection.
+          sets_running_now:         String(dispatchSets.length),
+          sets_with_open_positions: String(dispatchSets.length),
+          sets_progressing:         String(qualifying.length),
           dispatch_selected: String(dispatchSelected),
           dispatch_suppressed: String(dispatchSuppressed),
           dispatch_suppressed_keys: dispatchSuppressedKeys.join(","),
@@ -5695,6 +5715,80 @@ export class StrategyCoordinator {
       dispatchSelected: dispatchSets.length,
       dispatchSuppressed: dispatchSuppressedKeys.length,
       dispatchSuppressedKeys,
+    }
+  }
+
+  /**
+   * Select the Live candidate Sets that may actually dispatch this cycle.
+   *
+   * `qualifying` is the Live candidate pool after PF/DDT/maxLive filtering.
+   * The exchange path can only make progress for the first highest-PF Set in
+   * each direction/variant dispatch lane, so active/running metrics must use
+   * this selected subset rather than the wider candidate count.
+   */
+  private preselectLiveDispatchSets(qualifying: StrategySet[]): {
+    dispatchSets: StrategySet[]
+    dispatchSelected: number
+    dispatchSuppressed: number
+    dispatchSuppressedKeys: string[]
+    dispatchSuppressedReasons: Record<string, number>
+  } {
+    const dispatchSets: StrategySet[] = []
+    const dispatchSuppressedKeys: string[] = []
+    const dispatchSuppressedReasons: Record<string, number> = {}
+    let sawNewLong  = false
+    let sawNewShort = false
+    let sawBlockLong  = false
+    let sawBlockShort = false
+    let sawDcaLong    = false
+    let sawDcaShort   = false
+
+    for (const s of qualifying) {
+      const isBlock = s.variant === "block"
+      const isDca   = s.variant === "dca"
+      const isNew   = !isBlock && !isDca // default / trailing / pause
+      const lane = isBlock ? "block" : isDca ? "dca" : "new"
+      const direction = s.direction === "short" ? "short" : "long"
+      let selected = false
+
+      if (direction === "long") {
+        if (isNew && !sawNewLong) {
+          sawNewLong = true
+          selected = true
+        } else if (isBlock && !sawBlockLong) {
+          sawBlockLong = true
+          selected = true
+        } else if (isDca && !sawDcaLong) {
+          sawDcaLong = true
+          selected = true
+        }
+      } else {
+        if (isNew && !sawNewShort) {
+          sawNewShort = true
+          selected = true
+        } else if (isBlock && !sawBlockShort) {
+          sawBlockShort = true
+          selected = true
+        } else if (isDca && !sawDcaShort) {
+          sawDcaShort = true
+          selected = true
+        }
+      }
+
+      if (selected) dispatchSets.push(s)
+      else {
+        const reason = `${lane}_${direction}_lane_already_selected`
+        dispatchSuppressedKeys.push(s.setKey)
+        dispatchSuppressedReasons[reason] = (dispatchSuppressedReasons[reason] ?? 0) + 1
+      }
+    }
+
+    return {
+      dispatchSets,
+      dispatchSelected: dispatchSets.length,
+      dispatchSuppressed: dispatchSuppressedKeys.length,
+      dispatchSuppressedKeys,
+      dispatchSuppressedReasons,
     }
   }
 
