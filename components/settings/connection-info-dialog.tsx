@@ -125,10 +125,6 @@ export function ConnectionInfoDialog({ open, onOpenChange, connectionId, connect
               <h3 className="text-lg font-semibold">Configuration Settings</h3>
               <div className="grid grid-cols-2 gap-4 text-sm">
                 <div className="p-3 border rounded">
-                  <div className="font-medium mb-1">Base Volume Factor</div>
-                  <div className="text-2xl font-bold">{info?.settings?.baseVolumeFactor || 1.0}</div>
-                </div>
-                <div className="p-3 border rounded">
                   <div className="font-medium mb-1">Range Percentage</div>
                   <div className="text-2xl font-bold">{info?.settings?.volumeRangePercentage || 20}%</div>
                 </div>

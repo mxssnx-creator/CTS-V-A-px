@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server"
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     // Mock strategy data - in production, fetch from database or trade engine
