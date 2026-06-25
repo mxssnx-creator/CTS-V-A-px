@@ -153,7 +153,7 @@ async function seedPredefinedConnections(): Promise<void> {
       // Mark as NOT predefined so quick-start can find it (string "false" for Redis consistency)
       is_predefined: "false",
       active_symbols: "[]",
-      live_volume_factor: "1",
+      live_volume_factor: "0.1",
     }))
 
     // Save individual connections to Redis (connection:{id} hashes)

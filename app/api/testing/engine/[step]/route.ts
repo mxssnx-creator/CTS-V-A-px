@@ -6,6 +6,7 @@ interface RouteParams {
   }
 }
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const body = await request.json()

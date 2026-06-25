@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { ChevronDown, ChevronRight, Save, TrendingUp } from "lucide-react"
 import type { AutoOptimalResult, AutoOptimalSymbolSummary } from "@/lib/types-auto-optimal"
+import { formatSampledMetric, grossProfitFactorTitle } from "@/lib/metric-formatting"
 
 interface AutoOptimalResultsProps {
   results: AutoOptimalResult[]
@@ -100,7 +101,7 @@ export function AutoOptimalResults({ results, onSaveSet }: AutoOptimalResultsPro
                 <Badge variant="outline">{summary.total_configurations} configs</Badge>
                 <div className="flex items-center gap-2">
                   <TrendingUp className="h-4 w-4 text-green-500" />
-                  <span className="text-sm">PF: {summary.best_profit_factor.toFixed(2)}</span>
+                  <span className="text-sm">PF: {formatSampledMetric(summary.best_profit_factor, summary.total_configurations)}</span>
                 </div>
                 <div className="text-sm text-muted-foreground">{summary.avg_positions_per_24h.toFixed(1)} pos/24h</div>
               </div>
@@ -136,7 +137,7 @@ export function AutoOptimalResults({ results, onSaveSet }: AutoOptimalResultsPro
                           {config.stoploss.toFixed(1)}%
                         </div>
                         <Badge variant={config.profit_factor >= 1.5 ? "default" : "secondary"}>
-                          PF: {config.profit_factor.toFixed(2)}
+                          PF: {formatSampledMetric(config.profit_factor, config.total_trades)}
                         </Badge>
                         <div className="text-xs text-muted-foreground">
                           {config.total_trades} trades | {config.positions_per_24h.toFixed(1)}/24h
@@ -149,11 +150,11 @@ export function AutoOptimalResults({ results, onSaveSet }: AutoOptimalResultsPro
                       <div className="p-4 bg-muted/20 space-y-4">
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                           <div>
-                            <div className="text-xs text-muted-foreground">Profit Factor</div>
-                            <div className="text-lg font-semibold">{config.profit_factor.toFixed(2)}</div>
+                            <div className="text-xs text-muted-foreground">PF</div>
+                            <div className="text-lg font-semibold" title={grossProfitFactorTitle(config.profit_factor, config.total_trades)}>{formatSampledMetric(config.profit_factor, config.total_trades)}</div>
                             <div className="text-xs">
-                              Last 8: {config.profit_factor_last_8.toFixed(2)} | 25:{" "}
-                              {config.profit_factor_last_25.toFixed(2)} | 50: {config.profit_factor_last_50.toFixed(2)}
+                              Last 8: {formatSampledMetric(config.profit_factor_last_8, Math.min(config.total_trades, 8))} | 25:{" "}
+                              {formatSampledMetric(config.profit_factor_last_25, Math.min(config.total_trades, 25))} | 50: {formatSampledMetric(config.profit_factor_last_50, Math.min(config.total_trades, 50))}
                             </div>
                           </div>
                           <div>

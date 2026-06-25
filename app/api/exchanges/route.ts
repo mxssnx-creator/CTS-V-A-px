@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server"
 import { query } from "@/lib/db"
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     console.log("[v0] Fetching exchanges from database")

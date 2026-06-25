@@ -61,8 +61,8 @@ export function StrategyMetrics({ stages, totalEvaluated, overallPassRate, avgPr
             <div className="font-bold text-lg text-green-600">{Math.round(overallPassRate)}%</div>
           </div>
           <div className="text-center p-2 bg-muted/50 rounded">
-            <div className="text-muted-foreground">Avg PF</div>
-            <div className="font-bold text-lg">{avgProfitFactor.toFixed(2)}</div>
+            <div className="text-muted-foreground">Avg R</div>
+            <div className="font-bold text-lg">{totalEvaluated > 0 ? avgProfitFactor.toFixed(2) : "—"}</div>
           </div>
           <div className="text-center p-2 bg-muted/50 rounded">
             <div className="text-muted-foreground">Avg DDT</div>
@@ -97,8 +97,8 @@ export function StrategyMetrics({ stages, totalEvaluated, overallPassRate, avgPr
                   <span className="font-medium text-green-600">{stage.passed}</span>
                 </div>
                 <div>
-                  <span className="text-muted-foreground block">Profit Factor</span>
-                  <span className="font-medium">{stage.avgProfitFactor.toFixed(2)}</span>
+                  <span className="text-muted-foreground block">Avg R</span>
+                  <span className="font-medium">{stage.evaluated > 0 ? stage.avgProfitFactor.toFixed(2) : "—"}</span>
                 </div>
                 <div>
                   <span className="text-muted-foreground block">Drawdown Time</span>
