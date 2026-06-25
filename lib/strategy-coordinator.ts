@@ -490,21 +490,96 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
+type ProtectionCostModel = {
+  takerFeeBpsPerSide: number
+  estimatedSpreadBps: number
+  estimatedMarketSlippageBps: number
+  fundingHoldCostBufferBps?: number
+  source?: string
+}
+
+type DerivedProtection = {
+  takeProfitPct: number
+  stopLossPct: number
+  grossPF: number
+  netPF: number
+  costBufferPct: number
+  effectiveTpPct: number
+  effectiveSlPct: number
+}
+
+function conservativeCostFallbackForExchange(exchange: string): ProtectionCostModel {
+  const ex = exchange.toLowerCase()
+  if (ex === "binance" || ex === "binanceusdm") {
+    return { takerFeeBpsPerSide: 5, estimatedSpreadBps: 2, estimatedMarketSlippageBps: 4, fundingHoldCostBufferBps: 2, source: "fallback:binance" }
+  }
+  if (ex === "okx" || ex === "okex") {
+    return { takerFeeBpsPerSide: 5, estimatedSpreadBps: 3, estimatedMarketSlippageBps: 5, fundingHoldCostBufferBps: 2, source: "fallback:okx" }
+  }
+  if (ex === "bybit") {
+    return { takerFeeBpsPerSide: 6, estimatedSpreadBps: 3, estimatedMarketSlippageBps: 5, fundingHoldCostBufferBps: 2, source: "fallback:bybit" }
+  }
+  if (ex === "bingx") {
+    return { takerFeeBpsPerSide: 7, estimatedSpreadBps: 5, estimatedMarketSlippageBps: 8, fundingHoldCostBufferBps: 3, source: "fallback:bingx" }
+  }
+  return { takerFeeBpsPerSide: 8, estimatedSpreadBps: 6, estimatedMarketSlippageBps: 10, fundingHoldCostBufferBps: 4, source: "fallback:generic" }
+}
+
+function pickFiniteBps(settings: Record<string, unknown>, keys: string[], fallback: number): number {
+  for (const key of keys) {
+    const n = Number(settings[key])
+    if (Number.isFinite(n) && n >= 0) return n
+  }
+  return fallback
+}
+
+function resolveProtectionCostModel(exchange: string, settings: Record<string, unknown>): ProtectionCostModel {
+  const fallback = conservativeCostFallbackForExchange(exchange)
+  const hasExplicit = (...keys: string[]) => keys.some((k) => settings[k] !== undefined && settings[k] !== null && settings[k] !== "")
+  return {
+    takerFeeBpsPerSide: pickFiniteBps(settings, ["takerFeeBpsPerSide", "takerFeeBps", "exchangeTakerFeeBps", "taker_fee_bps"], fallback.takerFeeBpsPerSide),
+    estimatedSpreadBps: pickFiniteBps(settings, ["estimatedSpreadBps", "spreadBps", "exchangeSpreadBps", "estimated_spread_bps"], fallback.estimatedSpreadBps),
+    estimatedMarketSlippageBps: pickFiniteBps(settings, ["estimatedMarketSlippageBps", "marketSlippageBps", "slippageBps", "estimated_market_slippage_bps"], fallback.estimatedMarketSlippageBps),
+    fundingHoldCostBufferBps: pickFiniteBps(settings, ["fundingHoldCostBufferBps", "fundingBufferBps", "holdCostBufferBps", "funding_hold_cost_buffer_bps"], fallback.fundingHoldCostBufferBps ?? 0),
+    source: hasExplicit(
+      "takerFeeBpsPerSide", "takerFeeBps", "exchangeTakerFeeBps", "taker_fee_bps",
+      "estimatedSpreadBps", "spreadBps", "exchangeSpreadBps", "estimated_spread_bps",
+      "estimatedMarketSlippageBps", "marketSlippageBps", "slippageBps", "estimated_market_slippage_bps",
+      "fundingHoldCostBufferBps", "fundingBufferBps", "holdCostBufferBps", "funding_hold_cost_buffer_bps",
+    ) ? "settings" : fallback.source,
+  }
+}
+
 function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
   sizeMultiplier = 1,
-): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
+  costModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic"),
+): DerivedProtection {
   const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
   const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
   // Tie SL to the actual position-cost budget, then apply variant scaling.
   // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
   const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
-  const takeProfitPct = clampNumber(stopLossPct * Math.max(1, pf), 0.2, 22)
+  const costBufferPct = (
+    (costModel.takerFeeBpsPerSide * 2) +
+    costModel.estimatedSpreadBps +
+    (costModel.estimatedMarketSlippageBps * 2) +
+    (costModel.fundingHoldCostBufferBps ?? 0)
+  ) / 100
+  // Gross TP includes the full round-trip friction budget. After entry/exit
+  // taker fees, spread, market slippage, and optional hold-cost buffer, the
+  // net reward still approximates pf × stopLossPct unless the venue cap binds.
+  const takeProfitPct = clampNumber((stopLossPct * Math.max(1, pf)) + costBufferPct, 0.2, 22)
+  const effectiveTpPct = Math.max(0, takeProfitPct - costBufferPct)
   return {
     takeProfitPct,
     stopLossPct,
-    effectiveProfitFactor: takeProfitPct / stopLossPct,
+    grossPF: takeProfitPct / stopLossPct,
+    netPF: effectiveTpPct / stopLossPct,
+    costBufferPct,
+    effectiveTpPct,
+    effectiveSlPct: stopLossPct,
   }
 }
 
@@ -3603,6 +3678,7 @@ export class StrategyCoordinator {
     const metrics = this.METRICS.live
     let maxLive = this.config.maxLiveSets || 500
     let livePositionCostPct = 0.1
+    let liveCostModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic")
     try {
       const { getConnection } = await import("@/lib/redis-db")
       const [conn, connSettings] = await Promise.all([
@@ -3610,6 +3686,7 @@ export class StrategyCoordinator {
         getRedisClient().hgetall(`connection_settings:${this.connectionId}`).catch(() => ({})),
       ])
       const exchange = String((conn as any)?.exchange || "").toLowerCase()
+      liveCostModel = resolveProtectionCostModel(exchange, connSettings as Record<string, unknown>)
       // BingX commonly enforces a 200-open-order ceiling. Each live position
       // can carry two reduce-only control orders (SL + TP), so cap dispatch to
       // 90 positions per cycle (≤180 controls) and leave room for manual orders,
@@ -3963,6 +4040,8 @@ export class StrategyCoordinator {
             let filled = 0
             let rejected = 0
             let errored = 0
+            let costSuppressed = 0
+            let lastProtectionDetail: Record<string, string> = {}
 
             for (const set of dispatchSets) {
               try {
@@ -4012,9 +4091,47 @@ export class StrategyCoordinator {
                   effectivePF,
                   livePositionCostPct,
                   effectiveSizeMult,
+                  liveCostModel,
                 )
                 const tp = protection.takeProfitPct
                 const sl = protection.stopLossPct
+                const protectionDetail = {
+                  grossPF: protection.grossPF,
+                  netPF: protection.netPF,
+                  costBufferPct: protection.costBufferPct,
+                  effectiveTpPct: protection.effectiveTpPct,
+                  effectiveSlPct: protection.effectiveSlPct,
+                  takerFeeBpsPerSide: liveCostModel.takerFeeBpsPerSide,
+                  estimatedSpreadBps: liveCostModel.estimatedSpreadBps,
+                  estimatedMarketSlippageBps: liveCostModel.estimatedMarketSlippageBps,
+                  fundingHoldCostBufferBps: liveCostModel.fundingHoldCostBufferBps ?? 0,
+                  costModelSource: liveCostModel.source ?? "unknown",
+                }
+                lastProtectionDetail = {
+                  [`s:${symbol}:last_set_key`]: set.setKey,
+                  [`s:${symbol}:gross_pf`]: protection.grossPF.toFixed(4),
+                  [`s:${symbol}:net_pf`]: protection.netPF.toFixed(4),
+                  [`s:${symbol}:cost_buffer_pct`]: protection.costBufferPct.toFixed(4),
+                  [`s:${symbol}:effective_tp_pct`]: protection.effectiveTpPct.toFixed(4),
+                  [`s:${symbol}:effective_sl_pct`]: protection.effectiveSlPct.toFixed(4),
+                  [`s:${symbol}:cost_model_source`]: protectionDetail.costModelSource,
+                }
+
+                if (protection.netPF < this.METRICS.real.minProfitFactor) {
+                  rejected++
+                  costSuppressed++
+                  await logProgressionEvent(this.connectionId, "live_trading", "warning", "Live dispatch suppressed by exchange-cost net PF gate", {
+                    symbol,
+                    setKey: set.setKey,
+                    direction: set.direction,
+                    realStageMinPF: this.METRICS.real.minProfitFactor,
+                    ...protectionDetail,
+                  }).catch(() => {})
+                  console.log(
+                    `[v0] [StrategyFlow] ${symbol} LIVE suppressed ${set.setKey}: netPF=${protection.netPF.toFixed(4)} < realMinPF=${this.METRICS.real.minProfitFactor.toFixed(4)} costBuffer=${protection.costBufferPct.toFixed(4)}%`
+                  )
+                  continue
+                }
 
                 const liveResult = await executeLivePosition(
                   this.connectionId,
@@ -4041,7 +4158,7 @@ export class StrategyCoordinator {
                     ratios: {
                       // Use effectivePF (coord-record tuned) so risk ratios reflect
                       // the Real-stage performance bias rather than raw Base entry PF.
-                      profitabilityRatio: protection.effectiveProfitFactor,
+                      profitabilityRatio: protection.netPF,
                       accountRiskRatio: sl / 100,
                       successRateRatio: bestEntry.confidence,
                       consistencyRatio: set.avgConfidence,
@@ -4069,6 +4186,7 @@ export class StrategyCoordinator {
                     // already incorporated the CoordRecord sizeDelta from the
                     // Real-stage tuner — no extra entry scan needed.
                     sizeMultiplier: effectiveSizeMult,
+                    protectionCost: protectionDetail,
                   },
                   connector
                 )
@@ -4100,16 +4218,25 @@ export class StrategyCoordinator {
               }
             }
 
+            if (Object.keys(lastProtectionDetail).length > 0 || costSuppressed > 0) {
+              await getRedisClient().hset(`strategy_detail:${this.connectionId}:live`, {
+                [`s:${symbol}:cost_suppressed`]: String(costSuppressed),
+                [`s:${symbol}:dispatch_selected`]: String(dispatchSets.length),
+                ...lastProtectionDetail,
+                updated_at: String(Date.now()),
+              }).catch(() => {})
+            }
+
             if (placed > 0 || errored > 0) {
               console.log(
-                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} errored=${errored}`
+                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} costSuppressed=${costSuppressed} errored=${errored}`
               )
             } else if (rejected > 0 && (this as any)._liveRejectLogThrottle?.[symbol] !== Math.floor(Date.now() / 30000)) {
               // Throttle pure-rejection summaries (common in dev/test with no real exchange balance) — log at most once per 30s per symbol
               if (!(this as any)._liveRejectLogThrottle) (this as any)._liveRejectLogThrottle = {}
               ;(this as any)._liveRejectLogThrottle[symbol] = Math.floor(Date.now() / 30000)
               console.log(
-                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} errored=${errored} (throttled)`
+                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} costSuppressed=${costSuppressed} errored=${errored} (throttled)`
               )
             }
           } else {
