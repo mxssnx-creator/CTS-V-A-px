@@ -120,7 +120,7 @@ export class StrategyProcessor {
       }
 
       if (indications.length === 0) {
-        console.warn(`[v0] [StrategyProcessor] No indications available for ${symbol} on ${this.connectionId}`)
+        console.log(`[v0] [StrategyProcessor] No indications for ${symbol}/${this.connectionId}`)
         return { strategiesEvaluated: 0, liveReady: 0 }
       }
 
