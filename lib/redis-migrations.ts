@@ -1673,7 +1673,7 @@ const migrations: Migration[] = [
     // `app_settings`. Existing hashes have no coordination fields, so the first
     // cycle after upgrade would fall back to global which may also be absent.
     // Seed spec defaults idempotently (never clobbers operator-set values):
-    //   variants:  trailing=true, block=true, dca=false, pause=true
+    //   variants:  trailing=true, block=true, dca=false (pause is an axis, not a variant)
     //   axes:      all disabled by default, maxWindow seeded to spec defaults
     //   block knobs: blockVolumeRatio=1.0, blockMaxStack=3
     //
@@ -1688,7 +1688,6 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false",  // off by spec default
-        variantPauseEnabled:    "true",
         // Axis toggles — disabled by default (operator must opt-in)
         axisPrevEnabled:   "false",
         axisPrevMaxWindow: "12",
@@ -1982,7 +1981,7 @@ const migrations: Migration[] = [
   //       that StrategyCoordinator.loadProfitFactors() reads (NOT the
   //       pf_base_min snake_case names used by the old settings UI)
   //   • variantTrailingEnabled / variantBlockEnabled / variantDcaEnabled /
-  //     variantPauseEnabled → written to connection_settings:bingx-x01
+  //     pause axis settings → written to connection_settings:bingx-x01
   //     using the camelCase keys that loadCoordinationSettings() reads
   //   • minStep=5, mainEvalPosCount=15, realEvalPosCount=10 →
   //     connection_settings:bingx-x01
@@ -2050,7 +2049,6 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false",
-        variantPauseEnabled:    "true",
         // Block knobs
         blockVolumeRatio:     "1.0",
         blockMaxStack:        "3",
@@ -2477,7 +2475,6 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false",
-        variantPauseEnabled:    "true",
         blockVolumeRatio:       "1.0",
         blockMaxStack:          "3",
         mainEvalPosCount:       "3",
