@@ -49,7 +49,7 @@ export async function GET(request: NextRequest) {
         ? JSON.parse(preset.block_adjustment_ratios)
         : [0.5, 1.0, 1.5, 2.0],
       dca_levels: preset.dca_levels ? JSON.parse(preset.dca_levels) : [3, 5, 7],
-      volume_factors: preset.volume_factors ? JSON.parse(preset.volume_factors) : [1, 2, 3, 4, 5],
+      volume_factors: preset.volume_factors ? JSON.parse(preset.volume_factors) : [0.1, 0.2, 0.5],
       trailing_enabled: preset.trailing_enabled === true,
       block_adjustment_enabled: preset.block_adjustment_enabled === true,
       dca_adjustment_enabled: preset.dca_adjustment_enabled === true,
@@ -111,7 +111,7 @@ export async function POST(request: NextRequest) {
         JSON.stringify(body.block_adjustment_ratios || [0.5, 1.0, 1.5, 2.0]),
         body.dca_adjustment_enabled !== undefined ? body.dca_adjustment_enabled : false,
         JSON.stringify(body.dca_levels || [3, 5, 7]),
-        JSON.stringify(body.volume_factors || [1, 2, 3, 4, 5]),
+        JSON.stringify(body.volume_factors || [0.1, 0.2, 0.5]),
         body.min_profit_factor || 0.4,
         body.min_win_rate || 0.0,
         body.max_drawdown || 50.0,
