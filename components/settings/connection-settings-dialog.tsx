@@ -1,5 +1,6 @@
 "use client"
 
+import { MIN_VOLUME_FACTOR } from "@/lib/constants"
 import { useState, useEffect, useCallback, useMemo } from "react"
 import {
   Dialog,
@@ -116,6 +117,12 @@ type SymbolOrder =
   | "newest"
   | "manual"
 
+function parseVolumeFactor(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null || raw === "") return fallback
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
 interface OverviewSettings {
   volumeFactorBase:   number
   volumeFactorLive:   number
@@ -177,9 +184,9 @@ export function ConnectionSettingsDialog({
 
   // ── Overview state ──────────────────────────────────────────────
   const [overview, setOverview] = useState<OverviewSettings>({
-    volumeFactorBase: 1.0,
-    volumeFactorLive: 2.2,   // operator spec: 2.2 default
-    volumeFactorPreset: 1.0,
+    volumeFactorBase: MIN_VOLUME_FACTOR,
+    volumeFactorLive: MIN_VOLUME_FACTOR,
+    volumeFactorPreset: MIN_VOLUME_FACTOR,
     marginMode: "cross",
     volumeType: "usdt",
     positionMode: "one_way",
@@ -294,9 +301,9 @@ export function ConnectionSettingsDialog({
       // Apply overview settings
       setOverview(prev => ({
         ...prev,
-        volumeFactorBase:   Number(p.volume_factor)         || prev.volumeFactorBase,
-        volumeFactorLive:   Number(p.volume_factor_live)    || prev.volumeFactorLive,
-        volumeFactorPreset: Number(p.volume_factor_preset)  || prev.volumeFactorPreset,
+        volumeFactorBase:   parseVolumeFactor(p.volume_factor, prev.volumeFactorBase),
+        volumeFactorLive:   parseVolumeFactor(p.volume_factor_live, prev.volumeFactorLive),
+        volumeFactorPreset: parseVolumeFactor(p.volume_factor_preset, prev.volumeFactorPreset),
         marginMode:        (p.margin_mode    as "cross" | "isolated") || prev.marginMode,
         volumeType:        (p.volume_type    as "usdt" | "contract" | "spot") || prev.volumeType,
         positionMode:      (p.position_mode  as "one_way" | "hedge") || prev.positionMode,
@@ -374,13 +381,13 @@ export function ConnectionSettingsDialog({
         const conn     = data.connection || {}
         setExchangeKey(String(conn.exchange || exchange).toLowerCase())
         setOverview({
-          volumeFactorBase:   Number(settings.volume_factor)        || Number(conn.volume_factor) || 1.0,
+          volumeFactorBase:   parseVolumeFactor(settings.volume_factor, parseVolumeFactor(conn.volume_factor, MIN_VOLUME_FACTOR)),
           // Read live/preset factor from BOTH the settings hash (volume_factor_live) and
           // the connection hash (live_volume_factor) so changes made via the card's inline
           // volume sliders (which write to the connection hash via the /volume route) are
           // always reflected when the dialog opens.
-          volumeFactorLive:   Number(settings.volume_factor_live)   || Number(conn.live_volume_factor)   || 2.2,
-          volumeFactorPreset: Number(settings.volume_factor_preset) || Number(conn.preset_volume_factor) || 1.0,
+          volumeFactorLive:   parseVolumeFactor(settings.volume_factor_live, parseVolumeFactor(conn.live_volume_factor, MIN_VOLUME_FACTOR)),
+          volumeFactorPreset: parseVolumeFactor(settings.volume_factor_preset, parseVolumeFactor(conn.preset_volume_factor, MIN_VOLUME_FACTOR)),
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
           positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
