@@ -3,6 +3,7 @@
  * Evaluates preset strategies using historical data with profit factor and drawdown metrics
  */
 
+import { resolveStopLossPercent } from "@/lib/tp-sl-ratio"
 import { getSettings, setSettings } from "@/lib/redis-db"
 import { sql } from "@/lib/db"
 import { calculateSignedResultR } from "@/lib/profit-factor"
@@ -285,10 +286,11 @@ export class BacktestEngine {
         ? entryPrice * (1 + (strategy.takeprofit_factor * 0.001) / 0.1) // TP in relation to 0.1% position cost
         : entryPrice * (1 - (strategy.takeprofit_factor * 0.001) / 0.1)
 
+    const stopLossPercent = resolveStopLossPercent(strategy.takeprofit_factor, strategy.stoploss_ratio)
     const slPrice =
       side === "long"
-        ? entryPrice * (1 - (strategy.stoploss_ratio * strategy.takeprofit_factor * 0.001) / 0.1)
-        : entryPrice * (1 + (strategy.stoploss_ratio * strategy.takeprofit_factor * 0.001) / 0.1)
+        ? entryPrice * (1 - stopLossPercent / 100)
+        : entryPrice * (1 + stopLossPercent / 100)
 
     // Simulate price movement until TP, SL, or timeout
     let exitPrice = entryPrice

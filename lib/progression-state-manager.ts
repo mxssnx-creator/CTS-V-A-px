@@ -869,6 +869,7 @@ return {
    * solid for the actual current configuration.
    */
   static async recoordinateForActualOne(connectionId: string): Promise<ProgressionRecoordinationResult> {
+  static async recoordinateForActualOne(connectionId: string, engineType = "main"): Promise<void> {
     try {
       await initRedis()
       const client = getRedisClient()
@@ -946,6 +947,7 @@ return {
       // *stored* snapshot (captured at engine-start) to the *live* values
       // so the first settings-save that differs triggers a clean restart.
       const liveFingerprint = [
+        engineType || "main",
         connData.is_live_trade   || "0",
         connData.is_testnet      || "0",
         connData.is_preset_trade || "0",
@@ -961,6 +963,7 @@ return {
           ? JSON.parse(existing.progress_settings_snapshot)
           : {}
         storedFingerprint = [
+          snap.engine_type || existing.engine_type || "main",
           snap.is_live_trade   || "0",
           snap.is_testnet      || "0",
           snap.is_preset_trade || "0",
@@ -973,6 +976,7 @@ return {
       const liveSnapshot = {
         symbol_count: liveSymbolCount,
         symbols_hash: liveSymbolsHash,
+        engine_type: engineType || "main",
         is_live_trade: connData.is_live_trade || "0",
         is_testnet: connData.is_testnet || "0",
         is_preset_trade: connData.is_preset_trade || "0",
@@ -1038,6 +1042,7 @@ return {
           active_symbols_hash: liveSymbolsHash,
           started_for_settings_version: new Date().toISOString(),
           progress_settings_snapshot: JSON.stringify(liveSnapshot),
+          engine_type: engineType || "main",
           prehistoric_phase_active: "false",
         }).catch(() => {})
 
@@ -1084,7 +1089,8 @@ return {
    * No concurrent multiple progressions/instances for the same connection.
    */
   static async ensureJustUniqueProgression(
-    connectionId: string
+    connectionId: string,
+    options: { ownerEpoch?: number; engineType?: string } = {},
   ): Promise<{ sessionNumber: number; epoch: number; wasNew: boolean }> {
     try {
       await initRedis()
@@ -1096,7 +1102,8 @@ return {
       }
 
       // First, make sure we are coordinated to actual current state
-      await this.recoordinateForActualOne(connectionId)
+      const engineType = options.engineType || "main"
+      await this.recoordinateForActualOne(connectionId, engineType)
 
       const key = `progression:${connectionId}`
       const existing = await client.hgetall(key).catch(() => null)
@@ -1118,13 +1125,46 @@ return {
       // a new engine start to a zombie session (wrong epoch, wrong counters).
       const STALENESS_MS = 30 * 60 * 1000
 
+      const ownerEpoch = options.ownerEpoch && Number.isFinite(options.ownerEpoch) && options.ownerEpoch > 0
+        ? options.ownerEpoch
+        : now
+
       if (existing && Object.keys(existing).length > 0 && existing.engine_started !== "true") {
         const sessionNumber = parseInt(existing.session_number || "1", 10)
-        const epoch = Number(existing.epoch) || now
+        const lastUpdateMs = existing.last_update
+          ? new Date(existing.last_update).getTime()
+          : (existing.started_at ? Number(existing.started_at) : 0)
+        const sessionAge = now - lastUpdateMs
+        const endedAt = Number(existing.ended_at || "0") || 0
+        const isReusableStopped =
+          !endedAt &&
+          lastUpdateMs &&
+          Number.isFinite(lastUpdateMs) &&
+          sessionAge <= STALENESS_MS
+
+        if (!isReusableStopped) {
+          const newSession = await this.archiveAndStartNewProgression(connectionId, ownerEpoch)
+          await client.hset(key, {
+            last_visited: nowIso,
+            last_update: nowIso,
+            engine_started: "true",
+            engine_type: engineType,
+          }).catch(() => {})
+          console.log(
+            `[v0] [Progression] Stopped/stale progression for ${connectionId} was not reusable ` +
+            `(ended_at=${endedAt || "none"}, age=${Math.round(sessionAge / 1000)}s) — started fresh ` +
+            `(session=${newSession}, epoch=${ownerEpoch})`,
+          )
+          return { sessionNumber: newSession, epoch: ownerEpoch, wasNew: true }
+        }
+
+        const epoch = ownerEpoch
         await client.hset(key, {
           last_update: nowIso,
           last_visited: nowIso,
           engine_started: "true",
+          epoch: String(epoch),
+          engine_type: engineType,
         }).catch(() => {})
         await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})
         console.log(
@@ -1146,13 +1186,15 @@ return {
         if (!isStale) {
           // There is already one healthy unique active progression (recoordinate ensured it matches current live state)
           const sessionNumber = parseInt(existing.session_number || "1", 10)
-          const epoch = Number(existing.epoch) || now
+          const epoch = ownerEpoch
 
           // Light attach: update activity timestamps, keep the same unique session/epoch
           await client.hset(key, {
             last_update: nowIso,
             last_visited: nowIso,
             engine_started: "true",
+            epoch: String(epoch),
+            engine_type: engineType,
           }).catch(() => {})
 
           await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})
@@ -1173,13 +1215,14 @@ return {
       }
 
       // No active unique progression (or it was cleaned by recoordinate) → start one
-      const newEpoch = now
+      const newEpoch = ownerEpoch
       const newSession = await this.archiveAndStartNewProgression(connectionId, newEpoch)
 
       await client.hset(key, {
         last_visited: nowIso,
         last_update: nowIso,
         engine_started: "true",
+        engine_type: engineType,
       }).catch(() => {})
 
       console.log(

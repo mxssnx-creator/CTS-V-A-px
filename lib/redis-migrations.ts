@@ -2941,6 +2941,54 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "43")
     },
   },
+  {
+    version: 45,
+    name: "045-canonical-tp-sl-ratio-settings",
+    description: "Persist canonical TP-percent/SL-ratio range semantics for dev and production",
+    up: async (client: any) => {
+      await client.set("_schema_version", "45")
+      const now = new Date().toISOString()
+      const ratioSettings: Record<string, string> = {
+        // takeprofit_factor is an absolute percent; stoploss_ratio is a
+        // multiplier of that TP distance. Example: TP=10, SL ratio=0.5 => SL=5%.
+        tp_sl_ratio_version: "2",
+        takeprofit_min: "2",
+        takeprofit_max: "22",
+        takeprofit_step: "1",
+        stoploss_ratio_min: "0.2",
+        stoploss_ratio_max: "2.2",
+        stoploss_ratio_step: "0.1",
+        updated_at: now,
+      }
+
+      await client.hset("app_settings", ratioSettings).catch(() => {})
+      await client.hset("settings:system", ratioSettings).catch(() => {})
+
+      const connectionIds = new Set<string>([
+        ...((await client.smembers("connections").catch(() => [])) || []),
+        ...((await client.smembers("connections:main:enabled").catch(() => [])) || []),
+        "bingx-x01",
+      ].map(String).filter(Boolean))
+
+      for (const connId of connectionIds) {
+        await client.hset(`connection_settings:${connId}`, {
+          tp_sl_ratio_version: "2",
+          takeprofit_min: "2",
+          takeprofit_max: "22",
+          takeprofit_step: "1",
+          stoploss_ratio_min: "0.2",
+          stoploss_ratio_max: "2.2",
+          stoploss_ratio_step: "0.1",
+          updated_at: now,
+        }).catch(() => {})
+      }
+
+      console.log(`[v0] Migration 045: canonical TP/SL ratio v2 settings applied to ${connectionIds.size} connection(s)`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "44")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -3563,22 +3611,24 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
  * Run all pending migrations
  */
 export async function runMigrations(): Promise<{ success: boolean; message: string; version: number }> {
-  // If a run is already in-flight (or completed), return the same promise so
-  // concurrent callers coalesce onto a single execution and never re-enter
-  // runMigrationsInternal(). Successful promises are cached for the process,
-  // but rejected promises MUST be cleared; otherwise one transient production
-  // Redis/deadline failure poisons the process forever and every later request
-  // receives the same stale rejection without retrying migrations.
+  // Only cache the active in-flight run. Completed runs must not stay cached:
+  // dev HMR and warm production workers can load newer code with a higher
+  // migration version while the old resolved Promise is still on globalThis.
+  // Clearing in `finally` lets the next call re-check `_schema_version` and run
+  // newly added migrations, while still coalescing concurrent cold-start calls.
   const existing = getMigrationRunPromise()
   if (existing) {
     return existing
   }
 
-  const promise = runMigrationsInternal().catch((error) => {
-    setMigrationRunPromise(null)
-    setMigrationsRun(false)
-    throw error
-  })
+  const promise = runMigrationsInternal()
+    .catch((error) => {
+      setMigrationsRun(false)
+      throw error
+    })
+    .finally(() => {
+      setMigrationRunPromise(null)
+    })
   setMigrationRunPromise(promise)
   return promise
 }
