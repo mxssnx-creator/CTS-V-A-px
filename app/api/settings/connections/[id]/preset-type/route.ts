@@ -4,6 +4,7 @@ import { initRedis, getConnection } from "@/lib/redis-db"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 // PATCH /api/settings/connections/[id]/preset-type - Assign preset type to connection
+export const dynamic = "force-dynamic"
 export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

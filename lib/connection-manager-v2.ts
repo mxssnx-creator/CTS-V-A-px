@@ -1,3 +1,4 @@
+import { MIN_VOLUME_FACTOR } from "@/lib/constants"
 /**
  * ConnectionManager v2 - Modern Connection Management with Redis Storage
  * Handles all connection CRUD operations, validation, and lifecycle management via Redis
@@ -152,7 +153,7 @@ export class ConnectionManagerV2 {
         is_live_trade: "0",
         is_preset_trade: "0",
         is_predefined: false,
-        volume_factor: input.volume_factor || 1,
+        volume_factor: input.volume_factor ?? MIN_VOLUME_FACTOR,
         created_at: now,
         updated_at: now,
       }

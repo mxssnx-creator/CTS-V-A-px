@@ -5,6 +5,7 @@
 
 import { getSettings, setSettings } from "@/lib/redis-db"
 import { sql } from "@/lib/db"
+import { calculateSignedResultR } from "@/lib/profit-factor"
 
 interface BacktestTrade {
   symbol: string
@@ -15,6 +16,8 @@ interface BacktestTrade {
   exit_time: Date
   profit_loss: number
   signedResultR: number
+  profit_factor: number
+  signed_result_r: number
   strategy_config: any
 }
 
@@ -358,6 +361,9 @@ export class BacktestEngine {
     const signedPricePercent = (profitLoss / entryPrice) * 100
     const positionCostPct = this.getPositionCostPct(strategy)
     const signedResultR = signedPricePercent / positionCostPct
+    // Calculate P&L and signed, cost-normalized return (R).
+    const profitLoss = side === "long" ? exitPrice - entryPrice : entryPrice - exitPrice
+    const signedResultR = calculateSignedResultR(entryPrice, exitPrice, side)
 
     return {
       symbol,
@@ -368,6 +374,8 @@ export class BacktestEngine {
       exit_time: exitTime,
       profit_loss: profitLoss,
       signedResultR,
+      profit_factor: Math.max(0, signedResultR),
+      signed_result_r: signedResultR,
       strategy_config: strategy,
     }
   }
@@ -396,7 +404,20 @@ export class BacktestEngine {
     const totalProfit = trades.filter((t) => t.signedResultR > 0).reduce((sum, t) => sum + t.signedResultR, 0)
     const totalLoss = Math.abs(trades.filter((t) => t.signedResultR <= 0).reduce((sum, t) => sum + t.signedResultR, 0))
     const netProfit = totalProfit - totalLoss
-    const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? 999 : 0
+    
+    // Cost-adjusted PF: totalProfit / (totalLoss + totalPositionCosts)
+    // Position cost = entry_price × quantity × 0.001 (0.1% maker fee)
+    // For backtest trades, we calculate cost from entry_price and assume unit qty
+    const totalPositionCosts = trades.reduce((sum, t) => {
+      if (Number.isFinite(t.entry_price) && t.entry_price > 0) {
+        // Backtest assumes unit quantity, so cost = entry_price × 0.001
+        return sum + (t.entry_price * 0.001)
+      }
+      return sum
+    }, 0)
+    
+    const adjustedDenominator = totalLoss + totalPositionCosts
+    const profitFactor = adjustedDenominator > 0 ? totalProfit / adjustedDenominator : totalProfit > 0 ? 999 : 0
 
     const avgWin = winningTrades > 0 ? totalProfit / winningTrades : 0
     const avgLoss = losingTrades > 0 ? totalLoss / losingTrades : 0
