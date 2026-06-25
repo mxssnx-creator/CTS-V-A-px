@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { initRedis, getAllConnections } from "@/lib/redis-db"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)

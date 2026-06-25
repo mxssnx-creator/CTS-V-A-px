@@ -8,6 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import type { BacktestResult, Preset } from "@/lib/types"
 import { Play, TrendingUp, TrendingDown, Activity, Clock, AlertTriangle } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
+import { formatSampledMetric, grossProfitFactorTitle } from "@/lib/metric-formatting"
 
 interface BacktestViewProps {
   preset: Preset
@@ -182,8 +183,8 @@ export function BacktestView({ preset }: BacktestViewProps) {
                   <div className="flex items-center gap-2">
                     <TrendingUp className="h-5 w-5 text-blue-500" />
                     <div>
-                      <div className="text-2xl font-bold">{selectedResult.profit_factor.toFixed(2)}</div>
-                      <div className="text-sm text-muted-foreground">Profit Factor</div>
+                      <div className="text-2xl font-bold" title={grossProfitFactorTitle(selectedResult.profit_factor, selectedResult.total_trades)}>{formatSampledMetric(selectedResult.profit_factor, selectedResult.total_trades)}</div>
+                      <div className="text-sm text-muted-foreground">PF</div>
                     </div>
                   </div>
                 </CardContent>

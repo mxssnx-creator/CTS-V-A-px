@@ -120,7 +120,7 @@ export class StrategyProcessor {
       }
 
       if (indications.length === 0) {
-        console.warn(`[v0] [StrategyProcessor] No indications available for ${symbol} on ${this.connectionId}`)
+        console.log(`[v0] [StrategyProcessor] No indications for ${symbol}/${this.connectionId}`)
         return { strategiesEvaluated: 0, liveReady: 0 }
       }
 
@@ -277,6 +277,10 @@ export class StrategyProcessor {
           setsFailed: result.failedEvaluation,
           avgProfitFactor: result.avgProfitFactor.toFixed(2),
           avgDrawdownTime: `${Math.round(result.avgDrawdownTime)}min`,
+          ...(result.type === "live" ? {
+            dispatchSelected: result.dispatchSelected ?? 0,
+            dispatchSuppressed: result.dispatchSuppressed ?? 0,
+          } : {}),
         }
 
         // Anchor the canonical "strategies this cycle" count on the REAL
@@ -291,7 +295,9 @@ export class StrategyProcessor {
         // BASE/REAL/LIVE: "N passed / M evaluated" (filter). MAIN: "N from M base" (fanout).
         const stageLabel = result.type === "main"
           ? `${result.passedEvaluation} Sets from ${result.totalCreated} base`
-          : `${result.passedEvaluation}/${result.totalCreated} Sets passed`
+          : result.type === "live"
+            ? `${result.passedEvaluation}/${result.totalCreated} candidates passed, ${result.dispatchSelected ?? result.passedEvaluation} dispatch selected, ${result.dispatchSuppressed ?? 0} suppressed`
+            : `${result.passedEvaluation}/${result.totalCreated} Sets passed`
         console.log(
           `[v0] [StrategyFlow] ${symbol} ${result.type.toUpperCase()}: ${stageLabel} | ` +
           `PF=${result.avgProfitFactor.toFixed(2)} | DDT=${Math.round(result.avgDrawdownTime)}min`

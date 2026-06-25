@@ -8,6 +8,7 @@ import { SystemLogger } from "@/lib/system-logger"
  * API Verification Endpoint
  * Tests all critical API functionality and connection manager integration
  */
+export const dynamic = "force-dynamic"
 export async function GET() {
   const results = {
     timestamp: new Date().toISOString(),
