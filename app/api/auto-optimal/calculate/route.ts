@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid"
 import DatabaseManager from "@/lib/database"
 import { EntityTypes, ConfigSubTypes } from "@/lib/core/entity-types"
 import { getSettings, setSettings, getMarketData } from "@/lib/redis-db"
+import { aggregateCostNormalizedResults } from "@/lib/profit-factor"
 
 interface SimulationResult {
   takeprofit: number
@@ -322,7 +323,7 @@ function calculateMetrics(trades: Trade[]): any {
   const totalProfit = trades.filter(t => t.profit_loss > 0).reduce((sum, t) => sum + t.profit_loss, 0)
   const totalLoss = Math.abs(trades.filter(t => t.profit_loss <= 0).reduce((sum, t) => sum + t.profit_loss, 0))
   const netProfit = totalProfit - totalLoss
-  const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? 999 : 0
+  const profitFactor = aggregateCostNormalizedResults(trades.map((trade) => trade.profit_loss)).profitFactor
   
   const avgWin = winningTrades > 0 ? totalProfit / winningTrades : 0
   const avgLoss = losingTrades > 0 ? totalLoss / losingTrades : 0

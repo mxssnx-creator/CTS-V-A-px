@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid"
 import type { IndicationConfig, PseudoPosition } from "./types"
 import { db } from "@/lib/database"
+import { calculateSignedResultR } from "@/lib/profit-factor"
 
 export interface IndicationResult {
   id: string
@@ -226,13 +227,14 @@ export class IndicationEngine {
   // Update pseudo positions with current market data
   updatePseudoPositions(positions: PseudoPosition[], currentPrice: number): PseudoPosition[] {
     return positions.map((position) => {
-      const priceDiff = currentPrice - position.entry_price
-      const profitFactor = priceDiff / (position.entry_price * position.position_cost)
+      const direction = position.direction || "long"
+      const signedResultR = calculateSignedResultR(position.entry_price, currentPrice, direction, position.position_cost)
 
       return {
         ...position,
         current_price: currentPrice,
-        profit_factor: profitFactor,
+        profit_factor: Math.max(0, signedResultR),
+        signed_result_r: signedResultR,
         updated_at: new Date().toISOString(),
       }
     })
