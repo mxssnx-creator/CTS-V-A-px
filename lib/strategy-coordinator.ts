@@ -496,7 +496,7 @@ function deriveProtectionFromProfitFactor(
   sizeMultiplier = 1,
 ): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
   const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
-  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.02
   // Tie SL to the actual position-cost budget, then apply variant scaling.
   // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
   const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
@@ -3602,7 +3602,7 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.live
     let maxLive = this.config.maxLiveSets || 500
-    let livePositionCostPct = 0.1
+    let livePositionCostPct = 0.02
     try {
       const { getConnection } = await import("@/lib/redis-db")
       const [conn, connSettings] = await Promise.all([
