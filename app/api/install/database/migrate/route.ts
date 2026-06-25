@@ -3,6 +3,7 @@ import { initRedis, getRedisClient, isRedisConnected, setSettings } from "@/lib/
 import { runMigrations, getMigrationStatus } from "@/lib/redis-migrations"
 import { SystemLogger } from "@/lib/system-logger"
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 export async function POST(request: NextRequest) {

@@ -225,6 +225,7 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
       stopPolling()
     }
     return () => stopPolling()
+
   }, [open])
 
   // Re-start polling when connection changes while open
@@ -232,6 +233,7 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
     if (!open) return
     stopPolling()
     startPolling()
+
   }, [activeConnectionId])
 
   useEffect(() => {
