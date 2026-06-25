@@ -192,12 +192,29 @@ export async function GET(
     const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
     const ordersBySymbolHash: Record<string, string> = ordersBySymbolRaw || {}
     const hedgePosAccHash: Record<string, string> = (hedgePosAccHashRaw as Record<string, string>) || {}
-    const strategyDetailBaseHash: Record<string, string> = (strategyDetailBaseHashRaw as Record<string, string>) || {}
-    const strategyDetailMainHash: Record<string, string> = (strategyDetailMainHashRaw as Record<string, string>) || {}
-    const strategyDetailRealHash: Record<string, string> = (strategyDetailRealHashRaw as Record<string, string>) || {}
+    const strategyDetailBaseHashRawObj: Record<string, string> = (strategyDetailBaseHashRaw as Record<string, string>) || {}
+    const strategyDetailMainHashRawObj: Record<string, string> = (strategyDetailMainHashRaw as Record<string, string>) || {}
+    const strategyDetailRealHashRawObj: Record<string, string> = (strategyDetailRealHashRaw as Record<string, string>) || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
+    const currentGeneration = String(
+      progHash.engine_generation || progHash.epoch || es.engine_generation || es.epoch || ""
+    ).trim()
+    const staleStatsIgnored: Array<{ key: string; generation: string; currentGeneration: string }> = []
+    const isCurrentGeneration = (key: string, generation: unknown): boolean => {
+      const gen = String(generation ?? "").trim()
+      if (!currentGeneration || !gen || gen === currentGeneration) return true
+      staleStatsIgnored.push({ key, generation: gen, currentGeneration })
+      return false
+    }
+    const filterHashByGeneration = (key: string, hash: Record<string, string>): Record<string, string> => {
+      if (!isCurrentGeneration(key, hash.engine_generation || hash.generation)) return {}
+      return hash
+    }
+    const strategyDetailBaseHash = filterHashByGeneration(`strategy_detail:${connectionId}:base`, strategyDetailBaseHashRawObj)
+    const strategyDetailMainHash = filterHashByGeneration(`strategy_detail:${connectionId}:main`, strategyDetailMainHashRawObj)
+    const strategyDetailRealHash = filterHashByGeneration(`strategy_detail:${connectionId}:real`, strategyDetailRealHashRawObj)
 
     // ── HISTORIC section ─────────────────────────────────────────────────────
     // Primary: prehistoric:{connId} hash (written by trackPrehistoricStats)
@@ -989,7 +1006,7 @@ export async function GET(
       ])
       // Persist for outer-scope access (strategiesActive in return object).
       stratActiveHash = (_stratActiveHash && typeof _stratActiveHash === "object")
-        ? (_stratActiveHash as Record<string, string>)
+        ? filterHashByGeneration(`strategies_active:${connectionId}`, _stratActiveHash as Record<string, string>)
         : null
       if (indActiveHash && typeof indActiveHash === "object") {
         for (const [field, val] of Object.entries(indActiveHash)) {
@@ -1010,6 +1027,7 @@ export async function GET(
       }
       if (stratActiveHash && typeof stratActiveHash === "object") {
         for (const [field, val] of Object.entries(stratActiveHash)) {
+          if (field.endsWith(":generation") || field === "generation" || field === "engine_generation") continue
           // Field shape: "{SYMBOL}:{stage}" or "{SYMBOL}:{stage}:evaluated"
           // e.g. "BTCUSDT:base", "BTCUSDT:base:evaluated", "ETHUSDT:real:evaluated"
           // Strip the symbol prefix by slicing from the FIRST colon, not the last.
@@ -1018,6 +1036,10 @@ export async function GET(
           const firstColon = field.indexOf(":")
           if (firstColon <= 0) continue
           const suffix = field.slice(firstColon + 1)   // e.g. "base", "main", "real", "base:evaluated"
+          const generationField = suffix.endsWith(":evaluated")
+            ? `${field.slice(0, firstColon)}:${suffix.slice(0, -":evaluated".length)}:generation`
+            : `${field}:generation`
+          if (!isCurrentGeneration(`strategies_active:${connectionId}:${field}`, stratActiveHash[generationField])) continue
           const numVal = n(val)
           // Fields ending in ":evaluated" are written by the engine to give cross-symbol
           // evaluated counts in the same scope as the stage counts. Aggregate them into
@@ -1121,7 +1143,11 @@ export async function GET(
     const variantDetail: Record<string, Record<string, number>> = {}
     await Promise.all(
       variantKeys.map(async (variant) => {
-        const h = ((await client.hgetall(`strategy_variant:${connectionId}:${variant}`).catch(() => null)) || {}) as Record<string, string>
+        const variantKey = `strategy_variant:${connectionId}:${variant}`
+        const h = filterHashByGeneration(
+          variantKey,
+          ((await client.hgetall(variantKey).catch(() => null)) || {}) as Record<string, string>,
+        )
         const createdSets      = n(h.created_sets)
         const passedSets       = n(h.passed_sets)
         const entriesCount     = n(h.entries_count)
@@ -1199,7 +1225,10 @@ export async function GET(
     await Promise.all(
       stratDetailKeys.map(async (stage) => {
         const detailKey = `strategy_detail:${connectionId}:${stage}`
-        const dh = ((await client.hgetall(detailKey).catch(() => null)) || {}) as Record<string, string>
+        const dh = filterHashByGeneration(
+          detailKey,
+          ((await client.hgetall(detailKey).catch(() => null)) || {}) as Record<string, string>,
+        )
 
         // ── Cross-symbol aggregation from per-symbol `s:{symbol}:*` fields ─
         // Each `(symbol, cycle)` writes a `s:{symbol}:*` bundle. We sum
@@ -1218,12 +1247,13 @@ export async function GET(
           if (!k.startsWith("s:") || !k.endsWith(":ts")) continue
           // k shape: "s:{symbol}:ts" — extract symbol between first and last colon.
           const symbol = k.slice(2, -3)
+          if (!isCurrentGeneration(`${detailKey}:s:${symbol}`, dh[`s:${symbol}:generation`])) continue
           const ts = Number(dh[k] || "0") || 0
           const ageMs = nowMs - ts
           if (ageMs > PRUNE_MS) {
             // Collect every per-symbol field for HDEL. Cheap because
             // these are stale samples already excluded from aggregation.
-            for (const f of ["created","entries","running","progressing","passed","evaluated","apf","addt","apps","aper","ts"]) {
+            for (const f of ["created","entries","running","progressing","passed","evaluated","apf","addt","apps","aper","generation","ts"]) {
               if (`s:${symbol}:${f}` in dh) staleFields.push(`s:${symbol}:${f}`)
             }
             continue
@@ -1602,6 +1632,7 @@ export async function GET(
       for (const k of Object.keys(dh)) {
         if (!k.startsWith("s:") || !k.endsWith(":ts")) continue
         const symbol = k.slice(2, -3)
+        if (!isCurrentGeneration(`strategy_detail:${connectionId}:${stageLabel}:s:${symbol}`, dh[`s:${symbol}:generation`])) continue
         const ts = Number(dh[k] || "0") || 0
         const fresh = (nowMs - ts) <= FRESH_MS
         const sCreated     = Number(dh[`s:${symbol}:created`]    || 0) || 0
@@ -2891,6 +2922,7 @@ export async function GET(
         // in the persisted `progression:{id}` hash.
         sessionNumber: n(progHash.session_number) || 0,
         epoch:         n(progHash.epoch) || 0,
+        currentGeneration,
         startedAt:     n(progHash.started_at) || 0,
         // `progressionId` is the stable per-session ID — `epoch:session`
         // is unique across all sessions for this connection.
@@ -2899,6 +2931,7 @@ export async function GET(
             ? `${progHash.epoch}:${progHash.session_number}`
             : "",
       },
+      staleStatsIgnored,
 
       // ── Plan fields: added to surface engine internals to UI ────────────
       // strategiesActive: raw {symbol}:{stage} hash snapshot from
