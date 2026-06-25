@@ -1,6 +1,6 @@
 "use client"
 
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 import {
@@ -26,6 +26,10 @@ export interface PerformanceTier {
   sharpe: number
   totalPnl: number
   avgPnl?: number
+  avgSignedR?: number
+  avgPositiveR?: number
+  avgNegativeR?: number
+  netR?: number
   totalCreated: number
   totalEntries: number
   totalRunning: number
@@ -172,6 +176,18 @@ function TierCard({ keyName, tier }: { keyName: string; tier: PerformanceTier })
             <div className="flex items-baseline justify-between">
               <span className="text-[10px] text-muted-foreground">Fill Rate</span>
               <span className="text-sm text-muted-foreground">{tier.fillRate ?? 0}%</span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-[10px] text-muted-foreground">Avg R</span>
+              <span className={`text-sm font-semibold ${pnlColor(tier.avgSignedR || 0)}`}>
+                {(tier.avgSignedR || 0) >= 0 ? "+" : ""}{(tier.avgSignedR || 0).toFixed(2)}R
+              </span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-[10px] text-muted-foreground">Avg Win / Loss</span>
+              <span className="text-sm text-muted-foreground">
+                +{(tier.avgPositiveR || 0).toFixed(2)}R / {(tier.avgNegativeR || 0).toFixed(2)}R
+              </span>
             </div>
             <div className="flex items-baseline justify-between">
               <span className="text-[10px] text-muted-foreground">Total P&L</span>
