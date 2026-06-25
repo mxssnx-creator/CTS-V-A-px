@@ -89,6 +89,12 @@
 
 import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 
+export interface RecoordinateProgressionResult {
+  changed: boolean
+  reason?: string
+  newEpoch?: number
+}
+
 export interface ProgressionState {
   connectionId: string
   // Session identity — increments each time a new progression starts
@@ -861,11 +867,11 @@ return {
    * Guarantees: previous progress is stopped (via archive + epoch bump), new one is
    * solid for the actual current configuration.
    */
-  static async recoordinateForActualOne(connectionId: string): Promise<void> {
+  static async recoordinateForActualOne(connectionId: string): Promise<RecoordinateProgressionResult> {
     try {
       await initRedis()
       const client = getRedisClient()
-      if (!client) return
+      if (!client) return { changed: false, reason: "redis-unavailable" }
 
       const key = `progression:${connectionId}`
       const existing = await client.hgetall(key).catch(() => null)
@@ -877,7 +883,7 @@ return {
         // beginning the prehistoric phase.
         const epoch = Date.now()
         await this.archiveAndStartNewProgression(connectionId, epoch)
-        return
+        return { changed: true, reason: "missing progression", newEpoch: epoch }
       }
 
       // Resolve current live state
@@ -1027,6 +1033,7 @@ return {
           progress_settings_snapshot: JSON.stringify(liveSnapshot),
           prehistoric_phase_active: "false",
         }).catch(() => {})
+        return { changed: true, reason, newEpoch }
 
         await setSettings(`engine_progression:${connectionId}`, {
           phase: "prehistoric_data",
@@ -1038,8 +1045,11 @@ return {
           updated_at: new Date().toISOString(),
         }).catch(() => {})
       }
+
+      return { changed: false, reason: "already current" }
     } catch (err) {
       console.warn(`[v0] [Progression] recoordinateForActualOne failed for ${connectionId}:`, err)
+      return { changed: false, reason: err instanceof Error ? err.message : String(err) }
     }
   }
 
