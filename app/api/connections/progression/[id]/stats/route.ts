@@ -198,6 +198,22 @@ export async function GET(
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
+    const currentGeneration = String(progHash.generation || progHash.epoch || "0")
+    const staleStatsIgnored: Array<{ key: string; generation: string; currentGeneration: string }> = []
+    const hashGeneration = (h: Record<string, string> | null | undefined): string =>
+      String(h?.generation || h?.epoch || "0")
+    const isCurrentStatsHash = (key: string, h: Record<string, string> | null | undefined): boolean => {
+      const generation = hashGeneration(h)
+      if (
+        currentGeneration !== "0" &&
+        generation !== "0" &&
+        generation !== currentGeneration
+      ) {
+        staleStatsIgnored.push({ key, generation, currentGeneration })
+        return false
+      }
+      return true
+    }
 
     // ── HISTORIC section ─────────────────────────────────────────────────────
     // Primary: prehistoric:{connId} hash (written by trackPrehistoricStats)
@@ -991,6 +1007,9 @@ export async function GET(
       stratActiveHash = (_stratActiveHash && typeof _stratActiveHash === "object")
         ? (_stratActiveHash as Record<string, string>)
         : null
+      if (stratActiveHash && !isCurrentStatsHash(`strategies_active:${connectionId}`, stratActiveHash)) {
+        stratActiveHash = null
+      }
       if (indActiveHash && typeof indActiveHash === "object") {
         for (const [field, val] of Object.entries(indActiveHash)) {
           // field shape: "{symbol}:{type}" — split on the LAST colon so
@@ -1010,6 +1029,7 @@ export async function GET(
       }
       if (stratActiveHash && typeof stratActiveHash === "object") {
         for (const [field, val] of Object.entries(stratActiveHash)) {
+          if (field === "generation" || field === "epoch" || field.endsWith(":generation")) continue
           // Field shape: "{SYMBOL}:{stage}" or "{SYMBOL}:{stage}:evaluated"
           // e.g. "BTCUSDT:base", "BTCUSDT:base:evaluated", "ETHUSDT:real:evaluated"
           // Strip the symbol prefix by slicing from the FIRST colon, not the last.
@@ -1018,6 +1038,15 @@ export async function GET(
           const firstColon = field.indexOf(":")
           if (firstColon <= 0) continue
           const suffix = field.slice(firstColon + 1)   // e.g. "base", "main", "real", "base:evaluated"
+          const fieldGeneration = stratActiveHash[`${field}:generation`] || stratActiveHash[`${field.replace(":evaluated", "")}:generation`] || hashGeneration(stratActiveHash)
+          if (
+            currentGeneration !== "0" &&
+            fieldGeneration !== "0" &&
+            fieldGeneration !== currentGeneration
+          ) {
+            staleStatsIgnored.push({ key: `strategies_active:${connectionId}:${field}`, generation: fieldGeneration, currentGeneration })
+            continue
+          }
           const numVal = n(val)
           // Fields ending in ":evaluated" are written by the engine to give cross-symbol
           // evaluated counts in the same scope as the stage counts. Aggregate them into
@@ -1122,6 +1151,18 @@ export async function GET(
     await Promise.all(
       variantKeys.map(async (variant) => {
         const h = ((await client.hgetall(`strategy_variant:${connectionId}:${variant}`).catch(() => null)) || {}) as Record<string, string>
+        if (!isCurrentStatsHash(`strategy_variant:${connectionId}:${variant}`, h)) {
+          variantDetail[variant] = {
+            createdSets: 0,
+            passedSets: 0,
+            entriesCount: 0,
+            avgPosPerSet: 0,
+            avgProfitFactor: 0,
+            avgDrawdownTime: 0,
+            passRate: 0,
+          }
+          return
+        }
         const createdSets      = n(h.created_sets)
         const passedSets       = n(h.passed_sets)
         const entriesCount     = n(h.entries_count)
@@ -1200,6 +1241,7 @@ export async function GET(
       stratDetailKeys.map(async (stage) => {
         const detailKey = `strategy_detail:${connectionId}:${stage}`
         const dh = ((await client.hgetall(detailKey).catch(() => null)) || {}) as Record<string, string>
+        const detailHashCurrent = isCurrentStatsHash(detailKey, dh)
 
         // ── Cross-symbol aggregation from per-symbol `s:{symbol}:*` fields ─
         // Each `(symbol, cycle)` writes a `s:{symbol}:*` bundle. We sum
@@ -1218,6 +1260,15 @@ export async function GET(
           if (!k.startsWith("s:") || !k.endsWith(":ts")) continue
           // k shape: "s:{symbol}:ts" — extract symbol between first and last colon.
           const symbol = k.slice(2, -3)
+          const fieldGeneration = dh[`s:${symbol}:generation`] || hashGeneration(dh)
+          if (
+            currentGeneration !== "0" &&
+            fieldGeneration !== "0" &&
+            fieldGeneration !== currentGeneration
+          ) {
+            staleStatsIgnored.push({ key: `${detailKey}:s:${symbol}`, generation: fieldGeneration, currentGeneration })
+            continue
+          }
           const ts = Number(dh[k] || "0") || 0
           const ageMs = nowMs - ts
           if (ageMs > PRUNE_MS) {
@@ -1257,24 +1308,24 @@ export async function GET(
         const useCross = freshSymbols > 0
         const createdSets       = useCross
           ? symCreated
-          : n(dh.created_sets      || progHash[`strategy_${stage}_created_sets`])
+          : detailHashCurrent ? n(dh.created_sets      || progHash[`strategy_${stage}_created_sets`]) : 0
         const avgPosPerSet      = useCross && weightSum > 0
           ? weightedPPS / weightSum
-          : parseFloat(dh.avg_pos_per_set      || progHash[`strategy_${stage}_avg_pos_per_set`]      || "0")
+          : detailHashCurrent ? parseFloat(dh.avg_pos_per_set      || progHash[`strategy_${stage}_avg_pos_per_set`]      || "0") : 0
         const avgProfitFactor   = useCross && weightSum > 0
           ? weightedPF / weightSum
-          : parseFloat(dh.avg_profit_factor    || progHash[`strategy_${stage}_avg_profit_factor`]    || "0")
-        const avgProcessingMs   = parseFloat(dh.avg_processing_ms    || progHash[`strategy_${stage}_avg_processing_ms`]    || "0")
+          : detailHashCurrent ? parseFloat(dh.avg_profit_factor    || progHash[`strategy_${stage}_avg_profit_factor`]    || "0") : 0
+        const avgProcessingMs   = detailHashCurrent ? parseFloat(dh.avg_processing_ms    || progHash[`strategy_${stage}_avg_processing_ms`]    || "0") : 0
         // Average position evaluation score for Real stage (stored by strategy-coordinator)
         const avgPosEvalReal    = useCross && weightSum > 0
           ? weightedPER / weightSum
-          : parseFloat(dh.avg_pos_eval_real    || progHash[`strategy_${stage}_avg_pos_eval_real`]    || "0")
+          : detailHashCurrent ? parseFloat(dh.avg_pos_eval_real    || progHash[`strategy_${stage}_avg_pos_eval_real`]    || "0") : 0
         // Count of positions that contributed to avgPosEvalReal (only meaningful for Real stage)
-        const countPosEval      = n(dh.count_pos_eval || progHash[`strategy_${stage}_count_pos_eval`])
+        const countPosEval      = detailHashCurrent ? n(dh.count_pos_eval || progHash[`strategy_${stage}_count_pos_eval`]) : 0
         // Drawdown time (avg minutes from strategy sets)
         const avgDrawdownTime   = useCross && weightSum > 0
           ? weightedDDT / weightSum
-          : parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
+          : detailHashCurrent ? parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0") : 0
 
         // Eval percentage per stage:
         //   base:  100% — Base self-evaluates all its sets (no filter).
@@ -1308,7 +1359,7 @@ export async function GET(
         //      every coordinator cycle with the correct semantics.
         const stageEvaluatedRaw = useCross
           ? symEvaluated
-          : n(dh.evaluated) > 1 ? n(dh.evaluated) : 0
+          : detailHashCurrent && n(dh.evaluated) > 1 ? n(dh.evaluated) : 0
         const stageEvaluated = stageEvaluatedRaw
           || stratEvaluated[stage]
           || stratCounts[stage]
@@ -1319,7 +1370,7 @@ export async function GET(
         // Filter stages (REAL): output count = stratCounts.real.
         const stagePassedRaw = useCross
           ? symPassed
-          : n(dh.passed_sets || progHash[`strategy_${stage}_passed`])
+          : detailHashCurrent ? n(dh.passed_sets || progHash[`strategy_${stage}_passed`]) : 0
         const stagePassed = stagePassedRaw > 0
           ? stagePassedRaw
           : stratCounts[stage] || 0
@@ -1328,7 +1379,7 @@ export async function GET(
         // but cross-validate it against the actual counted values.
         // If pass_rate * stageEvaluated diverges from stagePassed by more
         // than 10%, the hash is stale from a prior cycle — recompute.
-        const passRatioRaw = parseFloat(dh.pass_rate || "0")
+        const passRatioRaw = detailHashCurrent ? parseFloat(dh.pass_rate || "0") : 0
         const passRatioFromRate = passRatioRaw > 0
           ? Math.min(100, Math.round(passRatioRaw * 1000) / 10)
           : 0
@@ -1352,7 +1403,7 @@ export async function GET(
         // represents Sets that are CURRENTLY processing — those holding
         // an open pseudo-position OR mid-formation this cycle. The
         // dashboard surfaces this as the canonical "Active" count.
-        const setsRunningNow  = n(dh.sets_running_now || dh.sets_with_open_positions)
+        const setsRunningNow  = detailHashCurrent ? n(dh.sets_running_now || dh.sets_with_open_positions) : 0
         // setsProgressing: how many sets have entries/positions building up.
         // Fall back to setsRunningNow (sets with open pseudo-positions) NOT
         // createdSets (lifetime total) — createdSets inflates to 9000+ and is
@@ -1362,7 +1413,7 @@ export async function GET(
         stratDetail[stage] = {
           avgPosPerSet:        isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100      : 0,
           createdSets,
-          entriesCount:        n(dh.entries_total || dh.entries_count),
+          entriesCount:        detailHashCurrent ? n(dh.entries_total || dh.entries_count) : 0,
           avgProfitFactor:     isFinite(avgProfitFactor) ? Math.round(avgProfitFactor * 1000) / 1000 : 0,
           avgProcessingTimeMs: isFinite(avgProcessingMs) ? Math.round(avgProcessingMs * 10) / 10     : 0,
           avgPosEvalReal:      isFinite(avgPosEvalReal)  ? Math.round(avgPosEvalReal * 1000) / 1000  : 0,
@@ -1377,7 +1428,7 @@ export async function GET(
           setsProgressing,
           setsWithOpenPositions: setsRunningNow,
           // Main stage only: count of axis "additional Pos-Count Sets" created
-          axisSets: stage === "main" ? n(dh.axis_sets || progHash.strategies_main_axis_sets) : 0,
+          axisSets: stage === "main" && detailHashCurrent ? n(dh.axis_sets || progHash.strategies_main_axis_sets) : 0,
           // Real-only 4-perspective stats (overall/accumulated/general/combined).
           // For non-Real stages the fields are 0 — the dialog only renders
           // the 4-tile panel when stage === "real".
@@ -1448,9 +1499,9 @@ export async function GET(
 
                 return {
                   statOverall:     n(progHash.strategies_real_total) || stratCounts.real || 0,
-                  statAccumulated: n(dh.stat_accumulated),
-                  statGeneral:     n(dh.stat_general) || stageEvaluated || stratCounts.real || 0,
-                  statCombined:    n(dh.stat_combined) || setsRunningNow || stratCounts.real || 0,
+                  statAccumulated: detailHashCurrent ? n(dh.stat_accumulated) : 0,
+                  statGeneral:     (detailHashCurrent ? n(dh.stat_general) : 0) || stageEvaluated || stratCounts.real || 0,
+                  statCombined:    (detailHashCurrent ? n(dh.stat_combined) : 0) || setsRunningNow || stratCounts.real || 0,
                   // ── Hedge pos-count accumulation (long/short per base Set) ──
                   hedgePosAcc: {
                     totalLongEntries:  hedgeTotalLong,
@@ -2898,6 +2949,10 @@ export async function GET(
           progHash.session_number && progHash.epoch
             ? `${progHash.epoch}:${progHash.session_number}`
             : "",
+      },
+
+      diagnostics: {
+        staleStatsIgnored,
       },
 
       // ── Plan fields: added to surface engine internals to UI ────────────

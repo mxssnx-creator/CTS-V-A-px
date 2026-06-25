@@ -1061,6 +1061,19 @@ export class StrategyCoordinator {
   }
 
   /**
+   * Current engine generation stamped onto stats hashes. The progression
+   * epoch is the canonical generation token for this connection; readers can
+   * discard stale hashes left behind by an older engine run.
+   */
+  private async currentStatsGeneration(client = getRedisClient()): Promise<string> {
+    try {
+      const epoch = await client.hget(`progression:${this.connectionId}`, "epoch")
+      if (epoch && Number.isFinite(Number(epoch)) && Number(epoch) > 0) return String(epoch)
+    } catch { /* non-critical */ }
+    return "0"
+  }
+
+  /**
    * Load coordination settings from app settings with per-connection overlay.
    *
    * Reads axis enable flags, variant toggles, and block strategy settings.
@@ -1604,6 +1617,7 @@ export class StrategyCoordinator {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
       const detailKey  = `strategy_detail:${this.connectionId}:base`
+      const generation = await this.currentStatsGeneration(client)
       const baseAvgPF  = baseSets.length > 0 ? baseSets.reduce((s, st) => s + st.avgProfitFactor, 0) / baseSets.length : 0
       const baseAvgDDT = baseSets.length > 0 ? baseSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / baseSets.length : 0
       // Average config entries per Set — the canonical "positions per Set"
@@ -1637,6 +1651,8 @@ export class StrategyCoordinator {
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_base_current", String(baseSets.length)),
         client.hset(detailKey, {
+          generation,
+          epoch: generation,
           // ── Legacy per-cycle aggregate fields ─────────────────────────
           // These hold THIS-symbol's values and are overwritten on every
           // (symbol, cycle). They remain for backwards compatibility but
@@ -1687,6 +1703,7 @@ export class StrategyCoordinator {
           [`s:${symbol}:addt`]:       String(Math.round(baseAvgDDT)),
           [`s:${symbol}:apps`]:       String(baseAvgPosPerSet.toFixed(2)),
           [`s:${symbol}:ts`]:         String(Date.now()),
+          [`s:${symbol}:generation`]: generation,
         }),
         client.expire(detailKey, 86400),
         client.set(`strategies:${this.connectionId}:base:count`, String(baseSets.length)),
@@ -1717,6 +1734,9 @@ export class StrategyCoordinator {
       // hgetalls this hash and aggregates by stage.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
+          generation,
+          epoch: generation,
+          [`${symbol}:base:generation`]: generation,
           [`${symbol}:base`]:          String(baseSets.length),
           // base:evaluated = same as base (every Base Set IS evaluated at Base stage)
           [`${symbol}:base:evaluated`]: String(baseSets.length),
@@ -2318,6 +2338,7 @@ export class StrategyCoordinator {
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
+      const generation = await this.currentStatsGeneration(client)
 
       // ── Running-now resolution for Main (cloned/filtered Sets) ──
       const cache = this._activeKeysCache
@@ -2346,6 +2367,8 @@ export class StrategyCoordinator {
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
         client.hset(mainDetailKey, {
+          generation,
+          epoch: generation,
           created_sets:      String(mainSets.length),
           avg_profit_factor: String(mainAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(mainAvgDDT)),
@@ -2371,12 +2394,16 @@ export class StrategyCoordinator {
           [`s:${symbol}:addt`]:       String(Math.round(mainAvgDDT)),
           [`s:${symbol}:apps`]:       String(mainAvgPosPerSet.toFixed(2)),
           [`s:${symbol}:ts`]:         String(Date.now()),
+          [`s:${symbol}:generation`]: generation,
         }),
         client.expire(mainDetailKey, 86400),
         client.hset(`strategy_detail:${this.connectionId}:base`, {
+          generation,
+          epoch: generation,
           passed_sets: String(baseSets.length),
           pass_rate:   String(passRatioMain.toFixed(4)),
           [`s:${symbol}:passed`]: String(baseSets.length),
+          [`s:${symbol}:generation`]: generation,
         }).catch(() => {}),
         client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length)),
         client.set(`strategies:${this.connectionId}:main:evaluated`, String(mainSets.length)),
@@ -2394,6 +2421,9 @@ export class StrategyCoordinator {
       // bucket was always 0, making the Main column on the dashboard empty.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
+          generation,
+          epoch: generation,
+          [`${symbol}:main:generation`]: generation,
           [`${symbol}:main`]:           String(mainSets.length),
           // main:evaluated = Base Sets that entered Main filter (= candidates)
           [`${symbol}:main:evaluated`]: String(baseSets.length),
@@ -3147,6 +3177,7 @@ export class StrategyCoordinator {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
       const realDetailKey = `strategy_detail:${this.connectionId}:real`
+      const generation = await this.currentStatsGeneration(client)
       // Single pass over realSets — replaces 4 separate .reduce() calls that each
       // allocated an intermediate result and iterated the full array independently.
       let _sumPF = 0, _sumDDT = 0, _sumConf = 0, _sumEC = 0
@@ -3233,6 +3264,8 @@ export class StrategyCoordinator {
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
         client.hset(realDetailKey, {
+          generation,
+          epoch: generation,
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
           // for backwards compat; /stats prefers per-symbol sums below.
           created_sets:       String(realSets.length),
@@ -3280,6 +3313,7 @@ export class StrategyCoordinator {
           [`s:${symbol}:apps`]:       String(realAvgPosPerSet.toFixed(2)),
           [`s:${symbol}:aper`]:       String(realAvgPosEval.toFixed(4)),
           [`s:${symbol}:ts`]:         String(Date.now()),
+          [`s:${symbol}:generation`]: generation,
         }),
         client.expire(realDetailKey, 86400),
         // NOTE: do NOT patch strategy_detail:{conn}:main here. The Main detail
@@ -3315,6 +3349,9 @@ export class StrategyCoordinator {
       // forward to Live evaluation — not the raw post-filter count.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
+          generation,
+          epoch: generation,
+          [`${symbol}:real:generation`]: generation,
           [`${symbol}:real`]:           String(realSets.length),
           // real:evaluated = Main Sets that entered PF evaluation (excludes
           // pos-count pre-gated Sets). Cross-symbol sum in stats route will
@@ -3390,7 +3427,7 @@ export class StrategyCoordinator {
           client.hincrby(vKey, "passed_sets",    agg.passedSets),
           client.hincrby(vKey, "sum_pf_x1000",   Math.round(agg.sumPF * 1000)),
           client.hincrby(vKey, "sum_ddt_x10",    Math.round(agg.sumDDT * 10)),
-          client.hset(vKey, { updated_at: new Date().toISOString() }),
+          client.hset(vKey, { updated_at: new Date().toISOString(), generation, epoch: generation }),
           client.expire(vKey, 7 * 24 * 60 * 60),
         )
       }
@@ -3492,6 +3529,8 @@ export class StrategyCoordinator {
               const avgPosPerSet = createdSets > 0 ? entriesCount / createdSets : 0
               const passRate = createdSets > 0 ? (Number(h.passed_sets || "0") / createdSets) : 0
               await client.hset(vKey, {
+                generation,
+                epoch: generation,
                 avg_profit_factor: avgPF.toFixed(4),
                 avg_drawdown_time: avgDDT.toFixed(2),
                 avg_pos_per_set:   avgPosPerSet.toFixed(2),
@@ -3704,6 +3743,7 @@ export class StrategyCoordinator {
       const redisKey = `progression:${this.connectionId}`
       const liveDetailKey = `strategy_detail:${this.connectionId}:live`
       const liveCountKey = `strategies:${this.connectionId}:live:count`
+      const generation = await this.currentStatsGeneration(client)
 
       const liveAvgPF  = qualifying.length > 0 ? qualifying.reduce((s, st) => s + st.avgProfitFactor, 0) / qualifying.length : 0
       const liveAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
@@ -3775,6 +3815,8 @@ export class StrategyCoordinator {
         const avgDDT = agg.sumDDT / ec
         liveVariantWrites.push(
           client.hset(vKey, {
+            generation,
+            epoch: generation,
             created_sets:      String(agg.setsContaining),
             entries_count:     String(agg.entries),
             avg_profit_factor: avgPF.toFixed(4),
@@ -3799,6 +3841,9 @@ export class StrategyCoordinator {
         // Without {symbol}:live fields the `stratCounts.live` bucket in the
         // stats route always returned 0, making the Live column empty.
         client.hset(`strategies_active:${this.connectionId}`, {
+          generation,
+          epoch: generation,
+          [`${symbol}:live:generation`]: generation,
           [`${symbol}:live`]:           String(qualifying.length),
           // live:evaluated = Real Sets that entered Live selection (= candidates)
           [`${symbol}:live:evaluated`]: String(realSets.length),
@@ -3806,6 +3851,8 @@ export class StrategyCoordinator {
         client.expire(`strategies_active:${this.connectionId}`, 600),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(liveDetailKey, {
+          generation,
+          epoch: generation,
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
           // for backwards compat; /stats prefers per-symbol sums below.
           created_sets:      String(qualifying.length),
@@ -3838,6 +3885,7 @@ export class StrategyCoordinator {
           [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(liveAvgDDT)),
           [`s:${symbol}:ts`]:         String(Date.now()),
+          [`s:${symbol}:generation`]: generation,
         }),
         client.expire(liveDetailKey, 86400),
         // `set` with EX in a single command avoids the separate expire round-trip.
