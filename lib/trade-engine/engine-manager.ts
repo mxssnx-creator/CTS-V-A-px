@@ -632,7 +632,7 @@ export class TradeEngineManager {
           symbols_hash: symbolsHash,
           is_live_trade: connData.is_live_trade || "0",
           is_preset_trade: connData.is_preset_trade || "0",
-          live_volume_factor: connData.live_volume_factor || "1",
+          live_volume_factor: connData.live_volume_factor || "0.1",
           connection_method: connData.connection_method || "library",
           updated_at: new Date().toISOString(),
         }
