@@ -55,7 +55,27 @@ async function emitSettingsChanged(keyCount: number, changedKeys: string[]): Pro
   }
 }
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
+
+const POSITION_COST_MIN_PERCENT = 0.02
+const POSITION_COST_MAX_PERCENT = 1.0
+const POSITION_COST_KEYS = ["positionCost", "exchangePositionCost", "exchange_position_cost"] as const
+
+function normalizePositionCostSettings<T extends Record<string, any>>(settings: T): T {
+  const normalized: Record<string, any> = { ...settings }
+
+  for (const key of POSITION_COST_KEYS) {
+    if (normalized[key] === undefined || normalized[key] === null || normalized[key] === "") continue
+
+    const value = Number(normalized[key])
+    if (Number.isFinite(value)) {
+      normalized[key] = Math.max(POSITION_COST_MIN_PERCENT, Math.min(POSITION_COST_MAX_PERCENT, value))
+    }
+  }
+
+  return normalized as T
+}
 
 function getDefaultSettings(): Record<string, any> {
   return {
@@ -97,6 +117,8 @@ function getDefaultSettings(): Record<string, any> {
     // user-facing slider. Seeded so fresh installs match what the Strategy
     // Coordinator's `evaluateRealSets` falls back to internally.
     maxRealSets: 12000,
+    positionCost: POSITION_COST_MIN_PERCENT,
+    exchangePositionCost: POSITION_COST_MIN_PERCENT,
   }
   }
 
@@ -142,7 +164,8 @@ export async function POST(request: Request) {
     // pseudo-position-manager, market-data-cache, indication-processor-fixed,
     // indication-sets-processor — all of which read `all_settings`) see the
     // same snapshot on the next cycle.
-    await setAppSettings(body)
+    const normalizedBody = normalizePositionCostSettings(body)
+    await setAppSettings(normalizedBody)
     // Bust the in-process compaction config cache so the new
     // setCompactionFloor / setCompactionThresholdPct / per-type
     // overrides apply on the very next save cycle (otherwise the 5s
@@ -152,7 +175,7 @@ export async function POST(request: Request) {
     // Fan out a progression event AND a coordinator reload signal so the
     // running engine immediately picks up new positionCost / leverage /
     // TP/SL values without waiting for the 3 s watcher tick.
-    const changedKeys = Object.keys(body || {})
+    const changedKeys = Object.keys(normalizedBody || {})
     await emitSettingsChanged(changedKeys.length, changedKeys)
 
     console.log("[v0] Settings saved successfully to Redis (canonical + legacy mirror)")
@@ -182,7 +205,7 @@ export async function PUT(request: Request) {
     // semantics stay correct even if a setting currently lives only in the
     // legacy hash.
     const existingSettings = (await getAppSettings({ bypassCache: true })) || {}
-    const mergedSettings = { ...existingSettings, ...incoming }
+    const mergedSettings = normalizePositionCostSettings({ ...existingSettings, ...incoming })
 
     await setAppSettings(mergedSettings)
     invalidateCompactionCache()

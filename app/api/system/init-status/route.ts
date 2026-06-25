@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { getBaseConnectionCredentials } from "@/lib/base-connection-credentials"
 import { isTruthyFlag } from "@/lib/boolean-utils"
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 /**
