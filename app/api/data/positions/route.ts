@@ -137,6 +137,7 @@ async function getRealPositions(connectionId: string): Promise<Position[]> {
   }
 }
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const connectionId = request.nextUrl.searchParams.get("connectionId")

@@ -79,6 +79,22 @@ export async function POST(request: NextRequest) {
     await initRedis()
     const client = getRedisClient()
     
+    // DOUBLE-START GUARD: Check if already running to prevent concurrent startup issues
+    try {
+      const currentStatus = await client.hget("trade_engine:global", "status")
+      if (currentStatus === "running") {
+        console.log("[v0] [Trade Engine] Already running — skipping redundant start request")
+        return NextResponse.json({ 
+          success: true, 
+          message: "Engine already running", 
+          alreadyRunning: true,
+          startedConnections: [],
+        })
+      }
+    } catch (e) {
+      console.warn("[v0] [Trade Engine] Double-start check failed (continuing anyway):", e)
+    }
+    
     // Set global state in Redis (write-through to Upstash via persistent key prefix)
     // CRITICAL: clear `operator_stopped` so the migration bootstrap stops
     // honouring a prior explicit halt. Without this, a subsequent module
