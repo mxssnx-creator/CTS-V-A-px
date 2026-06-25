@@ -22,6 +22,8 @@ export interface RealPosition {
   rewardTarget: number
   stopLoss: number
   takeProfit: number
+  slFloorReason?: string
+  netEffectivePF?: number
   mainPositionCount: number
   evaluationScore: number // 0-1, final trading score
   ratioMet: boolean // Whether all ratio checks passed
