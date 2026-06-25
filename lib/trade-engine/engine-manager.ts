@@ -1878,6 +1878,7 @@ export class TradeEngineManager {
                 symbol,
                 mode: "realtime" as const,
                 indicationCount: 0,
+                indicationTypeCounts: {},
                 pseudoUpdates: 0,
                 strategiesEvaluated: 0,
                 liveReady: 0,
@@ -1915,29 +1916,17 @@ export class TradeEngineManager {
           pipelinePseudoUpdates += r.pseudoUpdates
         }
 
-        // Build per-type counts from pipeline result metadata.
-        // pipelineResults carry indicationCount (total per symbol) but not the
-        // individual indication objects (processIndication returns them inside
-        // the processor and the count is bubbled up via PipelineCycleResult).
-        // The canonical type breakdown comes from the active indication configs;
-        // we approximate it here as: symbols that produced > 0 indications
-        // contributed one "realtime" type indication per symbol (the inline
-        // PF-based fallback). When the full indication pipeline is wired in,
-        // the per-type field will reflect real type keys from the processor.
+        // Build per-type counts from the actual indications emitted by
+        // processIndication. PipelineCycleResult carries an already-reduced
+        // map so this loop preserves canonical live families (direction, move,
+        // active, optimal, auto, and any future processor-emitted types) without
+        // synthesizing pseudo-types such as pf_inline/strategy_eval/live_ready.
         const indicationTypeCounts: Record<string, number> = {}
         for (const r of pipelineResults) {
-          if (r.indicationCount > 0) {
-            // Tag indications from this cycle. The processor uses "pf_inline"
-            // as the type when falling back to the inline PF-based indication;
-            // real types (sma_cross, rsi, macd, etc.) will appear here once the
-            // indication pipeline emits them with a `type` field.
-            indicationTypeCounts["pf_inline"] = (indicationTypeCounts["pf_inline"] || 0) + r.indicationCount
-          }
-          if (r.strategiesEvaluated > 0) {
-            indicationTypeCounts["strategy_eval"] = (indicationTypeCounts["strategy_eval"] || 0) + r.strategiesEvaluated
-          }
-          if (r.liveReady > 0) {
-            indicationTypeCounts["live_ready"] = (indicationTypeCounts["live_ready"] || 0) + r.liveReady
+          for (const [type, count] of Object.entries(r.indicationTypeCounts ?? {})) {
+            if (count > 0) {
+              indicationTypeCounts[type] = (indicationTypeCounts[type] ?? 0) + count
+            }
           }
         }
         void pipelineStrategiesEvaluated; void pipelineLiveReady; void pipelinePseudoUpdates
@@ -1945,6 +1934,12 @@ export class TradeEngineManager {
         const totalIndications = indicationResults.reduce((sum: number, arr: any[]) => sum + (arr?.length || 0), 0)
         // producedIndications = totalIndications > 0
         producedIndications = totalIndications > 0
+        const missingTypeBreakdown = totalIndications > 0 && Object.keys(indicationTypeCounts).length === 0
+        if (missingTypeBreakdown) {
+          console.warn(
+            `[v0] [IndicationProcessor] WARNING: produced ${totalIndications} indications but no indication types were reported`,
+          )
+        }
 
         // Increment cycle count BEFORE writing to Redis so the stored value is accurate
         cycleCount++
@@ -2038,15 +2033,11 @@ export class TradeEngineManager {
           if (cycleCount % 500 === 1) {
             writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
           }
-          // GATE ON REAL PRODUCTION: `indicationTypeCounts` is intentionally
-          // left empty here (per-type counters are written authoritatively by
-          // trackIndicationStats inside the processor). The cumulative
-          // `indications_count` and the "live" cycle counter must therefore be
-          // gated on the REAL produced total — `totalIndications` — not on the
-          // always-empty indicationTypeCounts map. The previous guard
-          // (`Object.keys(indicationTypeCounts).length > 0`) was always false,
-          // so indications_count / indication_live_cycle_count never advanced
-          // and the dashboard's total-indications tile was stuck at 0.
+          // GATE ON REAL PRODUCTION: total indication telemetry remains based
+          // on the produced total, while per-type counters are now written from
+          // the real processor-emitted type map. If a cycle produces signals but
+          // no type map, the warning above surfaces the mismatch without losing
+          // the cumulative total.
           if (totalIndications > 0) {
             writes.push(client.hincrby(redisKey, "indication_live_cycle_count", 1))
             for (const [type, count] of Object.entries(indicationTypeCounts)) {
