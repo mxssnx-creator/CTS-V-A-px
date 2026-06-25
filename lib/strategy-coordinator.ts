@@ -4379,6 +4379,24 @@ export class StrategyCoordinator {
 
 
 
+    const {
+      dispatchSets,
+      dispatchSelected,
+      dispatchSuppressed,
+      dispatchSuppressedKeys,
+    } = this.preselectLiveDispatchSets(qualifying)
+
+    console.log(
+      `[v0] [StrategyFlow] ${this.connectionId}:${symbol} LIVE dispatch preselection`,
+      {
+        live_candidates: qualifying.length,
+        dispatchSelected,
+        dispatchSuppressed,
+        dispatchSuppressedKeys,
+      },
+    )
+
+    // Persist LIVE candidate sets — slim format (coord keys only). Skip in dev:
     // ── Live dispatch preselection ──────────────────────────────────────
     // `qualifying` is the Live candidate pool after PF/DDT/rank/cap. Only
     // `dispatchSets` are active/running targets for pseudo/live execution:
@@ -4501,6 +4519,9 @@ export class StrategyCoordinator {
       })
     }
 
+    // Create pseudo positions from the actually selected LIVE dispatch subset only.
+    // `qualifying` remains the candidate pool after PF/DDT/maxLive; `dispatchSets`
+    // is the dedup-aware subset that may actually run this cycle.
     // Create pseudo positions only for dispatch-selected LIVE Sets.
     // `qualifying` is the candidate pool; `dispatchSets` is the active/running
     // subset after duplicate-direction suppression. This keeps Live active logs
@@ -4520,6 +4541,10 @@ export class StrategyCoordinator {
       const generation = await this.currentStatsGeneration(client)
       const statsGeneration = await this.getStatsGeneration(client)
 
+      const liveAvgPF  = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + st.avgProfitFactor, 0) / dispatchSets.length : 0
+      const liveAvgDDT = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / dispatchSets.length : 0
+      const candidateAvgPF  = qualifying.length > 0 ? qualifying.reduce((s, st) => s + st.avgProfitFactor, 0) / qualifying.length : 0
+      const candidateAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
       const liveAvgPF  = dispatchAvgPF
       const liveAvgDDT = dispatchAvgDDT
       const passRatioLive = realSets.length > 0 ? qualifying.length / realSets.length : 0
@@ -4643,14 +4668,16 @@ export class StrategyCoordinator {
         )
       }
 
+      const dispatchEntryCount = dispatchSets.reduce((s, st) => s + (st.entryCount || 0), 0)
+
       // strategies_live_total must be CUMULATIVE (hincrby), not a per-cycle
       // snapshot (hset). All other stage _total fields use hincrby; using hset
       // here made Live's lifetime total reset to the current-cycle count every
       // cycle, so the dashboard always showed a tiny snapshot instead of the
       // true accumulated lifetime count.
       await Promise.all([
-        qualifying.length > 0
-          ? client.hincrby(redisKey, "strategies_live_total", qualifying.length)
+        dispatchSets.length > 0
+          ? client.hincrby(redisKey, "strategies_live_total", dispatchSets.length)
           : Promise.resolve(),
         realSets.length > 0
           ? client.hincrby(redisKey, "strategies_live_evaluated", realSets.length)
@@ -4659,6 +4686,10 @@ export class StrategyCoordinator {
         // Without {symbol}:live fields the `stratCounts.live` bucket in the
         // stats route always returned 0, making the Live column empty.
         client.hset(`strategies_active:${this.connectionId}`, {
+          [`${symbol}:live`]:           String(dispatchSets.length),
+          // live:evaluated = Real Sets that entered Live selection (= candidates)
+          [`${symbol}:live:evaluated`]: String(realSets.length),
+          [`${symbol}:live:candidates`]: String(qualifying.length),
           generation,
           epoch: generation,
           [`${symbol}:live:generation`]: generation,
@@ -4686,6 +4717,20 @@ export class StrategyCoordinator {
           output_sets:       String(qualifying.length),
           previous_stage_output_sets: String(realSets.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
+          live_candidates:   String(qualifying.length),
+          dispatch_candidates: String(qualifying.length),
+          dispatch_selected: String(dispatchSelected),
+          dispatch_suppressed: String(dispatchSuppressed),
+          dispatch_suppressed_keys: dispatchSuppressedKeys.join(","),
+          candidate_avg_profit_factor: String(candidateAvgPF.toFixed(4)),
+          candidate_avg_drawdown_time: String(Math.round(candidateAvgDDT)),
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
+          // `qualifying` is the Live candidate pool after PF/DDT/maxLive.
+          // `dispatchSets` is the subset selected to actually run after
+          // per-direction/variant preselection.
+          sets_running_now:         String(dispatchSets.length),
+          sets_with_open_positions: String(dispatchSets.length),
+          sets_progressing:         String(qualifying.length),
           dispatch_candidates: String(qualifying.length),
           dispatch_selected_count: String(dispatchSets.length),
           dispatch_suppressed_count: String(dispatchSuppressed.length),
@@ -4715,6 +4760,9 @@ export class StrategyCoordinator {
           // those keys are intentionally omitted from the per-symbol
           // bundle so /stats's weighted-mean calculator skips them.
           [`s:${symbol}:created`]:    String(dispatchSets.length),
+          [`s:${symbol}:entries`]:    String(dispatchEntryCount),
+          [`s:${symbol}:running`]:    String(dispatchSets.length),
+          [`s:${symbol}:progressing`]: String(qualifying.length),
           [`s:${symbol}:entries`]:    String(dispatchEntries),
           [`s:${symbol}:running`]:    String(dispatchSets.length),
           [`s:${symbol}:progressing`]: String(realSets.length),
@@ -5449,7 +5497,7 @@ export class StrategyCoordinator {
     // Create EXACTLY ONE pseudo position per Set (one per indication_type × direction combination).
     // Each Set represents a unique (indication_type × direction) coordinate.
     // We pick the highest-profitFactor entry from the Set as the representative config for the position.
-    if (qualifying.length > 0) {
+    if (dispatchSets.length > 0) {
       try {
         const posManager = new PseudoPositionManager(this.connectionId)
 
@@ -5485,7 +5533,7 @@ export class StrategyCoordinator {
           // enforced inside createPosition (one active pseudo position per Set).
           // Safe to fan out in parallel — no exchange calls, no shared balance.
           const creations = await Promise.all(
-            qualifying.map(async (set) => {
+            dispatchSets.map(async (set) => {
               try {
                 // Axis Sets carry one synthetic representative entry; for SL/TP
                 // derivation we need the full entries[] from the Base Set.
@@ -5582,6 +5630,71 @@ export class StrategyCoordinator {
         avgDrawdownTime: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgDrawdownTime, 0) / qualifying.length : 0,
       },
       sets: dispatchSets,
+    }
+  }
+
+  /**
+   * Select the Live candidate Sets that may actually dispatch this cycle.
+   *
+   * `qualifying` is the Live candidate pool after PF/DDT/maxLive filtering.
+   * The exchange path can only make progress for the first highest-PF Set in
+   * each direction/variant dispatch lane, so active/running metrics must use
+   * this selected subset rather than the wider candidate count.
+   */
+  private preselectLiveDispatchSets(qualifying: StrategySet[]): {
+    dispatchSets: StrategySet[]
+    dispatchSelected: number
+    dispatchSuppressed: number
+    dispatchSuppressedKeys: string[]
+  } {
+    const dispatchSets: StrategySet[] = []
+    const dispatchSuppressedKeys: string[] = []
+    let sawNewLong  = false
+    let sawNewShort = false
+    let sawBlockLong  = false
+    let sawBlockShort = false
+    let sawDcaLong    = false
+    let sawDcaShort   = false
+
+    for (const s of qualifying) {
+      const isBlock = s.variant === "block"
+      const isDca   = s.variant === "dca"
+      const isNew   = !isBlock && !isDca // default / trailing / pause
+      let selected = false
+
+      if (s.direction === "long") {
+        if (isNew && !sawNewLong) {
+          sawNewLong = true
+          selected = true
+        } else if (isBlock && !sawBlockLong) {
+          sawBlockLong = true
+          selected = true
+        } else if (isDca && !sawDcaLong) {
+          sawDcaLong = true
+          selected = true
+        }
+      } else {
+        if (isNew && !sawNewShort) {
+          sawNewShort = true
+          selected = true
+        } else if (isBlock && !sawBlockShort) {
+          sawBlockShort = true
+          selected = true
+        } else if (isDca && !sawDcaShort) {
+          sawDcaShort = true
+          selected = true
+        }
+      }
+
+      if (selected) dispatchSets.push(s)
+      else dispatchSuppressedKeys.push(s.setKey)
+    }
+
+    return {
+      dispatchSets,
+      dispatchSelected: dispatchSets.length,
+      dispatchSuppressed: dispatchSuppressedKeys.length,
+      dispatchSuppressedKeys,
     }
   }
 
