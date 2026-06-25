@@ -146,6 +146,7 @@ export async function GET(
       strategyDetailBaseHashRaw,
       strategyDetailMainHashRaw,
       strategyDetailRealHashRaw,
+      strategyDetailLiveHashRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -184,6 +185,8 @@ export async function GET(
       client.hgetall(`strategy_detail:${connectionId}:main`).catch(() => null),
       // Per-symbol strategy detail for the Real stage (performance tier source).
       client.hgetall(`strategy_detail:${connectionId}:real`).catch(() => null),
+      // Live-stage detail also carries compact dispatch selected/suppressed summaries.
+      client.hgetall(`strategy_detail:${connectionId}:live`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
@@ -195,6 +198,7 @@ export async function GET(
     const strategyDetailBaseHash: Record<string, string> = (strategyDetailBaseHashRaw as Record<string, string>) || {}
     const strategyDetailMainHash: Record<string, string> = (strategyDetailMainHashRaw as Record<string, string>) || {}
     const strategyDetailRealHash: Record<string, string> = (strategyDetailRealHashRaw as Record<string, string>) || {}
+    const strategyDetailLiveHash: Record<string, string> = (strategyDetailLiveHashRaw as Record<string, string>) || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -1223,7 +1227,7 @@ export async function GET(
           if (ageMs > PRUNE_MS) {
             // Collect every per-symbol field for HDEL. Cheap because
             // these are stale samples already excluded from aggregation.
-            for (const f of ["created","entries","running","progressing","passed","evaluated","apf","addt","apps","aper","ts"]) {
+            for (const f of ["created","entries","running","progressing","passed","evaluated","apf","addt","apps","aper","dispatch_selected","dispatch_suppressed","ts"]) {
               if (`s:${symbol}:${f}` in dh) staleFields.push(`s:${symbol}:${f}`)
             }
             continue
@@ -1505,6 +1509,60 @@ export async function GET(
       }
     } catch { /* archive empty */ }
 
+    type DispatchSummaryRow = {
+      bucket: string
+      direction: string
+      isTrailing: boolean
+      reason: string
+      count: number
+      detail?: string
+    }
+    const parseDispatchSummary = (raw: unknown): DispatchSummaryRow[] => {
+      if (!raw || typeof raw !== "string") return []
+      try {
+        const parsed = JSON.parse(raw)
+        if (!Array.isArray(parsed)) return []
+        return parsed
+          .map((row) => ({
+            bucket: String(row?.bucket || "unknown"),
+            direction: String(row?.direction || "unknown"),
+            isTrailing: Boolean(row?.isTrailing),
+            reason: String(row?.reason || "unknown"),
+            count: Number(row?.count || 0) || 0,
+            ...(row?.detail ? { detail: String(row.detail) } : {}),
+          }))
+          .filter((row) => row.count > 0)
+      } catch {
+        return []
+      }
+    }
+    const mergeDispatchSummaries = (rows: DispatchSummaryRow[]): DispatchSummaryRow[] => {
+      const merged = new Map<string, DispatchSummaryRow>()
+      for (const row of rows) {
+        const key = `${row.bucket}|${row.direction}|${row.isTrailing ? "1" : "0"}|${row.reason}|${row.detail || ""}`
+        const existing = merged.get(key)
+        if (existing) {
+          existing.count += row.count
+        } else {
+          merged.set(key, { ...row })
+        }
+      }
+      return Array.from(merged.values()).sort((a, b) => b.count - a.count || a.bucket.localeCompare(b.bucket))
+    }
+    const readFreshSymbolDispatchSummary = (suffix: "dispatch_selected" | "dispatch_suppressed"): DispatchSummaryRow[] => {
+      const FRESH_MS = 5 * 60 * 1000
+      const nowMs = Date.now()
+      const rows: DispatchSummaryRow[] = []
+      for (const [field, raw] of Object.entries(strategyDetailLiveHash)) {
+        if (!field.startsWith("s:") || !field.endsWith(`:${suffix}`)) continue
+        const symbol = field.slice(2, -(suffix.length + 1))
+        const ts = Number(strategyDetailLiveHash[`s:${symbol}:ts`] || "0") || 0
+        if (!ts || nowMs - ts > FRESH_MS) continue
+        rows.push(...parseDispatchSummary(raw))
+      }
+      return mergeDispatchSummaries(rows)
+    }
+
     // ── LIVE STAGE DETAIL (4th tier — mirrors Real but from real exchange) ��──
     // Sourced entirely from local Redis — the progression hash (counters) and
     // the closed-position archive written by the live-stage pipeline. No
@@ -1551,6 +1609,16 @@ export async function GET(
       const passRate   = livePlaced > 0 ? liveFilled / livePlaced : 0
       const winRate    = liveClosed > 0 ? liveWins / liveClosed : 0
       const avgPosSize = liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
+      const perSymbolDispatchSelected = readFreshSymbolDispatchSummary("dispatch_selected")
+      const perSymbolDispatchSuppressed = readFreshSymbolDispatchSummary("dispatch_suppressed")
+      const dispatchSelected = perSymbolDispatchSelected.length > 0
+        ? perSymbolDispatchSelected
+        : parseDispatchSummary(strategyDetailLiveHash.dispatch_selected)
+      const dispatchSuppressed = perSymbolDispatchSuppressed.length > 0
+        ? perSymbolDispatchSuppressed
+        : parseDispatchSummary(strategyDetailLiveHash.dispatch_suppressed)
+      const dispatchSelectedCount = dispatchSelected.reduce((sum, row) => sum + row.count, 0)
+      const dispatchSuppressedCount = dispatchSuppressed.reduce((sum, row) => sum + row.count, 0)
 
       stratDetail.live = {
         // Same shape as base/main/real so the UI can reuse its row renderer:
@@ -1574,6 +1642,10 @@ export async function GET(
         avgPnl:         Math.round(avgPnl * 100) / 100,
         openPositions:  Math.max(0, liveCreated - liveClosed),
         volumeUsdTotal: Math.round(liveVolumeUsd * 100) / 100,
+        dispatchSelected,
+        dispatchSuppressed,
+        dispatchSelectedCount,
+        dispatchSuppressedCount,
       }
     }
 

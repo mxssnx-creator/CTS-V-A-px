@@ -3668,7 +3668,94 @@ export class StrategyCoordinator {
         }
       }
     } catch (e) { /* non-fatal */ }
+    type DispatchSelectionRow = {
+      bucket: string
+      direction: "long" | "short"
+      isTrailing: boolean
+      reason: string
+      count: number
+      detail?: string
+    }
+    const dispatchSelectionKey = (set: StrategySet) => {
+      const bucket = set.variant || "default"
+      const isTrailing = bucket === "trailing" || !!set.trailingProfile
+      return { bucket, isTrailing }
+    }
+    const bumpDispatchRow = (
+      rows: DispatchSelectionRow[],
+      set: StrategySet,
+      reason: string,
+      detail?: string,
+    ) => {
+      const { bucket, isTrailing } = dispatchSelectionKey(set)
+      const existing = rows.find((row) =>
+        row.bucket === bucket &&
+        row.direction === set.direction &&
+        row.isTrailing === isTrailing &&
+        row.reason === reason &&
+        row.detail === detail
+      )
+      if (existing) {
+        existing.count += 1
+      } else {
+        rows.push({
+          bucket,
+          direction: set.direction,
+          isTrailing,
+          reason,
+          count: 1,
+          ...(detail ? { detail } : {}),
+        })
+      }
+    }
 
+    // Compact live-dispatch selection summary. `qualifying` may contain many
+    // high-PF Sets per symbol/direction, but the live exchange dispatcher only
+    // attempts the top Set per executable bucket/direction to avoid per-cycle
+    // duplicate-lock overhead. Persist both sides of that selection decision
+    // into strategy_detail:{conn}:live so stats/UI can explain why Live counts
+    // differ from attempted dispatch counts without enabling noisy per-cycle logs.
+    const dispatchSets: StrategySet[] = []
+    const dispatchSelectedRows: DispatchSelectionRow[] = []
+    const dispatchSuppressedRows: DispatchSelectionRow[] = []
+    {
+      let sawNewLong  = false
+      let sawNewShort = false
+      let sawBlockLong  = false
+      let sawBlockShort = false
+      let sawDcaLong    = false
+      let sawDcaShort   = false
+      for (const s of qualifying) {
+        const isBlock = s.variant === "block"
+        const isDca   = s.variant === "dca"
+        const isNew   = !isBlock && !isDca // default / trailing / pause
+        let selected = false
+        let suppressReason = "duplicate_new_direction"
+        let detail = "A higher-ranked new/default/trailing/pause Set already targets this direction."
+        if (s.direction === "long") {
+          if (isNew && !sawNewLong) { selected = true; sawNewLong = true }
+          else if (isBlock && !sawBlockLong) { selected = true; sawBlockLong = true }
+          else if (isDca && !sawDcaLong) { selected = true; sawDcaLong = true }
+        } else {
+          if (isNew && !sawNewShort) { selected = true; sawNewShort = true }
+          else if (isBlock && !sawBlockShort) { selected = true; sawBlockShort = true }
+          else if (isDca && !sawDcaShort) { selected = true; sawDcaShort = true }
+        }
+        if (isBlock) {
+          suppressReason = "duplicate_block_direction"
+          detail = "A higher-ranked block Set already targets this direction."
+        } else if (isDca) {
+          suppressReason = "duplicate_dca_direction"
+          detail = "A higher-ranked DCA Set already targets this direction."
+        }
+        if (selected) {
+          dispatchSets.push(s)
+          bumpDispatchRow(dispatchSelectedRows, s, "selected", "Highest-ranked Set for this dispatch bucket and direction.")
+        } else {
+          bumpDispatchRow(dispatchSuppressedRows, s, suppressReason, detail)
+        }
+      }
+    }
 
 
     // Persist LIVE sets — slim format (coord keys only). Skip in dev:
@@ -3837,6 +3924,10 @@ export class StrategyCoordinator {
           [`s:${symbol}:evaluated`]:  String(realSets.length),
           [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(liveAvgDDT)),
+          dispatch_selected:    JSON.stringify(dispatchSelectedRows),
+          dispatch_suppressed:  JSON.stringify(dispatchSuppressedRows),
+          [`s:${symbol}:dispatch_selected`]:   JSON.stringify(dispatchSelectedRows),
+          [`s:${symbol}:dispatch_suppressed`]: JSON.stringify(dispatchSuppressedRows),
           [`s:${symbol}:ts`]:         String(Date.now()),
         }),
         client.expire(liveDetailKey, 86400),
@@ -3934,30 +4025,8 @@ export class StrategyCoordinator {
             // Without this rule, block/dca sets targeting e.g. long were
             // always dropped because `sawLong=true` was already set by the
             // default set, meaning block strategy NEVER dispatched.
-            const dispatchSets: StrategySet[] = []
-            {
-              let sawNewLong  = false
-              let sawNewShort = false
-              let sawBlockLong  = false
-              let sawBlockShort = false
-              let sawDcaLong    = false
-              let sawDcaShort   = false
-              for (const s of qualifying) {
-                const isBlock = s.variant === "block"
-                const isDca   = s.variant === "dca"
-                const isNew   = !isBlock && !isDca // default / trailing / pause
-                if (s.direction === "long") {
-                  if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
-                  if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
-                  if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
-                } else {
-                  if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
-                  if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
-                  if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
-                }
-                if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
-              }
-            }
+            // Reuse the precomputed compact dispatch selection above; it is also persisted to strategy_detail live stats.
+
 
             let placed = 0
             let filled = 0
