@@ -3,6 +3,7 @@
  * Evaluates preset strategies using historical data with profit factor and drawdown metrics
  */
 
+import { resolveStopLossPercent } from "@/lib/tp-sl-ratio"
 import { getSettings, setSettings } from "@/lib/redis-db"
 import { sql } from "@/lib/db"
 
@@ -282,10 +283,11 @@ export class BacktestEngine {
         ? entryPrice * (1 + (strategy.takeprofit_factor * 0.001) / 0.1) // TP in relation to 0.1% position cost
         : entryPrice * (1 - (strategy.takeprofit_factor * 0.001) / 0.1)
 
+    const stopLossPercent = resolveStopLossPercent(strategy.takeprofit_factor, strategy.stoploss_ratio)
     const slPrice =
       side === "long"
-        ? entryPrice * (1 - (strategy.stoploss_ratio * strategy.takeprofit_factor * 0.001) / 0.1)
-        : entryPrice * (1 + (strategy.stoploss_ratio * strategy.takeprofit_factor * 0.001) / 0.1)
+        ? entryPrice * (1 - stopLossPercent / 100)
+        : entryPrice * (1 + stopLossPercent / 100)
 
     // Simulate price movement until TP, SL, or timeout
     let exitPrice = entryPrice
@@ -382,7 +384,20 @@ export class BacktestEngine {
     const totalProfit = trades.filter((t) => t.profit_loss > 0).reduce((sum, t) => sum + t.profit_loss, 0)
     const totalLoss = Math.abs(trades.filter((t) => t.profit_loss <= 0).reduce((sum, t) => sum + t.profit_loss, 0))
     const netProfit = totalProfit - totalLoss
-    const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? 999 : 0
+    
+    // Cost-adjusted PF: totalProfit / (totalLoss + totalPositionCosts)
+    // Position cost = entry_price × quantity × 0.001 (0.1% maker fee)
+    // For backtest trades, we calculate cost from entry_price and assume unit qty
+    const totalPositionCosts = trades.reduce((sum, t) => {
+      if (Number.isFinite(t.entry_price) && t.entry_price > 0) {
+        // Backtest assumes unit quantity, so cost = entry_price × 0.001
+        return sum + (t.entry_price * 0.001)
+      }
+      return sum
+    }, 0)
+    
+    const adjustedDenominator = totalLoss + totalPositionCosts
+    const profitFactor = adjustedDenominator > 0 ? totalProfit / adjustedDenominator : totalProfit > 0 ? 999 : 0
 
     const avgWin = winningTrades > 0 ? totalProfit / winningTrades : 0
     const avgLoss = losingTrades > 0 ? totalLoss / losingTrades : 0

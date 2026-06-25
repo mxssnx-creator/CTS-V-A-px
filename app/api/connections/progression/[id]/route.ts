@@ -5,6 +5,10 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 
 export const dynamic = "force-dynamic"
+export const dynamicParams = true
+export const runtime = "nodejs"
+export const revalidate = 0
+export const fetchCache = "force-no-store"
 
 function toNumber(value: unknown): number {
   const n = Number(value)
@@ -141,24 +145,19 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       progHash = (await client.hgetall(`progression:${connectionId}`)) || {}
     } catch { /* non-critical */ }
 
-    let indicationsCount = parseInt(progHash.indications_count || "0", 10)
-    let strategiesCount  = parseInt(progHash.strategies_count  || "0", 10)
-
-    // Fallback to string counter keys written by statistics-tracker
-    if (indicationsCount === 0) {
-      indicationsCount = toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0))
-    }
-    if (strategiesCount === 0) {
-      strategiesCount = toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0))
-    }
-
     // Cycle counts: prefer live progression hash over engineState (more current)
     const indicationCycleCount =
       parseInt(progHash.indication_cycle_count || "0", 10) ||
-      toNumber(engineState?.indication_cycle_count)
+      toNumber(engineState?.indication_cycle_count) ||
+      progressionState.indicationCycleCount ||
+      progressionState.indicationLiveCycleCount ||
+      0
     const strategyCycleCount =
       parseInt(progHash.strategy_cycle_count || "0", 10) ||
-      toNumber(engineState?.strategy_cycle_count)
+      toNumber(engineState?.strategy_cycle_count) ||
+      progressionState.strategyCycleCount ||
+      progressionState.strategyLiveCycleCount ||
+      0
     const hasRecentActivity = engineState?.last_indication_run 
       ? (Date.now() - new Date(engineState.last_indication_run).getTime()) < 60000 // Active in last 60s
       : false
@@ -168,6 +167,38 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       (isGloballyRunning && (isActiveInserted || isInserted) && isEnabled) ||
       engineState?.status === "running" ||
       hasRecentActivity
+
+    let indicationsCount = parseInt(progHash.indications_count || "0", 10)
+    let strategiesCount  = parseInt(progHash.strategies_count  || "0", 10)
+
+    // Fallback to string counter keys written by statistics-tracker, then to
+    // the canonical progression-state fields used by the status endpoint. The
+    // old route returned zero stats while /trade-engine/status showed active
+    // Base/Main/Real set counts, making the UI look stalled even after the
+    // engine reached live trading.
+    if (indicationsCount === 0) {
+      indicationsCount =
+        toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0)) ||
+        progressionState.indicationsCount ||
+        progressionState.indicationsDirectionCount ||
+        progressionState.indicationsMoveCount ||
+        progressionState.indicationsActiveCount ||
+        toNumber(engineState?.config_set_indication_results)
+    }
+    if (strategiesCount === 0) {
+      strategiesCount =
+        toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0)) ||
+        progressionState.strategiesCount ||
+        Math.max(
+          progressionState.strategiesBaseTotal || 0,
+          progressionState.strategiesMainTotal || 0,
+          progressionState.strategiesRealTotal || 0,
+          progressionState.strategyEvaluatedBase || 0,
+          progressionState.strategyEvaluatedMain || 0,
+          progressionState.strategyEvaluatedReal || 0,
+        ) ||
+        toNumber(engineState?.total_strategies_evaluated)
+    }
     
     // Phase progression depends on stored phase or derived from state
     let phase = progression?.phase || "idle"
@@ -195,6 +226,14 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       detail = progression?.phase === "prehistoric_data"
         ? (progression?.detail || "Prehistoric calc filling sets…")
         : "Prehistoric calc filling sets…"
+    } else if (progression?.phase === "live_trading" && Number(progression?.progress || 0) >= 100) {
+      // The engine writes the authoritative terminal live-trading state after
+      // prehistoric completes. Trust it before heuristic cycle/indication
+      // derivation; otherwise a fresh run with indications but zero completed
+      // realtime cycles regressed the visible UI back to 90% forever.
+      phase = "live_trading"
+      progress = 100
+      detail = progression.detail || `Live trading ACTIVE — evaluating ${configuredSymbolCount || "configured"} symbols`
     } else if (indicationCycleCount > 100 || progressionState.cyclesCompleted > 100) {
       phase = "live_trading"
       progress = 100
@@ -298,18 +337,17 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
           //   1. Hash field `symbols_processed` (written by engine-manager /
           //      config-set-processor on each symbol completion)
           //   2. SCARD of the `prehistoric:{id}:symbols` SADD set
-          //   3. Legacy `:*:completed` key scan (never written since v5 but
-          //      kept for back-compat during migrations)
-          //   4. Fall back to 1 if currently processing a symbol
+          //   3. Fall back to 1 if currently processing a symbol. Legacy
+          //      `:*:completed` markers are repaired by migrations instead of
+          //      scanned from the UI poll path.
           const hashProcessed = Number(prehistoricData.symbols_processed || 0)
           const setProcessed = processedSet.length
           let processed = Math.max(hashProcessed, setProcessed)
-          if (processed === 0) {
-            const legacyCompleted = await client
-              .keys(`prehistoric:${connectionId}:*:completed`)
-              .catch(() => [] as string[])
-            processed = Array.isArray(legacyCompleted) ? legacyCompleted.length : 0
-          }
+          // Do not fall back to a Redis KEYS scan here. In production that scan
+          // can block large keyspaces and make the progress endpoint itself
+          // look like the stall. Modern processors write both the hash and the
+          // canonical SADD set above; legacy completed-marker keys are repaired
+          // by migrations instead of scanned on every UI poll.
           if (processed === 0 && prehistoricProgress.currentSymbol) processed = 1
           prehistoricProgress.symbolsProcessed = Math.min(
             processed,
@@ -337,9 +375,15 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       console.warn(`[v0] [ProgressionAPI] Failed to get prehistoric progress for ${connectionId}:`, e)
     }
     
-    const subItem = progression?.sub_item || ""
-    const subCurrent = Number(progression?.sub_current) || 0
-    const subTotal = Number(progression?.sub_total) || 0
+    const subItem = progression?.sub_item || (phase === "prehistoric_data" ? "symbols" : "")
+    const storedSubCurrent = Number(progression?.sub_current) || 0
+    const storedSubTotal = Number(progression?.sub_total) || 0
+    const subCurrent = phase === "prehistoric_data"
+      ? Math.max(storedSubCurrent, prehistoricProgress.symbolsProcessed)
+      : storedSubCurrent
+    const subTotal = phase === "prehistoric_data"
+      ? Math.max(storedSubTotal, prehistoricProgress.symbolsTotal, configuredSymbolCount)
+      : storedSubTotal
 
     // Build comprehensive message
     let message = detail
@@ -404,9 +448,20 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       metrics: {
         indicationsCount,
         strategiesCount,
+        strategiesBaseTotal: progressionState.strategiesBaseTotal || parseInt(progHash.strategies_base_total || "0", 10),
+        strategiesMainTotal: progressionState.strategiesMainTotal || parseInt(progHash.strategies_main_total || "0", 10),
+        strategiesRealTotal: progressionState.strategiesRealTotal || parseInt(progHash.strategies_real_total || "0", 10),
+        strategyEvaluatedBase: progressionState.strategyEvaluatedBase || parseInt(progHash.strategies_base_evaluated || "0", 10),
+        strategyEvaluatedMain: progressionState.strategyEvaluatedMain || parseInt(progHash.strategies_main_evaluated || "0", 10),
+        strategyEvaluatedReal: progressionState.strategyEvaluatedReal || parseInt(progHash.strategies_real_evaluated || "0", 10),
         intervalsProcessed: toNumber(await client?.get(`intervals:${connectionId}:processed_count`).catch(() => 0)),
         engineRunning,
-        isEngineRunning,
+        // UI consumers historically read `isEngineRunning`; expose the same
+        // durable running truth as `engineRunning` so hot-reload coordinator
+        // loss does not show a false stopped state while Redis/global/runtime
+        // evidence proves the engine is active.
+        isEngineRunning: engineRunning,
+        coordinatorEngineRunning: isEngineRunning,
         hasRecentActivity,
         globalEngineStatus: globalState?.status || "unknown",
         engineStateStatus: engineState?.status || "unknown",

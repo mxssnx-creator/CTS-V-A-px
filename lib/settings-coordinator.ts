@@ -14,6 +14,14 @@ import { initRedis, getSettings, setSettings, getConnection, getRedisClient } fr
 const RESTART_REQUIRED_FIELDS = [
   "api_key", "api_secret", "exchange", "is_testnet",
   "api_type", "api_subtype", "is_enabled",
+  // Symbol and mode changes invalidate prehistoric gates, loaded interval
+  // markers, live exchange routing, and progression denominators. Treat
+  // them as one serialized restart event so the owning engine process
+  // restarts exactly once from the durable settings-change envelope instead
+  // of mixing a hot reload with a separately queued API-route restart.
+  "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
+  "is_live_trade", "is_preset_trade", "connection_method",
+  "symbol_count",  // ── Symbol list changes require NEW progression ──
 ]
 
 // Fields that can be hot-reloaded without restart
@@ -100,9 +108,8 @@ export async function notifySettingsChanged(
     }
   }
 
-  // If hot-reload, update engine state to signal reload needed.
-  // Also reset per-stage strategy counters so the dashboard doesn't show
-  // a statistically-incoherent blend of old-setting and new-setting data.
+  // If hot-reload, update engine state to signal reload needed without
+  // clearing progression counters or stopping the global coordinator.
   if (changeType === "reload") {
     const engineState = await getSettings(`trade_engine_state:${connectionId}`)
     if (engineState && (engineState.status === "running" || engineState.status === "ready")) {
@@ -112,35 +119,14 @@ export async function notifySettingsChanged(
         reload_fields: changedFields,
         reload_requested_at: new Date().toISOString(),
       })
-      // Reset per-stage counters so stats are recomputed from scratch
-      // under the new settings — avoids blending pre-change and
-      // post-change data in the dashboard.
-      //
-      // CRITICAL: setSettings() stores under a `settings:` prefix, so it writes
-      // to `settings:progression:{id}` — NOT the canonical `progression:{id}`
-      // hash that the dashboard reads via `getProgressionState / hgetall`.
-      // Use the raw Redis client + hset on the bare key instead.
+      // Keep progression/stat counters intact on hot reload. Operators expect
+      // settings-dialog saves to update the next cycle in-place; resetting the
+      // canonical progression hash here made dashboard stats disappear and looked
+      // like the global coordinator had stopped. Stamp only an audit timestamp.
       try {
         const client = getRedisClient()
         if (client) {
-          // Only reset the per-stage SET and EVALUATED counters. These are the
-          // fields that blend pre-change and post-change strategy data. Do NOT
-          // reset cycle_count or total_trades — the progression timeline is still
-          // valid; only the per-stage strategy output needs to restart clean.
-          const progKey = `progression:${connectionId}`
-          await client.hset(progKey, {
-            strategies_base_total: "0",
-            strategies_main_total: "0",
-            strategies_real_total: "0",
-            strategies_base_evaluated: "0",
-            strategies_main_evaluated: "0",
-            strategies_real_evaluated: "0",
-            indications_direction_count: "0",
-            indications_move_count: "0",
-            indications_active_count: "0",
-            indications_active_advanced_count: "0",
-            indications_optimal_count: "0",
-            indications_auto_count: "0",
+          await client.hset(`progression:${connectionId}`, {
             settings_changed_at: new Date().toISOString(),
           })
         }
@@ -193,6 +179,7 @@ export async function getChangeCounter(connectionId: string): Promise<number> {
 
 /**
  * Compute which fields changed between two connection objects.
+ * Handles nested fields like force_symbols within connection_settings.
  */
 export function detectChangedFields(
   previous: Record<string, unknown>,
@@ -208,6 +195,16 @@ export function detectChangedFields(
     if (prevVal !== newVal) {
       changed.push(key)
     }
+  }
+  
+  // ── Symbol count changes need special handling ──────────────────────
+  // force_symbols is nested within connection_settings, so a change to it
+  // won't appear in the top-level allKeys. Compare symbol counts explicitly:
+  // if they differ, it's a progression-level change (not just strategy reload).
+  const prevSymbols = previous.force_symbols as string[] | undefined || []
+  const updatedSymbols = updated.force_symbols as string[] | undefined || []
+  if ((prevSymbols || []).length !== (updatedSymbols || []).length) {
+    changed.push("symbol_count")  // Mark as a distinct "symbol count changed" signal
   }
   
   return changed

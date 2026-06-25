@@ -1,5 +1,6 @@
 "use client"
 
+import { MIN_VOLUME_FACTOR } from "@/lib/constants"
 import { useState, useEffect, useCallback, useMemo } from "react"
 import {
   Dialog,
@@ -116,6 +117,12 @@ type SymbolOrder =
   | "newest"
   | "manual"
 
+function parseVolumeFactor(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null || raw === "") return fallback
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
 interface OverviewSettings {
   volumeFactorBase:   number
   volumeFactorLive:   number
@@ -177,9 +184,9 @@ export function ConnectionSettingsDialog({
 
   // ── Overview state ──────────────────────────────────────────────
   const [overview, setOverview] = useState<OverviewSettings>({
-    volumeFactorBase: 1.0,
-    volumeFactorLive: 2.2,   // operator spec: 2.2 default
-    volumeFactorPreset: 1.0,
+    volumeFactorBase: MIN_VOLUME_FACTOR,
+    volumeFactorLive: MIN_VOLUME_FACTOR,
+    volumeFactorPreset: MIN_VOLUME_FACTOR,
     marginMode: "cross",
     volumeType: "usdt",
     positionMode: "one_way",
@@ -293,9 +300,9 @@ export function ConnectionSettingsDialog({
       // Apply overview settings
       setOverview(prev => ({
         ...prev,
-        volumeFactorBase:   Number(p.volume_factor)         || prev.volumeFactorBase,
-        volumeFactorLive:   Number(p.volume_factor_live)    || prev.volumeFactorLive,
-        volumeFactorPreset: Number(p.volume_factor_preset)  || prev.volumeFactorPreset,
+        volumeFactorBase:   parseVolumeFactor(p.volume_factor, prev.volumeFactorBase),
+        volumeFactorLive:   parseVolumeFactor(p.volume_factor_live, prev.volumeFactorLive),
+        volumeFactorPreset: parseVolumeFactor(p.volume_factor_preset, prev.volumeFactorPreset),
         marginMode:        (p.margin_mode    as "cross" | "isolated") || prev.marginMode,
         volumeType:        (p.volume_type    as "usdt" | "contract" | "spot") || prev.volumeType,
         positionMode:      (p.position_mode  as "one_way" | "hedge") || prev.positionMode,
@@ -373,13 +380,13 @@ export function ConnectionSettingsDialog({
         const conn     = data.connection || {}
         setExchangeKey(String(conn.exchange || exchange).toLowerCase())
         setOverview({
-          volumeFactorBase:   Number(settings.volume_factor)        || Number(conn.volume_factor) || 1.0,
+          volumeFactorBase:   parseVolumeFactor(settings.volume_factor, parseVolumeFactor(conn.volume_factor, MIN_VOLUME_FACTOR)),
           // Read live/preset factor from BOTH the settings hash (volume_factor_live) and
           // the connection hash (live_volume_factor) so changes made via the card's inline
           // volume sliders (which write to the connection hash via the /volume route) are
           // always reflected when the dialog opens.
-          volumeFactorLive:   Number(settings.volume_factor_live)   || Number(conn.live_volume_factor)   || 2.2,
-          volumeFactorPreset: Number(settings.volume_factor_preset) || Number(conn.preset_volume_factor) || 1.0,
+          volumeFactorLive:   parseVolumeFactor(settings.volume_factor_live, parseVolumeFactor(conn.live_volume_factor, MIN_VOLUME_FACTOR)),
+          volumeFactorPreset: parseVolumeFactor(settings.volume_factor_preset, parseVolumeFactor(conn.preset_volume_factor, MIN_VOLUME_FACTOR)),
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
           positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
@@ -457,10 +464,17 @@ export function ConnectionSettingsDialog({
             })(),
             minStep: (() => {
               const flat = Number((settings as Record<string, unknown>).minStep)
-              if (Number.isFinite(flat) && flat >= 3) return Math.min(30, Math.max(3, Math.round(flat)))
+              if (Number.isFinite(flat) && flat >= 2) return Math.min(30, Math.max(2, Math.round(flat)))
               const nested = Number((coord as Record<string, unknown>).minStep)
-              if (Number.isFinite(nested) && nested >= 3) return Math.min(30, Math.max(3, Math.round(nested)))
+              if (Number.isFinite(nested) && nested >= 2) return Math.min(30, Math.max(2, Math.round(nested)))
               return DEFAULT_COORDINATION_SETTINGS.minStep ?? 5
+            })(),
+            trailingMinStep: (() => {
+              const flat = Number((settings as Record<string, unknown>).trailingMinStep)
+              if (Number.isFinite(flat) && flat >= 2) return Math.min(30, Math.max(2, Math.round(flat)))
+              const nested = Number((coord as Record<string, unknown>).trailingMinStep)
+              if (Number.isFinite(nested) && nested >= 2) return Math.min(30, Math.max(2, Math.round(nested)))
+              return DEFAULT_COORDINATION_SETTINGS.trailingMinStep ?? 6
             })(),
           }))
         }
@@ -533,6 +547,7 @@ export function ConnectionSettingsDialog({
         realEvalPosCount: coordination.realEvalPosCount,
         prevPosWindow:    coordination.prevPosWindow,
         minStep:          coordination.minStep ?? 5,
+        trailingMinStep:  coordination.trailingMinStep ?? 6,
         // Control orders (SL/TP placement toggle) — operator spec: on by default
         control_orders:   true,
         // Flat variant toggles for backwards compat with old hash readers
@@ -916,17 +931,33 @@ export function ConnectionSettingsDialog({
                   <SectionHeading icon={Sparkles} title="Minimal Base Pseudo Positions Range Step" subtitle="Minimum step size for Base pseudo-position windows (3–30, default 5). Higher values create fewer, smoother position ranges." />
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
-                      <Label className="text-xs">Min Step (3–30)</Label>
+                      <Label className="text-xs">Base Min Step (2–30)</Label>
                       <span className="text-xs font-mono tabular-nums font-semibold">{coordination.minStep ?? 5}</span>
                     </div>
                     <Slider
-                      min={3} max={30} step={1}
+                      min={2} max={30} step={1}
                       value={[coordination.minStep ?? 5]}
                       onValueChange={([v]) => setCoordination(p => ({ ...p, minStep: v }))}
                       className="py-2"
                     />
                     <div className="flex justify-between text-[10px] text-muted-foreground">
-                      <span>3 — fast noise</span><span className="text-muted-foreground/60">default 5</span><span>30 — smooth</span>
+                      <span>2 — fastest</span><span className="text-muted-foreground/60">default 5</span><span>30 — smooth</span>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs">Trailing Min Step (2–30)</Label>
+                      <span className="text-xs font-mono tabular-nums font-semibold">{coordination.trailingMinStep ?? 6}</span>
+                    </div>
+                    <Slider
+                      min={2} max={30} step={1}
+                      value={[coordination.trailingMinStep ?? 6]}
+                      onValueChange={([v]) => setCoordination(p => ({ ...p, trailingMinStep: v }))}
+                      className="py-2"
+                    />
+                    <div className="flex justify-between text-[10px] text-muted-foreground">
+                      <span>2 — include fast trailing</span><span className="text-muted-foreground/60">default 6</span><span>30 — only slow trailing</span>
                     </div>
                   </div>
 
@@ -1210,11 +1241,27 @@ export function ConnectionSettingsDialog({
                     </div>
                   </div>
 
-                  {/* Auto-resolve notice when not in manual mode */}
-                  {symbolsCfg.symbolOrder !== "manual" && (
+                  {/* Resolution notice — explicit curated list wins over auto-rank.
+                      When the operator has hand-picked symbols (manual entry or
+                      toggled from the 1h ATR table) that exact list is saved and
+                      applied verbatim, regardless of the ranking order. Only when
+                      the list is empty does the engine auto-fetch the top-N. */}
+                  {symbolsCfg.symbols.length > 0 ? (
+                    <div className="rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
+                      <span className="font-medium text-foreground">Explicit selection:</span>{" "}
+                      On save, your curated list of <span className="font-mono font-medium">{symbolsCfg.symbols.length}</span>{" "}
+                      symbol{symbolsCfg.symbols.length === 1 ? "" : "s"} is applied exactly as selected.
+                      {symbolsCfg.symbolOrder !== "manual" && (
+                        <span className="ml-1">
+                          The <span className="font-medium">{orderLabel[symbolsCfg.symbolOrder]}</span> order only seeded the ranking —
+                          it will not re-fetch and overwrite your picks.
+                        </span>
+                      )}
+                    </div>
+                  ) : symbolsCfg.symbolOrder !== "manual" ? (
                     <div className="rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
                       <span className="font-medium text-foreground">Auto-assign:</span>{" "}
-                      On save, the engine will fetch the top <span className="font-mono font-medium">{symbolsCfg.symbolCount}</span> symbols
+                      No manual override — on save the engine will fetch the top <span className="font-mono font-medium">{symbolsCfg.symbolCount}</span> symbols
                       by <span className="font-medium">{orderLabel[symbolsCfg.symbolOrder]}</span> from the exchange and apply them.
                       {availableSymbols.length > 0 && (
                         <span className="ml-1">
@@ -1222,7 +1269,7 @@ export function ConnectionSettingsDialog({
                         </span>
                       )}
                     </div>
-                  )}
+                  ) : null}
 
                   <Separator />
 

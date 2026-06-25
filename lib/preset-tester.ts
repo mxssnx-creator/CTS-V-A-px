@@ -3,6 +3,7 @@
  * Tests configurations against historical data asynchronously
  */
 
+import { resolveStopLossPercent } from "@/lib/tp-sl-ratio"
 import { initRedis, getRedisClient, getSettings, setSettings } from "@/lib/redis-db"
 import { TechnicalIndicators } from "./indicators"
 import type { PresetConfiguration } from "./preset-config-generator"
@@ -131,9 +132,10 @@ export class PresetTester {
         ? entryPrice * (1 + (config.takeprofit_factor * config.position_cost) / 100)
         : entryPrice * (1 - (config.takeprofit_factor * config.position_cost) / 100)
 
+      const stopLossPercent = resolveStopLossPercent(config.takeprofit_factor, config.stoploss_ratio) * config.position_cost
       const slPrice = signal.direction === "long"
-        ? entryPrice * (1 - (config.stoploss_ratio * config.takeprofit_factor * config.position_cost) / 100)
-        : entryPrice * (1 + (config.stoploss_ratio * config.takeprofit_factor * config.position_cost) / 100)
+        ? entryPrice * (1 - stopLossPercent / 100)
+        : entryPrice * (1 + stopLossPercent / 100)
 
       let exitPrice = entryPrice
       let exitTime = entryTime

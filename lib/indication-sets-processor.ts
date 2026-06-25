@@ -94,6 +94,8 @@ export interface IndicationSet {
     id: string
     timestamp: Date
     profitFactor: number
+    signalScore?: number
+    rawSignalStrength?: number
     confidence: number
     config: any
     metadata: any
@@ -125,13 +127,18 @@ export class IndicationSetsProcessor {
    * settings hash on every fill.
    */
   private compactionCfgs: Partial<Record<SetCompactionType, CompactionConfig>> = {}
-  private directionMoveRanges: number[] = Array.from({ length: 28 }, (_, i) => i + 3) // 3..30
-  private optimalRanges: number[] = Array.from({ length: 28 }, (_, i) => i + 3) // 3..30
+  private directionMoveRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2) // 2..30
+  private optimalRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2) // 2..30
   private drawdownRatios: number[] = [0.5, 1.0, 1.5]
   private lastPartRatios: number[] = [0.25, 0.5]
   private factorMultipliers: number[] = [0.9, 1.0, 1.1]
   private activeThresholds: number[] = [0.5, 1.0, 1.5, 2.0, 2.5]
   private activeTimeRatios: number[] = [0.5, 1.0]
+  private outcomeHorizonCandles = 12
+  private outcomeTakeProfitPct = 0.01
+  private outcomeStopLossPct = 0.01
+  private outcomeTakerFeePct = 0.001
+  private outcomeSlippagePct = 0.0006
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -178,6 +185,11 @@ export class IndicationSetsProcessor {
         this.factorMultipliers = this.parseNumericList(settings.indicationFactorMultipliers, this.factorMultipliers)
         this.activeThresholds = this.parseNumericList(settings.activeThresholds, this.activeThresholds)
         this.activeTimeRatios = this.parseNumericList(settings.activeTimeRatios, this.activeTimeRatios)
+        this.outcomeHorizonCandles = this.parsePositiveNumber(settings.indicationOutcomeHorizonCandles, this.outcomeHorizonCandles)
+        this.outcomeTakeProfitPct = this.parsePositiveNumber(settings.indicationOutcomeTakeProfitPct, this.outcomeTakeProfitPct)
+        this.outcomeStopLossPct = this.parsePositiveNumber(settings.indicationOutcomeStopLossPct, this.outcomeStopLossPct)
+        this.outcomeTakerFeePct = this.parseNonNegativeNumber(settings.indicationOutcomeTakerFeePct, this.outcomeTakerFeePct)
+        this.outcomeSlippagePct = this.parseNonNegativeNumber(settings.indicationOutcomeSlippagePct ?? settings.slippageTolerance, this.outcomeSlippagePct)
         
         // Fallback: legacy maxEntriesPerSet applies to all
         if (settings.maxEntriesPerSet && !settings.databaseSizeDirection) {
@@ -252,6 +264,16 @@ export class IndicationSetsProcessor {
     return values.length > 0 ? values : fallback
   }
 
+  private parsePositiveNumber(raw: any, fallback: number): number {
+    const value = Number(raw)
+    return Number.isFinite(value) && value > 0 ? value : fallback
+  }
+
+  private parseNonNegativeNumber(raw: any, fallback: number): number {
+    const value = Number(raw)
+    return Number.isFinite(value) && value >= 0 ? value : fallback
+  }
+
   private parseNumericList(raw: any, fallback: number[]): number[] {
     if (Array.isArray(raw)) {
       const parsed = raw.map((v) => Number(v)).filter((v) => Number.isFinite(v))
@@ -286,6 +308,7 @@ export class IndicationSetsProcessor {
     const TIMEOUT_MS = 15000 // 15 second timeout per symbol
     
     try {
+      await this.closePendingRealtimeOutcomes(symbol, marketData)
       if (!marketData) {
         console.warn(`[v0] [IndicationSets] Invalid market data for ${symbol}`)
         await logProgressionEvent(this.connectionId, "indications_sets", "warning", `Invalid market data for ${symbol}`, {
@@ -295,12 +318,31 @@ export class IndicationSetsProcessor {
         return
       }
 
-      // Process all 4 main types in parallel with independent logic
+      // Process all 4 main types in parallel with independent logic.
+      // Use per-type isolation so an Optimal/Auto calculation failure never
+      // aborts Direction/Move/Active for the same symbol and never crashes the
+      // whole progression cycle.
+      const runType = async (type: string, fn: () => Promise<any>) => {
+        try {
+          return await fn()
+        } catch (error) {
+          console.warn(
+            `[v0] [IndicationSets] ${symbol}:${type} failed:`,
+            error instanceof Error ? error.message : String(error),
+          )
+          await logProgressionEvent(this.connectionId, "indications_sets", "error", `${type} indication failed for ${symbol}`, {
+            symbol,
+            type,
+            error: error instanceof Error ? error.message : String(error),
+          }).catch(() => {})
+          return { type, total: 0, qualified: 0, configs: 0, error: true }
+        }
+      }
       const [directionResults, moveResults, activeResults, optimalResults] = await Promise.all([
-        this.processDirectionSet(symbol, marketData),
-        this.processMoveSet(symbol, marketData),
-        this.processActiveSet(symbol, marketData),
-        this.processOptimalSet(symbol, marketData),
+        runType("direction", () => this.processDirectionSet(symbol, marketData)),
+        runType("move", () => this.processMoveSet(symbol, marketData)),
+        runType("active", () => this.processActiveSet(symbol, marketData)),
+        runType("optimal", () => this.processOptimalSet(symbol, marketData)),
       ])
 
       const duration = Date.now() - startTime
@@ -369,7 +411,7 @@ export class IndicationSetsProcessor {
   }
 
   /**
-   * Process Direction Indication Set (ranges 3-30)
+   * Process Direction Indication Set (ranges 2-30)
    * OPTIMIZED: Process all ranges in batch, minimize Redis calls
    */
   private async processDirectionSet(symbol: string, marketData: any): Promise<any> {
@@ -396,10 +438,10 @@ export class IndicationSetsProcessor {
             total++
             const direction = indication.metadata?.firstDir > 0 ? "long" : "short"
             indication.direction = direction
-            
-            if (indication.profitFactor >= 1.0) {
+            const setKey = `indication_set:${this.connectionId}:${symbol}:direction:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
+
+            if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
               qualified++
-              const setKey = `indication_set:${this.connectionId}:${symbol}:direction:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
               pendingWrites.push({
                 setKey,
                 indication,
@@ -420,7 +462,7 @@ export class IndicationSetsProcessor {
   }
 
   /**
-   * Process Move Indication Set (ranges 3-30, no opposite requirement)
+   * Process Move Indication Set (ranges 2-30, no opposite requirement)
    * OPTIMIZED: Process key ranges only, batch writes
    */
   private async processMoveSet(symbol: string, marketData: any): Promise<any> {
@@ -447,10 +489,10 @@ export class IndicationSetsProcessor {
             total++
             const direction = (indication.metadata?.movement || 0) >= 0 ? "long" : "short"
             indication.direction = direction
-            
-            if (indication.profitFactor >= 1.0) {
+            const setKey = `indication_set:${this.connectionId}:${symbol}:move:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
+
+            if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
               qualified++
-              const setKey = `indication_set:${this.connectionId}:${symbol}:move:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
               pendingWrites.push({
                 setKey,
                 indication,
@@ -497,9 +539,9 @@ export class IndicationSetsProcessor {
                 })
                 if (indication) {
                   total++
-                  if (indication.profitFactor >= 1.0) {
+                  const setKey = `indication_set:${this.connectionId}:${symbol}:active:t${threshold}:dd${drawdownRatio}:ar${activeTimeRatio}:lp${lastPartRatio}:f${factorMultiplier}`
+                  if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
                     qualified++
-                    const setKey = `indication_set:${this.connectionId}:${symbol}:active:t${threshold}:dd${drawdownRatio}:ar${activeTimeRatio}:lp${lastPartRatio}:f${factorMultiplier}`
                     pendingWrites.push({
                       setKey,
                       indication,
@@ -540,9 +582,9 @@ export class IndicationSetsProcessor {
         if (!indication) continue
         
         total++
-        if (indication.profitFactor >= 1.0) {
+        const setKey = `indication_set:${this.connectionId}:${symbol}:optimal:range${range}:factor${factorMultiplier}`
+        if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
           qualified++
-          const setKey = `indication_set:${this.connectionId}:${symbol}:optimal:range${range}:factor${factorMultiplier}`
           pendingWrites.push({ setKey, indication, config: { range, factorMultiplier } })
         }
       }
@@ -615,6 +657,8 @@ export class IndicationSetsProcessor {
               type,
               direction,
               profitFactor: indication.profitFactor,
+              signalScore: indication.signalScore,
+              rawSignalStrength: indication.rawSignalStrength,
               confidence: indication.confidence,
               config,
               metadata: indication.metadata,
@@ -622,7 +666,7 @@ export class IndicationSetsProcessor {
 
             const existing = await client.get(setKey)
             let entries = existing ? JSON.parse(existing) : []
-            // ── Newest-at-last (per spec) ────────────────────────────
+            // ── Newest-at-last (per spec) ──���─────────────────────────
             // The compaction policy drops oldest by `slice(-floor)`,
             // which requires chronological order. Use `push`, never
             // `unshift`. Switching from the prior unshift+slice(0, n)
@@ -695,6 +739,8 @@ export class IndicationSetsProcessor {
         type,
         direction,
         profitFactor: indication.profitFactor,
+        signalScore: indication.signalScore,
+        rawSignalStrength: indication.rawSignalStrength,
         confidence: indication.confidence,
         config,
         metadata: indication.metadata,
@@ -738,6 +784,147 @@ export class IndicationSetsProcessor {
    * Calculation methods for each type
    */
 
+  private async attachOutcomeBackedProfitFactor(
+    symbol: string,
+    marketData: any,
+    setKey: string,
+    indication: any,
+  ): Promise<number> {
+    const outcome = this.evaluateForwardOutcome(marketData, indication.direction)
+    if (outcome.completed) {
+      const sample = {
+        profit: Math.max(outcome.pnlPct, 0),
+        loss: Math.max(-outcome.pnlPct, 0),
+        pnlPct: outcome.pnlPct,
+        closedAt: new Date().toISOString(),
+      }
+      const pf = await this.recordOutcomeSample(setKey, sample)
+      indication.profitFactor = pf
+      indication.metadata = {
+        ...indication.metadata,
+        outcome,
+        profitFactorSource: "realized_forward_outcomes",
+      }
+      return pf
+    }
+
+    indication.profitFactor = 0
+    indication.metadata = {
+      ...indication.metadata,
+      outcomePending: true,
+      profitFactorSource: "pending_realtime_outcome",
+    }
+    await this.persistPendingRealtimeOutcome(symbol, setKey, indication)
+    return indication.signalScore || indication.rawSignalStrength || 0
+  }
+
+  private async recordOutcomeSample(setKey: string, sample: any): Promise<number> {
+    const client = await getCachedClient()
+    const key = `${setKey}:outcomes`
+    const raw = await client.get(key)
+    const samples = raw ? JSON.parse(raw) : []
+    samples.push(sample)
+    const trimmed = samples.slice(-1000)
+    await client.set(key, JSON.stringify(trimmed))
+
+    const grossProfit = trimmed.reduce((sum: number, s: any) => sum + Number(s.profit || 0), 0)
+    const grossLoss = trimmed.reduce((sum: number, s: any) => sum + Number(s.loss || 0), 0)
+    if (grossLoss <= 0) return grossProfit > 0 ? grossProfit / 0.000001 : 0
+    return grossProfit / grossLoss
+  }
+
+  private async persistPendingRealtimeOutcome(symbol: string, setKey: string, indication: any): Promise<void> {
+    try {
+      const client = await getCachedClient()
+      const key = `indication_outcomes_pending:${this.connectionId}:${symbol}`
+      const pending = {
+        setKey,
+        direction: indication.direction,
+        signalScore: indication.signalScore,
+        rawSignalStrength: indication.rawSignalStrength,
+        openedAt: Date.now(),
+      }
+      await client.rpush(key, JSON.stringify(pending))
+      await client.ltrim(key, -1000, -1)
+      await client.expire(key, 86400)
+    } catch { /* non-critical */ }
+  }
+
+  private async closePendingRealtimeOutcomes(symbol: string, marketData: any): Promise<void> {
+    if (!marketData) return
+    try {
+      if (this.getForwardCandles(marketData).length < 2) return
+      const client = await getCachedClient()
+      const key = `indication_outcomes_pending:${this.connectionId}:${symbol}`
+      const raw = await client.lrange(key, 0, -1)
+      if (!raw?.length) return
+      await client.del(key)
+      for (const item of raw) {
+        const pending = JSON.parse(item)
+        const closed = this.evaluateForwardOutcome(marketData, pending.direction)
+        if (!closed.completed) {
+          await client.rpush(key, item)
+          continue
+        }
+        const pf = await this.recordOutcomeSample(pending.setKey, {
+          profit: Math.max(closed.pnlPct, 0),
+          loss: Math.max(-closed.pnlPct, 0),
+          pnlPct: closed.pnlPct,
+          closedAt: new Date().toISOString(),
+        })
+        const existing = await client.get(pending.setKey)
+        const entries = existing ? JSON.parse(existing) : []
+        for (let i = entries.length - 1; i >= 0; i--) {
+          if (entries[i]?.profitFactor === 0 && entries[i]?.metadata?.outcomePending) {
+            entries[i].profitFactor = pf
+            entries[i].metadata = { ...entries[i].metadata, outcomePending: false, outcome: closed }
+            break
+          }
+        }
+        await client.set(pending.setKey, JSON.stringify(entries))
+      }
+      await client.expire(key, 86400)
+    } catch { /* non-critical */ }
+  }
+
+  private evaluateForwardOutcome(marketData: any, direction: "long" | "short"): any {
+    const candles = this.getForwardCandles(marketData)
+    if (candles.length < 2) return { completed: false, reason: "insufficient_forward_candles" }
+    const entry = Number(marketData.executionPrice ?? candles[1].open ?? candles[1].close ?? candles[1].price)
+    if (!Number.isFinite(entry) || entry <= 0) return { completed: false, reason: "invalid_entry_price" }
+    const cost = this.outcomeTakerFeePct * 2 + this.outcomeSlippagePct
+    const tp = direction === "long" ? entry * (1 + this.outcomeTakeProfitPct) : entry * (1 - this.outcomeTakeProfitPct)
+    const sl = direction === "long" ? entry * (1 - this.outcomeStopLossPct) : entry * (1 + this.outcomeStopLossPct)
+    const horizon = Math.min(candles.length - 1, Math.max(1, Math.floor(this.outcomeHorizonCandles)))
+    let exit = Number(candles[horizon].close ?? candles[horizon].price ?? candles[horizon].open)
+    let reason = "horizon"
+    for (let i = 1; i <= horizon; i++) {
+      const high = Number(candles[i].high ?? candles[i].close ?? candles[i].price ?? candles[i].open)
+      const low = Number(candles[i].low ?? candles[i].close ?? candles[i].price ?? candles[i].open)
+      if (direction === "long" && high >= tp) { exit = tp; reason = "take_profit"; break }
+      if (direction === "long" && low <= sl) { exit = sl; reason = "stop_loss"; break }
+      if (direction === "short" && low <= tp) { exit = tp; reason = "take_profit"; break }
+      if (direction === "short" && high >= sl) { exit = sl; reason = "stop_loss"; break }
+    }
+    const gross = direction === "long" ? (exit - entry) / entry : (entry - exit) / entry
+    return { completed: true, entry, exit, reason, pnlPct: gross - cost, costPct: cost, horizonCandles: horizon }
+  }
+
+  private getForwardCandles(marketData: any): any[] {
+    const raw = Array.isArray(marketData?.forwardCandles)
+      ? marketData.forwardCandles
+      : Array.isArray(marketData?.candles)
+      ? marketData.candles
+      : []
+    const candles = raw
+      .map((c: any) => (typeof c === "number" ? { open: c, high: c, low: c, close: c } : c))
+      .filter((c: any) => Number.isFinite(Number(c?.close ?? c?.price ?? c?.open)))
+    if (candles.length < 2) return candles
+    const firstTs = Number(candles[0]?.timestamp ?? candles[0]?.time ?? 0)
+    const lastTs = Number(candles[candles.length - 1]?.timestamp ?? candles[candles.length - 1]?.time ?? 0)
+    return firstTs > lastTs ? candles.slice().reverse() : candles
+  }
+
   private calculateDirectionIndication(
     marketData: any,
     config: { range: number; drawdownRatio: number; lastPartRatio: number; factorMultiplier: number },
@@ -757,8 +944,11 @@ export class IndicationSetsProcessor {
       const reversalStrength = Math.abs(firstDir + secondDir)
       const drawdownPenalty = reversalStrength / Math.max(drawdownRatio * 10, 1)
       const tailWeight = 1 + lastPartRatio
+      const signalScore = 1.0 + reversalStrength * factorMultiplier * tailWeight - drawdownPenalty
       return {
-        profitFactor: 1.0 + reversalStrength * factorMultiplier * tailWeight - drawdownPenalty,
+        profitFactor: 0,
+        signalScore,
+        rawSignalStrength: signalScore,
         confidence: Math.min(1.0, ((Math.abs(firstDir) + Math.abs(secondDir)) / 2) * factorMultiplier),
         metadata: { firstDir, secondDir, range, drawdownRatio, lastPartRatio, factorMultiplier },
       }
@@ -780,8 +970,11 @@ export class IndicationSetsProcessor {
     const drawdownPenalty = movement / Math.max(drawdownRatio * 10, 1)
     const tailWeight = 1 + lastPartRatio
 
+    const signalScore = 1.0 + (movement * 2 + volatility) * factorMultiplier * tailWeight - drawdownPenalty
     return {
-      profitFactor: 1.0 + (movement * 2 + volatility) * factorMultiplier * tailWeight - drawdownPenalty,
+      profitFactor: 0,
+      signalScore,
+      rawSignalStrength: signalScore,
       confidence: Math.min(1.0, (movement + volatility / 2) * factorMultiplier),
       metadata: { movement, volatility, range, drawdownRatio, lastPartRatio, factorMultiplier },
     }
@@ -808,8 +1001,11 @@ export class IndicationSetsProcessor {
       const estimatedDrawdown = Math.max(0.1, normalizedChange / Math.max(drawdownRatio, 0.1))
       const activeTimeScore = normalizedChange * activeTimeRatio
       const tailWeight = 1 + lastPartRatio
+      const signalScore = 1.0 + ((priceChange / 100) * factorMultiplier * tailWeight) - (estimatedDrawdown * 0.01)
       return {
-        profitFactor: 1.0 + ((priceChange / 100) * factorMultiplier * tailWeight) - (estimatedDrawdown * 0.01),
+        profitFactor: 0,
+        signalScore,
+        rawSignalStrength: signalScore,
         confidence: Math.min(1.0, priceChange / threshold / 2),
         metadata: {
           priceChange,
@@ -836,8 +1032,11 @@ export class IndicationSetsProcessor {
 
     if (steps >= 2) {
       const volatility = this.calculateVolatility(prices)
+      const signalScore = 1.0 + (steps * 0.5 + volatility) * factorMultiplier
       return {
-        profitFactor: 1.0 + (steps * 0.5 + volatility) * factorMultiplier,
+        profitFactor: 0,
+        signalScore,
+        rawSignalStrength: signalScore,
         confidence: Math.min(1.0, steps / 3),
         metadata: { consecutiveSteps: steps, volatility, range, factorMultiplier },
       }
@@ -852,25 +1051,45 @@ export class IndicationSetsProcessor {
 
   private getPriceHistory(marketData: any, count: number): number[] | null {
     const prices = marketData.prices || []
-    return prices.slice(0, count).map((p: any) => Number.parseFloat(p))
+    if (!Array.isArray(prices) || prices.length === 0) return null
+    
+    // Convert to numbers and filter out NaN/invalid values
+    const validPrices = prices
+      .slice(0, count)
+      .map((p: any) => {
+        const num = typeof p === "number" ? p : Number.parseFloat(String(p))
+        return Number.isFinite(num) ? num : null
+      })
+      .filter((p: number | null): p is number => p !== null)
+    
+    return validPrices.length > 0 ? validPrices : null
   }
 
   private getDirection(prices: number[]): number {
+    if (prices.length === 0) return 0
     const avg = prices.reduce((a, b) => a + b, 0) / prices.length
+    if (!Number.isFinite(avg)) return 0
     return prices.reduce((a, b) => a + (b > avg ? 1 : -1), 0) / prices.length
   }
 
   private calculateVolatility(prices: number[]): number {
+    if (prices.length < 2) return 0
     const avg = prices.reduce((a, b) => a + b, 0) / prices.length
+    if (!Number.isFinite(avg) || avg === 0) return 0
     const variance = prices.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / prices.length
-    return Math.sqrt(variance) / avg
+    const vol = Math.sqrt(variance) / avg
+    return Number.isFinite(vol) ? vol : 0
   }
 
   private detectConsecutiveSteps(prices: number[], range: number): number {
+    if (prices.length < range * 2) return 0
     let steps = 0
     for (let i = range; i < prices.length - range; i += range) {
-      const dir1 = this.getDirection(prices.slice(i - range, i))
-      const dir2 = this.getDirection(prices.slice(i, i + range))
+      const slice1 = prices.slice(i - range, i)
+      const slice2 = prices.slice(i, i + range)
+      if (slice1.length === 0 || slice2.length === 0) continue
+      const dir1 = this.getDirection(slice1)
+      const dir2 = this.getDirection(slice2)
       if ((dir1 > 0 && dir2 < 0) || (dir1 < 0 && dir2 > 0)) {
         steps++
       }

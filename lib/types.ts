@@ -67,7 +67,7 @@ export interface PseudoPosition {
   updated_at: string
   base_position_id?: string // Added link to base pseudo position
 
-  indication_range?: number // Range value used (3-30 for direction/move, 1-10 for active)
+  indication_range?: number // Range value used (2-30 for direction/move, 1-10 for active)
   indication_interval?: number // Interval in ms for indication processing
   indication_timeout?: number // Timeout in seconds for indication
 
@@ -166,7 +166,7 @@ export interface TradingPosition extends RealPosition {
 
 export interface IndicationConfig {
   type: "direction" | "move" | "active" | "optimal" | "auto" // Renamed active_advanced to auto
-  range: number // 3-30 step 1 (for direction and move), 1-10 step 1 (for active)
+  range: number // 2-30 step 1 (for direction and move), 1-10 step 1 (for active)
   drawdown_ratio?: number // 0.1, 0.2, 0.3, 0.4, 0.5 step 0.1 (5 variations)
   price_change_ratio?: number // 0.1-1.0 for direction/move
 

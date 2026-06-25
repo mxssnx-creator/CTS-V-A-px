@@ -6,6 +6,7 @@
 
 import { getRedisClient, getAppSettings, getSettings, getSettingsVersionCachedSync, createPosition as redisCreatePosition } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
+import { resolveStopLossPercent } from "@/lib/tp-sl-ratio"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
 import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
 
@@ -285,9 +286,12 @@ export class PseudoPositionManager {
       const volumeCalc = await (async () => {
         const settings = (await getAppSettings()) || {}
         const positionCostPercent = parseFloat(
-          String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
+          String(settings.exchangePositionCost ?? settings.positionCost ?? "0.02")
         )
-        const positionCost = positionCostPercent / 100
+        const positionCost =
+          (Number.isFinite(positionCostPercent) && positionCostPercent > 0
+            ? Math.max(0.02, Math.min(1.0, positionCostPercent))
+            : 0.02) / 100
         const positionsAverage = (() => {
           const raw = parseFloat(String(settings.positions_average ?? "2"))
           return Number.isFinite(raw) && raw > 0 ? raw : 2
@@ -328,10 +332,11 @@ export class PseudoPositionManager {
           ? params.entryPrice * (1 + params.takeprofitFactor / 100)
           : params.entryPrice * (1 - params.takeprofitFactor / 100)
 
+      const stopLossPercent = resolveStopLossPercent(params.takeprofitFactor, params.stoplossRatio)
       const stopLossPrice =
         params.side === "long"
-          ? params.entryPrice * (1 - params.stoplossRatio / 100)
-          : params.entryPrice * (1 + params.stoplossRatio / 100)
+          ? params.entryPrice * (1 - stopLossPercent / 100)
+          : params.entryPrice * (1 + stopLossPercent / 100)
 
       // Calculate position cost
       const positionCost = (volumeCalc.finalVolume * params.entryPrice) / volumeCalc.leverage
@@ -680,6 +685,8 @@ export class PseudoPositionManager {
           direction: directionRaw,
           pnl,
           drawdownMinutes,
+          entryPrice,  // For cost-adjusted PF calculation
+          quantity,    // For cost-adjusted PF calculation
           pipeline,
         })
       } catch (posErr) {

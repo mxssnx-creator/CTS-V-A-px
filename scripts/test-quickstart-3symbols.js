@@ -71,28 +71,9 @@ async function main() {
 
   try {
     const symbolsArg = JSON.stringify(SYMBOLS_3);
-    const evalCode = `
-      import runDiagnostic from "./COMPREHENSIVE_DIAGNOSTIC_TEST.ts";
-      runDiagnostic("bingx-x01", ${symbolsArg}).then(r => {
-        console.log("DIAG_RESULT_3SYM:", JSON.stringify(r, null, 2));
-        const hasRealAttempt = (r.issues || []).some(i => /REAL_ORDER|live/i.test(JSON.stringify(i)));
-        console.log("\\n=== LIVE ORDER CREATION CHECK (3 symbols, live enabled) ===");
-        console.log("Real sets present:", r.stats?.realStats?.total || 0);
-        console.log("Live positions:", r.stats?.liveStats?.open || 0);
-        console.log("Volume issues detected:", (r.issues || []).filter(i => /volume|NO_REAL/i.test(i.code || "")).length);
-        console.log("Live order attempt markers would appear in full run when Redis + engine active.");
-        console.log("See new logs in lib/trade-engine/stages/live-stage.ts for [REAL_ORDER_ATTEMPT] and [NO_REAL_ORDER]");
-        process.exit(r.summary.failed > 0 ? 1 : 0);
-      }).catch(e => {
-        console.error("DIAG_ERR:", e);
-        process.exit(1);
-      });
-    `;
-
     const diag = spawnSync(process.execPath, [
-      "./node_modules/.bin/tsx",
-      "--eval",
-      evalCode
+      "scripts/standalone-bingx-live-diagnostic.mjs",
+      symbolsArg,
     ], { stdio: "inherit", timeout: 60000 });
 
     console.log("\n[Standalone 3-symbol diagnostic] Exit code:", diag.status);
