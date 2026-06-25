@@ -2463,6 +2463,8 @@ export class StrategyCoordinator {
   private async createPseudoPositionsFromRealSets(
     symbol: string,
     realSets: StrategySet[],
+    coordIndex?: CoordIndex,
+    positionCostPct = 0.1,
   ): Promise<void> {
     // DEV-MODE BYPASS: pseudo_position hashes are only used by the dashboard
     // "Positions" tile. Writing up to 3000 hashes per symbol per cycle (3 writes
@@ -2503,7 +2505,33 @@ export class StrategyCoordinator {
         if (existing[i]) continue
         const { set, setKey, existingKey } = setMeta[i]
         try {
-          const avgPF       = set.avgProfitFactor || 1
+          const parentKey = set.parentSetKey || set.setKey.split("#")[0]
+          const effectiveEntries: StrategySetEntry[] =
+            set.entries.length > 0
+              ? set.entries
+              : coordIndex
+                ? (coordIndex.base.byKey.get(parentKey)?.entries ?? [])
+                : (realSets.find((s) => s.setKey === parentKey)?.entries ?? [])
+          const bestEntry = effectiveEntries.reduce(
+            (best, e) => (e.profitFactor > best.profitFactor ? e : best),
+            effectiveEntries[0],
+          )
+          const coordRec = coordIndex?.byCoordKey.get(set.setKey)
+          const baseSizeMult = bestEntry?.sizeMultiplier ?? 1
+          const effectiveSizeMult = coordRec?.sizeDelta !== undefined
+            ? Math.max(0.5, Math.min(2.0, baseSizeMult * (1 + coordRec.sizeDelta)))
+            : baseSizeMult
+          const effectivePF =
+            coordRec?.tunedAvgPF ??
+            set.avgProfitFactor ??
+            bestEntry?.profitFactor ??
+            1
+          const protection = deriveProtectionFromProfitFactor(
+            effectivePF,
+            positionCostPct,
+            effectiveSizeMult,
+          )
+          const avgPF       = protection.effectiveProfitFactor || set.avgProfitFactor || 1
           const entryPrice  = Math.max(1, avgPF * 100)   // unitless proxy
           const quantity    = set.entryCount || 1
           const positionCost = entryPrice * quantity
@@ -2527,6 +2555,10 @@ export class StrategyCoordinator {
             source_set_key: setKey,
             created_at: createdAtIso,
             profit_factor: set.avgProfitFactor || 0,
+            effective_profit_factor: protection.effectiveProfitFactor,
+            takeprofit_factor: protection.takeProfitPct,
+            stoploss_ratio: protection.stopLossPct,
+            size_multiplier: effectiveSizeMult,
             confidence: set.avgConfidence || 0,
           }
 
@@ -3692,7 +3724,7 @@ export class StrategyCoordinator {
     // writes for sets that never reach live dispatch. `qualifying` is the capped
     // Live subset (typically ≤500/symbol) — the only sets that semantically need
     // pseudo-position records (they represent active dispatch candidates).
-    await this.createPseudoPositionsFromRealSets(symbol, qualifying)
+    await this.createPseudoPositionsFromRealSets(symbol, qualifying, coordIndex, livePositionCostPct)
 
     // Write live set count into progression hash — use hset so count reflects current cycle snapshot.
     // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
@@ -4001,7 +4033,7 @@ export class StrategyCoordinator {
                   : (bestEntry.sizeMultiplier ?? 1)
                 // Use tunedAvgPF for SL/TP derivation when available — reflects the
                 // Real-stage tuner's per-variant performance bias.
-                const effectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
+                const effectivePF = dispatchCoordRec?.tunedAvgPF ?? set.avgProfitFactor ?? bestEntry.profitFactor
 
                 // Derive SL/TP % from PF and the actual position-cost budget.
                 // The live-stage converts these percentages to concrete prices
@@ -4224,8 +4256,21 @@ export class StrategyCoordinator {
                 )
                 if (!bestEntry) return false
 
-                const tp = Math.max(0.5, (bestEntry.profitFactor - 1) * 100)
-                const sl = Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5)
+                const pseudoCoordRec = coordIndex?.byCoordKey.get(set.setKey)
+                const effectiveSizeMult = pseudoCoordRec?.sizeDelta !== undefined
+                  ? Math.max(0.5, Math.min(2.0, (bestEntry.sizeMultiplier ?? 1) * (1 + pseudoCoordRec.sizeDelta)))
+                  : (bestEntry.sizeMultiplier ?? 1)
+                const effectivePF =
+                  pseudoCoordRec?.tunedAvgPF ??
+                  set.avgProfitFactor ??
+                  bestEntry.profitFactor
+                const protection = deriveProtectionFromProfitFactor(
+                  effectivePF,
+                  livePositionCostPct,
+                  effectiveSizeMult,
+                )
+                const tp = protection.takeProfitPct
+                const sl = protection.stopLossPct
 
                 // Multi-step trailing — Set carries its own profile from
                 // BASE, so trailing-on/off and the three ratios are
@@ -4261,6 +4306,7 @@ export class StrategyCoordinator {
                   takeprofitFactor: tp,
                   stoplossRatio: sl,
                   profitFactor: bestEntry.profitFactor,
+                  effectiveProfitFactor: protection.effectiveProfitFactor,
                   trailingEnabled: trailing,
                   configSetKey,
                   ...(profile && {
