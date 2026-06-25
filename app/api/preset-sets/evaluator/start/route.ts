@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { getSetEvaluator } from "@/lib/preset-set-evaluator"
 
 // POST /api/preset-sets/evaluator/start - Start hourly re-evaluation
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     const evaluator = getSetEvaluator()

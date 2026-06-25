@@ -10,6 +10,7 @@ import { logProgressionEvent } from "@/lib/engine-progression-logs"
  * - Strategy evaluation status
  * - Recent errors and performance metrics
  */
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     await initRedis()
