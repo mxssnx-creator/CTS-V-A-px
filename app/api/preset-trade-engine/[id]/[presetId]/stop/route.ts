@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
 
+export const dynamic = "force-dynamic"
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string; presetId: string }> }

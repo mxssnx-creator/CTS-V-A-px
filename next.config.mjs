@@ -30,6 +30,35 @@ const nextConfig = {
       allowedOrigins: ["*"],
     },
   },
+  // Production-specific headers for performance
+  async headers() {
+    return process.env.NODE_ENV === "production" ? [
+      {
+        source: "/api/:path*",
+        headers: [
+          { key: "Cache-Control", value: "no-cache, no-store, must-revalidate" },
+          { key: "Pragma", value: "no-cache" },
+          { key: "Expires", value: "0" },
+        ],
+      },
+      {
+        source: "/_next/static/:path*",
+        headers: [
+          { key: "Cache-Control", value: "public, max-age=31536000, immutable" },
+        ],
+      },
+    ] : []
+  },
+  // Production-specific redirects for health checks and monitoring
+  async redirects() {
+    return process.env.NODE_ENV === "production" ? [
+      {
+        source: "/health",
+        destination: "/api/system/status",
+        permanent: false,
+      },
+    ] : []
+  },
   webpack: (config, { isServer, nextRuntime, webpack }) => {
     config.resolve = config.resolve || {}
     config.plugins = config.plugins || []
