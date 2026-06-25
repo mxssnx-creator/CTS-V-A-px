@@ -26,6 +26,10 @@ export const revalidate = 0
     return Math.round(x * m) / m
   }
 
+  function pct(num: number, den: number): number {
+    return den > 0 ? Math.round((num / den) * 1000) / 10 : 0
+  }
+
   /**
    * Compute live-stage performance metrics from a closed-position snapshot.
    * Used by both `buildTradeHistory` (row-level PF) and `aggregateClosedStats`
@@ -1276,29 +1280,6 @@ export async function GET(
           ? weightedDDT / weightSum
           : parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
 
-        // Eval percentage per stage:
-        //   base:  100% — Base self-evaluates all its sets (no filter).
-        //   main:  evaluated/base, capped at 100 (expansion: 1 base → N main).
-        //   real:  evaluated/main, capped at 100 (filter: N main → M real).
-        //   live:  evaluated/real, capped at 100 (filter: M real → K live).
-        let evalPct = 0
-        if (stage === "base") {
-          // createdSets may be 0 if dh.created_sets absent; use stratCounts.base fallback
-          evalPct = (createdSets > 0 || (stratCounts.base || 0) > 0) ? 100 : 0
-        } else if (stage === "main") {
-          const base = stratCounts.base || 1
-          const raw = base > 0 ? (stratEvaluated.main / base) * 100 : 0
-          evalPct = Math.min(100, Math.round(raw * 10) / 10)
-        } else if (stage === "real") {
-          const main = stratCounts.main || 1
-          const raw = main > 0 ? (stratEvaluated.real / main) * 100 : 0
-          evalPct = Math.min(100, Math.round(raw * 10) / 10)
-        } else if (stage === "live") {
-          const real = stratCounts.real || 1
-          const raw = real > 0 ? (stratEvaluated.real / real) * 100 : 0
-          evalPct = Math.min(100, Math.round(raw * 10) / 10)
-        }
-
         // ── evaluated / passed / passRatio ───���────────────────────────
         // Source priority:
         //   1. Per-symbol cross-sum (symEvaluated / symPassed) when fresh.
@@ -1345,6 +1326,23 @@ export async function GET(
           ? passRatioFromRate
           : passRatioFromCounts
 
+        // Stage flow counters use explicit pipeline semantics instead of
+        // overloading evalPct with different denominators per stage:
+        //   Base input = generated Base universe.
+        //   Main input = Base output.
+        //   Real input = Main output.
+        // For base/main/real, output is the count that advanced from that stage.
+        const inputSets = stage === "base"
+          ? (stageEvaluated || createdSets || stratCounts.base || 0)
+          : stage === "main"
+            ? (stratCounts.base || 0)
+            : (stratCounts.main || 0)
+        const evaluatedSets = stageEvaluated
+        const outputSets = stagePassed
+        const evalPct = pct(evaluatedSets, inputSets)
+        const passPct = pct(outputSets, evaluatedSets)
+        const transitionPct = pct(outputSets, inputSets)
+
         // ── Actively-running counts (operator spec) ──
         // `sets_running_now` is written by strategy-coordinator using
         // membership in the `pseudo_positions:{conn}:active_config_keys`
@@ -1368,10 +1366,15 @@ export async function GET(
           avgPosEvalReal:      isFinite(avgPosEvalReal)  ? Math.round(avgPosEvalReal * 1000) / 1000  : 0,
           countPosEval:        countPosEval,
           avgDrawdownTime:     isFinite(avgDrawdownTime) ? Math.round(avgDrawdownTime * 10) / 10     : 0,
+          inputSets,
+          evaluatedSets,
+          outputSets,
           evalPct,
+          passPct,
+          transitionPct,
           passRatio,
-          evaluated: stageEvaluated,
-          passed: stagePassed,
+          evaluated: evaluatedSets,
+          passed: outputSets,
           failed: Math.max(0, stageEvaluated - stagePassed),
           setsRunningNow,
           setsProgressing,
@@ -1552,6 +1555,12 @@ export async function GET(
       const winRate    = liveClosed > 0 ? liveWins / liveClosed : 0
       const avgPosSize = liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
 
+      const liveInputSets = stratCounts.real || n(progHash.strategies_real_current) || n(progHash.strategies_real_total) || 0
+      // Live numerator is the Live stage's own promoted/created/attempted count.
+      // Do not use stratEvaluated.real here: that is Real-stage input, not Live progress.
+      const liveOutputSets = pick(stratCounts.live, liveCreated, livePlaced)
+      const liveEvaluatedSets = liveOutputSets
+
       stratDetail.live = {
         // Same shape as base/main/real so the UI can reuse its row renderer:
         avgPosPerSet:        Math.round(avgPosSize * 100) / 100,        // avg position notional (USD)
@@ -1561,13 +1570,16 @@ export async function GET(
         avgPosEvalReal:      Math.round(avgRoi * 10000) / 10000,        // avg ROI fraction
         countPosEval:        countSampled,
         avgDrawdownTime:     Math.round(avgHoldMin * 10) / 10,          // avg hold time in minutes
-        evalPct: n(progHash.strategies_real_total) > 0
-          ? Math.round((liveCreated / n(progHash.strategies_real_total)) * 1000) / 10
-          : 0,                                                          // how many Real sets became Live positions
-        passRatio: Math.round(passRate * 1000) / 10,                    // fill rate %
-        evaluated: livePlaced,
-        passed:    liveFilled,
-        failed:    Math.max(0, livePlaced - liveFilled),
+        inputSets: liveInputSets,
+        evaluatedSets: liveEvaluatedSets,
+        outputSets: liveOutputSets,
+        evalPct: pct(liveEvaluatedSets, liveInputSets),                 // how many Real-output sets became Live
+        passPct: pct(liveOutputSets, liveEvaluatedSets),
+        transitionPct: pct(liveOutputSets, liveInputSets),
+        passRatio: Math.round(passRate * 1000) / 10,                    // order fill rate %
+        evaluated: liveEvaluatedSets,
+        passed:    liveOutputSets,
+        failed:    Math.max(0, liveEvaluatedSets - liveOutputSets),
         // Live-exclusive fields for richer UI display:
         winRate:        Math.round(winRate * 1000) / 10,
         totalPnl:       Math.round(sumPnl * 100) / 100,
