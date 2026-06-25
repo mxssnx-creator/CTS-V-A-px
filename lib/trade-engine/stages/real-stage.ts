@@ -42,7 +42,7 @@ export interface RealPosition {
   //    the LivePosition the executor produces. ────────────────────────
   setKey?: string
   parentSetKey?: string
-  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
+  setVariant?: "default" | "trailing" | "block" | "dca"
   axisWindows?: { prev: number; last: number; cont: number; pause: number }
   // Variant size multiplier carried to the live executor for volume scaling.
   // block=1.5-2.0, dca=0.5, default/trailing/pause=1.0 (absent → 1.0).
