@@ -700,10 +700,26 @@ export interface StrategyCoordinatorConfig {
 }
 
 export class StrategyCoordinator {
+  private static _settingsReloadGenerationByConnection: Map<string, number> = new Map()
+
+  /**
+   * Cross-manager hot-reload hook. Called by TradeEngineManager when a
+   * settings PATCH is observed in a different worker/process from the
+   * strategy loop. The next StrategyCoordinator cycle for this connection
+   * must bypass its short TTLs and re-read PF thresholds, DDT thresholds,
+   * trailing/min-step settings, and coordination toggles immediately.
+   */
+  static forceNextSettingsReload(connectionId: string): number {
+    const next = (StrategyCoordinator._settingsReloadGenerationByConnection.get(connectionId) || 0) + 1
+    StrategyCoordinator._settingsReloadGenerationByConnection.set(connectionId, next)
+    return next
+  }
+
   private connectionId: string
   constructor(connectionId: string) {
     this.connectionId = connectionId
   }
+  private _seenSettingsReloadGeneration = 0
   private config: StrategyCoordinatorConfig = {
     maxEntriesPerSet: 250,
     // Live Sets default is now per-exchange (see setExchangeMaxLive).
@@ -1381,6 +1397,18 @@ export class StrategyCoordinator {
     this._stratCycleCount++
 
     try {
+      const requestedSettingsGeneration =
+        StrategyCoordinator._settingsReloadGenerationByConnection.get(this.connectionId) || 0
+      if (requestedSettingsGeneration !== this._seenSettingsReloadGeneration) {
+        this._seenSettingsReloadGeneration = requestedSettingsGeneration
+        this._pfThresholdsLoadedAt = 0
+        this._coordinationLoadedAt = 0
+        this._hedgeLoadedAt = 0
+        this._prevPosMinCountAt = 0
+        this._prevPosWindowAt = 0
+        ;(this as any)._trailingVariantsCache = undefined
+      }
+
       // ── Hydrate PF thresholds + Coordination settings + stage thresholds + normalise ─
       await Promise.all([
         this.loadAppPFThresholds(),
