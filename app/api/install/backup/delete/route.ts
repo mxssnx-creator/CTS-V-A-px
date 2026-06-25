@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 
+export const dynamic = "force-dynamic"
 export async function DELETE(request: NextRequest) {
   try {
     const body = await request.json()

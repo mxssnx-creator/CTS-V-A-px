@@ -1171,6 +1171,17 @@ export async function GET(
     // entries (default / trailing / block / dca). Pause is intentionally not
     // a strategy variant; it remains a position-count axis under
     // `strategyCoordination.axis.pause`.
+    // The Main stage expands each promoted Base Set into position-variant
+    // entries (default / trailing / block / dca). StrategyCoordinator writes
+    // per-variant aggregates to `strategy_variant:{connId}:{variant}` hash
+    // fields:
+    //   created_sets, passed_sets, entries_count, avg_profit_factor,
+    //   avg_drawdown_time, avg_pos_per_set, pass_rate, updated_at
+    //
+    // We surface these alongside the stage-level detail so the dashboard can
+    // show "Avg PF / Avg DDT per variant" over the lifetime of the run.
+    // Pause is not a strategy variant; it is exposed below as a
+    // position-count axis (`axisAccumulation.pause`).
     const variantKeys = ["default", "trailing", "block", "dca"] as const
     const variantDetail: Record<string, Record<string, number>> = {}
     await Promise.all(

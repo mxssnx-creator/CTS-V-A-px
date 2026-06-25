@@ -8,6 +8,7 @@ import { ensureDefaultExchangesExist } from "@/lib/default-exchanges-seeder"
  * Initialize system with default disabled exchanges (BingX)
  * These are pre-configured but disabled until user provides credentials
  */
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     console.log("[v0] [Initialize Defaults] Ensuring canonical base connections...")
