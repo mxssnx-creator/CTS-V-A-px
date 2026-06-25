@@ -34,6 +34,7 @@ interface Trade {
   profit_loss: number
 }
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     const config = await request.json()

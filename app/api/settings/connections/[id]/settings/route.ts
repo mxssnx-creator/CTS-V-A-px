@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { updateConnection, initRedis, getConnection, getRedisClient, setSettings, getSettings } from "@/lib/redis-db"
+import { updateConnection, initRedis, getConnection, getRedisClient, setSettings, getSettings, persistNow } from "@/lib/redis-db"
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 import { getGlobalTradeEngineCoordinator, getTradeEngine } from "@/lib/trade-engine"
@@ -8,6 +8,7 @@ import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { toRedisFlag } from "@/lib/boolean-utils"
 
+export const dynamic = "force-dynamic"
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -70,13 +71,13 @@ export async function GET(
           "useSystemCloseOnly", "use_system_close_only",
           // Coordination variant toggles
           "variantTrailingEnabled", "variantBlockEnabled",
-          "variantDcaEnabled", "variantPauseEnabled",
+          "variantDcaEnabled",
           // Axis enable flags
           "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
         ].includes(k)) {
           // Store as boolean so dialog toggle/checkbox checks work correctly.
           hashSettings[k] = v === "true"
-        } else if (k === "symbols" || k === "active_symbols") {
+        } else if (k === "symbols" || k === "active_symbols" || k === "force_symbols") {
           // Symbols are stored as JSON strings in the hash.
           try { hashSettings[k] = JSON.parse(v) } catch { hashSettings[k] = v }
         } else {
@@ -146,18 +147,18 @@ export async function PUT(
       updated_at: new Date().toISOString(),
     }
 
-    await updateConnection(id, updated)
+    let effectiveConnection = (await updateConnection(id, updated)) || updated
 
     // Full propagation: notify + fast-path apply + recoordinate
     // (start/stop/hot-reload as the new state dictates). See
     // lib/connection-recoordinator.ts for the design rationale.
-    await recoordinateAfterSettingsChange(id, connection, updated, {
+    await recoordinateAfterSettingsChange(id, connection, effectiveConnection, {
       logTag: "PUT /settings",
     })
 
     await SystemLogger.logConnection(`Updated settings`, id, "info")
 
-    return NextResponse.json({ success: true, connection: updated })
+    return NextResponse.json({ success: true, connection: effectiveConnection })
   } catch (error) {
     console.error("[v0] [Settings] PUT error:", error)
     await SystemLogger.logError(error, "api", "PUT /api/settings/connections/[id]/settings")
@@ -224,7 +225,7 @@ export async function PATCH(
       updated_at: new Date().toISOString(),
     }
 
-    await updateConnection(id, updated)
+    let effectiveConnection = (await updateConnection(id, updated)) || updated
 
     // ── Flat eval-knob hash mirror (CRITICAL) ───────────────────────────
     // The strategy coordinator and detailed-tracking read the per-eval
@@ -271,6 +272,9 @@ export async function PATCH(
         const syms = (merged as Record<string, unknown>).symbols
         if (Array.isArray(syms) && syms.length > 0) {
           flatKnobs.symbols = JSON.stringify(syms)
+          // Also write force_symbols to the connection_settings hash so
+          // getSettings("trade_engine_state:{id}") finds the symbols
+          flatKnobs.force_symbols = JSON.stringify(syms)
         }
       }
 
@@ -311,12 +315,13 @@ export async function PATCH(
           | Record<string, unknown>
           | undefined
         if (coord && typeof coord === "object") {
-          // Variant toggles:  variants.{trailing,block,dca,pause}
+          // Variant toggles:  variants.{trailing,block,dca}; pause is an axis, not a strategy variant.
+          // Variant toggles:  variants.{trailing,block,dca}
           //   → flat key variantTrailingEnabled, variantBlockEnabled, …
           const variantsObj = coord.variants as Record<string, unknown> | undefined
           if (variantsObj && typeof variantsObj === "object") {
             for (const [vk, vv] of Object.entries(variantsObj)) {
-              if (typeof vv === "boolean") {
+              if (typeof vv === "boolean" && ["trailing", "block", "dca"].includes(vk)) {
                 const cap = vk.charAt(0).toUpperCase() + vk.slice(1)
                 flatKnobs[`variant${cap}Enabled`] = vv ? "true" : "false"
               }
@@ -354,19 +359,15 @@ export async function PATCH(
         }
       }
 
-      // ── Volume factor mirror ─���────────────────────────────────────────────
-      // VolumeCalculator reads volume_factor_live and volume_factor from the
-      // connection_settings:{id} hash. Mirror all three so per-connection
-      // volume factor saves actually reach the engine.
+      // ── Volume factor mirror ─────────────────────────────────────────────
+      // Live/Preset order sizing is operator configurable. Base pseudo
+      // positions are intentionally ratio/count based and must not expose or
+      // persist a separate "Base volume factor" knob, because the base stage
+      // never places exchange orders.
       {
         const vfl = Number((merged as Record<string, unknown>).volume_factor_live)
         if (Number.isFinite(vfl) && vfl > 0) {
           flatKnobs.volume_factor_live   = String(Math.max(0.1, Math.min(10, vfl)))
-        }
-        const vfb = Number((merged as Record<string, unknown>).volume_factor ?? (merged as Record<string, unknown>).volume_factor_base)
-        if (Number.isFinite(vfb) && vfb > 0) {
-          flatKnobs.volume_factor        = String(Math.max(0.1, Math.min(10, vfb)))
-          flatKnobs.volume_factor_base   = flatKnobs.volume_factor
         }
         const vfp = Number((merged as Record<string, unknown>).volume_factor_preset)
         if (Number.isFinite(vfp) && vfp > 0) {
@@ -442,6 +443,22 @@ export async function PATCH(
 
       if (Object.keys(flatKnobs).length > 0) {
         await getRedisClient().hset(`connection_settings:${id}`, flatKnobs)
+        const volumeConnectionPatch: Record<string, string> = {}
+        if (flatKnobs.volume_factor_live !== undefined) {
+          volumeConnectionPatch.live_volume_factor = flatKnobs.volume_factor_live
+        }
+        if (flatKnobs.volume_factor_preset !== undefined) {
+          volumeConnectionPatch.preset_volume_factor = flatKnobs.volume_factor_preset
+        }
+        if (flatKnobs.volume_factor !== undefined) {
+          volumeConnectionPatch.volume_factor = flatKnobs.volume_factor
+        }
+        if (Object.keys(volumeConnectionPatch).length > 0) {
+          effectiveConnection = (await updateConnection(id, volumeConnectionPatch)) || {
+            ...effectiveConnection,
+            ...volumeConnectionPatch,
+          }
+        }
       }
     } catch (mirrorErr) {
       console.error("[v0] [Settings] eval-knob hash mirror failed:", mirrorErr)
@@ -503,11 +520,22 @@ export async function PATCH(
           : []
 
         let resolved: string[] = []
-        if (order === "manual" && manualList.length > 0) {
-          // Operator-curated list wins verbatim (still capped at count).
-          resolved = manualList.slice(0, count)
+        if (manualList.length > 0) {
+          // Operator curated an EXPLICIT symbol list — either typed manually or
+          // hand-picked from the ranked 1h-ATR auto-select table in the dialog.
+          // Honor it verbatim regardless of `symbol_order`: the order field only
+          // records which ranking method seeded the list; once the operator has
+          // explicitly chosen symbols, those win over a fresh exchange re-rank.
+          //
+          // Previously this branch required `order === "manual"`, so any curated
+          // selection made while the order was still "volatility_1h" / "volume_24h"
+          // (the common case, since the auto-select button sets order to
+          // volatility_1h) was silently discarded and the engine re-fetched the
+          // exchange top-N instead. The slider count acts only as an upper bound:
+          // truncate when the list is LONGER than count, never pad.
+          resolved = manualList.length > count ? manualList.slice(0, count) : manualList
         } else {
-          // Auto-resolve top-N by the chosen order. Call the shared resolver
+          // No explicit list — auto-resolve top-N by the chosen order. Call the shared resolver
           // DIRECTLY (no HTTP self-fetch — that fails on loopback/origin inside
           // a route handler, which is why the first cut resolved 0 symbols).
           const exchange = String((connection as Record<string, unknown>).exchange || "bingx").toLowerCase()
@@ -534,25 +562,100 @@ export async function PATCH(
         if (resolved.length > 0) {
           resolvedSymbolsForSettings = resolved
           // 1. Persist as the connection's ACTIVE symbol source (what the engine reads).
-          await updateConnection(id, { active_symbols: JSON.stringify(resolved) })
+          const resolvedSymbolsJson = JSON.stringify(resolved)
+          effectiveConnection = (await updateConnection(id, {
+            active_symbols: resolvedSymbolsJson,
+            // Keep force_symbols in lock-step with the resolved selection.
+            // EngineManager.getSymbols() gives force_symbols precedence over
+            // active_symbols; leaving an older force_symbols list in place made
+            // a successful "save 12 symbols" still boot with the previous
+            // migration/admin override list.
+            force_symbols: resolvedSymbolsJson,
+            symbol_count: String(resolved.length),
+            symbol_order: order,
+          })) || { ...effectiveConnection, active_symbols: resolvedSymbolsJson, force_symbols: resolvedSymbolsJson, symbol_count: String(resolved.length), symbol_order: order }
           // 2. Mirror into trade_engine_state (the engine's primary lookup) +
           //    seed the prehistoric symbol total so the progress bar denominator
           //    matches the new selection immediately.
           const stateKey = `trade_engine_state:${id}`
           const prevState = (await getSettings(stateKey)) || {}
+          const settingsConnectionKey = `connection:${id}`
+          const prevSettingsConnection = (await getSettings(settingsConnectionKey)) || {}
           await setSettings(stateKey, {
             ...prevState,
             connection_id: id,
-            symbols: JSON.stringify(resolved),
-            active_symbols: JSON.stringify(resolved),
+            symbols: resolvedSymbolsJson,
+            active_symbols: resolvedSymbolsJson,
+            force_symbols: resolvedSymbolsJson,
             config_set_symbols_total: resolved.length,
             updated_at: new Date().toISOString(),
           })
+          // 3. Fast-path only: invalidate the running engine's in-memory
+          //    symbol cache in this process so the change takes effect on the
+          //    next tick without waiting for the durable reload event.
+          //    Correctness does NOT depend on this call: production may run
+          //    the API route and engine manager in different processes, so
+          //    the manager also invalidates its cache when it consumes the
+          //    Redis-backed connection_settings reload event below.
+          await setSettings(settingsConnectionKey, {
+            ...prevSettingsConnection,
+            connection_id: id,
+            symbols: resolvedSymbolsJson,
+            active_symbols: resolvedSymbolsJson,
+            force_symbols: resolvedSymbolsJson,
+            symbol_count: resolved.length,
+            symbol_order: order,
+            updated_at: new Date().toISOString(),
+          })
+          ;(merged as Record<string, unknown>).active_symbols = resolved
+          ;(merged as Record<string, unknown>).force_symbols = resolved
+          ;(merged as Record<string, unknown>).symbol_count = resolved.length
           // 3. Invalidate the running engine's in-memory symbol cache so the
           //    change takes effect on the next tick without a restart.
           try {
             getTradeEngine()?.getEngineManager(id)?.invalidateSymbolsCache()
           } catch { /* engine may not be running yet — state above is enough */ }
+          await persistNow().catch((persistErr: unknown) => {
+            console.warn(
+              "[v0] [Settings] Persisting resolved symbols failed:",
+              persistErr instanceof Error ? persistErr.message : persistErr,
+            )
+          })
+          // Next.js dev can compile this route while another module instance is
+          // still finishing migrations. Re-assert the operator's saved symbols
+          // shortly after the response so any late migration write that raced
+          // this save cannot leave the in-memory store or snapshot on an older
+          // canonical symbol list.
+          for (const delayMs of [2_000, 6_000]) {
+            setTimeout(() => {
+              void (async () => {
+                await updateConnection(id, {
+                  active_symbols: resolvedSymbolsJson,
+                  force_symbols: resolvedSymbolsJson,
+                  symbol_count: String(resolved.length),
+                  symbol_order: order,
+                }).catch(() => null)
+                await setSettings(stateKey, {
+                  connection_id: id,
+                  symbols: resolvedSymbolsJson,
+                  active_symbols: resolvedSymbolsJson,
+                  force_symbols: resolvedSymbolsJson,
+                  config_set_symbols_total: resolved.length,
+                  updated_at: new Date().toISOString(),
+                }).catch(() => null)
+                await setSettings(settingsConnectionKey, {
+                  connection_id: id,
+                  symbols: resolvedSymbolsJson,
+                  active_symbols: resolvedSymbolsJson,
+                  force_symbols: resolvedSymbolsJson,
+                  symbol_count: resolved.length,
+                  symbol_order: order,
+                  updated_at: new Date().toISOString(),
+                }).catch(() => null)
+                await persistNow().catch(() => false)
+              })()
+            }, delayMs)
+          }
           console.log(`[v0] [Settings] Resolved ${resolved.length} symbol(s) for ${id} (order=${order}): ${resolved.join(", ")}`)
         }
       } catch (symErr) {
@@ -613,12 +716,98 @@ export async function PATCH(
               `[v0] [Settings PATCH] Progression re-coordinated for ${id} (${recoordination.reason ?? "changed"}); restarting running engine instead of hot reload.`,
             )
             await coordinator.restartEngine(id)
+    let progressionRestartHandled = false
+    if (symbolsModeChanged) {
+      try {
+        const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
+        if (recoordination.changed) {
+          progressionRestartHandled = true
+
+          // The progression epoch/lock changed, so this is no longer a safe
+          // in-place hot reload for a running manager. Publish a restart-class
+          // settings event and explicitly restart an active manager so it binds
+          // to the newly-created progression instead of continuing to write
+          // underneath an archived epoch.
+          try {
+            const { notifySettingsChanged } = await import("@/lib/settings-coordinator")
+            await notifySettingsChanged(
+              id,
+              ["progression_epoch", "connection_settings"],
+              { ...connection, connection_settings: current },
+              { ...connection, connection_settings: merged, updated_at: updated.updated_at },
+            )
+          } catch (notifyErr) {
+            console.warn(
+              `[v0] [Settings PATCH] restart-class notify failed for ${id}:`,
+              notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
+            )
+          }
+
+          try {
+            const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+            const coordinator = getGlobalTradeEngineCoordinator()
+            if (coordinator.isEngineRunning(id)) {
+              console.log(
+                `[v0] [Settings PATCH] Restarting ${id} after progression recoordination (${recoordination.reason || "changed"})`,
+              )
+              await coordinator.restartEngine(id)
+            }
+          } catch (restartErr) {
+            console.warn(
+              `[v0] [Settings PATCH] engine restart after progression recoordination failed for ${id}:`,
+              restartErr instanceof Error ? restartErr.message : String(restartErr),
+            )
           }
         }
       } catch (recoordErr) {
         console.warn(
           `[v0] [Settings PATCH] recoordinateForActualOne failed for ${id} (non-fatal):`,
           recoordErr instanceof Error ? recoordErr.message : String(recoordErr),
+        )
+      }
+
+      // The durable settings-change envelope below now carries the concrete
+      // symbol/mode field names, so the engine-owning process classifies this
+      // as a serialized restart event. Do not also queue a separate route-local
+      // restart here: in production the route can run in a different worker than
+      // the engine, and the old double path raced hot-reload vs stop/start,
+      // producing duplicate progressions and stalled stats after settings saves.
+      // A symbol/mode change invalidates the currently running prehistoric
+      // gates. Recoordination clears Redis state; this background restart makes
+      // the active manager actually start processing the new symbols instead of
+      // waiting for a later watchdog tick. It is intentionally queued and
+      // cooldown-protected so the settings dialog response stays fast and a
+      // double-save cannot spawn duplicate restarts.
+      try {
+        const coordinator = getTradeEngine()
+        const client = getRedisClient()
+        const restartKey = `engine_restart_cooldown:${id}`
+        const lastRestartRaw = await client.get(restartKey).catch(() => null)
+        const lastRestartMs = Number(lastRestartRaw)
+        if (
+          coordinator &&
+          typeof (coordinator as any).isEngineRunning === "function" &&
+          (coordinator as any).isEngineRunning(id) &&
+          (!Number.isFinite(lastRestartMs) || Date.now() - lastRestartMs > 2_000)
+        ) {
+          await client.set(restartKey, String(Date.now()), { EX: 5 }).catch(() => null)
+          setImmediate(() => {
+            void (async () => {
+              try {
+                await (coordinator as any).restartEngine(id)
+              } catch (restartErr) {
+                console.warn(
+                  `[v0] [Settings PATCH] background restart failed for ${id}:`,
+                  restartErr instanceof Error ? restartErr.message : String(restartErr),
+                )
+              }
+            })()
+          })
+        }
+      } catch (restartScheduleErr) {
+        console.warn(
+          `[v0] [Settings PATCH] failed to schedule symbol/mode restart for ${id}:`,
+          restartScheduleErr instanceof Error ? restartScheduleErr.message : String(restartScheduleErr),
         )
       }
     }
@@ -629,6 +818,7 @@ export async function PATCH(
     // settings keys the caller touched, so the recoordinator knows
     // something inside `connection_settings` actually changed.
     if (!progressionChangedForActualOne) {
+    if (!progressionRestartHandled) {
       await recoordinateAfterSettingsChange(
         id,
         { ...connection, connection_settings: current },
@@ -639,6 +829,17 @@ export async function PATCH(
         },
       )
     }
+    await recoordinateAfterSettingsChange(
+      id,
+      { ...connection, connection_settings: current },
+      { ...effectiveConnection, connection_settings: merged, updated_at: effectiveConnection.updated_at || updated.updated_at },
+      {
+        logTag: "PATCH /settings",
+        changedFieldsOverride: Object.keys(settings).length > 0
+          ? Array.from(new Set([...Object.keys(settings), "connection_settings"]))
+          : [],
+      },
+    )
 
     await SystemLogger.logConnection(`Patched settings`, id, "info")
 

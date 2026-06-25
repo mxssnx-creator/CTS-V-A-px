@@ -31,7 +31,7 @@ export const initialSettings: Settings = {
   validationTimeoutSeconds: 15,
   mainTradeInterval: 1,
   presetTradeInterval: 2,
-  positionCost: 0.1, // Fixed default to 0.1 (representing 0.1%)
+  positionCost: 0.02, // Fixed default to 0.02 (representing 0.02%)
   useMaximalLeverage: true,
   min_volume_enforcement: true, // Added missing min_volume_enforcement property
   minStep: 5, // 2-30 step 1 — minimum pseudo-position step-window size

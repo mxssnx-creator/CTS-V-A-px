@@ -1,5 +1,6 @@
 "use client"
 
+import { MIN_VOLUME_FACTOR } from "@/lib/constants"
 import { useState, useEffect, useCallback, useMemo } from "react"
 import {
   Dialog,
@@ -116,6 +117,12 @@ type SymbolOrder =
   | "newest"
   | "manual"
 
+function parseVolumeFactor(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null || raw === "") return fallback
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
 interface OverviewSettings {
   volumeFactorBase:   number
   volumeFactorLive:   number
@@ -177,9 +184,9 @@ export function ConnectionSettingsDialog({
 
   // ── Overview state ──────────────────────────────────────────────
   const [overview, setOverview] = useState<OverviewSettings>({
-    volumeFactorBase: 1.0,
-    volumeFactorLive: 2.2,   // operator spec: 2.2 default
-    volumeFactorPreset: 1.0,
+    volumeFactorBase: MIN_VOLUME_FACTOR,
+    volumeFactorLive: MIN_VOLUME_FACTOR,
+    volumeFactorPreset: MIN_VOLUME_FACTOR,
     marginMode: "cross",
     volumeType: "usdt",
     positionMode: "one_way",
@@ -241,7 +248,6 @@ export function ConnectionSettingsDialog({
     try {
       // Build current dialog state as payload — same shape as saveAll sends
       const payload = {
-        volume_factor:        overview.volumeFactorBase,
         volume_factor_live:   overview.volumeFactorLive,
         volume_factor_preset: overview.volumeFactorPreset,
         margin_mode:          overview.marginMode,
@@ -294,9 +300,9 @@ export function ConnectionSettingsDialog({
       // Apply overview settings
       setOverview(prev => ({
         ...prev,
-        volumeFactorBase:   Number(p.volume_factor)         || prev.volumeFactorBase,
-        volumeFactorLive:   Number(p.volume_factor_live)    || prev.volumeFactorLive,
-        volumeFactorPreset: Number(p.volume_factor_preset)  || prev.volumeFactorPreset,
+        volumeFactorBase:   parseVolumeFactor(p.volume_factor, prev.volumeFactorBase),
+        volumeFactorLive:   parseVolumeFactor(p.volume_factor_live, prev.volumeFactorLive),
+        volumeFactorPreset: parseVolumeFactor(p.volume_factor_preset, prev.volumeFactorPreset),
         marginMode:        (p.margin_mode    as "cross" | "isolated") || prev.marginMode,
         volumeType:        (p.volume_type    as "usdt" | "contract" | "spot") || prev.volumeType,
         positionMode:      (p.position_mode  as "one_way" | "hedge") || prev.positionMode,
@@ -374,13 +380,13 @@ export function ConnectionSettingsDialog({
         const conn     = data.connection || {}
         setExchangeKey(String(conn.exchange || exchange).toLowerCase())
         setOverview({
-          volumeFactorBase:   Number(settings.volume_factor)        || Number(conn.volume_factor) || 1.0,
+          volumeFactorBase:   parseVolumeFactor(settings.volume_factor, parseVolumeFactor(conn.volume_factor, MIN_VOLUME_FACTOR)),
           // Read live/preset factor from BOTH the settings hash (volume_factor_live) and
           // the connection hash (live_volume_factor) so changes made via the card's inline
           // volume sliders (which write to the connection hash via the /volume route) are
           // always reflected when the dialog opens.
-          volumeFactorLive:   Number(settings.volume_factor_live)   || Number(conn.live_volume_factor)   || 2.2,
-          volumeFactorPreset: Number(settings.volume_factor_preset) || Number(conn.preset_volume_factor) || 1.0,
+          volumeFactorLive:   parseVolumeFactor(settings.volume_factor_live, parseVolumeFactor(conn.live_volume_factor, MIN_VOLUME_FACTOR)),
+          volumeFactorPreset: parseVolumeFactor(settings.volume_factor_preset, parseVolumeFactor(conn.preset_volume_factor, MIN_VOLUME_FACTOR)),
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
           positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
@@ -493,6 +499,10 @@ export function ConnectionSettingsDialog({
       setLoading(false)
     }
   // Reload settings whenever the active connection or exchange changes.
+  // connectionId and exchange are stable — both come from props and don't change
+  // within a single dialog open. Excluding them from the dep array intentionally
+  // to avoid re-triggering on every render cycle.
+
   }, [connectionId, exchange])
 
   // ─────────────────────────────────────────────────────────────────
@@ -504,7 +514,6 @@ export function ConnectionSettingsDialog({
     try {
       const payload = {
         // Overview
-        volume_factor:        overview.volumeFactorBase,
         volume_factor_live:   overview.volumeFactorLive,
         volume_factor_preset: overview.volumeFactorPreset,
         margin_mode: overview.marginMode,
@@ -672,6 +681,7 @@ export function ConnectionSettingsDialog({
   useEffect(() => {
     if (!open) return
     fetchExchangeSymbols()
+
   }, [open, exchangeKey, symbolsCfg.symbolOrder])
 
   const addSymbol = useCallback((sym: string) => {
@@ -715,6 +725,9 @@ export function ConnectionSettingsDialog({
     loadAllSettings()
     fetchPresets()
     // Opening the dialog resets the transient preset state and refreshes data.
+    // Stable stable refs — intentionally omit from dep array to avoid
+    // retriggering on every render. `open` is the only signal we need.
+
   }, [open])
 
   // ─────────────────────────────────────────────────────────────────
@@ -723,7 +736,7 @@ export function ConnectionSettingsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl h-[90vh] overflow-hidden flex flex-col p-0 [&>button]:z-10">
+      <DialogContent className="max-w-3xl h-[90dvh] max-h-[90dvh] overflow-hidden flex flex-col p-0 [&>button]:z-10">
         {/* Header */}
         <DialogHeader className="px-5 pt-4 pb-3 border-b shrink-0">
           <div className="flex items-center gap-2">
@@ -768,7 +781,7 @@ export function ConnectionSettingsDialog({
               `overflow-hidden` on the `Tabs` parent above combined with
               `flex-1 min-h-0` here constrains the height to the remaining
               space below the TabsList. */}
-          <ScrollArea className="flex-1 min-h-0 px-5 py-4">
+          <ScrollArea className="flex-1 min-h-0 overflow-y-auto px-5 py-4">
             {loading && (
               <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-sm">
                 <Loader2 className="h-4 w-4 animate-spin" /> Loading settings…
@@ -915,7 +928,7 @@ export function ConnectionSettingsDialog({
                   <Separator className="my-1" />
 
                   {/* ── Minimal Position Step — promoted to page 1 per operator spec ─ */}
-                  <SectionHeading icon={Sparkles} title="Minimal Position-Creation Step" subtitle="Minimum step size for pseudo-position windows (Base stage). Controls which indication configs are generated — higher = fewer, smoother signals." />
+                  <SectionHeading icon={Sparkles} title="Minimal Base Pseudo Positions Range Step" subtitle="Minimum step size for Base pseudo-position windows (3–30, default 5). Higher values create fewer, smoother position ranges." />
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
                       <Label className="text-xs">Base Min Step (2–30)</Label>
@@ -1228,11 +1241,27 @@ export function ConnectionSettingsDialog({
                     </div>
                   </div>
 
-                  {/* Auto-resolve notice when not in manual mode */}
-                  {symbolsCfg.symbolOrder !== "manual" && (
+                  {/* Resolution notice — explicit curated list wins over auto-rank.
+                      When the operator has hand-picked symbols (manual entry or
+                      toggled from the 1h ATR table) that exact list is saved and
+                      applied verbatim, regardless of the ranking order. Only when
+                      the list is empty does the engine auto-fetch the top-N. */}
+                  {symbolsCfg.symbols.length > 0 ? (
+                    <div className="rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
+                      <span className="font-medium text-foreground">Explicit selection:</span>{" "}
+                      On save, your curated list of <span className="font-mono font-medium">{symbolsCfg.symbols.length}</span>{" "}
+                      symbol{symbolsCfg.symbols.length === 1 ? "" : "s"} is applied exactly as selected.
+                      {symbolsCfg.symbolOrder !== "manual" && (
+                        <span className="ml-1">
+                          The <span className="font-medium">{orderLabel[symbolsCfg.symbolOrder]}</span> order only seeded the ranking —
+                          it will not re-fetch and overwrite your picks.
+                        </span>
+                      )}
+                    </div>
+                  ) : symbolsCfg.symbolOrder !== "manual" ? (
                     <div className="rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
                       <span className="font-medium text-foreground">Auto-assign:</span>{" "}
-                      On save, the engine will fetch the top <span className="font-mono font-medium">{symbolsCfg.symbolCount}</span> symbols
+                      No manual override — on save the engine will fetch the top <span className="font-mono font-medium">{symbolsCfg.symbolCount}</span> symbols
                       by <span className="font-medium">{orderLabel[symbolsCfg.symbolOrder]}</span> from the exchange and apply them.
                       {availableSymbols.length > 0 && (
                         <span className="ml-1">
@@ -1240,7 +1269,7 @@ export function ConnectionSettingsDialog({
                         </span>
                       )}
                     </div>
-                  )}
+                  ) : null}
 
                   <Separator />
 
@@ -1608,7 +1637,7 @@ function StrategyProfileEditor({
               />
               <div className="flex justify-between text-[10px] text-muted-foreground">
                 <span>100</span>
-                <span className="text-muted-foreground/60">{type === "real" ? "default 2,000" : "default 5,000"}</span>
+                <span className="text-muted-foreground/60">{type === "real" ? "default 5,000" : "default 10,000"}</span>
                 <span>50,000</span>
               </div>
             </div>
