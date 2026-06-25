@@ -469,10 +469,18 @@ export async function getStrategyTracking(
       if (count === 0) {
         // No samples in-window: fall back to the latest live snapshot so the
         // tiles show the current values rather than zero on a fresh boot.
+        // For posPerSet, use the avg_pos_per_set from the tracking data.
+        // For posOpen, calculate it as a percentage: (sets with open / total sets) * 100
+        const realSetsWithOpen = Number(real.sets_with_open_positions || "0")
+        const realSetsTotal = Number(real.sets_total || "0")
+        const posOpenPercent = realSetsTotal > 0 
+          ? Math.round((realSetsWithOpen / realSetsTotal) * 10000) / 100
+          : 0
+        
         return {
           activeSets: realCombined,
           posPerSet: Number(real.avg_pos_per_set || "0"),
-          posOpen: Number(real.entries_total || "0"),
+          posOpen: posOpenPercent,
           samples: 0,
         }
       }

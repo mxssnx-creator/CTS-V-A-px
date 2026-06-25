@@ -2673,6 +2673,171 @@ const migrations: Migration[] = [
     },
   },
 
+  // ── Migration 043 ──────────────────────────────────────────────────────────
+  // Production progression repair: align all configured symbol lists across the
+  // raw connection hash and the setSettings-prefixed hashes, and repair visible
+  // prehistoric denominators without manufacturing completion. This is safe to
+  // run on already-migrated installs because it only mirrors existing operator
+  // symbol choices and never marks processing done.
+  {
+    version: 43,
+    name: "043-align-symbol-state-and-prehistoric-denominators",
+    description: "Mirror operator symbol lists into engine read paths and repair prehistoric progress denominators",
+    up: async (client: any) => {
+      await client.set("_schema_version", "43")
+      const now = new Date().toISOString()
+      const parseSymbols = (raw: unknown): string[] => {
+        if (Array.isArray(raw)) return raw.map(String).map((x) => x.trim()).filter(Boolean)
+        const value = String(raw ?? "").trim()
+        if (!value || value === "[]") return []
+        if (value.startsWith("[")) {
+          try {
+            const parsed = JSON.parse(value)
+            if (Array.isArray(parsed)) return parsed.map(String).map((x) => x.trim()).filter(Boolean)
+          } catch { /* fall through */ }
+        }
+        return value.split(/[,|\n]/).map((x) => x.trim()).filter(Boolean)
+      }
+
+      const connectionIds = new Set<string>([
+        ...((await client.smembers("connections").catch(() => [])) || []),
+        ...((await client.smembers("connections:main:enabled").catch(() => [])) || []),
+      ].map(String).filter(Boolean))
+
+      let repaired = 0
+      for (const connId of connectionIds) {
+        const rawConn = (await client.hgetall(`connection:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
+        const prefConn = (await client.hgetall(`settings:connection:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
+        const engineState = (await client.hgetall(`settings:trade_engine_state:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
+        const symbols = [
+          parseSymbols(rawConn.force_symbols),
+          parseSymbols(rawConn.active_symbols),
+          parseSymbols(prefConn.force_symbols),
+          parseSymbols(prefConn.active_symbols),
+          parseSymbols(engineState.force_symbols),
+          parseSymbols(engineState.active_symbols),
+          parseSymbols(engineState.symbols),
+        ].find((candidate) => candidate.length > 0) || []
+
+        if (symbols.length === 0) continue
+
+        const symbolsJson = JSON.stringify(symbols)
+        await Promise.all([
+          client.hset(`connection:${connId}`, {
+            active_symbols: symbolsJson,
+            force_symbols: symbolsJson,
+            symbol_count: String(symbols.length),
+            updated_at: now,
+          }).catch(() => {}),
+          client.hset(`settings:connection:${connId}`, {
+            active_symbols: symbolsJson,
+            force_symbols: symbolsJson,
+            symbol_count: String(symbols.length),
+            updated_at: now,
+          }).catch(() => {}),
+          client.hset(`settings:trade_engine_state:${connId}`, {
+            symbols: symbolsJson,
+            active_symbols: symbolsJson,
+            force_symbols: symbolsJson,
+            symbol_count: String(symbols.length),
+            config_set_symbols_total: String(symbols.length),
+            updated_at: now,
+          }).catch(() => {}),
+        ])
+
+        const engineProgression = (await client.hgetall(`settings:engine_progression:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
+        if (engineProgression.phase === "prehistoric_data") {
+          await client.hset(`settings:engine_progression:${connId}`, {
+            sub_item: engineProgression.sub_item || "symbols",
+            sub_total: String(Math.max(Number(engineProgression.sub_total || 0), symbols.length)),
+            updated_at: now,
+          }).catch(() => {})
+        }
+        repaired++
+      }
+
+      console.log(`[v0] Migration 043: aligned symbol state and prehistoric denominators for ${repaired} connection(s)`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "42")
+    },
+  },
+  {
+    version: 44,
+    name: "044-initialize-production-progression-tracking",
+    description: "Ensure progression counters and stats are initialized for production mode",
+    up: async (client: any) => {
+      await client.set("_schema_version", "44")
+      const now = new Date().toISOString()
+      
+      // Initialize progression tracking structures for all known connections
+      const connectionIds = new Set<string>([
+        ...((await client.smembers("connections").catch(() => [])) || []),
+        ...((await client.smembers("connections:main:enabled").catch(() => [])) || []),
+        "bingx-x01", // Ensure primary connection is always set up
+      ].map(String).filter(Boolean))
+
+      let initialized = 0
+      for (const connId of connectionIds) {
+        try {
+          // Initialize progression tracking hash
+          const progressionKey = `progression:${connId}`
+          const existingProg = await client.hgetall(progressionKey).catch(() => ({}))
+          
+          // Only initialize if not already set
+          if (!existingProg || Object.keys(existingProg || {}).length === 0) {
+            await client.hset(progressionKey, {
+              prehistoric_passed: "0",
+              prehistoric_failed: "0",
+              prehistoric_placed: "0",
+              prehistoric_filled: "0",
+              prehistoric_canceled: "0",
+              prehistoric_rejected: "0",
+              prehistoric_errored: "0",
+              real_evaluated: "0",
+              real_passed: "0",
+              real_placed: "0",
+              real_filled: "0",
+              live_evaluated: "0",
+              live_passed: "0",
+              live_placed: "0",
+              live_filled: "0",
+              candlesLoaded: "0",
+              indicatorsComputed: "0",
+              configSetsCreated: "0",
+              initialized_at: now,
+              updated_at: now,
+            })
+            
+            // Set TTL to never expire (production uses indefinite progression)
+            await client.persist(progressionKey).catch(() => {})
+          }
+
+          // Initialize strategies_active hash if not present
+          const strategiesKey = `strategies_active:${connId}`
+          const existingStrat = await client.hgetall(strategiesKey).catch(() => ({}))
+          
+          if (!existingStrat || Object.keys(existingStrat || {}).length === 0) {
+            // Initialize empty for now; coordinator will populate on first cycle
+            await client.hset(strategiesKey, {
+              "_initialized": now,
+            })
+            // Set TTL to 10 minutes; coordinator refreshes every cycle
+            await client.expire(strategiesKey, 600).catch(() => {})
+          }
+
+          initialized++
+        } catch (err: any) {
+          console.warn(`[v0] Migration 044: failed to initialize ${connId}: ${err?.message}`)
+        }
+      }
+
+      console.log(`[v0] Migration 044: initialized progression tracking for ${initialized} connection(s)`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "43")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -2759,7 +2924,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     const { apiKey, apiSecret } = getBaseConnectionCredentials(cfg.credentialId)
     const hasRealCredentials = apiKey.length > 10 && apiSecret.length > 10
 
-    // ── OPERATOR-STATE PRESERVATION CONTRACT ──────────────────────────
+    // ── OPERATOR-STATE PRESERVATION CONTRACT ��─────────────────────────
     // Bug being fixed (operator report): "after removing main connections,
     // it's getting re-added by some procedure".
     //
@@ -2997,7 +3162,7 @@ const ensureBootstrapDiag = new Set<string>()
  * It guarantees:
  *  - All migration-022 style indexes and progression containers exist
  *  - Progression counters, strategy sets, live-position indexes are repaired
- *  - trade_engine:global is bootstrapped to "running" (unless operator stopped)
+ *  - trade_engine:global is never force-started; operator start/stop intent is preserved
  *  - Zero-count metadata keys are initialized for every enabled connection
  *  - No "No Progress / No counts" after cold start / redeploy
  * 
@@ -3081,6 +3246,29 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
 
   console.log("[v0] [Migrations] PRODUCTION MODE — INTENSIVE COMPLETE COVERAGE (making Prod identical to long-running Dev)")
 
+  // Ensure the entire Site/Project has ONE unique instance (independent of
+  // connections) without calling redis-db.ensureUniqueSiteInstance(). That helper
+  // normally calls initRedis(); invoking it from inside runMigrations() re-enters
+  // the migration promise and deadlocks production cold start. We already have a
+  // ready core Redis client here, so write the small site-instance hash directly.
+  try {
+    const siteKey = "site:unique_instance"
+    const existingSite = await client.hgetall(siteKey).catch(() => null)
+    if (existingSite?.site_session_id) {
+      await client.hset(siteKey, { last_activity: new Date().toISOString() }).catch(() => {})
+    } else {
+      const now = new Date().toISOString()
+      const siteSessionId = "site_" + Date.now() + "_" + Math.random().toString(36).slice(2, 12)
+      await client.hset(siteKey, {
+        site_session_id: siteSessionId,
+        created_at: now,
+        last_activity: now,
+        version: "1",
+      }).catch(() => {})
+      await client.hset("trade_engine:global", {
+        site_session_id: siteSessionId,
+        site_instance_created: now,
+      }).catch(() => {})
   // Ensure the entire Site/Project has ONE unique instance (independent of connections).
   // IMPORTANT: do not call redis-db.ensureUniqueSiteInstance() from inside
   // migrations; that helper calls initRedis(), and initRedis is currently
@@ -3274,15 +3462,20 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
 export async function runMigrations(): Promise<{ success: boolean; message: string; version: number }> {
   // If a run is already in-flight (or completed), return the same promise so
   // concurrent callers coalesce onto a single execution and never re-enter
-  // runMigrationsInternal(). The promise is intentionally kept after resolution —
-  // clearing it in `finally` caused a race where a second caller that had just
-  // started awaiting would see null and immediately start a second migration run.
+  // runMigrationsInternal(). Successful promises are cached for the process,
+  // but rejected promises MUST be cleared; otherwise one transient production
+  // Redis/deadline failure poisons the process forever and every later request
+  // receives the same stale rejection without retrying migrations.
   const existing = getMigrationRunPromise()
   if (existing) {
     return existing
   }
 
-  const promise = runMigrationsInternal()
+  const promise = runMigrationsInternal().catch((error) => {
+    setMigrationRunPromise(null)
+    setMigrationsRun(false)
+    throw error
+  })
   setMigrationRunPromise(promise)
   return promise
 }
