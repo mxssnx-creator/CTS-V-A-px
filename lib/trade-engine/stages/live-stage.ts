@@ -122,6 +122,7 @@ interface LivePosition {
   setKey?: string
   exchangeData?: Record<string, unknown>
   orderId?: string
+  liveOrderAuditTraceId?: string
   connection_id?: string
   entry_price?: number
   current_price?: number
@@ -135,6 +136,100 @@ interface LivePosition {
   accumulatedSetKeys?: string[]
   
   progression?: { step: string; timestamp: number; success: boolean; details: string }[]
+}
+
+
+interface LiveOrderAudit {
+  traceId: string
+  connectionId: string
+  symbol: string
+  direction: string
+  exchangeSide: string
+  quantityRequested: number
+  quantityAccepted: number
+  entryOrderId: string | null
+  entryOrderStatus: string | null
+  averageFillPrice: number
+  assignedStopLossPct: number
+  assignedTakeProfitPct: number
+  intendedStopLossPrice: number
+  intendedTakeProfitPrice: number
+  stopLossOrderId: string | null
+  takeProfitOrderId: string | null
+  protectionState: "pending" | "not_applicable" | "unprotected" | "partial" | "armed"
+  exchangeErrorCode: string | number | null
+  exchangeErrorMessage: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+function liveOrderAuditKey(connectionId: string, traceId: string): string {
+  return `live_order_audit:${connectionId}:${traceId}`
+}
+
+function extractExchangeError(result: any): { code: string | number | null; message: string | null } {
+  if (!result) return { code: null, message: null }
+  return {
+    code: result.errorCode ?? result.code ?? result.error_code ?? result.statusCode ?? null,
+    message: result.error ?? result.message ?? result.msg ?? null,
+  }
+}
+
+function resolveProtectionState(audit: LiveOrderAudit): LiveOrderAudit["protectionState"] {
+  const wantsSl = audit.intendedStopLossPrice > 0
+  const wantsTp = audit.intendedTakeProfitPrice > 0
+  const hasSl = !!audit.stopLossOrderId
+  const hasTp = !!audit.takeProfitOrderId
+  if (!wantsSl && !wantsTp) return "not_applicable"
+  if ((wantsSl && hasSl) && (wantsTp && hasTp)) return "armed"
+  if (hasSl || hasTp) return "partial"
+  return "unprotected"
+}
+
+async function persistLiveOrderAudit(audit: LiveOrderAudit): Promise<void> {
+  try {
+    const client = getRedisClient()
+    audit.updatedAt = new Date().toISOString()
+    audit.protectionState = resolveProtectionState(audit)
+    const key = liveOrderAuditKey(audit.connectionId, audit.traceId)
+    await client.set(key, JSON.stringify(audit), { EX: 30 * 24 * 60 * 60 })
+    await client.zadd(`live_order_audit:${audit.connectionId}:recent`, Date.parse(audit.updatedAt), audit.traceId).catch(() => 0)
+    await client.zremrangebyscore(`live_order_audit:${audit.connectionId}:recent`, "-inf", Date.now() - 30 * 24 * 60 * 60 * 1000).catch(() => 0)
+  } catch {
+    // Audit persistence must never block exchange execution.
+  }
+}
+
+function buildLiveOrderAudit(args: {
+  trace: LiveOrderTrace
+  livePosition: LivePosition
+  exchangeSide: "buy" | "sell"
+  quantityRequested: number
+}): LiveOrderAudit {
+  const now = new Date().toISOString()
+  return {
+    traceId: args.trace.traceId,
+    connectionId: args.trace.connectionId,
+    symbol: args.trace.symbol,
+    direction: args.trace.direction,
+    exchangeSide: args.exchangeSide,
+    quantityRequested: args.quantityRequested,
+    quantityAccepted: 0,
+    entryOrderId: null,
+    entryOrderStatus: null,
+    averageFillPrice: 0,
+    assignedStopLossPct: Number(args.livePosition.assignedStopLoss ?? args.livePosition.stopLoss ?? 0) || 0,
+    assignedTakeProfitPct: Number(args.livePosition.assignedTakeProfit ?? args.livePosition.takeProfit ?? 0) || 0,
+    intendedStopLossPrice: 0,
+    intendedTakeProfitPrice: 0,
+    stopLossOrderId: null,
+    takeProfitOrderId: null,
+    protectionState: "pending",
+    exchangeErrorCode: null,
+    exchangeErrorMessage: null,
+    createdAt: now,
+    updatedAt: now,
+  }
 }
 
 interface FillRecord {
@@ -2429,6 +2524,14 @@ export async function executeLivePosition(
       direction: realPosition.direction,
       exchangeSide,
     })
+    livePosition.liveOrderAuditTraceId = orderTrace.traceId
+    const liveOrderAudit = buildLiveOrderAudit({
+      trace: orderTrace,
+      livePosition,
+      exchangeSide,
+      quantityRequested: computedVolume,
+    })
+    await persistLiveOrderAudit(liveOrderAudit)
 
     console.log(
       `${LOG_PREFIX} EXECUTING REAL: ${realPosition.symbol} ${realPosition.direction} → ${exchangeSide} qty=${computedVolume.toFixed(
@@ -2458,6 +2561,11 @@ export async function executeLivePosition(
       livePosition.statusReason =
         `Control Orders disabled (is_live_trade=false) — order blocked before exchange placement`
       pushStep(livePosition, "entry", false, livePosition.statusReason)
+      const blockedError = extractExchangeError({ code: "LIVE_TRADE_DISABLED", message: livePosition.statusReason })
+      liveOrderAudit.entryOrderStatus = livePosition.status
+      liveOrderAudit.exchangeErrorCode = blockedError.code
+      liveOrderAudit.exchangeErrorMessage = blockedError.message
+      await persistLiveOrderAudit(liveOrderAudit)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_blocked_count")
       await logProgressionEvent(
@@ -2683,6 +2791,11 @@ export async function executeLivePosition(
       livePosition.status = "error"
       livePosition.statusReason = `Exchange circuit breaker active for ${realPosition.symbol} — retrying in <5min`
       pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      const circuitError = extractExchangeError(orderResult)
+      liveOrderAudit.entryOrderStatus = livePosition.status
+      liveOrderAudit.exchangeErrorCode = circuitError.code
+      liveOrderAudit.exchangeErrorMessage = circuitError.message || livePosition.statusReason
+      await persistLiveOrderAudit(liveOrderAudit)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_failed_count")
       await logProgressionEvent(connectionId, "live_trading", "warning", livePosition.statusReason, {
@@ -2721,6 +2834,11 @@ export async function executeLivePosition(
       livePosition.status = "rejected"
       livePosition.statusReason = String(reason)
       pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      const rejectError = extractExchangeError(orderResult)
+      liveOrderAudit.entryOrderStatus = livePosition.status
+      liveOrderAudit.exchangeErrorCode = rejectError.code
+      liveOrderAudit.exchangeErrorMessage = rejectError.message || livePosition.statusReason
+      await persistLiveOrderAudit(liveOrderAudit)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_failed_count")
       await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "failed")
@@ -2749,6 +2867,10 @@ export async function executeLivePosition(
 
     livePosition.orderId = String(entryOrderId)
     livePosition.status = "placed"
+    liveOrderAudit.entryOrderId = livePosition.orderId
+    liveOrderAudit.entryOrderStatus = String(orderResult?.status ?? livePosition.status)
+    liveOrderAudit.quantityAccepted = computedVolume
+    await persistLiveOrderAudit(liveOrderAudit)
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
     await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "placed")
@@ -2880,6 +3002,10 @@ export async function executeLivePosition(
         reason: `fill via=${fill.status}`,
         extra: { orderId: livePosition.orderId, attempts: placeAttempt },
       })
+      liveOrderAudit.quantityAccepted = fill.filledQty
+      liveOrderAudit.entryOrderStatus = fill.status
+      liveOrderAudit.averageFillPrice = fill.filledPrice || currentPrice
+      await persistLiveOrderAudit(liveOrderAudit)
       // BingX hedge-mode positions need a brief settling period after a
       // market order fills before a STOP/TP_MARKET can reference them.
       // Even when the fill is confirmed by pollOrderFill / getPosition,
@@ -2932,6 +3058,10 @@ export async function executeLivePosition(
         reason: `fill unconfirmed — using computedVolume as fallback (pollStatus=${fill.status})`,
         extra: { orderId: livePosition.orderId, attempts: placeAttempt },
       })
+      liveOrderAudit.quantityAccepted = computedVolume
+      liveOrderAudit.entryOrderStatus = fill.status
+      liveOrderAudit.averageFillPrice = currentPrice
+      await persistLiveOrderAudit(liveOrderAudit)
     }
 
     // ── Step 7: Place Stop Loss and Take Profit orders ─��───────────────────
@@ -2947,6 +3077,9 @@ export async function executeLivePosition(
       const sideClose: "buy" | "sell" = realPosition.direction === "long" ? "sell" : "buy"
       const { desiredSl: slPrice, desiredTp: tpPrice } =
         computeDesiredProtectionPrices(livePosition)
+      liveOrderAudit.intendedStopLossPrice = slPrice || 0
+      liveOrderAudit.intendedTakeProfitPrice = tpPrice || 0
+      await persistLiveOrderAudit(liveOrderAudit)
       // Duplicate-prevention is handled inside the Promise.all below:
       // each leg resolves to the existing orderId when an order is already
       // present (`!livePosition.stopLossOrderId` guard on the ternary),
@@ -3036,6 +3169,10 @@ export async function executeLivePosition(
         )
         pushStep(livePosition, "place_take_profit", false, `initial TP placement failed @ ${tpPrice}`)
       }
+      liveOrderAudit.stopLossOrderId = livePosition.stopLossOrderId || null
+      liveOrderAudit.takeProfitOrderId = livePosition.takeProfitOrderId || null
+      await persistLiveOrderAudit(liveOrderAudit)
+
       // Record the qty SL/TP were armed for so the next reconcile
       // pass can detect quantity drift (delayed partial fills,
       // accumulation merges) and re-arm. Without this the drift
@@ -3137,6 +3274,12 @@ export async function executeLivePosition(
       )
     }
 
+    liveOrderAudit.entryOrderStatus = livePosition.status || liveOrderAudit.entryOrderStatus
+    liveOrderAudit.quantityAccepted = livePosition.executedQuantity || liveOrderAudit.quantityAccepted
+    liveOrderAudit.averageFillPrice = livePosition.averageExecutionPrice || liveOrderAudit.averageFillPrice
+    liveOrderAudit.stopLossOrderId = livePosition.stopLossOrderId || liveOrderAudit.stopLossOrderId
+    liveOrderAudit.takeProfitOrderId = livePosition.takeProfitOrderId || liveOrderAudit.takeProfitOrderId
+    await persistLiveOrderAudit(liveOrderAudit)
     await savePosition(livePosition)
 
     // Only count this as a real "position created" when the entry
