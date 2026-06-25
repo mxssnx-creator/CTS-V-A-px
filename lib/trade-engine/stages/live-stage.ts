@@ -63,6 +63,24 @@ const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  3_000  // was 10 s
  * is intentionally kept separate (it represents the cached exchange API
  * shape, not the stage pipeline shape).
  */
+
+interface ProtectionAudit {
+  entryPrice: number
+  exchangeFillPrice: number
+  direction: "long" | "short"
+  assignedTakeProfitPct: number
+  assignedStopLossPct: number
+  intendedTakeProfitPrice: number
+  intendedStopLossPrice: number
+  exchangeTakeProfitOrderPrice: number
+  exchangeStopLossOrderPrice: number
+  takeProfitPriceDiffPct: number
+  stopLossPriceDiffPct: number
+  positionCostPct: number
+  configuredTpR: number
+  configuredSlR: number
+}
+
 interface LivePosition {
   id: string
   connectionId: string
@@ -74,6 +92,7 @@ interface LivePosition {
   remainingQuantity: number
   averageExecutionPrice: number
   volumeUsd?: number
+  positionCostPct?: number
   leverage: number
   marginType: "cross" | "isolated"
   unrealized_pnl?: number
@@ -106,6 +125,7 @@ interface LivePosition {
   assignedStopLoss?: number
   assignedTakeProfit?: number
   protectionArmedQuantity?: number
+  protectionAudit?: ProtectionAudit
   // ── Trailing stop state ────────────────────────────────────────────────
   // Written by syncLiveFromPseudo when the pseudo position's trailing machine
   // is armed. These fields make the ratcheted absolute stop price available to
@@ -163,6 +183,52 @@ function pushStep(position: LivePosition, step: string, ok: boolean, detail: str
   } catch {
     // non-critical
   }
+}
+
+function pctDiff(actual: number, intended: number): number {
+  if (!Number.isFinite(actual) || !Number.isFinite(intended) || intended <= 0) return 0
+  return Math.round(((actual - intended) / intended) * 100 * 1e6) / 1e6
+}
+
+function buildProtectionAudit(
+  pos: LivePosition,
+  intended: { desiredSl: number; desiredTp: number },
+  exchangePrices: { stopLoss?: number; takeProfit?: number } = {},
+): ProtectionAudit {
+  const entryPrice = Number(pos.entryPrice || 0)
+  const exchangeFillPrice = Number(pos.averageExecutionPrice || pos.entryPrice || 0)
+  const assignedTakeProfitPct = Number(pos.assignedTakeProfit ?? pos.takeProfit ?? 0) || 0
+  const assignedStopLossPct = Number(pos.assignedStopLoss ?? pos.stopLoss ?? 0) || 0
+  const exchangeTakeProfitOrderPrice = Number(exchangePrices.takeProfit ?? pos.takeProfitPrice ?? 0) || 0
+  const exchangeStopLossOrderPrice = Number(exchangePrices.stopLoss ?? pos.stopLossPrice ?? 0) || 0
+  const positionCostPct = Number((pos as any).positionCostPct ?? 0) || 0
+  return {
+    entryPrice,
+    exchangeFillPrice,
+    direction: (pos.direction === "short" ? "short" : "long"),
+    assignedTakeProfitPct,
+    assignedStopLossPct,
+    intendedTakeProfitPrice: intended.desiredTp || 0,
+    intendedStopLossPrice: intended.desiredSl || 0,
+    exchangeTakeProfitOrderPrice,
+    exchangeStopLossOrderPrice,
+    takeProfitPriceDiffPct: pctDiff(exchangeTakeProfitOrderPrice, intended.desiredTp),
+    stopLossPriceDiffPct: pctDiff(exchangeStopLossOrderPrice, intended.desiredSl),
+    positionCostPct,
+    configuredTpR: Number(pos.takeProfit ?? assignedTakeProfitPct) || 0,
+    configuredSlR: Number(pos.stopLoss ?? assignedStopLossPct) || 0,
+  }
+}
+
+function refreshProtectionAudit(
+  pos: LivePosition,
+  intended?: { desiredSl: number; desiredTp: number },
+  exchangePrices: { stopLoss?: number; takeProfit?: number } = {},
+): ProtectionAudit {
+  const desired = intended ?? computeDesiredProtectionPrices(pos)
+  const audit = buildProtectionAudit(pos, desired, exchangePrices)
+  pos.protectionAudit = audit
+  return audit
 }
 
 function normalizeStopLossPercent(rawStopLoss: unknown): { value: number; adjusted: boolean; reason?: string } {
@@ -1044,7 +1110,7 @@ async function placeProtectionOrder(
   triggerPrice: number,
   orderLabel: "StopLoss" | "TakeProfit",
   positionDirection: "long" | "short",
-): Promise<string | null> {
+): Promise<{ orderId: string; orderPrice: number } | null> {
   // ── Structured trace context ────────────────────────────────────────
   // Every protection-order placement gets a single multi-field log line
   // before any exchange interaction, so when an operator reports "the
@@ -1245,7 +1311,7 @@ async function placeProtectionOrder(
       console.log(
         `${tag} PLACED: orderId=${orderId} @ trigger=${triggerPrice} qty=${effectiveQty}${effectiveQty !== quantity ? ` (requested=${quantity}, adjusted)` : ""} latency=${latencyMs}ms`,
       )
-      return orderId
+      return { orderId, orderPrice: parseFloat(String(result.orderPrice ?? result.stopPrice ?? result.price ?? triggerPrice)) || triggerPrice }
     }
     // result.error is the connector's normalized venue-side message
     // (e.g. "BingX stop order error (code=110413): Take Profit price
@@ -1771,7 +1837,7 @@ async function updateProtectionOrders(
         }
       }
       if (oldGone) {
-        const id = await placeProtectionOrder(
+        const placed = await placeProtectionOrder(
           connector,
           pos.symbol,
           closeSide,
@@ -1785,9 +1851,9 @@ async function updateProtectionOrders(
         // on a failed placement would make the next pass think the
         // level is live (priceDrifted compares < 0.25%) and skip
         // retry — leaving the position permanently unprotected.
-        if (id) {
-          pos.stopLossOrderId = id
-          pos.stopLossPrice = desiredSl
+        if (placed) {
+          pos.stopLossOrderId = placed.orderId
+          pos.stopLossPrice = placed.orderPrice || desiredSl
           pos.stopLossLastArmedAt = Date.now()
           result.changed = true
           result.slPlaced = true
@@ -1833,7 +1899,7 @@ async function updateProtectionOrders(
         }
       }
       if (oldGone) {
-        const id = await placeProtectionOrder(
+        const placed = await placeProtectionOrder(
           connector,
           pos.symbol,
           closeSide,
@@ -1842,9 +1908,9 @@ async function updateProtectionOrders(
           "TakeProfit",
           pos.direction!,
         )
-        if (id) {
-          pos.takeProfitOrderId = id
-          pos.takeProfitPrice = desiredTp
+        if (placed) {
+          pos.takeProfitOrderId = placed.orderId
+          pos.takeProfitPrice = placed.orderPrice || desiredTp
           pos.takeProfitLastArmedAt = Date.now()
           result.changed = true
           result.tpPlaced = true
@@ -1868,13 +1934,15 @@ async function updateProtectionOrders(
     pos.protectionArmedQuantity = effectiveQty
   }
 
+  const protectionAudit = refreshProtectionAudit(pos, { desiredSl, desiredTp })
+
   if (result.changed) {
     pushStep(
       pos,
       "update_sl_tp",
       true,
       `[${reason}] SL ${pos.stopLoss}% → ${pos.stopLossPrice ? pos.stopLossPrice.toFixed(6) : "—"} (${pos.stopLossOrderId || "—"}) | ` +
-      `TP ${pos.takeProfit}% → ${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"})`,
+      `TP ${pos.takeProfit}% → ${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"}) | audit=${JSON.stringify(protectionAudit)}`,
     )
     await logProgressionEvent(
       pos.connectionId,
@@ -1896,6 +1964,7 @@ async function updateProtectionOrders(
         tpOrderId: pos.takeProfitOrderId,
         tpPrice: pos.takeProfitPrice,
         fillPrice: pos.averageExecutionPrice,
+        protectionAudit,
       },
     )
   }
@@ -2585,6 +2654,9 @@ export async function executeLivePosition(
     livePosition.quantity = computedVolume
     livePosition.remainingQuantity = computedVolume
     livePosition.volumeUsd = computedVolume * currentPrice
+    const positionCostRawForAudit = (connSettings as any).exchangePositionCost ?? (connSettings as any).positionCost ?? (connSettings as any).exchange_position_cost
+    const parsedPositionCostPct = parseFloat(String(positionCostRawForAudit ?? "0"))
+    livePosition.positionCostPct = Number.isFinite(parsedPositionCostPct) && parsedPositionCostPct > 0 ? parsedPositionCostPct : 0
     livePosition.leverage = volumeResult?.leverage || livePosition.leverage
 
     // If the volume calculator clamped the quantity UP to the exchange
@@ -3309,6 +3381,39 @@ export async function executeLivePosition(
       // for that leg. A failed placement leaves it at 0, which
       // `priceDrifted(0, desired)` correctly classifies as "needs arming"
       // on the next reconcile pass.
+      // BingX hedge-mode: placing SL and TP concurrently (Promise.all) causes
+      // the second order to receive code=109420 "position not exist" while the
+      // first order is still being registered by the exchange.  Serialise SL
+      // first, wait 500 ms, then place TP.  The 500 ms gap is enough for the
+      // exchange registry to reflect the first stop order.  The existing 4 s
+      // retry inside placeProtectionOrder handles any residual 109420s.
+      const slPlaced = (slPrice > 0 && !livePosition.stopLossOrderId)
+        ? await placeProtectionOrder(
+            exchangeConnector,
+            realPosition.symbol,
+            sideClose,
+            livePosition.executedQuantity,
+            slPrice,
+            "StopLoss",
+            realPosition.direction,
+          )
+        : (livePosition.stopLossOrderId ? { orderId: livePosition.stopLossOrderId, orderPrice: livePosition.stopLossPrice || slPrice } : null)
+
+      if (slPrice > 0 && tpPrice > 0 && !livePosition.takeProfitOrderId) {
+        await new Promise((r) => setTimeout(r, 500))
+      }
+
+      const tpPlaced = (tpPrice > 0 && !livePosition.takeProfitOrderId)
+        ? await placeProtectionOrder(
+            exchangeConnector,
+            realPosition.symbol,
+            sideClose,
+            livePosition.executedQuantity,
+            tpPrice,
+            "TakeProfit",
+            realPosition.direction,
+          )
+        : (livePosition.takeProfitOrderId ? { orderId: livePosition.takeProfitOrderId, orderPrice: livePosition.takeProfitPrice || tpPrice } : null)
       // OPTIMIZATION: Batch SL and TP placement to reduce API calls.
       // Instead of sequential placement (SL → wait 500ms → TP),
       // attempt batch placement first if the connector supports it.
@@ -3386,9 +3491,11 @@ export async function executeLivePosition(
         ) || null
       }
 
-      if (slOrderId) {
-        livePosition.stopLossOrderId = slOrderId
-        livePosition.stopLossPrice = slPrice
+      const slOrderId = slPlaced?.orderId || null
+      const tpOrderId = tpPlaced?.orderId || null
+      if (slPlaced) {
+        livePosition.stopLossOrderId = slPlaced.orderId
+        livePosition.stopLossPrice = slPlaced.orderPrice || slPrice
       } else if (slPrice > 0) {
         // Surface the protection gap loudly so operators and the
         // dashboard see it; the next reconcile will retry.
@@ -3404,9 +3511,9 @@ export async function executeLivePosition(
         )
         pushStep(livePosition, "place_stop_loss", false, `initial SL placement failed @ ${slPrice}`)
       }
-      if (tpOrderId) {
-        livePosition.takeProfitOrderId = tpOrderId
-        livePosition.takeProfitPrice = tpPrice
+      if (tpPlaced) {
+        livePosition.takeProfitOrderId = tpPlaced.orderId
+        livePosition.takeProfitPrice = tpPlaced.orderPrice || tpPrice
       } else if (tpPrice > 0) {
         console.error(
           `${LOG_PREFIX} INITIAL TakeProfit placement FAILED for ${realPosition.symbol} — position is LIVE without TP until next reconcile tick`,
@@ -3438,6 +3545,8 @@ export async function executeLivePosition(
         if (tpOrderId) livePosition.takeProfitLastArmedAt = nowMs
       }
 
+      const protectionAudit = refreshProtectionAudit(livePosition, { desiredSl: slPrice, desiredTp: tpPrice })
+
       // Step record + progression log carry BOTH the assigned percent
       // and the resulting absolute trigger price, so an operator
       // reading the timeline never has to mentally reconstruct one
@@ -3449,7 +3558,7 @@ export async function executeLivePosition(
         "place_sl_tp",
         !!(slOrderId || tpOrderId),
         `SL ${livePosition.stopLoss}% → ${slPrice ? slPrice.toFixed(6) : "—"} (${slOrderId || "—"}) | ` +
-        `TP ${livePosition.takeProfit}% → ${tpPrice ? tpPrice.toFixed(6) : "—"} (${tpOrderId || "—"})`
+        `TP ${livePosition.takeProfit}% → ${tpPrice ? tpPrice.toFixed(6) : "—"} (${tpOrderId || "—"}) | audit=${JSON.stringify(protectionAudit)}`
       )
       await logProgressionEvent(
         connectionId,
@@ -3469,6 +3578,7 @@ export async function executeLivePosition(
           tpOrderId,
           tpPrice,
           fillPrice: livePosition.averageExecutionPrice,
+          protectionAudit,
         },
       )
     } else {
@@ -4047,6 +4157,7 @@ export async function closeLivePosition(
       marginAtRisk: margin,
       exchangeCloseSucceeded: exchangeCloseSuccess,
       exchangeCloseClassification: exchangeCloseReason,
+      protectionAudit: position.protectionAudit,
     })
 
     const closeStatus =
