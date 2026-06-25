@@ -490,21 +490,102 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
+type LiveExecutionCostProfile = {
+  exchange: string
+  takerFeePct: number
+  estimatedSpreadPct: number
+  slippagePct: number
+  fundingBufferPct: number
+  costBufferPct: number
+}
+
+type ProfitFactorProtection = {
+  takeProfitPct: number
+  stopLossPct: number
+  effectiveProfitFactor: number
+  grossPF: number
+  costBufferPct: number
+  netEffectivePF: number
+  adjustedTakeProfitPct: number
+}
+
+
+type LiveDispatchDecision = {
+  setKey: string
+  parentSetKey?: string
+  variant: string
+  symbol: string
+  direction: "long" | "short"
+  grossPF: number
+  costBufferPct: number
+  netEffectivePF: number
+  takeProfitPct: number
+  adjustedTakeProfitPct: number
+  stopLossPct: number
+  effectiveProfitFactor: number
+  liveThresholdPF: number
+  costs: LiveExecutionCostProfile
+  reason?: "net_pf_after_costs_low" | "tp_after_costs_exceeds_max"
+}
+
+const MAX_LIVE_TAKE_PROFIT_PCT = 22
+
 function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
   sizeMultiplier = 1,
-): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
+  costBufferPct = 0,
+): ProfitFactorProtection {
   const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
   const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  const normalizedCostBufferPct = Number.isFinite(costBufferPct) && costBufferPct > 0 ? costBufferPct : 0
   // Tie SL to the actual position-cost budget, then apply variant scaling.
   // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
   const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
-  const takeProfitPct = clampNumber(stopLossPct * Math.max(1, pf), 0.2, 22)
+  const grossTakeProfitPct = Math.max(0.2, stopLossPct * Math.max(1, pf))
+  const adjustedTakeProfitPct = grossTakeProfitPct + normalizedCostBufferPct
+  const takeProfitPct = clampNumber(adjustedTakeProfitPct, 0.2, MAX_LIVE_TAKE_PROFIT_PCT)
+  const netRewardPct = Math.max(0, grossTakeProfitPct - normalizedCostBufferPct)
   return {
     takeProfitPct,
     stopLossPct,
     effectiveProfitFactor: takeProfitPct / stopLossPct,
+    grossPF: pf,
+    costBufferPct: normalizedCostBufferPct,
+    netEffectivePF: netRewardPct / stopLossPct,
+    adjustedTakeProfitPct,
+  }
+}
+
+function normalizePercentSetting(value: unknown, fallbackPct: number): number {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return fallbackPct
+  // Settings often store tolerances as ratios (0.0006 = 0.06%). Accept both.
+  return n <= 1 ? n * 100 : n
+}
+
+function defaultTakerFeePct(exchange: string): number {
+  switch (exchange) {
+    case "binance": return 0.04
+    case "bybit": return 0.055
+    case "okx": return 0.05
+    case "bingx": return 0.05
+    default: return 0.06
+  }
+}
+
+function resolveLiveExecutionCostProfile(exchange: string, connSettings: Record<string, unknown>): LiveExecutionCostProfile {
+  const takerFeePct = normalizePercentSetting(connSettings.takerFeePct ?? connSettings.takerFee ?? connSettings.exchangeTakerFeePct, defaultTakerFeePct(exchange))
+  const estimatedSpreadPct = normalizePercentSetting(connSettings.estimatedSpreadPct ?? connSettings.spreadPct ?? connSettings.exchangeSpreadPct, 0.02)
+  const slippagePct = normalizePercentSetting(connSettings.slippageTolerance ?? connSettings.slippagePct ?? connSettings.exchangeSlippagePct, 0.06)
+  const fundingBufferPct = normalizePercentSetting(connSettings.fundingBufferPct ?? connSettings.fundingPct ?? connSettings.exchangeFundingBufferPct, 0)
+  return {
+    exchange,
+    takerFeePct,
+    estimatedSpreadPct,
+    slippagePct,
+    fundingBufferPct,
+    costBufferPct: (takerFeePct * 2) + estimatedSpreadPct + (slippagePct * 2) + fundingBufferPct,
   }
 }
 
@@ -3603,6 +3684,9 @@ export class StrategyCoordinator {
     const metrics = this.METRICS.live
     let maxLive = this.config.maxLiveSets || 500
     let livePositionCostPct = 0.1
+    let liveExecutionCosts: LiveExecutionCostProfile = resolveLiveExecutionCostProfile("unknown", {})
+    const dispatchSelected: LiveDispatchDecision[] = []
+    const dispatchSuppressed: LiveDispatchDecision[] = []
     try {
       const { getConnection } = await import("@/lib/redis-db")
       const [conn, connSettings] = await Promise.all([
@@ -3610,6 +3694,7 @@ export class StrategyCoordinator {
         getRedisClient().hgetall(`connection_settings:${this.connectionId}`).catch(() => ({})),
       ])
       const exchange = String((conn as any)?.exchange || "").toLowerCase()
+      liveExecutionCosts = resolveLiveExecutionCostProfile(exchange || "unknown", connSettings as Record<string, unknown>)
       // BingX commonly enforces a 200-open-order ceiling. Each live position
       // can carry two reduce-only control orders (SL + TP), so cap dispatch to
       // 90 positions per cycle (≤180 controls) and leave room for manual orders,
@@ -3684,6 +3769,9 @@ export class StrategyCoordinator {
         created:    new Date(),
         executable: true,
         _slim:      true,
+        dispatchSelected,
+        dispatchSuppressed,
+        liveExecutionCosts,
       })
     }
 
@@ -4012,7 +4100,33 @@ export class StrategyCoordinator {
                   effectivePF,
                   livePositionCostPct,
                   effectiveSizeMult,
+                  liveExecutionCosts.costBufferPct,
                 )
+                const protectionDispatch: LiveDispatchDecision = {
+                  setKey: set.setKey,
+                  parentSetKey: set.parentSetKey,
+                  variant: set.variant ?? "default",
+                  symbol,
+                  direction: set.direction,
+                  grossPF: Number(protection.grossPF.toFixed(6)),
+                  costBufferPct: Number(protection.costBufferPct.toFixed(6)),
+                  netEffectivePF: Number(protection.netEffectivePF.toFixed(6)),
+                  takeProfitPct: Number(protection.takeProfitPct.toFixed(6)),
+                  adjustedTakeProfitPct: Number(protection.adjustedTakeProfitPct.toFixed(6)),
+                  stopLossPct: Number(protection.stopLossPct.toFixed(6)),
+                  effectiveProfitFactor: Number(protection.effectiveProfitFactor.toFixed(6)),
+                  liveThresholdPF: metrics.minProfitFactor,
+                  costs: liveExecutionCosts,
+                }
+                if (protection.adjustedTakeProfitPct > MAX_LIVE_TAKE_PROFIT_PCT) {
+                  dispatchSuppressed.push({ ...protectionDispatch, reason: "tp_after_costs_exceeds_max" })
+                  continue
+                }
+                if (protection.netEffectivePF < metrics.minProfitFactor) {
+                  dispatchSuppressed.push({ ...protectionDispatch, reason: "net_pf_after_costs_low" })
+                  continue
+                }
+                dispatchSelected.push(protectionDispatch)
                 const tp = protection.takeProfitPct
                 const sl = protection.stopLossPct
 
@@ -4041,7 +4155,7 @@ export class StrategyCoordinator {
                     ratios: {
                       // Use effectivePF (coord-record tuned) so risk ratios reflect
                       // the Real-stage performance bias rather than raw Base entry PF.
-                      profitabilityRatio: protection.effectiveProfitFactor,
+                      profitabilityRatio: protection.netEffectivePF,
                       accountRiskRatio: sl / 100,
                       successRateRatio: bestEntry.confidence,
                       consistencyRatio: set.avgConfidence,
@@ -4115,6 +4229,34 @@ export class StrategyCoordinator {
           } else {
             console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: live_trade=true but connector not available`)
           }
+
+          try {
+            const client = getRedisClient()
+            const payload = {
+              selected: JSON.stringify(dispatchSelected),
+              suppressed: JSON.stringify(dispatchSuppressed),
+              costs: JSON.stringify(liveExecutionCosts),
+              updated_at: String(Date.now()),
+              [`s:${symbol}:dispatchSelected`]: JSON.stringify(dispatchSelected),
+              [`s:${symbol}:dispatchSuppressed`]: JSON.stringify(dispatchSuppressed),
+            }
+            await Promise.all([
+              client.hset(`strategy_dispatch:${this.connectionId}:live`, payload),
+              client.expire(`strategy_dispatch:${this.connectionId}:live`, 86400),
+              process.env.NODE_ENV !== "development"
+                ? setSettings(`strategies:${this.connectionId}:${symbol}:live:sets`, {
+                    setKeys: qualifying.map((s) => s.setKey),
+                    count: qualifying.length,
+                    created: new Date(),
+                    executable: true,
+                    _slim: true,
+                    dispatchSelected,
+                    dispatchSuppressed,
+                    liveExecutionCosts,
+                  })
+                : Promise.resolve(),
+            ])
+          } catch { /* non-critical */ }
         }
       } catch (liveErr) {
         console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: Real exchange execution error:`, liveErr instanceof Error ? liveErr.message : String(liveErr))
