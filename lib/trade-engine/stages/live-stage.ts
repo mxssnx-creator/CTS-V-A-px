@@ -150,7 +150,7 @@ interface LivePosition {
   //   when trailing becomes inactive so the static stopLoss % takes over again.
   trailingActive?: boolean
   trailingStopPrice?: number
-  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending" | "blocked"
   statusReason?: string
   closeReason?: string
   setKey?: string
@@ -179,6 +179,108 @@ interface FillRecord {
   timestamp?: number
   fee?: number
   feeAsset?: string
+}
+
+interface LivePreflightResult {
+  ok: boolean
+  reason?: string
+  cached?: boolean
+}
+
+const LIVE_PREFLIGHT_CACHE_TTL_MS = 30_000
+const LIVE_PREFLIGHT_TIMEOUT_MS = 3_000
+const livePreflightCache = new Map<string, { result: LivePreflightResult; checkedAt: number }>()
+
+function hasLiveCredentials(settings: Record<string, any> | null | undefined, connector: any): boolean {
+  const sources = [
+    settings,
+    connector,
+    connector?.config,
+    connector?.credentials,
+    connector?.options,
+  ].filter(Boolean)
+
+  return sources.some((source: any) => {
+    const apiKey = source.api_key ?? source.apiKey ?? source.key
+    const apiSecret = source.api_secret ?? source.apiSecret ?? source.secret
+    return typeof apiKey === "string" && apiKey.trim().length > 0 &&
+      typeof apiSecret === "string" && apiSecret.trim().length > 0
+  })
+}
+
+async function runLiveOrderPreflight(
+  connectionId: string,
+  exchangeConnector: any,
+  connSettings: Record<string, any> | null | undefined,
+): Promise<LivePreflightResult> {
+  if (!exchangeConnector || typeof exchangeConnector.placeOrder !== "function") {
+    return { ok: false, reason: "Exchange connector not available or missing placeOrder" }
+  }
+
+  if (!hasLiveCredentials(connSettings, exchangeConnector)) {
+    return { ok: false, reason: "Exchange credentials missing" }
+  }
+
+  const cacheKey = connectionId
+  const cached = livePreflightCache.get(cacheKey)
+  const now = Date.now()
+  if (cached && now - cached.checkedAt < LIVE_PREFLIGHT_CACHE_TTL_MS) {
+    return { ...cached.result, cached: true }
+  }
+
+  try {
+    let balanceChecked = false
+    if (typeof exchangeConnector.testConnection === "function") {
+      const result: any = await withTimeout(
+        exchangeConnector.testConnection(),
+        LIVE_PREFLIGHT_TIMEOUT_MS,
+        "live-preflight-testConnection",
+      )
+      if (result && result.success === false) {
+        const reason = result.error || result.message || "Exchange transport test failed"
+        const failed = { ok: false, reason: String(reason) }
+        livePreflightCache.set(cacheKey, { result: failed, checkedAt: now })
+        return failed
+      }
+    } else if (typeof exchangeConnector.getPositions === "function") {
+      await withTimeout(
+        exchangeConnector.getPositions(),
+        LIVE_PREFLIGHT_TIMEOUT_MS,
+        "live-preflight-getPositions",
+      )
+    } else if (typeof exchangeConnector.getBalance === "function") {
+      await withTimeout(
+        exchangeConnector.getBalance(),
+        LIVE_PREFLIGHT_TIMEOUT_MS,
+        "live-preflight-getBalance",
+      )
+      balanceChecked = true
+    } else {
+      return { ok: false, reason: "Exchange connector has no transport health probe" }
+    }
+
+    // Optional account balance endpoint probe.  If the connector exposes it,
+    // verify that authenticated account REST calls are reachable before any
+    // order, SL, or TP is attempted.
+    if (!balanceChecked && typeof exchangeConnector.getBalance === "function") {
+      await withTimeout(
+        exchangeConnector.getBalance(),
+        LIVE_PREFLIGHT_TIMEOUT_MS,
+        "live-preflight-getBalance",
+      )
+    }
+
+    const ok = { ok: true }
+    livePreflightCache.set(cacheKey, { result: ok, checkedAt: now })
+    return ok
+  } catch (err) {
+    const failed = {
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+    }
+    livePreflightCache.set(cacheKey, { result: failed, checkedAt: now })
+    return failed
+  }
 }
 
 // ── Helper function stubs (defined in adjacent modules) ──────────────
@@ -2507,20 +2609,20 @@ export async function executeLivePosition(
       return livePosition
     }
 
-    if (!exchangeConnector || typeof exchangeConnector.placeOrder !== "function") {
-      livePosition.status = "error"
-      livePosition.statusReason = "Exchange connector not available or missing placeOrder"
-      pushStep(livePosition, "connector_check", false, livePosition.statusReason)
+    const initialPreflight = await runLiveOrderPreflight(connectionId, exchangeConnector, connSettings)
+    if (!initialPreflight.ok) {
+      livePosition.status = "blocked"
+      livePosition.statusReason = initialPreflight.reason || "Live order preflight failed"
+      pushStep(livePosition, "preflight_connector", false, livePosition.statusReason)
       await savePosition(livePosition)
-      await incrementMetric(connectionId, "live_orders_failed_count")
-      await logProgressionEvent(connectionId, "live_trading", "error", "Live order failed — no connector", {
-        symbol: realPosition.symbol,
-      })
-      // Release the dedup lock we acquired at the top of this function so
-      // the next signal isn't blocked for the full 5-min TTL on a non-
-      // recoverable connector failure (operator likely didn't configure a
-      // connector — they need to be able to retry once they do).
+      await incrementMetric(connectionId, "live_orders_blocked_count")
       await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      await logProgressionEvent(connectionId, "live_trading", "warning", "live_trade_blocked_reason", {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+        reason: livePosition.statusReason,
+        cached: initialPreflight.cached === true,
+      })
       return livePosition
     }
 
@@ -2860,6 +2962,30 @@ export async function executeLivePosition(
         "info",
         livePosition.statusReason,
         { symbol: realPosition.symbol, direction: realPosition.direction },
+      ).catch(() => {})
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      return livePosition
+    }
+
+    const liveOrderPreflight = await runLiveOrderPreflight(connectionId, exchangeConnector, freshSettings)
+    if (!liveOrderPreflight.ok) {
+      livePosition.status = "blocked"
+      livePosition.statusReason = liveOrderPreflight.reason || "Live order preflight failed"
+      pushStep(livePosition, "preflight_exchange", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_blocked_count")
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        "live_trade_blocked_reason",
+        {
+          symbol: realPosition.symbol,
+          direction: realPosition.direction,
+          reason: livePosition.statusReason,
+          cached: liveOrderPreflight.cached === true,
+        },
       ).catch(() => {})
       await releaseLock(
         connectionId,
