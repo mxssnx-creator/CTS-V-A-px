@@ -2300,7 +2300,26 @@ export class StrategyCoordinator {
       ...ctx,
       continuousCount: ctx.perSymbolOpen[symbol] ?? 0,
     }
+
+    const rawBlockProfile = this.variantProfiles().find((p) => p.name === "block")
+    const blockRawSizes = rawBlockProfile?.configs.map((c) => c.size) ?? []
+    const blockGatePassed = Boolean(
+      rawBlockProfile?.gate(symbolCtx) && this._coordinationSettings.variants.block === true
+    )
     const activeVariants = this.selectActiveVariants(symbolCtx)
+    const activeBlockProfile = activeVariants.find((p) => p.name === "block")
+    const blockMul = 1 + (Math.max(1, symbolCtx.continuousCount | 0) - 1) * this._coordinationSettings.blockVolumeRatio
+    const blockDiagnosticBase = {
+      symbol,
+      blockVolumeRatio: this._coordinationSettings.blockVolumeRatio,
+      blockMaxStack: this._coordinationSettings.blockMaxStack,
+      continuousCount: symbolCtx.continuousCount,
+      blockMul: Number(blockMul.toFixed(6)),
+      rawBlockConfigSizes: blockRawSizes,
+      finalScaledBlockSizes: (activeBlockProfile?.configs ?? rawBlockProfile?.configs ?? []).map((c) => c.size),
+      blockGatePassed,
+      updatedAt: Date.now(),
+    }
 
     // Per-cycle Block diagnostics: expose the exact open-position count,
     // operator ratio, computed multiplier, and final scaled sizes used for
@@ -2908,6 +2927,12 @@ export class StrategyCoordinator {
 
       const relatedCreated = n - reused
       const activeVariantNames = activeVariants.map((p) => p.name)
+      const blockDiagnostic = {
+        ...blockDiagnosticBase,
+        blockSetsCreated: variantAgg.block.setsContaining,
+        blockSetsPassed: variantAgg.block.passedSets,
+        blockSetsDispatched: 0,
+      }
       writes.push(
         client.hincrby(redisKey, "strategies_main_related_created", relatedCreated),
         client.hincrby(redisKey, "strategies_main_related_reused",  reused),
@@ -2924,6 +2949,12 @@ export class StrategyCoordinator {
           strategies_main_ctx_prev_total:       String(ctx.prevPosCount),
           strategies_main_ctx_updated_at:       String(Date.now()),
         }),
+        client.hset(`block_strategy:${this.connectionId}`, {
+          [`s:${symbol}`]: JSON.stringify(blockDiagnostic),
+          [`s:${symbol}:dispatched`]: "0",
+          updated_at: String(Date.now()),
+        }),
+        client.expire(`block_strategy:${this.connectionId}`, 600),
       )
 
       // ── Position count metrics for main stage ──
@@ -5015,6 +5046,15 @@ export class StrategyCoordinator {
                 JSON.stringify({ dispatchSelected, dispatchSuppressed })
               )
             }
+
+            const blockSetsDispatched = dispatchSets.filter((s) => s.variant === "block").length
+            try {
+              await getRedisClient().hset(`block_strategy:${this.connectionId}`, {
+                [`s:${symbol}:dispatched`]: String(blockSetsDispatched),
+                updated_at: String(Date.now()),
+              })
+              await getRedisClient().expire(`block_strategy:${this.connectionId}`, 600)
+            } catch { /* non-critical diagnostics */ }
 
             let placed = 0
             let filled = 0
