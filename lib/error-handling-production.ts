@@ -155,9 +155,9 @@ export class ProductionErrorHandler {
    */
   private static async emergencyCloseAllPositions(): Promise<void> {
     try {
-      const { getAllConnections, initRedis } = await import("@/lib/redis-db")
-      const { getLivePositions, closeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
-      const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
+      const { getAllConnections, initRedis } = await import(/* webpackMode: "eager" */ "@/lib/redis-db")
+      const { getLivePositions, closeLivePosition } = await import(/* webpackMode: "eager" */ "@/lib/trade-engine/stages/live-stage")
+      const { exchangeConnectorFactory } = await import(/* webpackMode: "eager" */ "@/lib/exchange-connectors/factory")
       await initRedis()
       const connections = await getAllConnections()
 

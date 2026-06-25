@@ -3,6 +3,7 @@ import { hashPassword, createToken, setSession } from "@/lib/auth"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
 import { nanoid } from "nanoid"
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     const { username, email, password } = await request.json()
