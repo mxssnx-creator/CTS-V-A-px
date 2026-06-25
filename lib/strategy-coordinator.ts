@@ -3671,7 +3671,24 @@ export class StrategyCoordinator {
 
 
 
-    // Persist LIVE sets — slim format (coord keys only). Skip in dev:
+    const {
+      dispatchSets,
+      dispatchSelected,
+      dispatchSuppressed,
+      dispatchSuppressedKeys,
+    } = this.preselectLiveDispatchSets(qualifying)
+
+    console.log(
+      `[v0] [StrategyFlow] ${this.connectionId}:${symbol} LIVE dispatch preselection`,
+      {
+        live_candidates: qualifying.length,
+        dispatchSelected,
+        dispatchSuppressed,
+        dispatchSuppressedKeys,
+      },
+    )
+
+    // Persist LIVE candidate sets — slim format (coord keys only). Skip in dev:
     // setSettings writes to InlineLocalRedis (on-heap Map) on every cycle for
     // every symbol; 20 symbols × every 0.3s = 67 writes/s with no reclaim.
     // The coordIndex holds live state in dev; live:sets is only needed for the
@@ -3687,12 +3704,10 @@ export class StrategyCoordinator {
       })
     }
 
-    // Create pseudo positions from the LIVE-qualifying subset only.
-    // Previously received all `realSets` (up to 3000/symbol), causing N×3 Redis
-    // writes for sets that never reach live dispatch. `qualifying` is the capped
-    // Live subset (typically ≤500/symbol) — the only sets that semantically need
-    // pseudo-position records (they represent active dispatch candidates).
-    await this.createPseudoPositionsFromRealSets(symbol, qualifying)
+    // Create pseudo positions from the actually selected LIVE dispatch subset only.
+    // `qualifying` remains the candidate pool after PF/DDT/maxLive; `dispatchSets`
+    // is the dedup-aware subset that may actually run this cycle.
+    await this.createPseudoPositionsFromRealSets(symbol, dispatchSets)
 
     // Write live set count into progression hash — use hset so count reflects current cycle snapshot.
     // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
@@ -3705,8 +3720,10 @@ export class StrategyCoordinator {
       const liveDetailKey = `strategy_detail:${this.connectionId}:live`
       const liveCountKey = `strategies:${this.connectionId}:live:count`
 
-      const liveAvgPF  = qualifying.length > 0 ? qualifying.reduce((s, st) => s + st.avgProfitFactor, 0) / qualifying.length : 0
-      const liveAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
+      const liveAvgPF  = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + st.avgProfitFactor, 0) / dispatchSets.length : 0
+      const liveAvgDDT = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / dispatchSets.length : 0
+      const candidateAvgPF  = qualifying.length > 0 ? qualifying.reduce((s, st) => s + st.avgProfitFactor, 0) / qualifying.length : 0
+      const candidateAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
       const passRatioLive = realSets.length > 0 ? qualifying.length / realSets.length : 0
 
       // ── P1-1: Live-stage per-variant aggregation ──────────────────────
@@ -3724,7 +3741,7 @@ export class StrategyCoordinator {
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
       }
-      for (const set of qualifying) {
+      for (const set of dispatchSets) {
         // Slim-path sets carry entries: [] — use entryCount + set-level avgPF/DDT
         // so Live variant aggregates are accurate (mirrors Main stage accounting).
         const variant = (set.variant as keyof typeof liveVariantAgg) ?? "default"
@@ -3746,7 +3763,7 @@ export class StrategyCoordinator {
         try {
           const { bumpValidPositions } = await import("@/lib/pos-history")
           const vpPipeline = getRedisClient().multi()
-          for (const set of qualifying) {
+          for (const set of dispatchSets) {
             bumpValidPositions({
               connectionId: this.connectionId,
               symbol,
@@ -3786,53 +3803,60 @@ export class StrategyCoordinator {
         )
       }
 
+      const dispatchEntryCount = dispatchSets.reduce((s, st) => s + (st.entryCount || 0), 0)
+
       // strategies_live_total must be CUMULATIVE (hincrby), not a per-cycle
       // snapshot (hset). All other stage _total fields use hincrby; using hset
       // here made Live's lifetime total reset to the current-cycle count every
       // cycle, so the dashboard always showed a tiny snapshot instead of the
       // true accumulated lifetime count.
       await Promise.all([
-        qualifying.length > 0
-          ? client.hincrby(redisKey, "strategies_live_total", qualifying.length)
+        dispatchSets.length > 0
+          ? client.hincrby(redisKey, "strategies_live_total", dispatchSets.length)
           : Promise.resolve(),
         // ── ACTIVE-NOW snapshot for Live stage ────────────────────────────
         // Without {symbol}:live fields the `stratCounts.live` bucket in the
         // stats route always returned 0, making the Live column empty.
         client.hset(`strategies_active:${this.connectionId}`, {
-          [`${symbol}:live`]:           String(qualifying.length),
+          [`${symbol}:live`]:           String(dispatchSets.length),
           // live:evaluated = Real Sets that entered Live selection (= candidates)
           [`${symbol}:live:evaluated`]: String(realSets.length),
+          [`${symbol}:live:candidates`]: String(qualifying.length),
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(liveDetailKey, {
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
           // for backwards compat; /stats prefers per-symbol sums below.
-          created_sets:      String(qualifying.length),
+          created_sets:      String(dispatchSets.length),
           avg_profit_factor: String(liveAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(liveAvgDDT)),
           evaluated:         String(realSets.length),
           passed_sets:       String(qualifying.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
+          live_candidates:   String(qualifying.length),
+          dispatch_candidates: String(qualifying.length),
+          dispatch_selected: String(dispatchSelected),
+          dispatch_suppressed: String(dispatchSuppressed),
+          dispatch_suppressed_keys: dispatchSuppressedKeys.join(","),
+          candidate_avg_profit_factor: String(candidateAvgPF.toFixed(4)),
+          candidate_avg_drawdown_time: String(Math.round(candidateAvgDDT)),
           // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
-          //   Live's `qualifying` Sets ARE the executed orders. They
-          //   are by definition "running" — exchange has accepted the
-          //   order or is holding the position. `sets_progressing` is
-          //   the real-stage input pool being ranked & capped this
-          //   cycle (i.e. candidates currently progressing toward live
-          //   execution).
-          sets_running_now:         String(qualifying.length),
-          sets_with_open_positions: String(qualifying.length),
-          sets_progressing:         String(realSets.length),
+          // `qualifying` is the Live candidate pool after PF/DDT/maxLive.
+          // `dispatchSets` is the subset selected to actually run after
+          // per-direction/variant preselection.
+          sets_running_now:         String(dispatchSets.length),
+          sets_with_open_positions: String(dispatchSets.length),
+          sets_progressing:         String(qualifying.length),
           updated_at:        String(Date.now()),
           // Per-symbol fields — see createBaseSets for rationale.
           // Live doesn't compute avg_pos_per_set / avg_pos_eval_real;
           // those keys are intentionally omitted from the per-symbol
           // bundle so /stats's weighted-mean calculator skips them.
-          [`s:${symbol}:created`]:    String(qualifying.length),
-          [`s:${symbol}:entries`]:    String(qualifying.reduce((s, st) => s + (st.entryCount || 0), 0)),
-          [`s:${symbol}:running`]:    String(qualifying.length),
-          [`s:${symbol}:progressing`]: String(realSets.length),
+          [`s:${symbol}:created`]:    String(dispatchSets.length),
+          [`s:${symbol}:entries`]:    String(dispatchEntryCount),
+          [`s:${symbol}:running`]:    String(dispatchSets.length),
+          [`s:${symbol}:progressing`]: String(qualifying.length),
           [`s:${symbol}:passed`]:     String(qualifying.length),
           [`s:${symbol}:evaluated`]:  String(realSets.length),
           [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
@@ -3841,7 +3865,7 @@ export class StrategyCoordinator {
         }),
         client.expire(liveDetailKey, 86400),
         // `set` with EX in a single command avoids the separate expire round-trip.
-        client.set(liveCountKey, String(qualifying.length), { EX: 86400 } as any),
+        client.set(liveCountKey, String(dispatchSets.length), { EX: 86400 } as any),
         ...liveVariantWrites,
       ])
     } catch { /* non-critical */ }
@@ -3899,66 +3923,6 @@ export class StrategyCoordinator {
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
           const connector = await exchangeConnectorFactory.getOrCreateConnector(this.connectionId)
           if (connector) {
-            // Dispatch live positions. Each pipeline call is heavyweight:
-            // price fetch → volume calc → leverage → order → fill poll →
-            // SL/TP → sync. With 10+ symbols × N qualifying Sets per symbol,
-            // dispatching every Set serially creates a blocking storm that
-            // saturates the cycle budget.
-            //
-            // The dedup lock (live:lock:{conn}:{sym}:{dir}) already enforces
-            // "at most 1 open position per symbol+direction". Every Set beyond
-            // the first that targets the same direction will hit "Dedup lock
-            // held" and still cost 3-5 Redis round-trips (tryAcquireLock +
-            // findOpenLivePositionByDir + savePosition + incrementMetric +
-            // logProgressionEvent) before being deferred.
-            //
-            // Fix: pre-select at most 1 Set per direction (the highest-PF one,
-            // already guaranteed by .sort() above) before calling the pipeline.
-            // Only call executeLivePosition for sets that have a real chance of
-            // acquiring the lock or merging — not for the 49 duplicates that
-            // will always be deferred on the same cycle.
-            //
-            // The qualifying array is already sorted by avgProfitFactor desc.
-            //
-            // Preselection rules:
-            //   • "new" variants (default, trailing, pause): at most 1 per
-            //     direction — first (highest-PF) wins.
-            //   • "block" variant: allowed through even when the direction
-            //     already has a "new" set selected. Block places an ADD-ON
-            //     order into an existing open position; the dedup-lock path
-            //     handles whether to accumulate or open a fresh add-on lot.
-            //     At most 1 block set per direction (the highest-PF one).
-            //   • "dca" variant: same as block — at most 1 per direction,
-            //     allowed alongside a "new" set.
-            //
-            // Without this rule, block/dca sets targeting e.g. long were
-            // always dropped because `sawLong=true` was already set by the
-            // default set, meaning block strategy NEVER dispatched.
-            const dispatchSets: StrategySet[] = []
-            {
-              let sawNewLong  = false
-              let sawNewShort = false
-              let sawBlockLong  = false
-              let sawBlockShort = false
-              let sawDcaLong    = false
-              let sawDcaShort   = false
-              for (const s of qualifying) {
-                const isBlock = s.variant === "block"
-                const isDca   = s.variant === "dca"
-                const isNew   = !isBlock && !isDca // default / trailing / pause
-                if (s.direction === "long") {
-                  if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
-                  if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
-                  if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
-                } else {
-                  if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
-                  if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
-                  if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
-                }
-                if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
-              }
-            }
-
             let placed = 0
             let filled = 0
             let rejected = 0
@@ -4169,7 +4133,7 @@ export class StrategyCoordinator {
     // Create EXACTLY ONE pseudo position per Set (one per indication_type × direction combination).
     // Each Set represents a unique (indication_type × direction) coordinate.
     // We pick the highest-profitFactor entry from the Set as the representative config for the position.
-    if (qualifying.length > 0) {
+    if (dispatchSets.length > 0) {
       try {
         const posManager = new PseudoPositionManager(this.connectionId)
 
@@ -4205,7 +4169,7 @@ export class StrategyCoordinator {
           // enforced inside createPosition (one active pseudo position per Set).
           // Safe to fan out in parallel — no exchange calls, no shared balance.
           const creations = await Promise.all(
-            qualifying.map(async (set) => {
+            dispatchSets.map(async (set) => {
               try {
                 // Axis Sets carry one synthetic representative entry; for SL/TP
                 // derivation we need the full entries[] from the Base Set.
@@ -4296,6 +4260,71 @@ export class StrategyCoordinator {
         avgDrawdownTime: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgDrawdownTime, 0) / qualifying.length : 0,
       },
       sets: qualifying,
+    }
+  }
+
+  /**
+   * Select the Live candidate Sets that may actually dispatch this cycle.
+   *
+   * `qualifying` is the Live candidate pool after PF/DDT/maxLive filtering.
+   * The exchange path can only make progress for the first highest-PF Set in
+   * each direction/variant dispatch lane, so active/running metrics must use
+   * this selected subset rather than the wider candidate count.
+   */
+  private preselectLiveDispatchSets(qualifying: StrategySet[]): {
+    dispatchSets: StrategySet[]
+    dispatchSelected: number
+    dispatchSuppressed: number
+    dispatchSuppressedKeys: string[]
+  } {
+    const dispatchSets: StrategySet[] = []
+    const dispatchSuppressedKeys: string[] = []
+    let sawNewLong  = false
+    let sawNewShort = false
+    let sawBlockLong  = false
+    let sawBlockShort = false
+    let sawDcaLong    = false
+    let sawDcaShort   = false
+
+    for (const s of qualifying) {
+      const isBlock = s.variant === "block"
+      const isDca   = s.variant === "dca"
+      const isNew   = !isBlock && !isDca // default / trailing / pause
+      let selected = false
+
+      if (s.direction === "long") {
+        if (isNew && !sawNewLong) {
+          sawNewLong = true
+          selected = true
+        } else if (isBlock && !sawBlockLong) {
+          sawBlockLong = true
+          selected = true
+        } else if (isDca && !sawDcaLong) {
+          sawDcaLong = true
+          selected = true
+        }
+      } else {
+        if (isNew && !sawNewShort) {
+          sawNewShort = true
+          selected = true
+        } else if (isBlock && !sawBlockShort) {
+          sawBlockShort = true
+          selected = true
+        } else if (isDca && !sawDcaShort) {
+          sawDcaShort = true
+          selected = true
+        }
+      }
+
+      if (selected) dispatchSets.push(s)
+      else dispatchSuppressedKeys.push(s.setKey)
+    }
+
+    return {
+      dispatchSets,
+      dispatchSelected: dispatchSets.length,
+      dispatchSuppressed: dispatchSuppressedKeys.length,
+      dispatchSuppressedKeys,
     }
   }
 
