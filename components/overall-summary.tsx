@@ -115,7 +115,7 @@ export function OverallSummary({ data }: OverallSummaryProps) {
                   ? data.historicAvgProfitFactor.toFixed(2)
                   : "—"}
               </div>
-              <div className="text-xs text-muted-foreground">Avg Profit Factor</div>
+              <div className="text-xs text-muted-foreground">Avg R</div>
             </div>
           </div>
         )}
@@ -155,8 +155,8 @@ export function OverallSummary({ data }: OverallSummaryProps) {
               <Badge variant="secondary" className="text-xs">
                 {data.strategySummary.totalEvaluated} evals
               </Badge>
-              <span className="ml-2 text-muted-foreground">PF:</span>{" "}
-              <span className="font-medium">{data.strategySummary.avgProfitFactor.toFixed(2)}</span>
+              <span className="ml-2 text-muted-foreground">Avg R:</span>{" "}
+              <span className="font-medium">{data.strategySummary.totalEvaluated > 0 ? data.strategySummary.avgProfitFactor.toFixed(2) : "—"}</span>
             </div>
           </div>
 

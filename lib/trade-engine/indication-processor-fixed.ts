@@ -317,8 +317,15 @@ export class IndicationProcessor {
 
       const setsProcessor = new IndicationSetsProcessor(this.connectionId)
 
+      const candlesOldestFirst = [...historicalData].sort((a, b) => {
+        const aTs = Number(new Date(a?.timestamp ?? a?.time ?? a?.date ?? 0).getTime())
+        const bTs = Number(new Date(b?.timestamp ?? b?.time ?? b?.date ?? 0).getTime())
+        return aTs - bTs
+      })
+
       let recordsProcessed = 0
-      for (const marketData of historicalData) {
+      for (let index = 0; index < candlesOldestFirst.length; index++) {
+        const currentCandle = candlesOldestFirst[index]
         // Check timeout
         const elapsed = Date.now() - processStartTime
         if (elapsed > TIMEOUT_MS) {
@@ -332,7 +339,15 @@ export class IndicationProcessor {
           break
         }
 
-        await setsProcessor.processAllIndicationSets(symbol, marketData)
+        const recentCandles = candlesOldestFirst.slice(0, index + 1)
+        const rollingMarketData = {
+          ...currentCandle,
+          candles: recentCandles,
+          prices: recentCandles.map((c) => Number(c?.close ?? c?.price ?? c?.last ?? c?.markPrice)).filter((p) => Number.isFinite(p)),
+          priceOrder: "oldest-first",
+        }
+
+        await setsProcessor.processAllIndicationSets(symbol, rollingMarketData)
         recordsProcessed++
       }
 

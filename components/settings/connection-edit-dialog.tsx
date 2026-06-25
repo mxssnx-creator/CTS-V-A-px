@@ -1,5 +1,6 @@
 "use client"
 
+import { MIN_VOLUME_FACTOR } from "@/lib/constants"
 import { useState, useEffect } from "react"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
@@ -48,7 +49,7 @@ export function ConnectionEditDialog({ isOpen, connection, onClose, onSave }: Co
     margin_type: "cross",
     position_mode: "hedge",
     is_testnet: false,
-    volume_factor: 0.1,
+    volume_factor: MIN_VOLUME_FACTOR,
   })
 
   const [activeTab, setActiveTab] = useState("basic")
@@ -74,7 +75,7 @@ export function ConnectionEditDialog({ isOpen, connection, onClose, onSave }: Co
         margin_type: connection.margin_type || "cross",
         position_mode: connection.position_mode || "hedge",
         is_testnet: connection.is_testnet || false,
-        volume_factor: connection.volume_factor || 1.0,
+        volume_factor: connection.volume_factor ?? MIN_VOLUME_FACTOR,
       })
       setActiveTab("basic")
       setShowSecrets(false)

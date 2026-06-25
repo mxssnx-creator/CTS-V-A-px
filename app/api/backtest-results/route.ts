@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams

@@ -1,5 +1,6 @@
 "use client"
 
+import { MIN_VOLUME_FACTOR } from "@/lib/constants"
 import { useState, useEffect } from "react"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Label } from "@/components/ui/label"
@@ -60,9 +61,9 @@ export function ExchangeConnectionSettingsDialog({
   connectionName,
 }: ExchangeConnectionSettingsDialogProps) {
   const [settings, setSettings] = useState<ConnectionSettings>({
-    baseVolumeFactor: 1.0,
-    baseVolumeFactorLive: 1.0,
-    baseVolumeFactorPreset: 1.0,
+    baseVolumeFactor: MIN_VOLUME_FACTOR,
+    baseVolumeFactorLive: MIN_VOLUME_FACTOR,
+    baseVolumeFactorPreset: MIN_VOLUME_FACTOR,
     liveTradeProfitFactorMinBase: 0.6,
     liveTradeProfitFactorMinMain: 0.6,
     liveTradeProfitFactorMinReal: 0.6,
@@ -126,9 +127,9 @@ export function ExchangeConnectionSettingsDialog({
       setSettings({
         ...settings,
         ...loadedSettings,
-        baseVolumeFactor: loadedSettings.baseVolumeFactor ?? globalSettings?.base_volume_factor ?? 1.0,
-        baseVolumeFactorLive: loadedSettings.baseVolumeFactorLive ?? 1.0,
-        baseVolumeFactorPreset: loadedSettings.baseVolumeFactorPreset ?? 1.0,
+        baseVolumeFactor: loadedSettings.baseVolumeFactor ?? globalSettings?.base_volume_factor ?? MIN_VOLUME_FACTOR,
+        baseVolumeFactorLive: loadedSettings.baseVolumeFactorLive ?? MIN_VOLUME_FACTOR,
+        baseVolumeFactorPreset: loadedSettings.baseVolumeFactorPreset ?? MIN_VOLUME_FACTOR,
         trailingWithTrailing: loadedSettings.trailingWithTrailing ?? strategySettings?.trailing_enabled ?? true,
         blockEnabled: loadedSettings.blockEnabled ?? strategySettings?.block_enabled ?? true,
         dcaEnabled: loadedSettings.dcaEnabled ?? strategySettings?.dca_enabled ?? false,
@@ -215,12 +216,12 @@ export function ExchangeConnectionSettingsDialog({
                       min={0.1}
                       max={10}
                       step={0.1}
-                      value={[settings.baseVolumeFactorLive || settings.baseVolumeFactor || 1.0]}
+                      value={[settings.baseVolumeFactorLive ?? settings.baseVolumeFactor ?? MIN_VOLUME_FACTOR]}
                       onValueChange={([value]) => updateSetting("baseVolumeFactorLive", value)}
                       className="flex-1"
                     />
                     <span className="text-sm font-medium w-12 text-right">
-                      {(settings.baseVolumeFactorLive || settings.baseVolumeFactor || 1.0).toFixed(1)}
+                      {(settings.baseVolumeFactorLive ?? settings.baseVolumeFactor ?? MIN_VOLUME_FACTOR).toFixed(1)}
                     </span>
                   </div>
                   <p className="text-xs text-muted-foreground">
@@ -236,12 +237,12 @@ export function ExchangeConnectionSettingsDialog({
                       min={0.1}
                       max={10}
                       step={0.1}
-                      value={[settings.baseVolumeFactorPreset || settings.baseVolumeFactor || 1.0]}
+                      value={[settings.baseVolumeFactorPreset ?? settings.baseVolumeFactor ?? MIN_VOLUME_FACTOR]}
                       onValueChange={([value]) => updateSetting("baseVolumeFactorPreset", value)}
                       className="flex-1"
                     />
                     <span className="text-sm font-medium w-12 text-right">
-                      {(settings.baseVolumeFactorPreset || settings.baseVolumeFactor || 1.0).toFixed(1)}
+                      {(settings.baseVolumeFactorPreset ?? settings.baseVolumeFactor ?? MIN_VOLUME_FACTOR).toFixed(1)}
                     </span>
                   </div>
                   <p className="text-xs text-muted-foreground">

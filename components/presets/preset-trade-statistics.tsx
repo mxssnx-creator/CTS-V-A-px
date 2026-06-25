@@ -109,9 +109,9 @@ export function PresetTradeStatistics({ presetTypeId }: { presetTypeId: string }
               <p className="text-2xl font-bold text-blue-500">{stats.activePositions}</p>
             </div>
             <div>
-              <p className="text-sm text-muted-foreground">Profit Factor</p>
+              <p className="text-sm text-muted-foreground">PF</p>
               <div className="flex items-center gap-2">
-                <p className="text-2xl font-bold">{stats.overallProfitFactor.toFixed(3)}</p>
+                <p className="text-2xl font-bold">{stats.totalPositions > 0 ? stats.overallProfitFactor.toFixed(3) : "—"}</p>
                 {stats.overallProfitFactor >= 1.0 ? (
                   <TrendingUp className="h-5 w-5 text-green-500" />
                 ) : (
@@ -175,7 +175,7 @@ export function PresetTradeStatistics({ presetTypeId }: { presetTypeId: string }
                   </div>
                 </div>
                 <div className="text-right">
-                  <p className="text-sm font-bold">PF: {symbolStat.profitFactor.toFixed(3)}</p>
+                  <p className="text-sm font-bold">PF: {symbolStat.positions > 0 ? symbolStat.profitFactor.toFixed(3) : "—"}</p>
                   <p className="text-xs text-muted-foreground capitalize">{symbolStat.status}</p>
                 </div>
               </div>

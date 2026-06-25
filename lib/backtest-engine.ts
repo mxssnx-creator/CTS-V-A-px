@@ -5,6 +5,7 @@
 
 import { getSettings, setSettings } from "@/lib/redis-db"
 import { sql } from "@/lib/db"
+import { calculateSignedResultR } from "@/lib/profit-factor"
 
 interface BacktestTrade {
   symbol: string
@@ -14,7 +15,9 @@ interface BacktestTrade {
   entry_time: Date
   exit_time: Date
   profit_loss: number
+  signedResultR: number
   profit_factor: number
+  signed_result_r: number
   strategy_config: any
 }
 
@@ -353,9 +356,14 @@ export class BacktestEngine {
       exitTime = currentTime
     }
 
-    // Calculate P&L
+    // Calculate P&L and cost-normalized signed return (R)
     const profitLoss = side === "long" ? exitPrice - entryPrice : entryPrice - exitPrice
-    const profitFactor = profitLoss / (entryPrice * 0.001) // Relative to 0.1% position cost
+    const signedPricePercent = (profitLoss / entryPrice) * 100
+    const positionCostPct = this.getPositionCostPct(strategy)
+    const signedResultR = signedPricePercent / positionCostPct
+    // Calculate P&L and signed, cost-normalized return (R).
+    const profitLoss = side === "long" ? exitPrice - entryPrice : entryPrice - exitPrice
+    const signedResultR = calculateSignedResultR(entryPrice, exitPrice, side)
 
     return {
       symbol,
@@ -365,9 +373,23 @@ export class BacktestEngine {
       entry_time: entryTime,
       exit_time: exitTime,
       profit_loss: profitLoss,
-      profit_factor: profitFactor,
+      signedResultR,
+      profit_factor: Math.max(0, signedResultR),
+      signed_result_r: signedResultR,
       strategy_config: strategy,
     }
+  }
+
+  private getPositionCostPct(strategy: any): number {
+    const rawPositionCostPct = Number(
+      strategy?.positionCostPct ??
+        strategy?.position_cost_pct ??
+        strategy?.position_cost ??
+        strategy?.positionCost ??
+        0.1,
+    )
+
+    return Number.isFinite(rawPositionCostPct) && rawPositionCostPct > 0 ? rawPositionCostPct : 0.1
   }
 
   /**
@@ -379,10 +401,23 @@ export class BacktestEngine {
     const losingTrades = trades.filter((t) => t.profit_loss <= 0).length
     const winRate = totalTrades > 0 ? (winningTrades / totalTrades) * 100 : 0
 
-    const totalProfit = trades.filter((t) => t.profit_loss > 0).reduce((sum, t) => sum + t.profit_loss, 0)
-    const totalLoss = Math.abs(trades.filter((t) => t.profit_loss <= 0).reduce((sum, t) => sum + t.profit_loss, 0))
+    const totalProfit = trades.filter((t) => t.signedResultR > 0).reduce((sum, t) => sum + t.signedResultR, 0)
+    const totalLoss = Math.abs(trades.filter((t) => t.signedResultR <= 0).reduce((sum, t) => sum + t.signedResultR, 0))
     const netProfit = totalProfit - totalLoss
-    const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? 999 : 0
+    
+    // Cost-adjusted PF: totalProfit / (totalLoss + totalPositionCosts)
+    // Position cost = entry_price × quantity × 0.001 (0.1% maker fee)
+    // For backtest trades, we calculate cost from entry_price and assume unit qty
+    const totalPositionCosts = trades.reduce((sum, t) => {
+      if (Number.isFinite(t.entry_price) && t.entry_price > 0) {
+        // Backtest assumes unit quantity, so cost = entry_price × 0.001
+        return sum + (t.entry_price * 0.001)
+      }
+      return sum
+    }, 0)
+    
+    const adjustedDenominator = totalLoss + totalPositionCosts
+    const profitFactor = adjustedDenominator > 0 ? totalProfit / adjustedDenominator : totalProfit > 0 ? 999 : 0
 
     const avgWin = winningTrades > 0 ? totalProfit / winningTrades : 0
     const avgLoss = losingTrades > 0 ? totalLoss / losingTrades : 0
@@ -400,7 +435,7 @@ export class BacktestEngine {
     const drawdownMetrics = this.calculateDrawdown(trades)
 
     // Calculate Sharpe and Sortino ratios
-    const returns = trades.map((t) => t.profit_loss)
+    const returns = trades.map((t) => t.signedResultR)
     const avgReturn = returns.reduce((sum, r) => sum + r, 0) / returns.length
     const stdDev = Math.sqrt(returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length)
     const sharpeRatio = stdDev > 0 ? avgReturn / stdDev : 0

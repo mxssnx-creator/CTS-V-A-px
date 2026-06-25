@@ -80,8 +80,18 @@ export async function GET(request: NextRequest) {
       positions.push({ ...pos, id: posId, _source: "legacy" })
     }
 
+    // Deduplicate positions by ID (same position might appear from multiple sources)
+    const seenIds = new Set<string>()
+    const deduped: any[] = []
+    for (const pos of positions) {
+      if (!seenIds.has(pos.id)) {
+        seenIds.add(pos.id)
+        deduped.push(pos)
+      }
+    }
+    
     // Apply pagination
-    const paginated = positions.slice(offset, offset + limit)
+    const paginated = deduped.slice(offset, offset + limit)
 
     await logProgressionEvent(
       connectionId,
@@ -95,7 +105,7 @@ export async function GET(request: NextRequest) {
       success: true,
       data: paginated,
       count: paginated.length,
-      total: positions.length,
+      total: deduped.length,
       limit,
       offset,
       duration: Date.now() - startTime,

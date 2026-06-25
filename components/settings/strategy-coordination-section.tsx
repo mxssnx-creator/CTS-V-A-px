@@ -24,9 +24,10 @@
  *      • Block         (gated on continuousCount 1..2; INDEPENDENT of
  *                       Pos-count axes per the user's spec)
  *      • DCA           (gated on prevLosses ≥ 1; INDEPENDENT of axes)
- *      • Pause         (gated on lastPosCount ≥ 1)
  *
- * Block + DCA are flagged "Independent" in the UI so the operator
+ * Pause is intentionally modeled only as a Position-Count axis above; it
+ * pauses/calibrates further calculations by count window and is not a
+ * general strategy variant. Block + DCA are flagged "Independent" in the UI so the operator
  * understands they don't fold into the axis windows above.
  *
  * The component is *purely controlled* — it accepts the current
@@ -54,7 +55,6 @@ export interface CoordinationSettings {
     trailing: boolean
     block:    boolean
     dca:      boolean
-    pause:    boolean
   }
   // ── Block-strategy: live position × vol-ratio coordination ──────────
   // Knobs that flow into the Block variant's runtime size scaling.
@@ -150,7 +150,6 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
     trailing: true,
     block:    true,
     dca:      false, // off by default per operator spec
-    pause:    true,
   },
   blockVolumeRatio: 1.0,
   blockMaxStack:    3,
@@ -190,7 +189,7 @@ const AXES: Array<{
     range: "1–4",
     ceiling: 4,
     description:
-      "Magnitude of the last-N wins / losses dimension. Drives the trailing & pause variants' aggressiveness.",
+      "Magnitude of the last-N wins / losses dimension. Drives trailing aggressiveness and the pause count-axis.",
   },
   {
     key: "cont",
@@ -206,7 +205,7 @@ const AXES: Array<{
     range: "1–8",
     ceiling: 8,
     description:
-      "Last-N validation lookback. Wider windows produce more conservative entry configurations.",
+      "Last-N validation lookback for pausing further position-count calculations; not a general strategy variant.",
   },
 ]
 
@@ -240,14 +239,6 @@ const VARIANTS: Array<{
     axisIndependent: true,
     description:
       "Recovery profile after recent losses (prevLosses ≥ 1). Reduce / close states with conservative sizing. Evaluated INDEPENDENTLY of position-count axes.",
-  },
-  {
-    key: "pause",
-    label: "Pause",
-    badge: "Throttle",
-    axisIndependent: false,
-    description:
-      "Throttles entry size when the last-N closed positions contain losers. 8 sub-configs ramp size DOWN as the lookback widens.",
   },
 ]
 
