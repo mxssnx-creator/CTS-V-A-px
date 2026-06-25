@@ -170,6 +170,10 @@ interface LivePosition {
   // Variant size multiplier mirrored from RealPosition (block=1.5-2.0,
   // dca=0.5, others=1.0). Stored so accumulation can match original sizing.
   sizeMultiplier?: number
+  // Exchange-cost-aware protection diagnostics produced before Live
+  // dispatch. Persisted with the LivePosition so UI/detail views can explain
+  // widened TP/SL bands after the order leaves the strategy coordinator.
+  protectionCost?: Record<string, unknown>
   parentSetKey?: string
   setVariant?: "default" | "trailing" | "block" | "dca"
   trailingProfile?: { startRatio: number; stopRatio: number; stepRatio: number }
@@ -2351,6 +2355,7 @@ export async function executeLivePosition(
       setVariant:     realPosition.setVariant,
       axisWindows:    realPosition.axisWindows,
       sizeMultiplier: realPosition.sizeMultiplier,
+      protectionCost: realPosition.protectionCost,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
     }
     pushStep(cbSkipped, "preflight", false, cbSkipped.statusReason!)
@@ -2407,6 +2412,7 @@ export async function executeLivePosition(
       setVariant:     realPosition.setVariant,
       axisWindows:    realPosition.axisWindows,
       sizeMultiplier: realPosition.sizeMultiplier,
+      protectionCost: realPosition.protectionCost,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
     }
     pushStep(skipped, "preflight", false, skipped.statusReason!)
@@ -2464,6 +2470,7 @@ export async function executeLivePosition(
     setVariant:     realPosition.setVariant,
     axisWindows:    realPosition.axisWindows,
     sizeMultiplier: realPosition.sizeMultiplier,
+    protectionCost: realPosition.protectionCost,
     trailingProfile: realPosition.trailingProfile,
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
   }
@@ -4174,6 +4181,7 @@ export async function executeLivePosition(
       realParentSetKey: realPosition.parentSetKey,
       realSetVariant: realPosition.setVariant,
       realAxisWindows: realPosition.axisWindows,
+      realProtectionCost: realPosition.protectionCost,
       // ── Entry metrics ──
       leverage: realPosition.leverage,
       quantity: realPosition.quantity,
@@ -4644,6 +4652,7 @@ export async function closeLivePosition(
       realParentSetKey: position.parentSetKey,
       realSetVariant: position.setVariant,
       realAxisWindows: position.axisWindows,
+      realProtectionCost: position.protectionCost,
       pnl,
       roi,
       closePrice,
