@@ -93,6 +93,8 @@ interface LivePosition {
   takeProfit?: number
   stopLossPrice?: number
   takeProfitPrice?: number
+  desiredStopLossPrice?: number
+  desiredTakeProfitPrice?: number
   stopLossOrderId?: string
   takeProfitOrderId?: string
   // Epoch-ms timestamps of the last successful SL/TP placement on the venue.
@@ -1303,6 +1305,42 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   return { desiredSl, desiredTp }
 }
 
+function readAbsoluteProtectionPrices(pos: LivePosition): {
+  desiredSl: number
+  desiredTp: number
+} {
+  const desiredSl =
+    Number(pos.desiredStopLossPrice) > 0
+      ? Number(pos.desiredStopLossPrice)
+      : Number(pos.stopLossPrice) > 0
+        ? Number(pos.stopLossPrice)
+        : computeDesiredProtectionPrices(pos).desiredSl
+  const desiredTp =
+    Number(pos.desiredTakeProfitPrice) > 0
+      ? Number(pos.desiredTakeProfitPrice)
+      : Number(pos.takeProfitPrice) > 0
+        ? Number(pos.takeProfitPrice)
+        : computeDesiredProtectionPrices(pos).desiredTp
+  return { desiredSl, desiredTp }
+}
+
+function detectSltpCross(
+  pos: Pick<LivePosition, "direction">,
+  markPrice: number,
+  desiredSl: number,
+  desiredTp: number,
+): "sl_hit" | "tp_hit" | null {
+  if (desiredSl <= 0 && desiredTp <= 0) return null
+  if (pos.direction === "long") {
+    if (desiredSl > 0 && markPrice <= desiredSl) return "sl_hit"
+    if (desiredTp > 0 && markPrice >= desiredTp) return "tp_hit"
+  } else {
+    if (desiredSl > 0 && markPrice >= desiredSl) return "sl_hit"
+    if (desiredTp > 0 && markPrice <= desiredTp) return "tp_hit"
+  }
+  return null
+}
+
 /**
  * Has the desired protection price drifted enough from the currently
  * placed one to warrant cancelling and re-placing? We use 0.25% as the
@@ -1493,6 +1531,8 @@ async function updateProtectionOrders(
   }
 
   const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
+  pos.desiredStopLossPrice = desiredSl > 0 ? desiredSl : undefined
+  pos.desiredTakeProfitPrice = desiredTp > 0 ? desiredTp : undefined
   const closeSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
 
   // ── Quantity drift detection ──────────────────────────────────��───────
@@ -2151,11 +2191,19 @@ export async function executeLivePosition(
       // because that function uses it as the fill price for SL/TP calculation.
       livePosition.averageExecutionPrice = simEntryPrice
       // Compute SL/TP prices for the simulated position so reconcile and
-      // checkAndForceCloseOnSltpCross have valid price targets.
+      // checkAndForceCloseOnSltpCross have valid absolute price targets.
+      // Keep assignedStopLoss/assignedTakeProfit as the original percentages;
+      // the absolute prices live in the dedicated price fields.
       if (simEntryPrice > 0) {
         const simProtection = computeDesiredProtectionPrices(livePosition)
-        if (simProtection.desiredSl > 0) livePosition.assignedStopLoss  = simProtection.desiredSl
-        if (simProtection.desiredTp > 0) livePosition.assignedTakeProfit = simProtection.desiredTp
+        if (simProtection.desiredSl > 0) {
+          livePosition.stopLossPrice = simProtection.desiredSl
+          livePosition.desiredStopLossPrice = simProtection.desiredSl
+        }
+        if (simProtection.desiredTp > 0) {
+          livePosition.takeProfitPrice = simProtection.desiredTp
+          livePosition.desiredTakeProfitPrice = simProtection.desiredTp
+        }
       }
       livePosition.executedQuantity = simQty
       livePosition.remainingQuantity = 0
@@ -3887,47 +3935,8 @@ async function checkAndForceCloseOnSltpCross(
   // confirmed filled yet; skip until it is.
   if (!fillPrice || fillPrice <= 0) return null
 
-  // ── Trailing stop: honour the ratcheted absolute price ─────────────────
-  // When trailing is active syncLiveFromPseudo has stamped trailingStopPrice
-  // onto the position. Using that absolute price means the proactive force-close
-  // fires at the RATCHETED level — not the static origin level that the
-  // percentage anchor would compute. Without this fix a trailing stop that
-  // ratcheted from, say, 2% below entry to 0.5% below entry would NEVER
-  // trigger the proactive close (the static 2% level is never reached while
-  // in profit), letting the position blow through the ratcheted stop if the
-  // exchange order somehow failed to fire.
-  let desiredSl: number
-  if (pos.trailingActive && pos.trailingStopPrice && pos.trailingStopPrice > 0) {
-    desiredSl = pos.trailingStopPrice
-  } else {
-    const slPct = Math.max(0, pos.stopLoss || 0) / 100
-    desiredSl =
-      slPct > 0
-        ? pos.direction === "long"
-          ? fillPrice * (1 - slPct)
-          : fillPrice * (1 + slPct)
-        : 0
-  }
-
-  const tpPct = Math.max(0, pos.takeProfit || 0) / 100
-  const desiredTp =
-    tpPct > 0
-      ? pos.direction === "long"
-        ? fillPrice * (1 + tpPct)
-        : fillPrice * (1 - tpPct)
-      : 0
-
-  // Nothing to evaluate if neither protection band is configured.
-  if (desiredSl <= 0 && desiredTp <= 0) return null
-
-  let crossReason: "sl_hit" | "tp_hit" | null = null
-  if (pos.direction === "long") {
-    if (desiredSl > 0 && markPrice <= desiredSl) crossReason = "sl_hit"
-    else if (desiredTp > 0 && markPrice >= desiredTp) crossReason = "tp_hit"
-  } else {
-    if (desiredSl > 0 && markPrice >= desiredSl) crossReason = "sl_hit"
-    else if (desiredTp > 0 && markPrice <= desiredTp) crossReason = "tp_hit"
-  }
+  const { desiredSl, desiredTp } = readAbsoluteProtectionPrices(pos)
+  const crossReason = detectSltpCross(pos, markPrice, desiredSl, desiredTp)
 
   if (!crossReason) return null
 
@@ -4746,6 +4755,12 @@ export async function processSimulatedPositions(
     )
     return summary
   }
+}
+
+export const __liveStageTest = {
+  computeDesiredProtectionPrices,
+  readAbsoluteProtectionPrices,
+  detectSltpCross,
 }
 
 /**
