@@ -125,7 +125,11 @@ async function main() {
   const last = samples[samples.length - 1] || {}
   const first = samples[0] || {}
   const histDoneAt = samples.find((s) => s.histDone)
-  const rtStartedAt = samples.find((s) => s.rtCycles > 0 || s.rtFrames > 0 || s.rtActive)
+  // `rtActive` means the engine/HTTP status is alive; it does NOT prove the
+  // realtime progression has processed generated prehistoric Sets. Treat
+  // realtime as "started" only after counters/frames advance, otherwise a
+  // clean pre-history gate is falsely reported as rtBeforeHist at t=0.
+  const rtStartedAt = samples.find((s) => s.rtCycles > 0 || s.rtFrames > 0 || s.indLive > 0 || s.stratLive > 0 || s.rtLive > 0)
 
   // Find first sample with any base set ever created
   const firstBaseSet = samples.find((s) => s.sets.base > 0)

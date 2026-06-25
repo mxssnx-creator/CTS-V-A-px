@@ -125,8 +125,8 @@ export class IndicationSetsProcessor {
    * settings hash on every fill.
    */
   private compactionCfgs: Partial<Record<SetCompactionType, CompactionConfig>> = {}
-  private directionMoveRanges: number[] = Array.from({ length: 28 }, (_, i) => i + 3) // 3..30
-  private optimalRanges: number[] = Array.from({ length: 28 }, (_, i) => i + 3) // 3..30
+  private directionMoveRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2) // 2..30
+  private optimalRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2) // 2..30
   private drawdownRatios: number[] = [0.5, 1.0, 1.5]
   private lastPartRatios: number[] = [0.25, 0.5]
   private factorMultipliers: number[] = [0.9, 1.0, 1.1]
@@ -295,12 +295,31 @@ export class IndicationSetsProcessor {
         return
       }
 
-      // Process all 4 main types in parallel with independent logic
+      // Process all 4 main types in parallel with independent logic.
+      // Use per-type isolation so an Optimal/Auto calculation failure never
+      // aborts Direction/Move/Active for the same symbol and never crashes the
+      // whole progression cycle.
+      const runType = async (type: string, fn: () => Promise<any>) => {
+        try {
+          return await fn()
+        } catch (error) {
+          console.warn(
+            `[v0] [IndicationSets] ${symbol}:${type} failed:`,
+            error instanceof Error ? error.message : String(error),
+          )
+          await logProgressionEvent(this.connectionId, "indications_sets", "error", `${type} indication failed for ${symbol}`, {
+            symbol,
+            type,
+            error: error instanceof Error ? error.message : String(error),
+          }).catch(() => {})
+          return { type, total: 0, qualified: 0, configs: 0, error: true }
+        }
+      }
       const [directionResults, moveResults, activeResults, optimalResults] = await Promise.all([
-        this.processDirectionSet(symbol, marketData),
-        this.processMoveSet(symbol, marketData),
-        this.processActiveSet(symbol, marketData),
-        this.processOptimalSet(symbol, marketData),
+        runType("direction", () => this.processDirectionSet(symbol, marketData)),
+        runType("move", () => this.processMoveSet(symbol, marketData)),
+        runType("active", () => this.processActiveSet(symbol, marketData)),
+        runType("optimal", () => this.processOptimalSet(symbol, marketData)),
       ])
 
       const duration = Date.now() - startTime
@@ -369,7 +388,7 @@ export class IndicationSetsProcessor {
   }
 
   /**
-   * Process Direction Indication Set (ranges 3-30)
+   * Process Direction Indication Set (ranges 2-30)
    * OPTIMIZED: Process all ranges in batch, minimize Redis calls
    */
   private async processDirectionSet(symbol: string, marketData: any): Promise<any> {
@@ -420,7 +439,7 @@ export class IndicationSetsProcessor {
   }
 
   /**
-   * Process Move Indication Set (ranges 3-30, no opposite requirement)
+   * Process Move Indication Set (ranges 2-30, no opposite requirement)
    * OPTIMIZED: Process key ranges only, batch writes
    */
   private async processMoveSet(symbol: string, marketData: any): Promise<any> {

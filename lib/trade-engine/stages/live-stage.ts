@@ -40,6 +40,7 @@ import {
 } from "@/lib/live-order-logger"
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
+const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
 
 // ── Exchange call timeouts ────────────────────────────────────────────────
 // Target: syncWithExchange completes in <1 s on the hot path.
@@ -158,6 +159,25 @@ function pushStep(position: LivePosition, step: string, ok: boolean, detail: str
   } catch {
     // non-critical
   }
+}
+
+function normalizeStopLossPercent(rawStopLoss: unknown): { value: number; adjusted: boolean; reason?: string } {
+  const n = Number(rawStopLoss)
+  if (!Number.isFinite(n) || n <= 0) {
+    return {
+      value: MIN_EXCHANGE_STOP_LOSS_PERCENT,
+      adjusted: true,
+      reason: `missing/disabled SL normalized to minimum ${MIN_EXCHANGE_STOP_LOSS_PERCENT}%`,
+    }
+  }
+  if (n < MIN_EXCHANGE_STOP_LOSS_PERCENT) {
+    return {
+      value: MIN_EXCHANGE_STOP_LOSS_PERCENT,
+      adjusted: true,
+      reason: `SL ${n}% below minimum ${MIN_EXCHANGE_STOP_LOSS_PERCENT}% — using minimum`,
+    }
+  }
+  return { value: n, adjusted: false }
 }
 async function savePosition(position: LivePosition): Promise<void> {
   const { savePosition: redisSave } = await import("@/lib/redis-db")
@@ -1257,6 +1277,12 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   if (pos.trailingActive && pos.trailingStopPrice && pos.trailingStopPrice > 0) {
     desiredSl = pos.trailingStopPrice
   } else {
+    // Do not apply the hard live-entry minimum here. This helper is shared by
+    // exchange control-order reconciliation, system-close checks, and operator
+    // recalculation flows. Control-order mode is independent from the live-entry
+    // SL policy, so reconciliation must honor the position's already-stored SL
+    // value. New live positions and operator overrides normalize that stored
+    // value at their boundaries instead.
     const slPct = Math.max(0, pos.stopLoss || 0) / 100
     desiredSl =
       slPct > 0
@@ -1734,10 +1760,10 @@ export async function executeLivePosition(
       volumeUsd: 0,
       leverage: realPosition.leverage,
       marginType: "cross",
-      stopLoss: realPosition.stopLoss,
-      takeProfit: realPosition.takeProfit,
-      assignedStopLoss: realPosition.stopLoss,
-      assignedTakeProfit: realPosition.takeProfit,
+      stopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
+      takeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
+      assignedStopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
+      assignedTakeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
       status: "rejected",
       statusReason: `Skipped — exchange circuit breaker active for ${realPosition.symbol} (market volatility, resumes in <5min)`,
       fills: [],
@@ -1832,14 +1858,14 @@ export async function executeLivePosition(
     volumeUsd: 0,
     leverage: realPosition.leverage,
     marginType: "cross",
-    stopLoss: realPosition.stopLoss,
-    takeProfit: realPosition.takeProfit,
+    stopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
+    takeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
     // Immutable assignment snapshot — preserved across overrides so the
     // progression panel and post-trade stats can always recover what the
     // upstream Set originally specified. Mirrors `stopLoss`/`takeProfit`
     // at creation; never mutated thereafter.
-    assignedStopLoss: realPosition.stopLoss,
-    assignedTakeProfit: realPosition.takeProfit,
+    assignedStopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
+    assignedTakeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
     status: "pending",
     fills: [],
     progression: [],
@@ -1859,6 +1885,24 @@ export async function executeLivePosition(
     axisWindows:    realPosition.axisWindows,
     sizeMultiplier: realPosition.sizeMultiplier,
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
+  }
+
+  const normalizedInitialSl = normalizeStopLossPercent(realPosition.stopLoss)
+  if (normalizedInitialSl.adjusted) {
+    pushStep(livePosition, "protection_sl_normalized", true, normalizedInitialSl.reason!)
+    logProgressionEvent(
+      connectionId,
+      "live_trading",
+      "warning",
+      `StopLoss normalized for ${realPosition.symbol}`,
+      {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+        assignedStopLoss: realPosition.stopLoss,
+        effectiveStopLoss: normalizedInitialSl.value,
+        reason: normalizedInitialSl.reason,
+      },
+    ).catch(() => {})
   }
 
   // Hoisted before the try/catch so the catch block can release the
@@ -2659,7 +2703,51 @@ export async function executeLivePosition(
       return livePosition
     }
 
-    livePosition.orderId = orderResult.orderId || orderResult.id
+    // ── Hard stop on failed entry placement ────────────────────────────────
+    // The protection/fill pipeline below is only valid after the exchange has
+    // acknowledged a real entry order. Previously a transient or venue-side
+    // `{ success:false }` result that was not classified as margin/circuit
+    // breaker still fell through, stamped the position as "placed" with an
+    // undefined orderId, then attempted fill fallback and SL/TP placement for
+    // an order that never existed. That created the exact class of live-order
+    // errors operators saw: fake local positions, repeated protection-order
+    // failures, and confusing "position not exist" exchange responses.
+    const entryOrderId = orderResult?.orderId || orderResult?.id
+    if (!orderResult?.success || !entryOrderId) {
+      const reason =
+        orderResult?.error ||
+        orderResult?.message ||
+        (orderResult?.success ? "Exchange accepted entry but returned no orderId" : "Exchange entry order was rejected")
+      livePosition.status = "rejected"
+      livePosition.statusReason = String(reason)
+      pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_failed_count")
+      await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "failed")
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      await logProgressionEvent(connectionId, "live_trading", "error", `Entry order rejected for ${realPosition.symbol}`, {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+        side: exchangeSide,
+        quantity: computedVolume,
+        price: currentPrice,
+        leverage: livePosition.leverage,
+        error: livePosition.statusReason,
+        attempts: placeAttempt,
+      })
+      await logLiveOrderFinal(orderTrace, {
+        status: "rejected",
+        livePositionId: livePosition.id,
+        reason: livePosition.statusReason,
+        extra: {
+          orderResult,
+          attempts: placeAttempt,
+        },
+      })
+      return livePosition
+    }
+
+    livePosition.orderId = String(entryOrderId)
     livePosition.status = "placed"
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
@@ -4752,6 +4840,34 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
     )
 
+    // If the operator requested live trading but the transport test failed,
+    // QuickStart leaves the progression running with is_live_trade=0. In that
+    // state the close/sync loop must not poll private exchange endpoints for
+    // positions/open orders; doing so produced continuous "fetch failed" error
+    // spam in dev and could make closed legacy live records look actionable.
+    // Simulated positions still get processed locally below.
+    const { getConnection: _getConnForSync } = await import("@/lib/redis-db")
+    const { isTruthyFlag: _isTruthyFlagForSync } = await import("@/lib/connection-state-utils")
+    const connForSync = (await _getConnForSync(connectionId).catch(() => null)) || {}
+    const liveTradeOn =
+      _isTruthyFlagForSync((connForSync as any).is_live_trade) ||
+      _isTruthyFlagForSync((connForSync as any).live_trade_enabled)
+    if (!liveTradeOn) {
+      const simSummary = await processSimulatedPositions(connectionId)
+      const statusBreakdown = allOpen.reduce<Record<string, number>>((acc, p) => {
+        const s = String(p.status || "unknown")
+        acc[s] = (acc[s] || 0) + 1
+        return acc
+      }, {})
+      console.log(
+        `${LOG_PREFIX} [sync-skip] conn=${connectionId} live_trade=false; ` +
+        `skipped private exchange sync, tracked=${allOpen.length}, ` +
+        `simProcessed=${simSummary.processed}, simClosed=${simSummary.closed}, ` +
+        `statuses=${JSON.stringify(statusBreakdown)}`,
+      )
+      return
+    }
+
     // ── Batch pre-loop fetches in parallel ───────────────────────────────
     // Three independent I/O calls are needed before the per-position loop:
     //   1. getPositions()    — exchange position list (adoption + map)
@@ -4933,7 +5049,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             const tradingSettings = (await client.hgetall("settings:trading")) || {}
             const slRaw = parseFloat(String((tradingSettings as any).default_stop_loss_percent ?? "1"))
             const tpRaw = parseFloat(String((tradingSettings as any).default_take_profit_percent ?? "2"))
-            if (Number.isFinite(slRaw) && slRaw > 0) defaultSlPct = slRaw
+            if (Number.isFinite(slRaw) && slRaw > 0) defaultSlPct = normalizeStopLossPercent(slRaw).value
             if (Number.isFinite(tpRaw) && tpRaw > 0) defaultTpPct = tpRaw
           } catch { /* use defaults */ }
 
@@ -5599,7 +5715,10 @@ export async function recalculateAndApplySLTP(
     // values while `stopLoss` / `takeProfit` carry the operator override.
     const prevStopLossPct = position.stopLoss
     const prevTakeProfitPct = position.takeProfit
-    if (overrides?.stopLossPct !== undefined) position.stopLoss = overrides.stopLossPct
+    const normalizedOverrideSl = overrides?.stopLossPct !== undefined
+      ? normalizeStopLossPercent(overrides.stopLossPct)
+      : null
+    if (normalizedOverrideSl) position.stopLoss = normalizedOverrideSl.value
     if (overrides?.takeProfitPct !== undefined) position.takeProfit = overrides.takeProfitPct
 
     const slChanged = position.stopLoss !== prevStopLossPct
@@ -5622,6 +5741,8 @@ export async function recalculateAndApplySLTP(
           previousTakeProfitPct: prevTakeProfitPct,
           newStopLossPct: position.stopLoss,
           newTakeProfitPct: position.takeProfit,
+          stopLossNormalized: normalizedOverrideSl?.adjusted || false,
+          stopLossNormalizationReason: normalizedOverrideSl?.reason,
           slChanged,
           tpChanged,
         },

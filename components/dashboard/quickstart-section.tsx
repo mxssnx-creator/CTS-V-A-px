@@ -953,7 +953,6 @@ export function QuickstartSection() {
         } catch { /* ignore corrupted sessionStorage data */ }
       }
     } catch { /* localStorage may be unavailable */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Persist QuickStart UI session flags so page reloads restore the live

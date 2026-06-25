@@ -290,13 +290,13 @@ async function _createExchangeConnectorLazy() {
  * silently dead.
  *
  * `withCycleDeadline` wraps each tick's primary work in a `Promise.race`
- * against a 30s timeout. When the deadline fires, the wrapper rejects,
+ * against a bounded timeout (30s dev, 60s production). When the deadline fires, the wrapper rejects,
  * the rejection is caught by the tick's outer try/catch, `finally` runs,
  * and `scheduleNext` re-arms the loop. Any in-flight promises continue
  * to settle in the background — they just no longer block subsequent
  * ticks.
  */
-const CYCLE_DEADLINE_MS = 30_000
+const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 30_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -404,6 +404,7 @@ export class TradeEngineManager {
   private indicationTimer?: NodeJS.Timeout
   private strategyTimer?: NodeJS.Timeout
   private realtimeTimer?: NodeJS.Timeout
+  private liveProgressionsArmed = false
   private healthCheckTimer?: NodeJS.Timeout
   private heartbeatTimer?: NodeJS.Timeout
 
@@ -543,6 +544,7 @@ export class TradeEngineManager {
     // Cache config for the watchdog's in-place re-arm path. We do this
     // BEFORE any await so a fast-fail in startup still leaves a usable
     // record of intended intervals.
+    this.liveProgressionsArmed = false
     this.startConfig = config
 
     // ── Symbols cache invalidation ──────────────────────────────────────
@@ -608,6 +610,9 @@ export class TradeEngineManager {
         // JSON.parse(state.symbols). JSON.stringify keeps both sides consistent.
         symbols: JSON.stringify(symbols),
         active_symbols: JSON.stringify(symbols),
+        symbol_count: String(symbols.length),
+        config_set_symbols_total: symbols.length,
+        config_set_symbols_processed: 0,
         updated_at: new Date().toISOString(),
       })
 
@@ -816,9 +821,7 @@ export class TradeEngineManager {
         console.log(
           `[v0] [Engine ${this.connectionId}] Cache hit — arming live processors immediately (prehistoric data already complete)`,
         )
-        this.startIndicationProcessor(config.indicationInterval)
-        this.startStrategyProcessor(config.strategyInterval)
-        this.startRealtimeProcessor(config.realtimeInterval)
+        this.armLiveProgressions("cached prehistoric")
       }
 
       // ── Spec contract (prehistoric → realtime ordering) ─────────────────
@@ -870,13 +873,7 @@ export class TradeEngineManager {
       // before scheduleNext, so the realtime loops are armed before the
       // second prehistoric cycle even fires — no race window.
       const armLiveProgressions = () => {
-        if (!this.isRunning) return
-        console.log(
-          `[v0] [Engine ${this.connectionId}] Prehistoric first-pass complete — arming Realtime, Strategy heartbeat, and LivePositions loops.`,
-        )
-        this.startIndicationProcessor(config.indicationInterval)
-        this.startStrategyProcessor(config.strategyInterval)
-        this.startRealtimeProcessor(config.realtimeInterval)
+        this.armLiveProgressions("prehistoric first-pass complete")
       }
       this.startPrehistoricProgression(cacheHit ? undefined : armLiveProgressions)
 
@@ -1064,6 +1061,24 @@ export class TradeEngineManager {
   }
 
   /**
+   * Arm realtime/strategy/live processors exactly once for this engine generation.
+   * Prehistoric startup can complete through either the continuous first-pass loop
+   * or the one-time full-load path; both call this helper, so the idempotent guard
+   * prevents duplicate timer loops while still guaranteeing realtime starts after
+   * the authoritative prehistoric gate opens.
+   */
+  private armLiveProgressions(reason: string): void {
+    if (!this.isRunning || this.liveProgressionsArmed || !this.startConfig) return
+    this.liveProgressionsArmed = true
+    console.log(
+      `[v0] [Engine ${this.connectionId}] ${reason} — arming Realtime, Strategy heartbeat, and LivePositions loops.`,
+    )
+    this.startIndicationProcessor(this.startConfig.indicationInterval)
+    this.startStrategyProcessor(this.startConfig.strategyInterval)
+    this.startRealtimeProcessor(this.startConfig.realtimeInterval)
+  }
+
+  /**
    * In-place self-heal for a stalled engine. Called by the coordinator's
    * watchdog (heartbeat older than 60s) and the unhandled-rejection
    * recovery path. Re-arms ONLY the processor timers that are currently
@@ -1183,6 +1198,7 @@ export class TradeEngineManager {
     }
 
     this.isRunning = false
+    this.liveProgressionsArmed = false
     // Capture epoch before zeroing so endProgression can use it for the
     // stale-stop guard (prevents a delayed stop() from closing a newer
     // progression that already started in a different worker/restart).
@@ -1276,6 +1292,7 @@ export class TradeEngineManager {
             engine_ready: true,
             updated_at: new Date().toISOString(),
           })
+          this.armLiveProgressions("prehistoric full load complete")
         } catch (phaseErr) {
           console.warn(`[v0] [Engine] Failed to advance phase to live_trading after prehistoric:`, phaseErr instanceof Error ? phaseErr.message : String(phaseErr))
         }
@@ -1307,6 +1324,7 @@ export class TradeEngineManager {
             100,
             `Live trading ACTIVE — prehistoric failed, running without prev-set enrichment`,
           )
+          this.armLiveProgressions("prehistoric failure fallback")
         } catch { /* best-effort */ }
         // Fallback: load minimal market data
         try {
@@ -1465,7 +1483,10 @@ export class TradeEngineManager {
       // so the engine stops "spinning" on empty cycles once the historical calc
       // is finished. The interval itself stays effective whenever productive
       // work is available.
-      await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 })
+      await Promise.all([
+        redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 }),
+        redisClient.set(`prehistoric:${this.connectionId}:firstpass:done`, "1", { EX: 86400 }),
+      ])
 
       // Emit a log event (NOT a phase overwrite) so the dashboard can show
       // prehistoric completion in its event stream. The PHASE itself is
@@ -2184,7 +2205,6 @@ export class TradeEngineManager {
     return
     // The original loop body below is unreachable — preserved only as
     // a reference for the legacy behaviour. Safe to delete in a follow-up.
-    // eslint-disable-next-line @typescript-eslint/no-unreachable-code-error
     let cycleCount = 0
     let totalDuration = 0
     let errorCount = 0
@@ -2705,7 +2725,6 @@ export class TradeEngineManager {
     }
     return
     // ── Legacy body preserved as unreachable reference ───────────────────
-    // eslint-disable-next-line @typescript-eslint/no-unreachable-code-error
     let cycleCount_legacy = 0
     void cycleCount_legacy
     let cycleCount2 = 0
@@ -3206,8 +3225,10 @@ export class TradeEngineManager {
         )
         _ppLastSteps = stepsTotal
 
-        // First-pass done: flip both flags so the gated realtime loop can become
-        // productive. Only fire when this cycle did REAL work (at least one symbol
+        // First-pass done: flip the first-pass flag and arm live timer infrastructure.
+        // The authoritative `:done` gate remains owned by the full prehistoric
+        // load path below, so realtime ticks cannot become productive until the
+        // generated historic Sets are complete. Only fire when this cycle did REAL work (at least one symbol
         // replayed ≥1 candle step). If all symbols produced zero steps on the first
         // tick (cold candle cache, market data not yet loaded) we would arm realtime
         // against completely empty Sets — exactly the state the gate is designed to
@@ -3216,10 +3237,7 @@ export class TradeEngineManager {
           firstPassDone = true
           try {
             const client = getRedisClient()
-            await Promise.all([
-              client.set(`prehistoric:${connId}:done`, "1", { EX: 86400 }),
-              client.set(`prehistoric:${connId}:firstpass:done`, "1", { EX: 86400 }),
-            ])
+            await client.set(`prehistoric:${connId}:firstpass:done`, "1", { EX: 86400 })
           } catch { /* non-critical */ }
           await logProgressionEvent(
             connId,

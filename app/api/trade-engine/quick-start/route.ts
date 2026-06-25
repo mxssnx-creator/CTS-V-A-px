@@ -44,6 +44,41 @@ const LOG_PREFIX = `[v0] [QuickStart] ${API_VERSION}`
 // Default trading symbol (single symbol for quickstart - DRIFTUSDT for live testing)
 const DEFAULT_SYMBOLS = ["DRIFTUSDT"]
 
+const QUICKSTART_ZERO_COUNTERS: Record<string, string> = {
+  cycles_completed: "0",
+  successful_cycles: "0",
+  failed_cycles: "0",
+  total_trades: "0",
+  successful_trades: "0",
+  total_profit: "0",
+  cycle_success_rate: "0",
+  trade_success_rate: "0",
+  indication_cycle_count: "0",
+  indication_live_cycle_count: "0",
+  strategy_cycle_count: "0",
+  strategy_live_cycle_count: "0",
+  realtime_cycle_count: "0",
+  realtime_live_cycle_count: "0",
+  live_positions_cycle_count: "0",
+  frames_processed: "0",
+  indications_count: "0",
+  indications_direction_count: "0",
+  indications_move_count: "0",
+  indications_active_count: "0",
+  indications_active_advanced_count: "0",
+  indications_optimal_count: "0",
+  indications_auto_count: "0",
+  strategies_count: "0",
+  strategies_base_total: "0",
+  strategies_main_total: "0",
+  strategies_real_total: "0",
+  strategies_live_total: "0",
+  strategies_base_evaluated: "0",
+  strategies_main_evaluated: "0",
+  strategies_real_evaluated: "0",
+  strategies_live_ready: "0",
+}
+
 /**
  * POST /api/trade-engine/quick-start
  * Quick-start endpoint with direct function calls (no HTTP fetch):
@@ -363,7 +398,13 @@ export async function POST(request: Request) {
     }
 
     console.log(`${LOG_PREFIX}: [2/4] Final symbol: ${symbols.join(", ")}`)
-    
+
+    const liveTradeRequested = body.liveTrade !== false && body.is_live_trade !== false
+    const liveTradeEnabled = liveTradeRequested && hasCredentials && testPassed
+    const liveTradeBlockedReason = liveTradeRequested && !liveTradeEnabled
+      ? (hasCredentials ? `Connection test failed: ${testError || "exchange transport unavailable"}` : "No API credentials configured")
+      : ""
+
     await logProgressionEvent(connectionId, "quickstart_symbols", "info", "Trading symbols configured", {
       symbols,
       count: symbols.length,
@@ -410,11 +451,16 @@ export async function POST(request: Request) {
        is_enabled_dashboard: "1",
        is_assigned: "1",
        is_active: "1",
-       is_live_trade: "1",
+       // Keep the progression active even when the exchange is unreachable, but
+       // do not let live-stage place venue orders unless the transport test passed.
+       is_live_trade: liveTradeEnabled ? "1" : "0",
+       live_trade_requested: liveTradeRequested ? "1" : "0",
+       live_trade_blocked_reason: liveTradeBlockedReason,
        active_symbols: JSON.stringify(symbols),
-       // Operator spec: volume factor 2.2 for quickstart (moderate live exposure).
-       // Previously 0.1 (exchange minimum) — updated per operator directive.
-       live_volume_factor: "2.2",
+       force_symbols: JSON.stringify(symbols),
+       // QuickStart uses the minimum live volume factor so live-trade smoke tests
+       // place only exchange-minimum orders when credentials are available.
+       live_volume_factor: "0.1",
        // Symbol ordering: operator spec is volatility_1h for quickstart.
        symbol_order: "volatility_1h",
        symbol_count: String(symbols.length),
@@ -447,14 +493,14 @@ export async function POST(request: Request) {
     // to the hard-coded "3" when the historical phase reports progress.
     // Also reset the processed counter to 0 so progress starts correctly.
     // Operator-spec defaults for quickstart: base PF=1.0, main/real PF=1.2,
-    // trailing on, block on, dca off, control orders on, VF 2.2, volatility_1h.
+    // trailing on, block on, dca off, control orders on, minimum VF 0.1, volatility_1h.
     // These are persisted to connection_settings so the engine reads them on the
     // first tick instead of using its compiled defaults.
     const { getRedisClient: _gsClient } = await import("@/lib/redis-db")
     const _gsc = _gsClient()
     await _gsc.hset(`connection_settings:${connectionId}`, {
       // Volume factor
-      volume_factor_live:   "2.2",
+      volume_factor_live:   "0.1",
       volume_factor_preset: "1.0",
       // Symbol order
       symbol_order: "volatility_1h",
@@ -478,6 +524,7 @@ export async function POST(request: Request) {
       connection_id: connectionId,
       symbols: symbols,
       active_symbols: symbols,
+      force_symbols: symbols,
       status: "ready",
       config_set_symbols_total: symbols.length,
       config_set_symbols_processed: 0,
@@ -527,7 +574,17 @@ export async function POST(request: Request) {
        isAssigned,
        isMainEnabled,
        testPassed,
+       liveTradeRequested,
+       liveTradeEnabled,
+       liveTradeBlockedReason: liveTradeBlockedReason || undefined,
      })
+
+     if (liveTradeBlockedReason) {
+       await logProgressionEvent(connectionId, "quickstart_live_trade_blocked", "warning",
+         "Live exchange order placement disabled until connection test passes",
+         { reason: liveTradeBlockedReason, symbols, live_volume_factor: "0.1" },
+       )
+     }
      
       // Step 4: Start engine - FIRST ensure Global Coordinator is running
       console.log(`${LOG_PREFIX}: [4/4] Starting Global Trade Engine Coordinator first...`)
@@ -630,6 +687,18 @@ export async function POST(request: Request) {
               "prehistoric_cycles_completed",
               "prehistoric_phase_active",
             ).catch(() => 0),
+            // A same-symbol QuickStart run may intentionally reuse the
+            // canonical progression session, but the operator expects the
+            // progress graph to represent THIS run only. Reset all cumulative
+            // realtime/strategy/live counters before the new engine is armed
+            // so stale samples cannot make realtime appear to start before
+            // the freshly-generated prehistoric data is complete.
+            client.hset(`progression:${connectionId}`, {
+              ...QUICKSTART_ZERO_COUNTERS,
+              session_reset_at: new Date().toISOString(),
+              symbols_total: String(symbols.length),
+              symbols_processed: "0",
+            }).catch(() => 0),
           ])
           console.log(`${LOG_PREFIX}: Pre-start cleanup complete — engine_is_running flag cleared for ${connectionId}`)
         } catch (restartErr) {
@@ -700,10 +769,17 @@ export async function POST(request: Request) {
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             })
 
-            // Ensure is_live_trade is persisted after engine confirms start.
+            // Re-persist the current QuickStart symbol/live gate after engine confirms start.
+            // Do not spread the stale pre-QuickStart connection object here; it can
+            // revert active_symbols/force_symbols/live flags while the async boot finishes.
             await updateConnection(connectionId, {
-              ...connection,
-              is_live_trade: "1",
+              is_live_trade: liveTradeEnabled ? "1" : "0",
+              live_trade_requested: liveTradeRequested ? "1" : "0",
+              live_trade_blocked_reason: liveTradeBlockedReason,
+              active_symbols: JSON.stringify(symbols),
+              force_symbols: JSON.stringify(symbols),
+              symbol_count: String(symbols.length),
+              live_volume_factor: "0.1",
               updated_at: new Date().toISOString(),
             })
 
@@ -900,6 +976,9 @@ export async function POST(request: Request) {
         testPassed,
         testError: testError || undefined,
         testBalance,
+        liveTradeRequested,
+        liveTradeEnabled,
+        liveTradeBlockedReason: liveTradeBlockedReason || undefined,
       },
       engineCounts: {
         indications: indCount,
@@ -924,10 +1003,12 @@ export async function POST(request: Request) {
         cycleTimeMs: overallStats.cycleDurationMs,
         totalDurationMs: overallStats.totalDuration,
       },
-      status: hasCredentials ? "ready_with_credentials" : "ready_without_credentials",
-      nextSteps: hasCredentials 
-        ? "Connection assigned and enabled in Main Connections. Engine startup initiated."
-        : "Connection assigned and enabled for quickstart, but credentials are missing/invalid for live exchange operations.",
+      status: liveTradeEnabled ? "ready_with_live_trading" : (hasCredentials ? "ready_connection_test_failed" : "ready_without_credentials"),
+      nextSteps: liveTradeEnabled
+        ? "Connection assigned, enabled, and live exchange order placement is enabled."
+        : (hasCredentials
+          ? "Connection assigned and engine progression started, but live exchange order placement is blocked until the connection test passes."
+          : "Connection assigned and enabled for quickstart, but credentials are missing/invalid for live exchange operations."),
       duration: totalDuration,
       logs: allLogs.slice(0, 50),
       logsCount: allLogs.length,
