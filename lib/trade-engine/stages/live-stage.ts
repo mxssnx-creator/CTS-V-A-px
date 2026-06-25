@@ -44,6 +44,118 @@ import {
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
+const DEFAULT_ROUND_TRIP_FEE_PERCENT = 0.12
+const DEFAULT_SLIPPAGE_BUFFER_PERCENT = 0.05
+const DEFAULT_ATR_FLOOR_PERCENT = 0.25
+const MAX_PRACTICAL_TAKE_PROFIT_PERCENT = 22
+
+export interface LiveMicrostructureProtection {
+  stopLossPct: number
+  takeProfitPct: number
+  slFloorReason: string
+  netEffectivePF: number
+  viable: boolean
+  suppressReason?: "risk_reward_not_live_viable"
+  spreadPct: number
+  slippagePct: number
+  atrPct: number
+  feePct: number
+  maxTakeProfitPct: number
+}
+
+function parsePositiveNumber(value: unknown, fallback = 0): number {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+async function estimateRecentMicrostructure(symbol: string): Promise<{
+  spreadPct: number
+  slippagePct: number
+  atrPct: number
+}> {
+  const { getMarketData, getRedisClient } = await import("@/lib/redis-db")
+  let spreadPct = 0
+  let atrPct = 0
+  try {
+    const client = getRedisClient()
+    const mdHash = (await client.hgetall(`market_data:${symbol}`).catch(() => ({} as Record<string, string>))) || {}
+    const bid = parsePositiveNumber(mdHash.bid ?? mdHash.bestBid ?? mdHash.best_bid)
+    const ask = parsePositiveNumber(mdHash.ask ?? mdHash.bestAsk ?? mdHash.best_ask)
+    const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : parsePositiveNumber(mdHash.close ?? mdHash.price)
+    if (bid > 0 && ask > 0 && ask >= bid && mid > 0) {
+      spreadPct = ((ask - bid) / mid) * 100
+    }
+  } catch { /* best-effort */ }
+
+  try {
+    const data = await getMarketData(symbol, "1m").catch(() => null)
+    const rows = Array.isArray(data) ? data.slice(-20) : Array.isArray(data?.candles) ? data.candles.slice(-20) : []
+    const trs: number[] = []
+    let prevClose = 0
+    for (const row of rows) {
+      const high = parsePositiveNumber(row?.high ?? row?.[2])
+      const low = parsePositiveNumber(row?.low ?? row?.[3])
+      const close = parsePositiveNumber(row?.close ?? row?.[4] ?? row?.price)
+      if (high > 0 && low > 0 && close > 0) {
+        const tr = Math.max(high - low, prevClose > 0 ? Math.abs(high - prevClose) : 0, prevClose > 0 ? Math.abs(low - prevClose) : 0)
+        trs.push(tr)
+        prevClose = close
+      }
+    }
+    if (trs.length > 0 && prevClose > 0) {
+      atrPct = (trs.reduce((s, v) => s + v, 0) / trs.length / prevClose) * 100
+    }
+  } catch { /* best-effort */ }
+
+  if (!Number.isFinite(spreadPct) || spreadPct <= 0) spreadPct = 0.03
+  if (!Number.isFinite(atrPct) || atrPct <= 0) atrPct = DEFAULT_ATR_FLOOR_PERCENT
+  return {
+    spreadPct,
+    slippagePct: Math.max(DEFAULT_SLIPPAGE_BUFFER_PERCENT, spreadPct * 0.5),
+    atrPct,
+  }
+}
+
+export async function assessLiveMicrostructureProtection(args: {
+  connectionId: string
+  symbol: string
+  stopLossPct: number
+  takeProfitPct: number
+  profitFactor: number
+}): Promise<LiveMicrostructureProtection> {
+  const micro = await estimateRecentMicrostructure(args.symbol)
+  const exchangeFloor = MIN_EXCHANGE_STOP_LOSS_PERCENT
+  const costFloor = DEFAULT_ROUND_TRIP_FEE_PERCENT + micro.spreadPct + micro.slippagePct
+  const volatilityFloor = Math.max(DEFAULT_ATR_FLOOR_PERCENT, micro.atrPct)
+  const stopLossPct = Math.max(args.stopLossPct, exchangeFloor, costFloor, volatilityFloor)
+  const pf = Math.max(1, parsePositiveNumber(args.profitFactor, args.takeProfitPct / Math.max(args.stopLossPct, 0.000001)))
+  const takeProfitPct = stopLossPct * pf
+  const feeAndFriction = DEFAULT_ROUND_TRIP_FEE_PERCENT + micro.spreadPct + micro.slippagePct
+  const netEffectivePF = Math.max(0, takeProfitPct - feeAndFriction) / Math.max(0.000001, stopLossPct + feeAndFriction)
+  const floorMap = [
+    { name: "exchange_min_sl", value: exchangeFloor },
+    { name: "fee_spread_slippage", value: costFloor },
+    { name: "atr_volatility_floor", value: volatilityFloor },
+    { name: "strategy_sl", value: args.stopLossPct },
+  ].sort((a, b) => b.value - a.value)
+  const slFloorReason = `${floorMap[0].name}: SL ${args.stopLossPct.toFixed(4)}% → ${stopLossPct.toFixed(4)}% ` +
+    `(fee=${DEFAULT_ROUND_TRIP_FEE_PERCENT.toFixed(4)}%, spread=${micro.spreadPct.toFixed(4)}%, ` +
+    `slippage=${micro.slippagePct.toFixed(4)}%, atr=${micro.atrPct.toFixed(4)}%)`
+  const viable = takeProfitPct <= MAX_PRACTICAL_TAKE_PROFIT_PERCENT
+  return {
+    stopLossPct,
+    takeProfitPct,
+    slFloorReason,
+    netEffectivePF,
+    viable,
+    suppressReason: viable ? undefined : "risk_reward_not_live_viable",
+    spreadPct: micro.spreadPct,
+    slippagePct: micro.slippagePct,
+    atrPct: micro.atrPct,
+    feePct: DEFAULT_ROUND_TRIP_FEE_PERCENT,
+    maxTakeProfitPct: MAX_PRACTICAL_TAKE_PROFIT_PERCENT,
+  }
+}
 
 const DEFAULT_MIN_NOTIONAL_RISK_TOLERANCE_PCT = 25
 const MIN_NOTIONAL_RISK_REASON = "min_notional_exceeds_strategy_risk"
@@ -203,6 +315,8 @@ interface LivePosition {
   fills: FillRecord[]
   stopLoss?: number
   takeProfit?: number
+  slFloorReason?: string
+  netEffectivePF?: number
   stopLossPrice?: number
   takeProfitPrice?: number
   desiredStopLossPrice?: number
@@ -2523,6 +2637,8 @@ export async function executeLivePosition(
     stopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
     takeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
     takeProfit: realPosition.takeProfit,
+    slFloorReason: (realPosition as any).slFloorReason,
+    netEffectivePF: (realPosition as any).netEffectivePF,
     // Immutable assignment snapshot — preserved across overrides so the
     // progression panel and post-trade stats can always recover what the
     // upstream Set originally specified. Mirrors `stopLoss`/`takeProfit`
@@ -2919,6 +3035,40 @@ export async function executeLivePosition(
     }
     livePosition.entryPrice = currentPrice
     pushStep(livePosition, "price_fetch", true, `price=${currentPrice}`)
+
+    const riskReward = await assessLiveMicrostructureProtection({
+      connectionId,
+      symbol: realPosition.symbol,
+      stopLossPct: livePosition.stopLoss || 0,
+      takeProfitPct: livePosition.takeProfit || 0,
+      profitFactor: (livePosition.takeProfit || 0) / Math.max(livePosition.stopLoss || 0, 0.000001),
+    })
+    livePosition.stopLoss = riskReward.stopLossPct
+    livePosition.takeProfit = riskReward.takeProfitPct
+    livePosition.slFloorReason = riskReward.slFloorReason
+    livePosition.netEffectivePF = riskReward.netEffectivePF
+    pushStep(
+      livePosition,
+      "microstructure_risk",
+      riskReward.viable,
+      `${riskReward.slFloorReason}; netEffectivePF=${riskReward.netEffectivePF.toFixed(4)}; TP=${riskReward.takeProfitPct.toFixed(4)}%`,
+    )
+    if (!riskReward.viable) {
+      livePosition.status = "rejected"
+      livePosition.statusReason = "risk_reward_not_live_viable"
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_rejected_count")
+      await logProgressionEvent(connectionId, "live_trading", "warning", "Live order suppressed: risk_reward_not_live_viable", {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+        slFloorReason: riskReward.slFloorReason,
+        netEffectivePF: riskReward.netEffectivePF,
+        takeProfitPct: riskReward.takeProfitPct,
+        maxTakeProfitPct: riskReward.maxTakeProfitPct,
+      })
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      return livePosition
+    }
 
     // ── Operator policy: ALWAYS use venue max leverage ─────────────────
     // realPosition.leverage carries the per-variant coordination signal

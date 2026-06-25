@@ -5371,7 +5371,7 @@ export class StrategyCoordinator {
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
         const isLiveTrade = isTruthyFlag(connData?.is_live_trade) || isTruthyFlag(connData?.live_trade_enabled)
         if (isLiveTrade) {
-          const { executeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
+          const { executeLivePosition, assessLiveMicrostructureProtection } = await import("@/lib/trade-engine/stages/live-stage")
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
           const connector = await exchangeConnectorFactory.getOrCreateConnector(this.connectionId)
           if (connector) {
@@ -5590,6 +5590,35 @@ export class StrategyCoordinator {
                   liveCostModel,
                   liveExecutionCosts.costBufferPct,
                 )
+                const liveProtection = await assessLiveMicrostructureProtection({
+                  connectionId: this.connectionId,
+                  symbol,
+                  stopLossPct: protection.stopLossPct,
+                  takeProfitPct: protection.takeProfitPct,
+                  profitFactor: effectivePF,
+                })
+                if (!liveProtection.viable) {
+                  rejected++
+                  await logProgressionEvent(
+                    this.connectionId,
+                    "live_trading",
+                    "warning",
+                    `Live order suppressed for ${symbol}: risk_reward_not_live_viable`,
+                    {
+                      symbol,
+                      direction: set.direction,
+                      setKey: set.setKey,
+                      slFloorReason: liveProtection.slFloorReason,
+                      netEffectivePF: liveProtection.netEffectivePF,
+                      stopLossPct: liveProtection.stopLossPct,
+                      takeProfitPct: liveProtection.takeProfitPct,
+                      maxTakeProfitPct: liveProtection.maxTakeProfitPct,
+                    },
+                  ).catch(() => {})
+                  continue
+                }
+                const tp = liveProtection.takeProfitPct
+                const sl = liveProtection.stopLossPct
                 const protectionDispatch: LiveDispatchDecision = {
                   setKey: set.setKey,
                   parentSetKey: set.parentSetKey,
@@ -5673,6 +5702,8 @@ export class StrategyCoordinator {
                     rewardTarget: 0,
                     stopLoss: sl,
                     takeProfit: tp,
+                    slFloorReason: liveProtection.slFloorReason,
+                    netEffectivePF: liveProtection.netEffectivePF,
                     mainPositionCount: set.entryCount,
                     evaluationScore: bestEntry.confidence,
                     ratioMet: bestEntry.confidence >= 0.65,
@@ -5680,6 +5711,7 @@ export class StrategyCoordinator {
                     ratios: {
                       // Use effectivePF (coord-record tuned) so risk ratios reflect
                       // the Real-stage performance bias rather than raw Base entry PF.
+                      profitabilityRatio: liveProtection.netEffectivePF,
                       profitabilityRatio: protection.netPF,
                       profitabilityRatio: protection.netEffectivePF,
                       accountRiskRatio: sl / 100,
