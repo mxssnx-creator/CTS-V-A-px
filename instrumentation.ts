@@ -28,6 +28,15 @@ export async function register() {
     return
   }
 
+  const npmLifecycle = process.env.npm_lifecycle_event || ""
+  const isNextBuild =
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    npmLifecycle === "build" ||
+    npmLifecycle === "vercel-build" ||
+    process.argv.some((arg) => arg === "build" || arg.endsWith("/next") || arg.endsWith("\\next")) &&
+      process.argv.includes("build")
+
+  if (isNextBuild) {
   if (isNextBuildPhase()) {
     // `next build` imports instrumentation while collecting page data. Running
     // Redis migrations/startup/auto-start here makes deployment builders spend
