@@ -26,6 +26,37 @@ import {
   type CompactionConfig,
 } from "@/lib/sets-compaction"
 
+
+interface LiveExchangeFeedbackStats {
+  sampleSize: number
+  wins: number
+  losses: number
+  netPnl: number
+  grossProfit: number
+  grossLoss: number
+  fees: number
+  profitFactor: number
+  feeAdjustedProfitFactor: number
+  winRate: number
+}
+
+interface LiveExchangeFeedbackThresholds {
+  enabled: boolean
+  minSamples: number
+  recentLimit: number
+  minProfitFactor: number
+  minWinRate: number
+  minNetPnl: number
+  minFeeAdjustedProfitFactor: number
+}
+
+interface LiveExchangeFeedbackDecision {
+  suppress: boolean
+  reasons: string[]
+  stats: LiveExchangeFeedbackStats
+  thresholds: LiveExchangeFeedbackThresholds
+}
+
 export interface EvaluationMetrics {
   maxDrawdownTime: number
   minProfitFactor: number
@@ -1384,6 +1415,105 @@ export class StrategyCoordinator {
       confidence: 0.65,       // advisory only
       description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= maxDrawdownTime) ready for live trading",
     },
+  }
+
+  private parseLiveFeedbackThresholds(raw: Record<string, any> = {}): LiveExchangeFeedbackThresholds {
+    const boolish = (v: any, fallback: boolean) => {
+      if (v === undefined || v === null || v === "") return fallback
+      const s = String(v).toLowerCase()
+      return s === "1" || s === "true" || s === "yes" || s === "on"
+    }
+    const num = (v: any, fallback: number) => {
+      const n = Number(v)
+      return Number.isFinite(n) ? n : fallback
+    }
+    return {
+      enabled: boolish(raw.liveFeedbackFilterEnabled ?? raw.liveStageFeedbackFilterEnabled, true),
+      minSamples: Math.max(1, Math.floor(num(raw.liveFeedbackMinSamples ?? raw.liveRecentMinSamples, 3))),
+      recentLimit: Math.max(10, Math.floor(num(raw.liveFeedbackRecentLimit ?? raw.liveRecentStatsLimit, 200))),
+      minProfitFactor: num(raw.liveFeedbackMinProfitFactor ?? raw.liveRecentMinProfitFactor, this.METRICS.real.minProfitFactor),
+      minWinRate: num(raw.liveFeedbackMinWinRate ?? raw.liveRecentMinWinRate, 0),
+      minNetPnl: num(raw.liveFeedbackMinNetPnl ?? raw.liveRecentMinNetPnl, 0),
+      minFeeAdjustedProfitFactor: num(
+        raw.liveFeedbackMinFeeAdjustedProfitFactor ?? raw.liveFeeAdjustedMinProfitFactor,
+        this.METRICS.live.minProfitFactor,
+      ),
+    }
+  }
+
+  private axisWindowsEqual(a: StrategySet["axisWindows"] | undefined, b: StrategySet["axisWindows"] | undefined): boolean {
+    if (!a && !b) return true
+    if (!a || !b) return false
+    return (
+      a.prev === b.prev &&
+      a.last === b.last &&
+      a.cont === b.cont &&
+      a.pause === b.pause &&
+      (a.direction || "") === (b.direction || "") &&
+      (a.axisKey || "") === (b.axisKey || "") &&
+      (a.outcome || "") === (b.outcome || "")
+    )
+  }
+
+  private calculateLiveExchangeFeedback(
+    set: StrategySet,
+    symbol: string,
+    closedPositions: any[],
+    thresholds: LiveExchangeFeedbackThresholds,
+  ): LiveExchangeFeedbackDecision {
+    const matched = closedPositions
+      .filter((p: any) => {
+        const keys = new Set<string>([
+          String(p?.setKey || ""),
+          String(p?.parentSetKey || ""),
+          ...((Array.isArray(p?.accumulatedSetKeys) ? p.accumulatedSetKeys : []) as any[]).map((k) => String(k || "")),
+        ].filter(Boolean))
+        const keyMatch = keys.has(set.setKey) || (!!set.parentSetKey && keys.has(set.parentSetKey))
+        return (
+          keyMatch &&
+          String(p?.symbol || "") === symbol &&
+          String(p?.direction || p?.side || "") === set.direction &&
+          String(p?.setVariant || p?.variant || "default") === String(set.variant || "default") &&
+          this.axisWindowsEqual(p?.axisWindows, set.axisWindows)
+        )
+      })
+      .slice(0, thresholds.recentLimit)
+
+    let grossProfit = 0
+    let grossLoss = 0
+    let fees = 0
+    let wins = 0
+    for (const p of matched) {
+      const pnl = Number(p?.realizedPnL ?? p?.realized_pnl ?? p?.pnl ?? 0)
+      const fee = Math.abs(Number(p?.fee ?? p?.fees ?? p?.commission ?? 0) || 0)
+      fees += fee
+      if (pnl > 0) { grossProfit += pnl; wins++ }
+      else if (pnl < 0) grossLoss += Math.abs(pnl)
+    }
+    const netPnl = grossProfit - grossLoss - fees
+    const losses = matched.length - wins
+    const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 999 : 0
+    const feeAdjustedProfitFactor = (grossLoss + fees) > 0 ? grossProfit / (grossLoss + fees) : grossProfit > 0 ? 999 : 0
+    const stats: LiveExchangeFeedbackStats = {
+      sampleSize: matched.length,
+      wins,
+      losses,
+      netPnl,
+      grossProfit,
+      grossLoss,
+      fees,
+      profitFactor,
+      feeAdjustedProfitFactor,
+      winRate: matched.length > 0 ? wins / matched.length : 0,
+    }
+    const reasons: string[] = []
+    if (stats.sampleSize >= thresholds.minSamples) {
+      if (stats.profitFactor < thresholds.minProfitFactor) reasons.push("live_pf_below_real_threshold")
+      if (stats.netPnl < thresholds.minNetPnl) reasons.push("live_recent_net_negative")
+      if (stats.feeAdjustedProfitFactor < thresholds.minFeeAdjustedProfitFactor) reasons.push("live_fee_adjusted_pf_low")
+      if (thresholds.minWinRate > 0 && stats.winRate < thresholds.minWinRate) reasons.push("live_win_rate_below_threshold")
+    }
+    return { suppress: thresholds.enabled && reasons.length > 0, reasons, stats, thresholds }
   }
 
   /**
@@ -4463,6 +4593,7 @@ export class StrategyCoordinator {
     let maxLive = this.config.maxLiveSets || 500
     let livePositionCostPct = 0.02
     let livePositionCostPct = 0.1
+    let liveFeedbackThresholds = this.parseLiveFeedbackThresholds()
     let liveCostModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic")
     let liveExecutionCosts: LiveExecutionCostProfile = resolveLiveExecutionCostProfile("unknown", {})
     const dispatchSelected: LiveDispatchDecision[] = []
@@ -4483,6 +4614,7 @@ export class StrategyCoordinator {
       if (exchange === "bingx") maxLive = Math.min(maxLive, 90)
       const rawCost = Number((connSettings as any)?.exchangePositionCost ?? (connSettings as any)?.positionCost ?? "")
       if (Number.isFinite(rawCost) && rawCost > 0) livePositionCostPct = rawCost
+      liveFeedbackThresholds = this.parseLiveFeedbackThresholds(connSettings as Record<string, any>)
     } catch (err) {
       console.warn(
         `[v0] [StrategyFlow] ${this.connectionId}:${symbol} live dispatch settings read failed:`,
@@ -5481,6 +5613,18 @@ export class StrategyCoordinator {
               )
             }
 
+            let recentClosedLivePositions: any[] = []
+            if (liveFeedbackThresholds.enabled && dispatchSets.length > 0) {
+              try {
+                const { getClosedLivePositions } = await import("@/lib/trade-engine/stages/live-stage")
+                recentClosedLivePositions = await getClosedLivePositions(this.connectionId, liveFeedbackThresholds.recentLimit)
+              } catch (feedbackErr) {
+                console.warn(
+                  `[v0] [StrategyFlow] ${symbol} live feedback stats read failed:`,
+                  feedbackErr instanceof Error ? feedbackErr.message : String(feedbackErr),
+                )
+              }
+            }
             const blockSetsDispatched = dispatchSets.filter((s) => s.variant === "block").length
             try {
               await getRedisClient().hset(`block_strategy:${this.connectionId}`, {
@@ -5530,6 +5674,44 @@ export class StrategyCoordinator {
 
             for (const set of dispatchSets) {
               try {
+                const feedback = this.calculateLiveExchangeFeedback(set, symbol, recentClosedLivePositions, liveFeedbackThresholds)
+                const feedbackDetails = {
+                  symbol,
+                  direction: set.direction,
+                  setKey: set.setKey,
+                  parentSetKey: set.parentSetKey,
+                  variant: set.variant || "default",
+                  axisWindows: set.axisWindows,
+                  realProfitFactor: set.avgProfitFactor,
+                  liveRealizedProfitFactor: feedback.stats.profitFactor,
+                  liveFeeAdjustedProfitFactor: feedback.stats.feeAdjustedProfitFactor,
+                  liveWinRate: feedback.stats.winRate,
+                  liveNetPnl: feedback.stats.netPnl,
+                  liveSampleSize: feedback.stats.sampleSize,
+                  liveFeedbackThresholds: feedback.thresholds,
+                }
+                if (feedback.suppress) {
+                  rejected++
+                  await logProgressionEvent(
+                    this.connectionId,
+                    "live_trading",
+                    "warning",
+                    `dispatchSuppressed ${symbol} ${set.direction}`,
+                    {
+                      ...feedbackDetails,
+                      suppressionReasons: feedback.reasons,
+                    },
+                  ).catch(() => {})
+                  continue
+                }
+                await logProgressionEvent(
+                  this.connectionId,
+                  "live_trading",
+                  "info",
+                  `dispatchSelected ${symbol} ${set.direction}`,
+                  feedbackDetails,
+                ).catch(() => {})
+
                 const isBlockDispatch = set.variant === "block"
                 if (isBlockDispatch) {
                   blockExecutionStats.attempted++
