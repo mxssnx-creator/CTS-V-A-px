@@ -53,6 +53,8 @@ const EXCHANGE_TIMEOUT_PLACE_STOP_MS    =  5_000  // was 15 s
 const EXCHANGE_TIMEOUT_GET_POSITIONS_MS =  4_000  // was 10 s
 const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  3_000  // was 10 s
 
+type ProtectionState = "unprotected" | "partial" | "protected" | "protection_failed"
+
 /**
  * Live position as it flows through the live-stage pipeline and is
  * persisted in Redis.  This is the local definition; the external
@@ -95,6 +97,9 @@ interface LivePosition {
   takeProfitPrice?: number
   stopLossOrderId?: string
   takeProfitOrderId?: string
+  protectionState?: ProtectionState
+  protectionFailureReason?: string
+  protectionFailureAt?: number
   // Epoch-ms timestamps of the last successful SL/TP placement on the venue.
   // Used by the MIN_REARM_MS cooldown to prevent repeated cancel-replace
   // storms when a position's price oscillates at the 0.25% drift boundary.
@@ -1303,6 +1308,69 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   return { desiredSl, desiredTp }
 }
 
+function deriveProtectionState(
+  desiredSl: number,
+  desiredTp: number,
+  stopLossOrderId?: string | null,
+  takeProfitOrderId?: string | null,
+  placementFailed = false,
+): ProtectionState {
+  if (placementFailed) return "protection_failed"
+
+  const requiresSl = desiredSl > 0
+  const requiresTp = desiredTp > 0
+  const requiredCount = (requiresSl ? 1 : 0) + (requiresTp ? 1 : 0)
+  if (requiredCount === 0) return "unprotected"
+
+  const armedCount =
+    (requiresSl && !!stopLossOrderId ? 1 : 0) +
+    (requiresTp && !!takeProfitOrderId ? 1 : 0)
+
+  if (armedCount === requiredCount) return "protected"
+  if (armedCount > 0) return "partial"
+  return "unprotected"
+}
+
+async function exposeProtectionFailure(
+  connectionId: string,
+  position: LivePosition,
+  message: string,
+  details: Record<string, unknown>,
+): Promise<void> {
+  const failureAt = Date.now()
+  position.protectionState = "protection_failed"
+  position.protectionFailureReason = message
+  position.protectionFailureAt = failureAt
+
+  await incrementMetric(connectionId, "live_protection_failed_count")
+  try {
+    const client = getRedisClient()
+    await client.hset(`progression:${connectionId}`, {
+      live_protection_state: position.protectionState,
+      live_protection_last_failure: JSON.stringify({
+        timestamp: new Date(failureAt).toISOString(),
+        livePositionId: position.id,
+        symbol: position.symbol,
+        direction: position.direction,
+        message,
+        details,
+      }),
+    })
+  } catch {
+    // Stats/UI exposure is best-effort; the progression log below is the
+    // durable operator-facing source of truth.
+  }
+
+  await logProgressionEvent(connectionId, "live_trading", "error", message, {
+    severity: "high",
+    livePositionId: position.id,
+    symbol: position.symbol,
+    direction: position.direction,
+    protectionState: position.protectionState,
+    ...details,
+  })
+}
+
 /**
  * Has the desired protection price drifted enough from the currently
  * placed one to warrant cancelling and re-placing? We use 0.25% as the
@@ -1682,6 +1750,22 @@ async function updateProtectionOrders(
 
   await Promise.all([slLeg, tpLeg])
 
+  const previousProtectionState = pos.protectionState
+  const nextProtectionState = deriveProtectionState(
+    desiredSl,
+    desiredTp,
+    pos.stopLossOrderId,
+    pos.takeProfitOrderId,
+  )
+  pos.protectionState = nextProtectionState
+  if (previousProtectionState !== nextProtectionState) {
+    result.changed = true
+  }
+  if (nextProtectionState === "protected") {
+    delete pos.protectionFailureReason
+    delete pos.protectionFailureAt
+  }
+
   // Record the qty we armed for only when at least one leg was actually
   // (re-)placed on the exchange. A liveness-verify clear sets result.changed
   // but may not result in a successful placement (venue reject, timeout).
@@ -1698,7 +1782,8 @@ async function updateProtectionOrders(
       "update_sl_tp",
       true,
       `[${reason}] SL ${pos.stopLoss}% → ${pos.stopLossPrice ? pos.stopLossPrice.toFixed(6) : "—"} (${pos.stopLossOrderId || "—"}) | ` +
-      `TP ${pos.takeProfit}% → ${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"})`,
+      `TP ${pos.takeProfit}% → ${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"}) | ` +
+      `state=${pos.protectionState}`,
     )
     await logProgressionEvent(
       pos.connectionId,
@@ -1720,6 +1805,7 @@ async function updateProtectionOrders(
         tpOrderId: pos.takeProfitOrderId,
         tpPrice: pos.takeProfitPrice,
         fillPrice: pos.averageExecutionPrice,
+        protectionState: pos.protectionState,
       },
     )
   }
@@ -1866,6 +1952,7 @@ export async function executeLivePosition(
     // at creation; never mutated thereafter.
     assignedStopLoss: realPosition.stopLoss,
     assignedTakeProfit: realPosition.takeProfit,
+    protectionState: "unprotected",
     status: "pending",
     fills: [],
     progression: [],
@@ -2947,6 +3034,7 @@ export async function executeLivePosition(
       const sideClose: "buy" | "sell" = realPosition.direction === "long" ? "sell" : "buy"
       const { desiredSl: slPrice, desiredTp: tpPrice } =
         computeDesiredProtectionPrices(livePosition)
+      livePosition.protectionState = "unprotected"
       // Duplicate-prevention is handled inside the Promise.all below:
       // each leg resolves to the existing orderId when an order is already
       // present (`!livePosition.stopLossOrderId` guard on the ternary),
@@ -3002,39 +3090,70 @@ export async function executeLivePosition(
           )
         : (livePosition.takeProfitOrderId || null)
 
+      const slRequired = slPrice > 0
+      const tpRequired = tpPrice > 0
+      const slFailed = slRequired && !slOrderId
+      const tpFailed = tpRequired && !tpOrderId
+
       if (slOrderId) {
         livePosition.stopLossOrderId = slOrderId
         livePosition.stopLossPrice = slPrice
-      } else if (slPrice > 0) {
+      } else if (slFailed) {
         // Surface the protection gap loudly so operators and the
         // dashboard see it; the next reconcile will retry.
         console.error(
           `${LOG_PREFIX} INITIAL StopLoss placement FAILED for ${realPosition.symbol} — position is LIVE without SL until next reconcile tick`,
         )
-        await logProgressionEvent(
+        await exposeProtectionFailure(
           connectionId,
-          "live_trading",
-          "error",
+          livePosition,
           `StopLoss NOT placed for ${realPosition.symbol} — reconcile will retry`,
-          { livePositionId: livePosition.id, desiredSl: slPrice, executedQty: livePosition.executedQuantity },
+          {
+            failedLeg: "stop_loss",
+            desiredSl: slPrice,
+            desiredTp: tpPrice,
+            stopLossOrderId: livePosition.stopLossOrderId ?? null,
+            takeProfitOrderId: livePosition.takeProfitOrderId ?? null,
+            executedQty: livePosition.executedQuantity,
+          },
         )
         pushStep(livePosition, "place_stop_loss", false, `initial SL placement failed @ ${slPrice}`)
       }
       if (tpOrderId) {
         livePosition.takeProfitOrderId = tpOrderId
         livePosition.takeProfitPrice = tpPrice
-      } else if (tpPrice > 0) {
+      } else if (tpFailed) {
         console.error(
           `${LOG_PREFIX} INITIAL TakeProfit placement FAILED for ${realPosition.symbol} — position is LIVE without TP until next reconcile tick`,
         )
-        await logProgressionEvent(
+        await exposeProtectionFailure(
           connectionId,
-          "live_trading",
-          "error",
+          livePosition,
           `TakeProfit NOT placed for ${realPosition.symbol} — reconcile will retry`,
-          { livePositionId: livePosition.id, desiredTp: tpPrice, executedQty: livePosition.executedQuantity },
+          {
+            failedLeg: "take_profit",
+            desiredSl: slPrice,
+            desiredTp: tpPrice,
+            stopLossOrderId: livePosition.stopLossOrderId ?? null,
+            takeProfitOrderId: livePosition.takeProfitOrderId ?? null,
+            executedQty: livePosition.executedQuantity,
+          },
         )
         pushStep(livePosition, "place_take_profit", false, `initial TP placement failed @ ${tpPrice}`)
+      }
+      if (!slFailed && !tpFailed) {
+        livePosition.protectionState = deriveProtectionState(
+          slPrice,
+          tpPrice,
+          livePosition.stopLossOrderId,
+          livePosition.takeProfitOrderId,
+        )
+        delete livePosition.protectionFailureReason
+        delete livePosition.protectionFailureAt
+      } else if (slOrderId || tpOrderId) {
+        // Preserve the failure state for stats/UI, while the available order ID
+        // fields make the partial exchange-side coverage explicit.
+        livePosition.protectionState = "protection_failed"
       }
       // Record the qty SL/TP were armed for so the next reconcile
       // pass can detect quantity drift (delayed partial fills,
@@ -3063,15 +3182,16 @@ export async function executeLivePosition(
       pushStep(
         livePosition,
         "place_sl_tp",
-        !!(slOrderId || tpOrderId),
+        livePosition.protectionState === "protected",
         `SL ${livePosition.stopLoss}% → ${slPrice ? slPrice.toFixed(6) : "—"} (${slOrderId || "—"}) | ` +
-        `TP ${livePosition.takeProfit}% → ${tpPrice ? tpPrice.toFixed(6) : "—"} (${tpOrderId || "—"})`
+        `TP ${livePosition.takeProfit}% → ${tpPrice ? tpPrice.toFixed(6) : "—"} (${tpOrderId || "—"}) | ` +
+        `state=${livePosition.protectionState}`
       )
       await logProgressionEvent(
         connectionId,
         "live_trading",
-        "info",
-        `SL/TP placed for ${realPosition.symbol} at assigned values`,
+        livePosition.protectionState === "protected" ? "info" : "warning",
+        `${livePosition.protectionState === "protected" ? "SL/TP placed" : "SL/TP not fully protected"} for ${realPosition.symbol} at assigned values`,
         {
           // Assigned (immutable strategy contract) and current
           // (mutable, override-aware) percent pairs — equal on first
@@ -3085,10 +3205,12 @@ export async function executeLivePosition(
           tpOrderId,
           tpPrice,
           fillPrice: livePosition.averageExecutionPrice,
+          protectionState: livePosition.protectionState,
         },
       )
     } else {
       pushStep(livePosition, "place_sl_tp", false, "skipped — no fill yet")
+      livePosition.protectionState = "unprotected"
     }
 
     // ── Step 8: Sync with exchange for position data ───────────────────────
