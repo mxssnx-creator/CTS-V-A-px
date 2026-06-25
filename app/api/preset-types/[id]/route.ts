@@ -3,6 +3,7 @@ import DatabaseManager from "@/lib/database"
 const db = DatabaseManager.getInstance()
 import { EntityTypes } from "@/lib/core/entity-types"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

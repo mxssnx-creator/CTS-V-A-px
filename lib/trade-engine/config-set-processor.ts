@@ -248,9 +248,11 @@ export class ConfigSetProcessor {
           // SADD is idempotent so a replay can't double-count.
           symbolsProcessed++
           try {
-            await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+            const added = Number(await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)) || 0
             await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
-            await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+            if (added > 0) {
+              await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+            }
             const distinctSkipProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
             await client.hset(`prehistoric:${this.connectionId}`, {
               symbols_processed: String(distinctSkipProcessed),
@@ -344,17 +346,34 @@ export class ConfigSetProcessor {
         symbolsProcessed++
 
         // --- Write live progress to Redis hash (fire concurrently with computation) ---
-        const progressWrite = Promise.all([
-          client.hincrby(progressKey, "prehistoric_candles_processed", combinedCandles.length),
-          client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1),
-          client.hset(progressKey, {
-            prehistoric_current_symbol: symbol,
-            prehistoric_intervals_processed: String(totalIntervalsProcessed),
-            prehistoric_missing_loaded: String(missingIntervalsLoaded),
-            prehistoric_timeframe_seconds: String(timeframeSec),
-          }),
-          client.expire(progressKey, 7 * 24 * 60 * 60),
-        ]).catch(() => { /* non-critical */ })
+        // Use the same canonical processed-symbol SET as the skip/error paths
+        // before touching the legacy counter. A settings restart or duplicate
+        // bootstrap can replay the same symbol; blind HINCRBY made the status
+        // state report 30/15 symbols in 15-symbol live tests even though the
+        // distinct processed set was correct. SADD gives us an idempotent
+        // "new symbol" signal, then SCARD becomes the displayed count.
+        const progressWrite = (async () => {
+          const added = Number(await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol).catch(() => 0)) || 0
+          await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400).catch(() => 0)
+          if (added > 0) {
+            await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1).catch(() => 0)
+          }
+          const distinctProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`).catch(() => 0)
+          await Promise.all([
+            client.hincrby(progressKey, "prehistoric_candles_processed", combinedCandles.length),
+            client.hset(progressKey, {
+              prehistoric_symbols_processed_count: String(distinctProcessed),
+              prehistoric_current_symbol: symbol,
+              prehistoric_intervals_processed: String(totalIntervalsProcessed),
+              prehistoric_missing_loaded: String(missingIntervalsLoaded),
+              prehistoric_timeframe_seconds: String(timeframeSec),
+            }),
+            client.hset(`prehistoric:${this.connectionId}`, {
+              symbols_processed: String(distinctProcessed),
+            }),
+            client.expire(progressKey, 7 * 24 * 60 * 60),
+          ])
+        })().catch(() => { /* non-critical */ })
 
         // --- Run indications + strategies in parallel for this symbol ---
         const tCalcStart = Date.now()
@@ -455,9 +474,11 @@ export class ConfigSetProcessor {
         // monotonic distinct count.
         symbolsProcessed++
         try {
-          await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+          const added = Number(await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)) || 0
           await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
-          await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+          if (added > 0) {
+            await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+          }
           const distinctErrProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
           await client.hset(`prehistoric:${this.connectionId}`, {
             symbols_processed: String(distinctErrProcessed),
@@ -982,6 +1003,10 @@ export class ConfigSetProcessor {
                   direction,
                   pnl: resultPct,
                   drawdownMinutes,
+                  // Prehistoric backtest positions don't track quantity,
+                  // so position cost is not available. Live positions in
+                  // pseudo-position-manager pass both entryPrice and quantity.
+                  entryPrice: p.entry_price,
                   pipeline,
                 })
               }

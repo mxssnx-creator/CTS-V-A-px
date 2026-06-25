@@ -166,6 +166,10 @@ export interface RecordPosClosedInput {
   pnl: number
   /** Drawdown duration in minutes (best-effort, 0 ok). */
   drawdownMinutes?: number
+  /** Entry price for position cost calculation (optional, used for cost-adjusted PF). */
+  entryPrice?: number
+  /** Quantity for position cost calculation (optional, used for cost-adjusted PF). */
+  quantity?: number
   /**
    * Optional Redis pipeline. When provided we COMPOSE the writes into the
    * caller's existing pipeline so a single round-trip carries the full
@@ -197,6 +201,8 @@ export function recordPosClosed(input: RecordPosClosedInput): void {
     direction,
     pnl,
     drawdownMinutes = 0,
+    entryPrice,
+    quantity,
     pipeline: externalPipeline,
   } = input
 
@@ -211,6 +217,13 @@ export function recordPosClosed(input: RecordPosClosedInput): void {
   const grossProfit = Math.max(0,  pnl)
   const grossLoss   = Math.max(0, -pnl)
   const ddt         = Math.max(0,  drawdownMinutes)
+  
+  // Position cost calculation: entry price × quantity × 0.001 (0.1% maker fee)
+  // Used as adjustment factor in PF denominator so PF reflects cost-adjusted returns
+  const positionCost = 
+    Number.isFinite(entryPrice) && Number.isFinite(quantity) && entryPrice > 0 && quantity > 0
+      ? entryPrice * quantity * 0.001
+      : 0
 
   // Scaled integer fields so every increment is a single atomic hincrby.
   // We round-down on the way in and divide on the way out — small per-
@@ -244,12 +257,13 @@ export function recordPosClosed(input: RecordPosClosedInput): void {
   if (ddtX10 > 0)           client.hincrby(o, "ddt_num_x10",  ddtX10)
   client.expire(o, TTL_SECONDS)
 
-  // Windowed ring list (last-N). One compact "pnl|ddt" record per close,
-  // capped at RING_CAP so memory is bounded regardless of run length. We
+  // Windowed ring list (last-N). One compact "pnl|cost|ddt" record per close,
+  // including position cost (0.1% maker fee) so PF can be computed cost-adjusted.
+  // Capped at RING_CAP so memory is bounded regardless of run length. We
   // lpush (newest at head) then ltrim to [0, RING_CAP-1]; readers lrange
   // the head N. Both per-bucket and overall rings are maintained so the
   // eval gates and the dashboard "any-symbol" tile can both read windows.
-  const ringRecord = `${pnl.toFixed(6)}|${ddt.toFixed(3)}`
+  const ringRecord = `${pnl.toFixed(6)}|${positionCost.toFixed(6)}|${ddt.toFixed(3)}`
   const ringK = listKey(connectionId, cleanSymbol, cleanType, cleanDir)
   client.lpush(ringK, ringRecord)
   client.ltrim(ringK, 0, RING_CAP - 1)
@@ -387,17 +401,25 @@ function deriveWindow(records: string[], window: number): PosWindowStats {
   // records arrive newest-first (lpush head).
   const winN = Math.max(1, window)
   let wins = 0
-  let num = 0
-  let den = 0
+  let num = 0  // total winning PnL
+  let den = 0  // total losing PnL
+  let costSum = 0  // total position costs
   let n = 0
   let ddtSum = 0
   let ddtCount = 0
   for (let i = 0; i < records.length && i < winN; i++) {
     const rec = records[i]
-    const sep = rec.indexOf("|")
-    if (sep < 0) continue
-    const pnl = Number(rec.slice(0, sep))
-    const ddt = Number(rec.slice(sep + 1))
+    // NEW FORMAT: "pnl|cost|ddt" (cost-adjusted)
+    // LEGACY FORMAT: "pnl|ddt" (backward compat)
+    const parts = rec.split("|")
+    if (parts.length < 2) continue
+    
+    const pnl = Number(parts[0])
+    // Detect format: if parts.length === 2, legacy format (pnl|ddt)
+    // if parts.length >= 3, new format (pnl|cost|ddt)
+    const cost = parts.length >= 3 ? Number(parts[1]) : 0
+    const ddt = Number(parts[parts.length - 1])
+    
     if (Number.isFinite(pnl)) {
       n++
       if (pnl > 0) {
@@ -405,6 +427,10 @@ function deriveWindow(records: string[], window: number): PosWindowStats {
         num += pnl
       } else {
         den += -pnl
+      }
+      // Accumulate position costs for all positions (wins & losses)
+      if (Number.isFinite(cost) && cost > 0) {
+        costSum += cost
       }
       // DDT averaged over the SAME window sample as PF.
       if (Number.isFinite(ddt) && ddt > 0) {
@@ -414,7 +440,12 @@ function deriveWindow(records: string[], window: number): PosWindowStats {
     }
   }
   if (n === 0) return EMPTY_WINDOW
-  const profitFactor = den > 0 ? num / den : (num > 0 ? 99 : 0)
+  
+  // Cost-adjusted PF: totalWinPnL / (totalLosePnL + totalPositionCosts)
+  // This ensures profitability is measured after fees
+  const adjustedDen = den + costSum
+  const profitFactor = adjustedDen > 0 ? num / adjustedDen : (num > 0 ? 99 : 0)
+  
   return {
     count: n,
     successRate: wins / n,
@@ -611,7 +642,7 @@ export async function getAxisPosAccumulation(
   }
 }
 
-// ── Valid Positions Counters ───────────────────────────────────────────
+// ─�� Valid Positions Counters ───────────────────────────────────────────
 //
 // Separate from Pos history: these track LIVE-promoted Sets (positions
 // the engine considers "valid" — i.e. surviving Real and reaching Live).

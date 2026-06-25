@@ -19,6 +19,7 @@ function clearAllEngineTimers() {
   }
 }
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     let connectionId: string | undefined

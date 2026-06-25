@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { verifyPassword, createToken, setSession } from "@/lib/auth"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     const { email, password } = await request.json()

@@ -4,6 +4,7 @@ import { getSettings, setSettings } from "@/lib/redis-db"
 import { getWebSocketManager } from "@/lib/websocket-server"
 import { SystemLogger } from "@/lib/system-logger"
 
+export const dynamic = "force-dynamic"
 export async function POST(request: Request) {
   try {
     const body = await request.json()

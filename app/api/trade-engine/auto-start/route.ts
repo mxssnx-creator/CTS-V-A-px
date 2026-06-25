@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { initializeTradeEngineAutoStart, isAutoStartInitialized } from "@/lib/trade-engine-auto-start"
 import { SystemLogger } from "@/lib/system-logger"
 
+export const dynamic = "force-dynamic"
 export async function POST() {
   try {
     console.log("[v0] Manual trade engine auto-start triggered")
