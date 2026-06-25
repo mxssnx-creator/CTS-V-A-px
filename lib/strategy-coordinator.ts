@@ -548,6 +548,13 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
+export function sanitizeLiveProfitFactor(profitFactor: unknown, fallback = 1): number {
+  const pf = Number(profitFactor)
+  const fb = Number.isFinite(fallback) && fallback > 0 ? fallback : 1
+  return Number.isFinite(pf) && pf > 0 ? pf : fb
+}
+
+export function deriveProtectionFromProfitFactor(
 const LIVE_PROTECTION_FEE_BUFFER_PCT = 0.12
 type LiveExecutionCostProfile = {
   exchange: string
@@ -593,6 +600,8 @@ function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
   sizeMultiplier = 1,
+): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
+  const pf = sanitizeLiveProfitFactor(profitFactor, 1)
 ): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number; feeBufferPct: number } {
   costBufferPct = 0,
 ): ProfitFactorProtection {
@@ -4590,6 +4599,8 @@ export class StrategyCoordinator {
                   : (bestEntry.sizeMultiplier ?? 1)
                 // Use tunedAvgPF for SL/TP derivation when available — reflects the
                 // Real-stage tuner's per-variant performance bias.
+                const rawEffectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
+                const effectivePF = sanitizeLiveProfitFactor(rawEffectivePF, bestEntry.profitFactor)
                 const effectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
 
                 // Derive SL/TP % from PF and the actual position-cost budget.
@@ -4903,8 +4914,10 @@ export class StrategyCoordinator {
                 )
                 if (!bestEntry) return false
 
-                const tp = Math.max(0.5, (bestEntry.profitFactor - 1) * 100)
-                const sl = Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5)
+                const pseudoPF = sanitizeLiveProfitFactor(bestEntry.profitFactor, set.avgProfitFactor || 1)
+                const pseudoProtection = deriveProtectionFromProfitFactor(pseudoPF, livePositionCostPct, bestEntry.sizeMultiplier ?? 1)
+                const tp = pseudoProtection.takeProfitPct
+                const sl = pseudoProtection.stopLossPct
 
                 // Multi-step trailing — Set carries its own profile from
                 // BASE, so trailing-on/off and the three ratios are
@@ -4939,7 +4952,7 @@ export class StrategyCoordinator {
                   entryPrice,
                   takeprofitFactor: tp,
                   stoplossRatio: sl,
-                  profitFactor: bestEntry.profitFactor,
+                  profitFactor: pseudoProtection.effectiveProfitFactor,
                   trailingEnabled: trailing,
                   configSetKey,
                   ...(profile && {

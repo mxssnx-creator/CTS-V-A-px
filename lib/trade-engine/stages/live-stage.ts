@@ -1935,10 +1935,10 @@ export async function executeLivePosition(
       volumeUsd: 0,
       leverage: realPosition.leverage,
       marginType: "cross",
-      stopLoss: realPosition.stopLoss,
-      takeProfit: realPosition.takeProfit,
-      assignedStopLoss: realPosition.stopLoss,
-      assignedTakeProfit: realPosition.takeProfit,
+      stopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
+      takeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
+      assignedStopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
+      assignedTakeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
       status: "rejected",
       statusReason: `Skipped — exchange circuit breaker active for ${realPosition.symbol} (market volatility, resumes in <5min)`,
       fills: [],
@@ -2034,13 +2034,14 @@ export async function executeLivePosition(
     leverage: realPosition.leverage,
     marginType: "cross",
     stopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
+    takeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
     takeProfit: realPosition.takeProfit,
     // Immutable assignment snapshot — preserved across overrides so the
     // progression panel and post-trade stats can always recover what the
     // upstream Set originally specified. Mirrors `stopLoss`/`takeProfit`
     // at creation; never mutated thereafter.
-    assignedStopLoss: realPosition.stopLoss,
-    assignedTakeProfit: realPosition.takeProfit,
+    assignedStopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
+    assignedTakeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
     status: "pending",
     fills: [],
     progression: [],
