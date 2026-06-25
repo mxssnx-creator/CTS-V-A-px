@@ -3272,6 +3272,8 @@ export class StrategyCoordinator {
   private async createPseudoPositionsFromRealSets(
     symbol: string,
     realSets: StrategySet[],
+    coordIndex?: CoordIndex,
+    positionCostPct = 0.1,
     cachedMarketPrice = 0,
   ): Promise<void> {
     // DEV-MODE BYPASS: pseudo_position hashes are only used by the dashboard
@@ -3314,6 +3316,34 @@ export class StrategyCoordinator {
       for (let i = 0; i < setMeta.length; i++) {
         const { set, setKey, existingKey } = setMeta[i]
         try {
+          const parentKey = set.parentSetKey || set.setKey.split("#")[0]
+          const effectiveEntries: StrategySetEntry[] =
+            set.entries.length > 0
+              ? set.entries
+              : coordIndex
+                ? (coordIndex.base.byKey.get(parentKey)?.entries ?? [])
+                : (realSets.find((s) => s.setKey === parentKey)?.entries ?? [])
+          const bestEntry = effectiveEntries.reduce(
+            (best, e) => (e.profitFactor > best.profitFactor ? e : best),
+            effectiveEntries[0],
+          )
+          const coordRec = coordIndex?.byCoordKey.get(set.setKey)
+          const baseSizeMult = bestEntry?.sizeMultiplier ?? 1
+          const effectiveSizeMult = coordRec?.sizeDelta !== undefined
+            ? Math.max(0.5, Math.min(2.0, baseSizeMult * (1 + coordRec.sizeDelta)))
+            : baseSizeMult
+          const effectivePF =
+            coordRec?.tunedAvgPF ??
+            set.avgProfitFactor ??
+            bestEntry?.profitFactor ??
+            1
+          const protection = deriveProtectionFromProfitFactor(
+            effectivePF,
+            positionCostPct,
+            effectiveSizeMult,
+          )
+          const avgPF       = protection.effectiveProfitFactor || set.avgProfitFactor || 1
+          const entryPrice  = Math.max(1, avgPF * 100)   // unitless proxy
           const avgPF       = set.avgProfitFactor || 1
           // Prefer the same market-price snapshot used by live exchange dispatch
           // so dashboard pseudo positions and live orders align on entry basis.
@@ -3363,6 +3393,10 @@ export class StrategyCoordinator {
             source_set_key: setKey,
             created_at: createdAtIso,
             profit_factor: set.avgProfitFactor || 0,
+            effective_profit_factor: protection.effectiveProfitFactor,
+            takeprofit_factor: protection.takeProfitPct,
+            stoploss_ratio: protection.stopLossPct,
+            size_multiplier: effectiveSizeMult,
             confidence: set.avgConfidence || 0,
           }
 
@@ -4998,6 +5032,7 @@ export class StrategyCoordinator {
     // writes for sets that never reach live dispatch. `qualifying` is the capped
     // Live subset (typically ≤500/symbol) — the only sets that semantically need
     // pseudo-position records (they represent active dispatch candidates).
+    await this.createPseudoPositionsFromRealSets(symbol, qualifying, coordIndex, livePositionCostPct)
     await this.createPseudoPositionsFromRealSets(symbol, qualifying, _cachedMarketPrice)
     // Live candidate subset (typically ≤500/symbol) — dispatch selection is
     // tracked separately below so the UI can compare candidates vs selected sets.
@@ -5756,6 +5791,7 @@ export class StrategyCoordinator {
                   : (bestEntry.sizeMultiplier ?? 1)
                 // Use tunedAvgPF for SL/TP derivation when available — reflects the
                 // Real-stage tuner's per-variant performance bias.
+                const effectivePF = dispatchCoordRec?.tunedAvgPF ?? set.avgProfitFactor ?? bestEntry.profitFactor
                 const rawEffectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
                 const effectivePF = sanitizeLiveProfitFactor(rawEffectivePF, bestEntry.profitFactor)
                 const effectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
@@ -6204,6 +6240,21 @@ export class StrategyCoordinator {
                 )
                 if (!bestEntry) return false
 
+                const pseudoCoordRec = coordIndex?.byCoordKey.get(set.setKey)
+                const effectiveSizeMult = pseudoCoordRec?.sizeDelta !== undefined
+                  ? Math.max(0.5, Math.min(2.0, (bestEntry.sizeMultiplier ?? 1) * (1 + pseudoCoordRec.sizeDelta)))
+                  : (bestEntry.sizeMultiplier ?? 1)
+                const effectivePF =
+                  pseudoCoordRec?.tunedAvgPF ??
+                  set.avgProfitFactor ??
+                  bestEntry.profitFactor
+                const protection = deriveProtectionFromProfitFactor(
+                  effectivePF,
+                  livePositionCostPct,
+                  effectiveSizeMult,
+                )
+                const tp = protection.takeProfitPct
+                const sl = protection.stopLossPct
                 const pseudoPF = sanitizeLiveProfitFactor(bestEntry.profitFactor, set.avgProfitFactor || 1)
                 const pseudoProtection = deriveProtectionFromProfitFactor(pseudoPF, livePositionCostPct, bestEntry.sizeMultiplier ?? 1)
                 const tp = pseudoProtection.takeProfitPct
@@ -6242,6 +6293,8 @@ export class StrategyCoordinator {
                   entryPrice,
                   takeprofitFactor: tp,
                   stoplossRatio: sl,
+                  profitFactor: bestEntry.profitFactor,
+                  effectiveProfitFactor: protection.effectiveProfitFactor,
                   profitFactor: pseudoProtection.effectiveProfitFactor,
                   trailingEnabled: trailing,
                   configSetKey,
