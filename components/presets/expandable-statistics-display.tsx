@@ -155,7 +155,7 @@ export function ExpandableStatisticsDisplay({
                     </CardTitle>
                     {majorMetrics && (
                       <CardDescription className="text-xs mt-1">
-                        Avg PF: {majorMetrics.avgProfitFactor.toFixed(2)} • Win Rate:{" "}
+                        Avg R: {majorMetrics.totalTrades > 0 ? majorMetrics.avgProfitFactor.toFixed(2) : "—"} • Win Rate:{" "}
                         {(majorMetrics.avgWinRate * 100).toFixed(1)}% • Drawdown: {majorMetrics.avgDrawdown.toFixed(1)}h
                       </CardDescription>
                     )}
@@ -171,7 +171,7 @@ export function ExpandableStatisticsDisplay({
                           ) : (
                             <TrendingDown className="h-4 w-4 text-red-500" />
                           )}
-                          {majorMetrics.avgProfitFactor.toFixed(2)}
+                          {majorMetrics.totalTrades > 0 ? majorMetrics.avgProfitFactor.toFixed(2) : "—"}
                         </div>
                         <div className="text-xs text-muted-foreground">{majorMetrics.totalTrades} trades</div>
                       </div>
@@ -215,7 +215,7 @@ export function ExpandableStatisticsDisplay({
                             {minorMetrics && (
                               <div className="flex items-center gap-3 text-sm">
                                 <span className={minorMetrics.avgProfitFactor >= 1 ? "text-green-600" : "text-red-600"}>
-                                  PF: {minorMetrics.avgProfitFactor.toFixed(2)}
+                                  Avg R: {minorMetrics.totalTrades > 0 ? minorMetrics.avgProfitFactor.toFixed(2) : "—"}
                                 </span>
                                 <span className="text-muted-foreground">
                                   WR: {(minorMetrics.avgWinRate * 100).toFixed(0)}%
@@ -254,7 +254,7 @@ export function ExpandableStatisticsDisplay({
                                       </div>
                                       {tpMetrics && (
                                         <span className="text-xs text-muted-foreground">
-                                          {tpMetrics.avgProfitFactor.toFixed(2)}
+                                          {tpMetrics.totalTrades > 0 ? tpMetrics.avgProfitFactor.toFixed(2) : "—"}
                                         </span>
                                       )}
                                     </div>
@@ -289,7 +289,7 @@ export function ExpandableStatisticsDisplay({
                                                 </div>
                                                 {slMetrics && (
                                                   <span className="text-xs text-muted-foreground">
-                                                    {slMetrics.avgProfitFactor.toFixed(2)}
+                                                    {slMetrics.totalTrades > 0 ? slMetrics.avgProfitFactor.toFixed(2) : "—"}
                                                   </span>
                                                 )}
                                               </div>
@@ -332,7 +332,7 @@ export function ExpandableStatisticsDisplay({
                                                               : "text-red-600"
                                                           }
                                                         >
-                                                          PF: {trailMetrics.avgProfitFactor.toFixed(2)}
+                                                          Avg R: {trailMetrics.totalTrades > 0 ? trailMetrics.avgProfitFactor.toFixed(2) : "—"}
                                                         </span>
                                                         <span className="text-muted-foreground">
                                                           WR: {(trailMetrics.avgWinRate * 100).toFixed(0)}%

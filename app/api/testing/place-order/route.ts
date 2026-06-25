@@ -3,6 +3,7 @@ import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors/factory"
 import type { ExchangeConnection } from "@/lib/types"
 
+export const dynamic = "force-dynamic"
 export async function POST(req: NextRequest) {
   try {
     await initRedis()
