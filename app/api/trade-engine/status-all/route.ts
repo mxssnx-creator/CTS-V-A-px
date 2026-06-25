@@ -1,12 +1,36 @@
 import { NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
-import { loadConnections } from "@/lib/file-storage"
+import { getActiveConnectionsForEngine, getRedisClient, initRedis } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
+
+function isEnabledFlag(value: unknown): boolean {
+  return value === true || value === 1 || value === "1" || value === "true"
+}
+
+function parseSymbols(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string" && item.length > 0)
+  }
+  if (typeof value === "string" && value.length > 0) {
+    try {
+      const parsed = JSON.parse(value)
+      if (Array.isArray(parsed)) return parseSymbols(parsed)
+    } catch {
+      return value.split(",").map((item) => item.trim()).filter(Boolean)
+    }
+  }
+  return []
+}
 
 export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     console.log("[v0] Fetching all trade engine statuses")
+    await initRedis()
+    const client = getRedisClient()
+    const globalState = await client.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>))
+    const globallyRunning = globalState.status === "running"
+    const globallyPaused = globalState.status === "paused"
 
     const coordinator = getGlobalTradeEngineCoordinator()
     
@@ -22,7 +46,7 @@ export async function GET() {
       }, { status: 503 })
     }
 
-    const connections = loadConnections()
+    const connections = await getActiveConnectionsForEngine()
     
     // Ensure connections is an array
     if (!Array.isArray(connections)) {
@@ -36,23 +60,43 @@ export async function GET() {
       }, { status: 500 })
     }
 
-    const activeConnections = connections.filter((c) => c.is_active && c.is_enabled)
+    const activeConnections = connections.filter(
+      (c) =>
+        (isEnabledFlag(c.is_active_inserted) || isEnabledFlag(c.is_active)) &&
+        (isEnabledFlag(c.is_enabled_dashboard) || isEnabledFlag(c.is_enabled))
+    )
 
     const engineStatuses = await Promise.all(
       activeConnections.map(async (conn) => {
         try {
           const status = await coordinator.getEngineStatus(conn.id)
-          const isRunning = status !== null
+          const isRunning = globallyRunning && !globallyPaused
+          const configuredSymbols = parseSymbols(conn.active_symbols || conn.symbols)
+          const statusSymbols = parseSymbols(status?.symbols || status?.active_symbols)
+          const effectiveSymbols = configuredSymbols.length > 0 ? configuredSymbols : statusSymbols
+          const engineStatus = {
+            ...(status ?? {
+              status: globallyPaused ? "paused" : (isRunning ? "running" : "stopped"),
+              source: "trade_engine:global",
+            }),
+            ...(effectiveSymbols.length > 0
+              ? {
+                  symbols: effectiveSymbols,
+                  active_symbols: effectiveSymbols,
+                  symbol_count: effectiveSymbols.length,
+                }
+              : {}),
+          }
 
           return {
             connectionId: conn.id,
             connectionName: conn.name,
             exchange: conn.exchange,
-            isEnabled: conn.is_enabled,
-            isActive: conn.is_active,
-            isLiveTrading: conn.is_live_trade,
+            isEnabled: isEnabledFlag(conn.is_enabled_dashboard) || isEnabledFlag(conn.is_enabled),
+            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_active),
+            isLiveTrading: isEnabledFlag(conn.is_live_trade),
             isEngineRunning: isRunning,
-            engineStatus: status,
+            engineStatus,
           }
         } catch (error) {
           console.error(`[v0] Failed to get status for ${conn.id}:`, error)
@@ -60,9 +104,9 @@ export async function GET() {
             connectionId: conn.id,
             connectionName: conn.name,
             exchange: conn.exchange,
-            isEnabled: conn.is_enabled,
-            isActive: conn.is_active,
-            isLiveTrading: conn.is_live_trade,
+            isEnabled: isEnabledFlag(conn.is_enabled_dashboard) || isEnabledFlag(conn.is_enabled),
+            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_active),
+            isLiveTrading: isEnabledFlag(conn.is_live_trade),
             isEngineRunning: false,
             error: error instanceof Error ? error.message : "Unknown error",
           }

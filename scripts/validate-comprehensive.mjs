@@ -7,7 +7,8 @@ const API_BASE = 'http://localhost:3002/api'
 
 function request(path, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
-    const url = new URL(path, API_BASE)
+    const normalizedPath = path.startsWith('/') ? path.slice(1) : path
+    const url = new URL(normalizedPath, `${API_BASE}/`)
     const options = {
       hostname: url.hostname,
       port: url.port,
@@ -34,6 +35,37 @@ function request(path, method = 'GET', body = null) {
   })
 }
 
+function strategyCounts(stats) {
+  const strat = stats.breakdown?.strategies || {}
+  return {
+    base: Number(stats.base?.setsTotal ?? strat.base ?? stats.realtime?.setsCreated?.base ?? 0),
+    main: Number(stats.main?.setsTotal ?? strat.main ?? stats.realtime?.setsCreated?.main ?? 0),
+    real: Number(stats.real?.setsTotal ?? strat.real ?? stats.realtime?.setsCreated?.real ?? 0),
+    live: Number(strat.live ?? stats.realtime?.setsCreated?.live ?? 0),
+    baseEvaluated: Number(strat.baseEvaluated ?? 0),
+    mainEvaluated: Number(strat.mainEvaluated ?? 0),
+    realEvaluated: Number(strat.realEvaluated ?? 0),
+  }
+}
+
+function percent(numerator, denominator) {
+  if (!denominator) return '0.0'
+  return ((numerator / denominator) * 100).toFixed(1)
+}
+
+async function engineIsRunning() {
+  try {
+    const status = await request('/trade-engine/status-all')
+    return Boolean(
+      status.data?.isEngineRunning ||
+      status.data?.engineStatus?.isRunning ||
+      status.data?.engineStatus?.running
+    )
+  } catch {
+    return false
+  }
+}
+
 async function testPrehistoric() {
   console.log('\n=== TEST 1: PREHISTORIC DATA FLOW ===\n')
   
@@ -56,16 +88,23 @@ async function testPrehistoric() {
     }
 
     const track = trackRes.data
+    const counts = strategyCounts(track)
     console.log(`\n[DATA] Prehistoric tracking:`)
-    console.log(`  - Base sets: ${track.base?.setsTotal || 0}`)
-    console.log(`  - Main sets: ${track.main?.setsTotal || 0}`)
-    console.log(`  - Real sets: ${track.real?.setsTotal || 0}`)
-    console.log(`  - Real progress: ${track.real?.setsProgressing || 0} progressing`)
-    console.log(`  - Avg position per set: ${track.real?.avgPosPerSet || 0}`)
+    console.log(`  - Base sets: ${counts.base}`)
+    console.log(`  - Main sets: ${counts.main}`)
+    console.log(`  - Real sets: ${counts.real}`)
+    console.log(`  - Live sets: ${counts.live}`)
+    console.log(`  - Evaluated: base=${counts.baseEvaluated}, main=${counts.mainEvaluated}, real=${counts.realEvaluated}`)
 
-    // Verify continuity
-    const hasData = track.base?.setsTotal > 0 && track.main?.setsTotal > 0 && track.real?.setsTotal > 0
+    // Verify continuity across the current stats contract. The API now reports
+    // stage totals under breakdown.strategies/realtime.setsCreated instead of
+    // the legacy base/main/real top-level objects.
+    const hasData = counts.base > 0 && counts.main > 0 && counts.real > 0
     if (!hasData) {
+      if (!(await engineIsRunning())) {
+        console.log('[SKIP] No prehistoric data yet because the production engine is not running')
+        return { passed: 0, failed: 0, skipped: 1 }
+      }
       console.error('[FAIL] No data in prehistoric pipeline')
       return { passed: 0, failed: 1, skipped: 0 }
     }
@@ -142,8 +181,9 @@ async function testThresholdEvaluation() {
     const track = (await request(`/connections/progression/${connId}/stats`)).data
 
     // Real sets should be <= Main sets (filtering effect)
-    const realTotal = track.real?.setsTotal || 0
-    const mainTotal = track.main?.setsTotal || 0
+    const counts = strategyCounts(track)
+    const realTotal = counts.real
+    const mainTotal = counts.main
 
     if (realTotal > mainTotal) {
       console.error(`[FAIL] Real sets (${realTotal}) exceed Main sets (${mainTotal})`)
@@ -153,7 +193,7 @@ async function testThresholdEvaluation() {
     console.log(`\nThreshold evaluation:`)
     console.log(`  - Main sets: ${mainTotal}`)
     console.log(`  - Real sets (PF >= 1.4): ${realTotal}`)
-    console.log(`  - Filtered out: ${mainTotal - realTotal} (${((mainTotal - realTotal) / mainTotal * 100).toFixed(1)}%)`)
+    console.log(`  - Filtered out: ${mainTotal - realTotal} (${percent(mainTotal - realTotal, mainTotal)}%)`)
 
     if (realTotal > 0) {
       console.log('[PASS] Threshold evaluation working (Sets filtered by PF)')

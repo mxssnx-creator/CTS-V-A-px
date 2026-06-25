@@ -171,6 +171,9 @@ export async function GET(
       strategyDetailMainHashRaw,
       strategyDetailRealHashRaw,
       symbolProgressHashRaw,
+      liveDispatchHashRaw,
+      blockDiagHashRaw,
+      blockExecHashRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -212,6 +215,14 @@ export async function GET(
       // Per-symbol prehistoric progress from tracker (symbol → progress JSON).
       // Used to render detailed per-symbol completion status in UI.
       client.hgetall(`prehistoric:${connectionId}:symbol_progress`).catch(() => null),
+      // Per-cycle live dispatch diagnostics written by strategy-coordinator.ts.
+      // Each field is a symbol and each value is a compact JSON snapshot with
+      // qualified/selected/suppressed sets plus counts by suppression reason.
+      client.hgetall(`live_dispatch:${connectionId}`).catch(() => null),
+      // Per-cycle Block volume-ratio diagnostics written by StrategyCoordinator.
+      client.hgetall(`strategy_block_diag:${connectionId}`).catch(() => null),
+      // Per-cycle Block order/position execution diagnostics.
+      client.hgetall(`strategy_block_exec:${connectionId}`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
@@ -223,6 +234,60 @@ export async function GET(
     const strategyDetailBaseHash: Record<string, string> = (strategyDetailBaseHashRaw as Record<string, string>) || {}
     const strategyDetailMainHash: Record<string, string> = (strategyDetailMainHashRaw as Record<string, string>) || {}
     const strategyDetailRealHash: Record<string, string> = (strategyDetailRealHashRaw as Record<string, string>) || {}
+    const liveDispatchHash: Record<string, string> = (liveDispatchHashRaw as Record<string, string>) || {}
+    const blockDiagHash: Record<string, string> = (blockDiagHashRaw as Record<string, string>) || {}
+    const blockExecHash: Record<string, string> = (blockExecHashRaw as Record<string, string>) || {}
+
+    const parseJsonHash = (hash: Record<string, string>) => Object.fromEntries(
+      Object.entries(hash).map(([key, raw]) => {
+        try {
+          return [key, JSON.parse(String(raw))]
+        } catch {
+          return [key, { parseError: true, raw }]
+        }
+      })
+    )
+
+    const blockStrategyBySymbol = parseJsonHash(blockDiagHash)
+    const blockExecutionBySymbol = parseJsonHash(blockExecHash)
+    const blockStrategyLatest = (() => {
+      const snapshots = Object.values(blockStrategyBySymbol) as Array<any>
+      return snapshots.reduce<any | null>((latest, snap) => {
+        if (!snap || typeof snap !== "object") return latest
+        return !latest || Number(snap.cycleAt || 0) > Number(latest.cycleAt || 0) ? snap : latest
+      }, null)
+    })()
+    const blockExecutionLatest = (() => {
+      const snapshots = Object.values(blockExecutionBySymbol) as Array<any>
+      return snapshots.reduce<any | null>((latest, snap) => {
+        if (!snap || typeof snap !== "object") return latest
+        return !latest || Number(snap.cycleAt || 0) > Number(latest.cycleAt || 0) ? snap : latest
+      }, null)
+    })()
+
+    const liveDispatchBySymbol = Object.fromEntries(
+      Object.entries(liveDispatchHash).map(([sym, raw]) => {
+        try {
+          return [sym, JSON.parse(String(raw))]
+        } catch {
+          return [sym, { parseError: true, raw }]
+        }
+      })
+    )
+    const liveDispatchLatest = (() => {
+      const snapshots = Object.values(liveDispatchBySymbol) as Array<any>
+      return snapshots.reduce<any | null>((latest, snap) => {
+        if (!snap || typeof snap !== "object") return latest
+        return !latest || Number(snap.cycleAt || 0) > Number(latest.cycleAt || 0) ? snap : latest
+      }, null)
+    })()
+    const liveDispatchSuppressionCounts = Object.values(liveDispatchBySymbol).reduce<Record<string, number>>((acc, snap: any) => {
+      const counts = snap?.suppressionCounts || {}
+      for (const [reason, count] of Object.entries(counts)) {
+        acc[reason] = (acc[reason] || 0) + (Number(count) || 0)
+      }
+      return acc
+    }, {})
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -1139,6 +1204,10 @@ export async function GET(
     const stratTotal = stratCounts.real || strategiesTotal
 
     // ── STRATEGY VARIANT breakdown ───────────────────────────────────────��───
+    // The Main stage expands each promoted Base Set into strategy-variant
+    // entries (default / trailing / block / dca). Pause is intentionally not
+    // a strategy variant; it remains a position-count axis under
+    // `strategyCoordination.axis.pause`.
     // The Main stage expands each promoted Base Set into position-variant
     // entries (default / trailing / block / dca). StrategyCoordinator writes
     // per-variant aggregates to `strategy_variant:{connId}:{variant}` hash
@@ -1155,6 +1224,9 @@ export async function GET(
     // the dashboard quietly missed the count. Adding it here surfaces
     // those entries in `strategyVariants.pause` of the response.
     const variantKeys = ["default", "trailing", "block", "dca", "pause"] as const
+    // Pause is not a strategy variant; it is exposed below as a
+    // position-count axis (`axisAccumulation.pause`).
+    const variantKeys = ["default", "trailing", "block", "dca"] as const
     const variantDetail: Record<string, Record<string, number>> = {}
     await Promise.all(
       variantKeys.map(async (variant) => {
@@ -1187,8 +1259,10 @@ export async function GET(
         acc.createdSets     += variantDetail[v].createdSets
         acc.passedSets      += variantDetail[v].passedSets
         acc.entriesCount    += variantDetail[v].entriesCount
-        // Weighted averages across variants using createdSets as the weight
-        const w = variantDetail[v].createdSets
+        // PF/DDT are entry-weighted in StrategyCoordinator writes, so the
+        // overall row must use entriesCount too. Weighting by createdSets
+        // overstates small-entry variants and understates dense Sets.
+        const w = variantDetail[v].entriesCount
         if (w > 0) {
           acc.weightedPF  += variantDetail[v].avgProfitFactor * w
           acc.weightedDDT += variantDetail[v].avgDrawdownTime * w
@@ -2298,6 +2372,17 @@ export async function GET(
           live:  n(stratDetail.live?.createdSets) || 0,
           // `total` is the pipeline's final-stage output (Live when available, else Real).
           total: n(stratDetail.live?.createdSets) || n(stratDetail.real?.createdSets) || 0,
+        },
+        liveDispatch: {
+          latest: liveDispatchLatest,
+          bySymbol: liveDispatchBySymbol,
+          suppressionCounts: liveDispatchSuppressionCounts,
+        },
+        blockStrategy: {
+          latest: blockStrategyLatest,
+          bySymbol: blockStrategyBySymbol,
+          executionLatest: blockExecutionLatest,
+          executionBySymbol: blockExecutionBySymbol,
         },
         positions: {
           opened:    n(progHash.live_positions_created_count),

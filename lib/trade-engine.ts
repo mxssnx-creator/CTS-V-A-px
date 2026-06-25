@@ -211,14 +211,46 @@ export class GlobalTradeEngineCoordinator {
       // Next.js HMR cycles or full dev-server restarts.
       const localManagerAlive =
         this.engineManagers.get(connectionId)?.isEngineRunning === true
-      const acquired = await acquireProgressionLock(connectionId, undefined, {
+      let acquired = await acquireProgressionLock(connectionId, undefined, {
         selfOwnedIfAlive: localManagerAlive,
       })
       if (!acquired.acquired || !acquired.handle) {
         console.warn(
-          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Skipping.`,
+          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Requesting prior progress stop and retrying once.`,
         )
         return false
+        try {
+          const { getRedisClient } = await import("@/lib/redis-db")
+          const client = getRedisClient()
+          await Promise.all([
+            client.hset(`trade_engine_state:${connectionId}`, {
+              stop_requested: "1",
+              stop_reason: "superseded_by_new_start",
+              stop_requested_at: new Date().toISOString(),
+            }),
+            client.hset(`progression:${connectionId}`, {
+              stop_requested: "1",
+              stop_reason: "superseded_by_new_start",
+              stop_requested_at: new Date().toISOString(),
+            }),
+          ])
+        } catch { /* best-effort signal for the previous worker */ }
+        try {
+          await this.stopEngine(connectionId)
+        } catch { /* local worker may not own the previous engine */ }
+        try {
+          await forceBreakProgressionLock(connectionId)
+        } catch { /* TTL fallback */ }
+        acquired = await acquireProgressionLock(connectionId, undefined, {
+          selfOwnedIfAlive: false,
+          staleAfterMs: 0,
+        })
+        if (!acquired.acquired || !acquired.handle) {
+          console.warn(
+            `[v0] [STARTUP LOCK] Retry failed for ${connectionId}; still owned by ${acquired.existingOwner ?? "unknown"}.`,
+          )
+          return
+        }
       }
       lockHandle = acquired.handle
       console.log(

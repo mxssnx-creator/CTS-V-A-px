@@ -28,6 +28,15 @@ export async function register() {
     return
   }
 
+  const npmLifecycle = process.env.npm_lifecycle_event || ""
+  const isNextBuild =
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    npmLifecycle === "build" ||
+    npmLifecycle === "vercel-build" ||
+    process.argv.some((arg) => arg === "build" || arg.endsWith("/next") || arg.endsWith("\\next")) &&
+      process.argv.includes("build")
+
+  if (isNextBuild) {
   if (isNextBuildPhase()) {
     // `next build` imports instrumentation while collecting page data. Running
     // Redis migrations/startup/auto-start here makes deployment builders spend
@@ -40,7 +49,7 @@ export async function register() {
 
   // Initialize production error handlers FIRST (before any other startup)
   try {
-    const { default: ProductionErrorHandler } = await import("@/lib/error-handling-production")
+    const { default: ProductionErrorHandler } = await import(/* webpackMode: "eager" */ "@/lib/error-handling-production")
     ProductionErrorHandler.initialize()
   } catch (error) {
     console.error("[ERROR_HANDLER] Failed to initialize production error handlers:", error)
@@ -48,7 +57,7 @@ export async function register() {
 
   // Initialize error handling integration (circuit breakers, metrics, etc.)
   try {
-    const { initializeErrorHandling } = await import("@/lib/error-handling-integration")
+    const { initializeErrorHandling } = await import(/* webpackMode: "eager" */ "@/lib/error-handling-integration")
     initializeErrorHandling()
   } catch (error) {
     console.error("[ERROR_INTEGRATION] Failed to initialize error handling integration:", error)
@@ -79,7 +88,7 @@ export async function register() {
   // route hits will retry.
   // ──────────────────────────────────────────────────────────────────────
   try {
-    const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+    const { getGlobalTradeEngineCoordinator } = await import(/* webpackMode: "eager" */ "@/lib/trade-engine")
     getGlobalTradeEngineCoordinator()
     console.log("[v0] [Instrumentation] Trade engine coordinator initialized")
   } catch (error) {
@@ -87,14 +96,14 @@ export async function register() {
   }
 
   try {
-    const { completeStartup } = await import("@/lib/startup-coordinator")
+    const { completeStartup } = await import(/* webpackMode: "eager" */ "@/lib/startup-coordinator")
     await completeStartup()
   } catch (error) {
     console.error("[Instrumentation] completeStartup failed:", error)
   }
 
   try {
-    const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
+    const { initializeTradeEngineAutoStart } = await import(/* webpackMode: "eager" */ "@/lib/trade-engine-auto-start")
     await initializeTradeEngineAutoStart()
   } catch (error) {
     console.error("[Instrumentation] auto-start init failed:", error)
