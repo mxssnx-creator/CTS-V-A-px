@@ -268,11 +268,11 @@ export function PresetDialog({ open, onOpenChange, preset, onSave }: PresetDialo
               <Card>
                 <CardHeader>
                   <CardTitle>Volume Factors</CardTitle>
-                  <CardDescription>Position size multipliers (1-5)</CardDescription>
+                  <CardDescription>Position size multipliers starting at the minimum/default 0.1x</CardDescription>
                 </CardHeader>
                 <CardContent>
                   <div className="flex flex-wrap gap-2">
-                    {[1, 2, 3, 4, 5].map((factor) => (
+                    {[0.1, 0.2, 0.5, 1.0].map((factor) => (
                       <Badge
                         key={factor}
                         variant={formData.volume_factors?.includes(factor) ? "default" : "outline"}

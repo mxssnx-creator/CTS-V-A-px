@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 
 let globalTradeEngine: any = null
 
+export const dynamic = "force-dynamic"
 export function setGlobalTradeEngine(engine: any) {
   globalTradeEngine = engine
 }

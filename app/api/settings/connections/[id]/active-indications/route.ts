@@ -73,6 +73,7 @@ function profileToFlat(profile: ChannelProfile, suffix: "" | "_preset"): Record<
   return out
 }
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
