@@ -124,6 +124,39 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
+   * Redis `trade_engine:global.status` is the operator-intent source of truth.
+   * Connection engines may only be started/restarted while the global
+   * coordinator is explicitly enabled.  This prevents settings saves,
+   * dashboard refreshes, auto-start sweeps, or watchdog recovery from
+   * resurrecting progressions after the operator has stopped/paused the
+   * coordinator or after production Redis has not restored the global state yet.
+   */
+  private async isGlobalCoordinatorEnabled(context: string): Promise<boolean> {
+    try {
+      const { getRedisClient, initRedis } = await import("@/lib/redis-db")
+      await initRedis()
+      const client = getRedisClient()
+      const globalState = (await client.hgetall("trade_engine:global").catch(() => null)) as Record<string, string> | null
+      const status = globalState?.status || ""
+      const enabled = status === "running"
+      this.isPaused = status === "paused"
+      this.isGloballyRunning = enabled && Array.from(this.engineManagers.values()).some((manager) => manager.isEngineRunning)
+      if (!enabled) {
+        console.log(
+          `[v0] [Coordinator] ${context} skipped — global coordinator is not enabled (status="${status || "empty"}")`,
+        )
+      }
+      return enabled
+    } catch (err) {
+      console.warn(
+        `[v0] [Coordinator] ${context} could not verify global coordinator state; refusing to start/restart connection engines:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      return false
+    }
+  }
+
+  /**
    * Initialize engine for a specific connection
    */
   async initializeEngine(connectionId: string, config: EngineConfig): Promise<TradeEngineManager> {
@@ -158,6 +191,10 @@ export class GlobalTradeEngineCoordinator {
     // Self-heal background timers on every public entry-point — see
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
     this.ensureBackgroundTimers()
+
+    if (!(await this.isGlobalCoordinatorEnabled(`startEngine(${connectionId})`))) {
+      return false
+    }
 
     // Step 1: Check if already starting
     if (this.startingEngines.has(connectionId)) {
@@ -391,6 +428,9 @@ export class GlobalTradeEngineCoordinator {
    * concurrent restarts for the same connection.
    */
   async restartEngine(connectionId: string): Promise<void> {
+    if (!(await this.isGlobalCoordinatorEnabled(`restartEngine(${connectionId})`))) {
+      return
+    }
     if (this.escalatingEngines.has(connectionId)) {
       console.log(
         `[v0] [Coordinator] restartEngine(${connectionId}) skipped — restart already in flight`,
@@ -473,6 +513,9 @@ export class GlobalTradeEngineCoordinator {
    */
   private async startEngineFromConnectionConfig(connectionId: string): Promise<void> {
     try {
+      if (!(await this.isGlobalCoordinatorEnabled(`startEngineFromConnectionConfig(${connectionId})`))) {
+        return
+      }
       const { getAllConnections } = await import("@/lib/redis-db")
       const { loadSettingsAsync } = await import("@/lib/settings-storage")
       const connections = await getAllConnections()
@@ -703,21 +746,8 @@ export class GlobalTradeEngineCoordinator {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
 
-      // ── Check if coordinator is paused ─────────────────────────────────
-      // If the global coordinator is paused, don't start any engines.
-      // They will resume when the coordinator is resumed.
-      const { getRedisClient, initRedis } = await import("@/lib/redis-db")
-      try {
-        await initRedis()
-        const client = getRedisClient()
-        const globalState = await client.hgetall("trade_engine:global")
-        if ((globalState as any)?.status === "paused") {
-          console.log("[v0] [Coordinator] Skipping startMissingEngines - coordinator is paused")
-          return 0
-        }
-      } catch (err) {
-        console.warn("[v0] [Coordinator] Could not check pause state:", err instanceof Error ? err.message : String(err))
-        // Continue anyway - non-critical
+      if (!(await this.isGlobalCoordinatorEnabled("startMissingEngines"))) {
+        return 0
       }
 
       // Self-heal: make sure the watchdog and metrics tracker are armed
@@ -832,6 +862,10 @@ export class GlobalTradeEngineCoordinator {
   async refreshEngines(): Promise<void> {
     try {
       console.log("[v0] [Coordinator] === REFRESH ENGINES START (START ONLY) ===")
+
+      if (!(await this.isGlobalCoordinatorEnabled("refreshEngines"))) {
+        return
+      }
 
       // Self-heal background timers + drop dead Map slots before we
       // reconcile so a zombie manager doesn't shadow a connection that
@@ -1285,9 +1319,15 @@ export class GlobalTradeEngineCoordinator {
 
         // -- 2. Per-engine stall watchdog (in-place re-arm) ---------------
         //
-        // Always run, even when `isGloballyRunning` is false — individual
-        // engines can be running via dashboard toggle without the global
-        // run-all flag being set.
+        // Only run when the operator has explicitly enabled the global
+        // coordinator.  Settings/dashboard routes can leave local managers
+        // around briefly during stop/restart races; the watchdog must never
+        // re-arm or force-restart those managers while Redis says the global
+        // coordinator is stopped/paused.
+        if (!(await this.isGlobalCoordinatorEnabled("watchdog"))) {
+          this.stallEscalation.clear()
+          return
+        }
         const now = Date.now()
         for (const [connectionId, manager] of this.engineManagers.entries()) {
           if (!manager.isEngineRunning) continue

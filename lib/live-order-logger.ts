@@ -45,6 +45,12 @@ const REDIS_LIST_TTL_SECONDS = 7 * 24 * 60 * 60
 export interface LiveOrderTrace {
   /** Stable id shared by PRE / POST / FINAL for the same attempt. */
   traceId: string
+  /**
+   * Short exchange-safe correlation id sent as clientOrderId when the venue
+   * supports it. This is intentionally shorter than traceId because several
+   * futures venues cap client IDs around 32-40 chars.
+   */
+  exchangeTrackingId: string
   connectionId: string
   symbol: string
   direction: "long" | "short"
@@ -78,6 +84,8 @@ export interface LiveOrderResponseSummary {
   success: boolean
   /** Exchange's own order id when accepted. */
   orderId?: string
+  /** Client-supplied exchange-safe tracking id when accepted/echoed. */
+  clientOrderId?: string
   /** Error message echo, if any. */
   error?: string
   /** Exchange-specific error code (101204, 80014, 109400, ...). */
@@ -130,10 +138,25 @@ function safeRandSuffix(): string {
   return Math.random().toString(36).slice(2, 8)
 }
 
-export function newLiveOrderTrace(args: Omit<LiveOrderTrace, "traceId" | "startedAt">): LiveOrderTrace {
+function compactIdPart(value: string, max = 8): string {
+  return String(value || "")
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .slice(0, max)
+    || "x"
+}
+
+function makeExchangeTrackingId(args: Omit<LiveOrderTrace, "traceId" | "exchangeTrackingId" | "startedAt">): string {
+  const conn = compactIdPart(args.connectionId, 8)
+  const sym = compactIdPart(args.symbol, 8)
+  const dir = args.direction === "long" ? "L" : "S"
+  return `cts${conn}${sym}${dir}${Date.now().toString(36)}${safeRandSuffix()}`.slice(0, 32)
+}
+
+export function newLiveOrderTrace(args: Omit<LiveOrderTrace, "traceId" | "exchangeTrackingId" | "startedAt">): LiveOrderTrace {
   return {
     ...args,
     traceId: `lord-${args.symbol}-${args.direction}-${Date.now()}-${safeRandSuffix()}`,
+    exchangeTrackingId: makeExchangeTrackingId(args),
     startedAt: Date.now(),
   }
 }
@@ -165,7 +188,7 @@ export async function logLiveOrderPre(
   ctx: LiveOrderRequestContext,
 ): Promise<void> {
   const safeCtx = sanitizePayload(ctx)
-  const line = `${LOG_PREFIX} [PRE] trace=${trace.traceId} ${trace.symbol} ${trace.direction} → ${trace.exchangeSide} qty=${ctx.quantity} px=${ctx.price} lev=${ctx.leverage}x margin=${ctx.marginType}${ctx.label ? ` label=${ctx.label}` : ""}${ctx.attempt ? ` attempt=${ctx.attempt}` : ""}`
+  const line = `${LOG_PREFIX} [PRE] trace=${trace.traceId} track=${trace.exchangeTrackingId} ${trace.symbol} ${trace.direction} → ${trace.exchangeSide} qty=${ctx.quantity} px=${ctx.price} lev=${ctx.leverage}x margin=${ctx.marginType}${ctx.label ? ` label=${ctx.label}` : ""}${ctx.attempt ? ` attempt=${ctx.attempt}` : ""}`
   console.log(line)
 
   try {
@@ -173,14 +196,15 @@ export async function logLiveOrderPre(
       trace.connectionId,
       "live_trading",
       "info",
-      `Live order PRE - ${trace.symbol} ${trace.direction}`,
-      { phase: "pre", traceId: trace.traceId, ...safeCtx },
+	      `Live order PRE - ${trace.symbol} ${trace.direction}`,
+	      { phase: "pre", traceId: trace.traceId, exchangeTrackingId: trace.exchangeTrackingId, ...safeCtx },
     )
   } catch { /* ignore */ }
 
   await appendRedisLog(trace, {
     phase: "pre",
-    traceId: trace.traceId,
+	    traceId: trace.traceId,
+	    exchangeTrackingId: trace.exchangeTrackingId,
     connectionId: trace.connectionId,
     symbol: trace.symbol,
     direction: trace.direction,
@@ -202,7 +226,7 @@ export async function logLiveOrderPost(
 ): Promise<void> {
   const durationMs = Date.now() - trace.startedAt
   const safeRaw = sanitizePayload(resp.raw)
-  const line = `${LOG_PREFIX} [POST] trace=${trace.traceId} success=${resp.success} orderId=${resp.orderId ?? "-"} code=${resp.errorCode ?? "-"} err=${resp.error ?? "-"} duration=${durationMs}ms`
+  const line = `${LOG_PREFIX} [POST] trace=${trace.traceId} track=${trace.exchangeTrackingId} success=${resp.success} orderId=${resp.orderId ?? "-"} clientOrderId=${resp.clientOrderId ?? "-"} code=${resp.errorCode ?? "-"} err=${resp.error ?? "-"} duration=${durationMs}ms`
   if (resp.success) {
     console.log(line)
   } else {
@@ -217,9 +241,11 @@ export async function logLiveOrderPost(
       `Live order POST - ${trace.symbol} ${trace.direction} ${resp.success ? "accepted" : "rejected"}`,
       {
         phase: "post",
-        traceId: trace.traceId,
-        success: resp.success,
-        orderId: resp.orderId,
+	        traceId: trace.traceId,
+	        exchangeTrackingId: trace.exchangeTrackingId,
+	        success: resp.success,
+	        orderId: resp.orderId,
+	        clientOrderId: resp.clientOrderId,
         errorCode: resp.errorCode,
         error: resp.error,
         filledQty: resp.filledQty,
@@ -244,14 +270,16 @@ export async function logLiveOrderPost(
 
   await appendRedisLog(trace, {
     phase: "post",
-    traceId: trace.traceId,
+	    traceId: trace.traceId,
+	    exchangeTrackingId: trace.exchangeTrackingId,
     connectionId: trace.connectionId,
     symbol: trace.symbol,
     direction: trace.direction,
     ts: Date.now(),
     durationMs,
     success: resp.success,
-    orderId: resp.orderId,
+	    orderId: resp.orderId,
+	    clientOrderId: resp.clientOrderId,
     errorCode: resp.errorCode,
     error: resp.error,
     filledQty: resp.filledQty,
@@ -278,7 +306,7 @@ export async function logLiveOrderFinal(
   },
 ): Promise<void> {
   const durationMs = Date.now() - trace.startedAt
-  const line = `${LOG_PREFIX} [FINAL] trace=${trace.traceId} ${trace.symbol} ${trace.direction} outcome=${outcome.status} qty=${outcome.executedQuantity ?? "-"} avgPx=${outcome.averagePrice ?? "-"} reason=${outcome.reason ?? "-"} duration=${durationMs}ms`
+  const line = `${LOG_PREFIX} [FINAL] trace=${trace.traceId} track=${trace.exchangeTrackingId} ${trace.symbol} ${trace.direction} outcome=${outcome.status} qty=${outcome.executedQuantity ?? "-"} avgPx=${outcome.averagePrice ?? "-"} reason=${outcome.reason ?? "-"} duration=${durationMs}ms`
   if (outcome.status === "filled" || outcome.status === "placed" || outcome.status === "min_size_corrected") {
     console.log(line)
   } else {
@@ -297,7 +325,8 @@ export async function logLiveOrderFinal(
       `Live order FINAL - ${trace.symbol} ${trace.direction} ${outcome.status}`,
       {
         phase: "final",
-        traceId: trace.traceId,
+	        traceId: trace.traceId,
+	        exchangeTrackingId: trace.exchangeTrackingId,
         ...outcome,
         durationMs,
       },
@@ -306,7 +335,8 @@ export async function logLiveOrderFinal(
 
   await appendRedisLog(trace, {
     phase: "final",
-    traceId: trace.traceId,
+	    traceId: trace.traceId,
+	    exchangeTrackingId: trace.exchangeTrackingId,
     connectionId: trace.connectionId,
     symbol: trace.symbol,
     direction: trace.direction,
@@ -334,8 +364,9 @@ export async function withLiveOrderLogging<T extends Record<string, any>>(
     raw = await call()
     const r: any = raw ?? {}
     summary = {
-      success: !!r.success && !!(r.orderId || r.id),
-      orderId: r.orderId || r.id,
+	      success: !!r.success && !!(r.orderId || r.id),
+	      orderId: r.orderId || r.id,
+	      clientOrderId: r.clientOrderId ?? r.client_order_id ?? r.client_oid,
       error: r.error,
       errorCode: r.errorCode ?? r.code,
       filledQty: parseFloat(String(r.filledQty ?? r.executedQty ?? r.cumQty ?? "0")) || undefined,

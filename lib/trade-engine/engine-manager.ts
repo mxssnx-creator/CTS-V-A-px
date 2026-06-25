@@ -572,7 +572,7 @@ export class TradeEngineManager {
       // If mismatch → previous running progress is stopped (via archive) and we start a fresh,
       // unique, solid progression for the *actual* current configuration of this connection.
       try {
-        await ProgressionStateManager.recoordinateForActualOne(this.connectionId)
+        await ProgressionStateManager.recoordinateForActualOne(this.connectionId, config.engine_type || "main")
       } catch (recoordErr) {
         console.warn("[v0] [Engine] Re-coordination check failed (continuing):", recoordErr)
       }
@@ -584,7 +584,10 @@ export class TradeEngineManager {
       // - Page refreshes / independent opens attach to the current unique one (no explosion of instances).
       // "Just Unique" — one canonical active progression for the actual state.
       try {
-        const u = await ProgressionStateManager.ensureJustUniqueProgression(this.connectionId)
+        const u = await ProgressionStateManager.ensureJustUniqueProgression(this.connectionId, {
+          ownerEpoch: this.lockHandle?.epoch ?? this.epoch,
+          engineType: config.engine_type || "main",
+        })
         this.epoch = u.epoch
         console.log(
           `[v0] [Engine] Using ${u.wasNew ? "new" : "existing"} unique progression ` +
@@ -636,6 +639,7 @@ export class TradeEngineManager {
         const settingsSnapshot = {
           symbol_count: symbolCount,
           symbols_hash: symbolsHash,
+          engine_type: config.engine_type || "main",
           is_live_trade: connData.is_live_trade || "0",
           is_preset_trade: connData.is_preset_trade || "0",
           live_volume_factor: connData.live_volume_factor ?? String(MIN_VOLUME_FACTOR),
@@ -655,7 +659,8 @@ export class TradeEngineManager {
             symbol_count: String(symbolCount),
             active_symbols_hash: symbolsHash,
             started_for_settings_version: new Date().toISOString(),
-            progress_settings_snapshot: JSON.stringify(settingsSnapshot),
+          progress_settings_snapshot: JSON.stringify(settingsSnapshot),
+          engine_type: config.engine_type || "main",
           })
           snapWriteOk = true
         } catch (err) {
@@ -668,6 +673,7 @@ export class TradeEngineManager {
               active_symbols_hash: symbolsHash,
               started_for_settings_version: new Date().toISOString(),
               progress_settings_snapshot: JSON.stringify(settingsSnapshot),
+              engine_type: config.engine_type || "main",
             })
             snapWriteOk = true
           } catch (retryErr) {
