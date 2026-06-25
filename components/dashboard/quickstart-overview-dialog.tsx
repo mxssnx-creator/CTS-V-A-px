@@ -9,7 +9,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Progress } from "@/components/ui/progress"
 import {
   BarChart3, RefreshCw, Database, Activity, Zap, TrendingUp,
-  ChevronDown, ChevronUp, CheckCircle2, Circle, Clock,
+  ChevronDown, ChevronUp, CheckCircle2, Circle, Clock, DollarSign,
 } from "lucide-react"
 import { useExchange } from "@/lib/exchange-context"
 
@@ -275,6 +275,20 @@ export function QuickstartOverviewDialog() {
     pollRef.current = setInterval(() => load(true), 3000)
     return () => clearInterval(pollRef.current)
   }, [isOpen, load])
+
+  // Listen for settings changes and force immediate refresh of stats/progress
+  useEffect(() => {
+    if (!connectionId) return
+    const handleSettingsUpdated = (event: Event) => {
+      const customEvent = event as CustomEvent
+      if (customEvent.detail?.connectionId === connectionId) {
+        // Settings changed for this connection, force refresh immediately
+        load()
+      }
+    }
+    window.addEventListener("connection-settings-updated", handleSettingsUpdated)
+    return () => window.removeEventListener("connection-settings-updated", handleSettingsUpdated)
+  }, [connectionId, load])
 
   const h   = stats?.historic
   const rt  = stats?.realtime
@@ -542,8 +556,24 @@ export function QuickstartOverviewDialog() {
               </div>
             </div>
 
-            {/* success rate + cycle time */}
-            <div className="grid grid-cols-2 gap-2">
+            {/* live positions + PnL + success rate */}
+            <div className="grid grid-cols-3 gap-2">
+              <div className="rounded-md border p-3 space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="flex items-center gap-1 font-medium"><Activity className="w-3 h-3" />Live Pos</span>
+                  <span className="font-bold tabular-nums">{fmt(rt?.positionsOpen || 0)}</span>
+                </div>
+                <Progress value={Math.min((rt?.positionsOpen || 0) * 10, 100)} className="h-1.5" />
+              </div>
+              <div className="rounded-md border p-3 space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="flex items-center gap-1 font-medium"><DollarSign className="w-3 h-3" />Total PnL</span>
+                  <span className={`font-bold tabular-nums ${(sd?.live?.totalPnl || 0) >= 0 ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400"}`}>
+                    {(sd?.live?.totalPnl || 0) >= 0 ? "+" : ""}{(sd?.live?.totalPnl || 0).toFixed(2)}
+                  </span>
+                </div>
+                <Progress value={Math.max(0, Math.min((sd?.live?.totalPnl || 0) * 10, 100))} className="h-1.5" />
+              </div>
               <div className="rounded-md border p-3 space-y-1.5">
                 <div className="flex justify-between text-xs">
                   <span className="flex items-center gap-1 font-medium"><TrendingUp className="w-3 h-3" />Success Rate</span>
@@ -551,23 +581,25 @@ export function QuickstartOverviewDialog() {
                 </div>
                 <Progress value={rt?.successRate || 0} className="h-1.5" />
               </div>
-              <div className="rounded-md border p-3 space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="flex items-center gap-1 font-medium"><Clock className="w-3 h-3" />Avg Cycle</span>
-                  <span className="font-bold tabular-nums">{rt?.avgCycleTimeMs || 0}ms</span>
-                </div>
-                <div className="flex flex-wrap gap-1 mt-0.5">
-                  {[
-                    { label: "Historic",    done: h?.isComplete },
-                    { label: "Indications", done: (rt?.indicationCycles || 0) > 0 },
-                    { label: "Strategies",  done: (rt?.strategyCycles   || 0) > 0 },
-                    { label: "Realtime",    done: rt?.isActive },
-                  ].map(({ label, done }) => (
-                    <Badge key={label} variant={done ? "default" : "secondary"} className="text-[9px] h-4 px-1">
-                      {label}
-                    </Badge>
-                  ))}
-                </div>
+            </div>
+
+            {/* cycle time + status badges */}
+            <div className="rounded-md border p-3 space-y-1.5">
+              <div className="flex justify-between text-xs">
+                <span className="flex items-center gap-1 font-medium"><Clock className="w-3 h-3" />Avg Cycle</span>
+                <span className="font-bold tabular-nums">{rt?.avgCycleTimeMs || 0}ms</span>
+              </div>
+              <div className="flex flex-wrap gap-1 mt-0.5">
+                {[
+                  { label: "Historic",    done: h?.isComplete },
+                  { label: "Indications", done: (rt?.indicationCycles || 0) > 0 },
+                  { label: "Strategies",  done: (rt?.strategyCycles   || 0) > 0 },
+                  { label: "Realtime",    done: rt?.isActive },
+                ].map(({ label, done }) => (
+                  <Badge key={label} variant={done ? "default" : "secondary"} className="text-[9px] h-4 px-1">
+                    {label}
+                  </Badge>
+                ))}
               </div>
             </div>
           </TabsContent>
@@ -877,7 +909,7 @@ export function QuickstartOverviewDialog() {
                 </div>
                 <div
                   className="flex justify-between"
-                  title="Canonical 'total strategies' = Real-stage output. Base → Main → Real is a cascade filter of the same logical strategy — stages are NOT summed together."
+                  title="Canonical 'total strategies' = Real-stage output. Base ��� Main → Real is a cascade filter of the same logical strategy — stages are NOT summed together."
                 >
                   <span className="text-muted-foreground">Strategies (Real)</span>
                   <span className="font-medium tabular-nums">{fmt(bd?.strategies.total || 0)}</span>

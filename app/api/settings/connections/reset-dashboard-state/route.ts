@@ -5,6 +5,7 @@ import { initRedis, getAllConnections, updateConnection } from "@/lib/redis-db"
  * POST /api/settings/connections/reset-dashboard-state
  * Resets dashboard enable state only, without destroying base settings/credentials.
  */
+export const dynamic = "force-dynamic"
 export async function POST() {
   try {
     await initRedis()
