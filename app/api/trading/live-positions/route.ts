@@ -77,7 +77,7 @@ export async function GET(request: Request) {
         total:     all.length,
         open:      all.filter(p => p.status === "open").length,
         pending:   all.filter(p => p.status === "pending").length,
-        placed:    all.filter(p => p.status === "placed").length,
+        placed:    all.filter(p => p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed").length,
         filled:    all.filter(p => p.status === "filled").length,
         simulated: all.filter(p => p.status === "simulated").length,
         closed:    all.filter(p => p.status === "closed").length,

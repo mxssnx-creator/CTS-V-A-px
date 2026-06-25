@@ -238,7 +238,7 @@ async function executeReadyStrategiesAsLiveOrders(
         }
 
         const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
-        if (livePos?.status === "filled" || livePos?.status === "placed") {
+        if (livePos?.status === "filled" || livePos?.status === "placed" || livePos?.status === "pending_fill" || livePos?.status === "placed_unconfirmed") {
           createdCount++
           // ── CRITICAL FIX: Log full RealPosition context to progression ──
           // When a live position is created, the progression logs need to capture:
