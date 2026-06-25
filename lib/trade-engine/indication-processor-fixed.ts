@@ -519,7 +519,7 @@ export class IndicationProcessor {
       }
 
       // Calculate step-based indicators
-      const stepRange = Array.from({ length: 28 }, (_, i) => i + 3)
+      const stepRange = Array.from({ length: 29 }, (_, i) => i + 2)
       const stepIndicators = StepBasedIndicators.calculateAll(candles, stepRange)
 
       // Extract prices safely. In replay mode the priceSource must be
@@ -571,7 +571,7 @@ export class IndicationProcessor {
       // per-type counts naturally diverge and reflect real market structure:
       //
       //   direction — always emitted (2/cycle): primary + hedge trend signal
-      //   move      — any candle range (rangePercent ≥ 0, or flat candle)
+      //   move      — primary-direction candle expansion beyond a small live-noise floor
       //   active    — candle volume > recent-volume average (elevated activity)
       //   optimal   — strong confidence + strong body (conf ≥ 0.72 AND body-ratio ≥ 0.55)
       //   auto      — step-based indicator alignment across short/mid/long windows
@@ -669,12 +669,13 @@ export class IndicationProcessor {
           metadata: { direction: dir, primary: isPrimary },
         })
 
-        // 2. Move — fires on any measurable candle range, OR always for
-        // flat candles (range === 0). The previous 0.15% threshold
-        // silenced Move on nearly all 1-second BingX ticks where high
-        // often equals low, keeping Move counts near-zero. Threshold
-        // lowered to 0 so Move reliably populates on live data.
-        if (rangePercent >= 0 || range === 0) {
+        // 2. Move — independent from Direction. Emit only for the primary
+        // candle direction and only when the candle expands beyond a tiny
+        // live-noise floor. The previous `rangePercent >= 0` condition made
+        // Move fire for every Direction signal (including hedge), so dashboard
+        // counts for Direction and Move moved in lockstep.
+        const moveThresholdPct = Math.max(0.01, Math.min(0.08, bodyRatio * 0.03))
+        if (isPrimary && (rangePercent >= moveThresholdPct || bodyRatio >= 0.18)) {
           indications.push({
             type: "move",
             symbol,
@@ -769,8 +770,14 @@ export class IndicationProcessor {
       // Without this write the hash stays empty after its 10-min TTL
       // expires and every active-count tile shows 0 even while the
       // engine is producing thousands of indications per minute.
-      if (indications.length > 0) {
-        const typeCounts: Record<string, number> = {}
+      {
+        const typeCounts: Record<string, number> = {
+          direction: 0,
+          move: 0,
+          active: 0,
+          optimal: 0,
+          auto: 0,
+        }
         for (const ind of indications) {
           typeCounts[ind.type] = (typeCounts[ind.type] ?? 0) + 1
         }

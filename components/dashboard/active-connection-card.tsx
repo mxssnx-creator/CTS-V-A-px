@@ -460,7 +460,6 @@ export function ActiveConnectionCard({
         }
       }
     } catch { /* ignore corrupted data */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connection.connectionId])
 
   useEffect(() => {

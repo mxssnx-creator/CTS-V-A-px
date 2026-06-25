@@ -1,5 +1,5 @@
 // Step-Based Indicators Calculator
-// Calculates indicators (MA, RSI, MACD, BB) for each position cost step (3-30)
+// Calculates indicators (MA, RSI, MACD, BB) for each position cost step (2-30)
 // This aligns indicators with your strategy's position sizing steps
 
 export class StepBasedIndicators {

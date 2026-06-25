@@ -486,6 +486,28 @@ const AXIS_DIRS     = ["long", "short"]    as const
 const AXIS_OUTCOMES = ["pos", "neg"] as const
 type AxisOutcome = (typeof AXIS_OUTCOMES)[number]
 type AxisDir = (typeof AXIS_DIRS)[number]
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
+}
+
+function deriveProtectionFromProfitFactor(
+  profitFactor: number,
+  positionCostPct: number,
+  sizeMultiplier = 1,
+): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
+  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
+  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  // Tie SL to the actual position-cost budget, then apply variant scaling.
+  // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
+  const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
+  const takeProfitPct = clampNumber(stopLossPct * Math.max(1, pf), 0.2, 22)
+  return {
+    takeProfitPct,
+    stopLossPct,
+    effectiveProfitFactor: takeProfitPct / stopLossPct,
+  }
+}
+
 const AXIS_KEY_TABLE: ReadonlyMap<string, string> = (() => {
   const m = new Map<string, string>()
   for (const prev of AXIS_PREV) {
@@ -3555,7 +3577,28 @@ export class StrategyCoordinator {
     }
 
     const metrics = this.METRICS.live
-    const maxLive = this.config.maxLiveSets || 500
+    let maxLive = this.config.maxLiveSets || 500
+    let livePositionCostPct = 0.1
+    try {
+      const { getConnection } = await import("@/lib/redis-db")
+      const [conn, connSettings] = await Promise.all([
+        getConnection(this.connectionId).catch(() => null),
+        getRedisClient().hgetall(`connection_settings:${this.connectionId}`).catch(() => ({})),
+      ])
+      const exchange = String((conn as any)?.exchange || "").toLowerCase()
+      // BingX commonly enforces a 200-open-order ceiling. Each live position
+      // can carry two reduce-only control orders (SL + TP), so cap dispatch to
+      // 90 positions per cycle (≤180 controls) and leave room for manual orders,
+      // in-flight cancels, and venue-side lag.
+      if (exchange === "bingx") maxLive = Math.min(maxLive, 90)
+      const rawCost = Number((connSettings as any)?.exchangePositionCost ?? (connSettings as any)?.positionCost ?? "")
+      if (Number.isFinite(rawCost) && rawCost > 0) livePositionCostPct = rawCost
+    } catch (err) {
+      console.warn(
+        `[v0] [StrategyFlow] ${this.connectionId}:${symbol} live dispatch settings read failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
 
     // P0-2: Live filter axes are PF-min + DDT-max ONLY (then rank by
     // avgProfitFactor and take top N). Confidence is advisory metadata.
@@ -3936,10 +3979,18 @@ export class StrategyCoordinator {
                 // Real-stage tuner's per-variant performance bias.
                 const effectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
 
-                // Derive SL/TP % from the set's profit factor. The pipeline
-                // converts these to concrete prices after the entry fills.
-                const tp = Math.max(0.5, (effectivePF - 1) * 100)
-                const sl = Math.min(5, (100 / Math.max(1, effectivePF)) * 0.5)
+                // Derive SL/TP % from PF and the actual position-cost budget.
+                // The live-stage converts these percentages to concrete prices
+                // after fill. Keeping TP/SL ratio-aligned ensures PF comparisons
+                // are meaningful and variant volume multipliers are reflected in
+                // the risk band used for the live exchange order.
+                const protection = deriveProtectionFromProfitFactor(
+                  effectivePF,
+                  livePositionCostPct,
+                  effectiveSizeMult,
+                )
+                const tp = protection.takeProfitPct
+                const sl = protection.stopLossPct
 
                 const liveResult = await executeLivePosition(
                   this.connectionId,
@@ -3966,7 +4017,7 @@ export class StrategyCoordinator {
                     ratios: {
                       // Use effectivePF (coord-record tuned) so risk ratios reflect
                       // the Real-stage performance bias rather than raw Base entry PF.
-                      profitabilityRatio: effectivePF,
+                      profitabilityRatio: protection.effectiveProfitFactor,
                       accountRiskRatio: sl / 100,
                       successRateRatio: bestEntry.confidence,
                       consistencyRatio: set.avgConfidence,
