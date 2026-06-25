@@ -35,6 +35,7 @@ export const initialSettings: Settings = {
   useMaximalLeverage: true,
   min_volume_enforcement: true, // Added missing min_volume_enforcement property
   minStep: 5, // 2-30 step 1 — minimum pseudo-position step-window size
+  trailingMinStep: 6, // 2-30 step 1 — minimum Base step allowed to fan out into trailing Sets
 
   // Base Strategy
   baseValueRangeMin: 0.5,

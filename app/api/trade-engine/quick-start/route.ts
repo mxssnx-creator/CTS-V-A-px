@@ -44,6 +44,41 @@ const LOG_PREFIX = `[v0] [QuickStart] ${API_VERSION}`
 // Default trading symbol (single symbol for quickstart - DRIFTUSDT for live testing)
 const DEFAULT_SYMBOLS = ["DRIFTUSDT"]
 
+const QUICKSTART_ZERO_COUNTERS: Record<string, string> = {
+  cycles_completed: "0",
+  successful_cycles: "0",
+  failed_cycles: "0",
+  total_trades: "0",
+  successful_trades: "0",
+  total_profit: "0",
+  cycle_success_rate: "0",
+  trade_success_rate: "0",
+  indication_cycle_count: "0",
+  indication_live_cycle_count: "0",
+  strategy_cycle_count: "0",
+  strategy_live_cycle_count: "0",
+  realtime_cycle_count: "0",
+  realtime_live_cycle_count: "0",
+  live_positions_cycle_count: "0",
+  frames_processed: "0",
+  indications_count: "0",
+  indications_direction_count: "0",
+  indications_move_count: "0",
+  indications_active_count: "0",
+  indications_active_advanced_count: "0",
+  indications_optimal_count: "0",
+  indications_auto_count: "0",
+  strategies_count: "0",
+  strategies_base_total: "0",
+  strategies_main_total: "0",
+  strategies_real_total: "0",
+  strategies_live_total: "0",
+  strategies_base_evaluated: "0",
+  strategies_main_evaluated: "0",
+  strategies_real_evaluated: "0",
+  strategies_live_ready: "0",
+}
+
 /**
  * POST /api/trade-engine/quick-start
  * Quick-start endpoint with direct function calls (no HTTP fetch):
@@ -652,6 +687,18 @@ export async function POST(request: Request) {
               "prehistoric_cycles_completed",
               "prehistoric_phase_active",
             ).catch(() => 0),
+            // A same-symbol QuickStart run may intentionally reuse the
+            // canonical progression session, but the operator expects the
+            // progress graph to represent THIS run only. Reset all cumulative
+            // realtime/strategy/live counters before the new engine is armed
+            // so stale samples cannot make realtime appear to start before
+            // the freshly-generated prehistoric data is complete.
+            client.hset(`progression:${connectionId}`, {
+              ...QUICKSTART_ZERO_COUNTERS,
+              session_reset_at: new Date().toISOString(),
+              symbols_total: String(symbols.length),
+              symbols_processed: "0",
+            }).catch(() => 0),
           ])
           console.log(`${LOG_PREFIX}: Pre-start cleanup complete — engine_is_running flag cleared for ${connectionId}`)
         } catch (restartErr) {

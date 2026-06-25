@@ -1241,7 +1241,7 @@ export class StrategyCoordinator {
       // STAGE 2: MAIN — validate Base Sets AND create additional related
       // variant Sets (Default / Trailing / Block / DCA) gated by posCtx.
       // CoordIndex receives a SetCoordRecord per built set (O(1) per set).
-      const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx, coordIndex)
+      const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx, coordIndex, isPrehistoric)
       results.push(mainResult)
 
       // STAGE 3: REAL — promote Sets with avgPF >= 1.4 (base-promoted AND
@@ -1314,13 +1314,20 @@ export class StrategyCoordinator {
    * createBaseSets calls in `executeStrategyFlowBatch` share one read.
    */
   private async getEnabledTrailingVariants(): Promise<
-    Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string }>
+    Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string; minStep: number }>
   > {
     if ((this as any)._trailingVariantsCache) return (this as any)._trailingVariantsCache
     try {
       // Lazy import to avoid circular deps in legacy callers
-      const { getAppSettings } = await import("@/lib/redis-db")
+      const { getAppSettings, getRedisClient } = await import("@/lib/redis-db")
       const settings = (await getAppSettings()) || {}
+      let trailingMinStep = 6
+      try {
+        const client = getRedisClient()
+        const cs = (await client.hgetall(`connection_settings:${this.connectionId}`).catch(() => null)) as Record<string, string> | null
+        const rawMin = Number(cs?.trailingMinStep ?? cs?.trailing_min_step ?? (settings as any).trailingMinStep ?? 6)
+        if (Number.isFinite(rawMin)) trailingMinStep = Math.min(30, Math.max(2, Math.round(rawMin)))
+      } catch { /* default stays */ }
       const enabledMaster = settings.strategyBaseTrailingEnabled !== false
       if (!enabledMaster) {
         ;(this as any)._trailingVariantsCache = []
@@ -1341,7 +1348,7 @@ export class StrategyCoordinator {
         tokens = raw.split(/[\s,]+/).filter(Boolean)
       }
 
-      const profiles: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string }> = []
+      const profiles: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string; minStep: number }> = []
       for (const token of tokens) {
         if (typeof token !== "string") continue
         const [sStr, kStr] = token.split(":")
@@ -1351,7 +1358,7 @@ export class StrategyCoordinator {
         if (start <= 0 || stop <= 0) continue
         // tag is the canonical compact identifier used in setKey suffix
         const tag = `t${Math.round(start * 100)}-${Math.round(stop * 100)}`
-        profiles.push({ startRatio: start, stopRatio: stop, stepRatio: stop / 2, tag })
+        profiles.push({ startRatio: start, stopRatio: stop, stepRatio: stop / 2, tag, minStep: trailingMinStep })
       }
       ;(this as any)._trailingVariantsCache = profiles
       return profiles
@@ -1465,7 +1472,7 @@ export class StrategyCoordinator {
     // sentinel "untrailed" pass so the body of the loop is shared between
     // both paths.
     const trailingVariants = await this.getEnabledTrailingVariants()
-    const variantPasses: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string } | null> =
+    const variantPasses: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string; minStep: number } | null> =
       trailingVariants.length > 0 ? trailingVariants : [null]
 
     for (const variant of variantPasses) {
@@ -1481,6 +1488,22 @@ export class StrategyCoordinator {
         for (const ind of group.indications) {
           if (entryIdx >= maxEntries) break
           // Always parse as numbers — indication fields may arrive as strings from Redis hgetall
+          if (variant) {
+            // Only explicit step-window metadata participates in the
+            // trailing-min-step gate. Do NOT fall back to unrelated fields
+            // such as `range` or `consecutiveSteps`: those are volatility /
+            // pattern measurements, not Base position-window sizes, and using
+            // them here incorrectly filtered valid trailing Sets out of live
+            // production. Legacy indications without step metadata remain
+            // eligible so old saved runs do not lose trailing coverage.
+            const explicitStep =
+              ind.metadata?.stepWindow ??
+              ind.metadata?.step ??
+              ind.metadata?.windowSize ??
+              ind.metadata?.period
+            const rawStep = explicitStep == null ? Number.POSITIVE_INFINITY : Number(explicitStep)
+            if (Number.isFinite(rawStep) && rawStep < variant.minStep) continue
+          }
           const rawConf = parseFloat(String(ind.confidence ?? 0.5))
           const conf = Number.isFinite(rawConf) ? rawConf : 0.5
           const rawPF = parseFloat(String(ind.profitFactor ?? ind.profit_factor ?? 0))
@@ -1766,6 +1789,7 @@ export class StrategyCoordinator {
     inputSets?: StrategySet[],
     posCtx?: PositionContext,
     coordIndex?: CoordIndex,
+    skipAxisFanout: boolean = false,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
     // Prefer in-memory input (hot-path pipelined from createBaseSets). Fall
     // back to Redis only when called standalone (tests / diagnostics).
@@ -2083,7 +2107,7 @@ export class StrategyCoordinator {
     // takes care of accumulating continuous-count positions and
     // adjusting exchange exposure as new entries land.
     let axisSetsAdded = 0
-    if (defaultByBaseKey.size > 0) {
+    if (!skipAxisFanout && defaultByBaseKey.size > 0) {
       const minPF = metrics.minProfitFactor   // Same gate as Base→Main
       // ── Per-symbol axis fan-out ceiling (OOM-protection) ─────────────
       // expandAxisSets emits up to AXIS_PREV(5)×AXIS_LAST(4)×AXIS_CONT(8)×

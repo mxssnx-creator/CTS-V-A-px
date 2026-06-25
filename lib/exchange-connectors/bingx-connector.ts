@@ -56,6 +56,7 @@ export class BingXConnector extends BaseExchangeConnector {
   private static sharedLastSync:   number = 0
   private static sharedSyncPromise: Promise<void> | null = null
   private static lastSyncFailLogTs: number = 0
+  private static lastTransportFailLogTs: number = 0
 
   // Instance accessors delegate to the static shared state so the rest of
   // the class can use `this.timeOffset` / `this.lastTimeSync` / etc. without
@@ -672,6 +673,20 @@ export class BingXConnector extends BaseExchangeConnector {
           this.logError(`✗ Connection error: ${errorMsg} (100421 — throttled, next log in 30 s)`)
         }
         // Return a non-throwing failure so VolumeCalculator can write the cache.
+        return { success: false, error: errorMsg, balance: 0, capabilities: this.getCapabilities(), logs: this.logs }
+      }
+      const isTransportFailure =
+        errorMsg.toLowerCase().includes("fetch failed") ||
+        errorMsg.toLowerCase().includes("network") ||
+        errorMsg.toLowerCase().includes("econnreset") ||
+        errorMsg.toLowerCase().includes("etimedout") ||
+        errorMsg.toLowerCase().includes("aborted")
+      if (isTransportFailure) {
+        const now = Date.now()
+        if (now - BingXConnector.lastTransportFailLogTs > 30_000) {
+          BingXConnector.lastTransportFailLogTs = now
+          this.logError(`✗ Connection transport error: ${errorMsg} (throttled, next log in 30 s)`)
+        }
         return { success: false, error: errorMsg, balance: 0, capabilities: this.getCapabilities(), logs: this.logs }
       }
       this.logError(`✗ Connection error: ${errorMsg}`)
