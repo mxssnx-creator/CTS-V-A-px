@@ -1241,7 +1241,7 @@ export class StrategyCoordinator {
       // STAGE 2: MAIN — validate Base Sets AND create additional related
       // variant Sets (Default / Trailing / Block / DCA) gated by posCtx.
       // CoordIndex receives a SetCoordRecord per built set (O(1) per set).
-      const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx, coordIndex)
+      const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx, coordIndex, isPrehistoric)
       results.push(mainResult)
 
       // STAGE 3: REAL — promote Sets with avgPF >= 1.4 (base-promoted AND
@@ -1789,6 +1789,7 @@ export class StrategyCoordinator {
     inputSets?: StrategySet[],
     posCtx?: PositionContext,
     coordIndex?: CoordIndex,
+    skipAxisFanout: boolean = false,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
     // Prefer in-memory input (hot-path pipelined from createBaseSets). Fall
     // back to Redis only when called standalone (tests / diagnostics).
@@ -2106,7 +2107,7 @@ export class StrategyCoordinator {
     // takes care of accumulating continuous-count positions and
     // adjusting exchange exposure as new entries land.
     let axisSetsAdded = 0
-    if (defaultByBaseKey.size > 0) {
+    if (!skipAxisFanout && defaultByBaseKey.size > 0) {
       const minPF = metrics.minProfitFactor   // Same gate as Base→Main
       // ── Per-symbol axis fan-out ceiling (OOM-protection) ─────────────
       // expandAxisSets emits up to AXIS_PREV(5)×AXIS_LAST(4)×AXIS_CONT(8)×
