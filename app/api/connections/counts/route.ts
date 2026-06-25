@@ -6,6 +6,7 @@ import { getConnectionCounts } from "@/lib/connection-count-service"
  * Returns accurate connection counts for base and main panels
  * PHASE 2 FIX: Single source of truth for connection counts
  */
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const counts = await getConnectionCounts()

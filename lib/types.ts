@@ -52,6 +52,7 @@ export interface PseudoPosition {
   id: string
   connection_id: string
   symbol: string
+  direction?: "long" | "short"
   indication_type: "direction" | "move" | "active" | "optimal" | "auto" // auto is new advanced type
   takeprofit_factor: number
   stoploss_ratio: number
@@ -61,7 +62,11 @@ export interface PseudoPosition {
   entry_price: number
   current_price: number
   profit_factor: number
+  signedResultR?: number
+  costNormalizedReturn?: number
+  signed_result_r?: number
   position_cost: number
+  direction?: "long" | "short"
   status: "open" | "closed"
   created_at: string
   updated_at: string

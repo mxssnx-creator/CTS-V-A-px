@@ -11,6 +11,7 @@ import { notifySettingsChanged } from "@/lib/settings-coordinator"
  * Base connections (is_predefined=1): Enable directly if test passes
  * Active connections: Disable by default when added, require explicit enable
  */
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

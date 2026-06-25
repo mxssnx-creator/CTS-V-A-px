@@ -193,12 +193,23 @@ export async function GET() {
       errors: connectionStatuses.filter((c: any) => c.error).length,
     }
 
+    // In Next dev, route handlers may execute in a freshly compiled module
+    // instance whose in-memory coordinator has no local managers, while Redis
+    // correctly records operator intent and progression state. Report the
+    // effective running connection count as a floor so the UI does not flicker
+    // `activeEngineCount: 0` during hot-route recompiles even though the
+    // connection status remains running.
+    const coordinatorEngineCount = coordinator?.getActiveEngineCount() || 0
+    const activeEngineCount = effectivelyRunning
+      ? Math.max(coordinatorEngineCount, summary.running)
+      : coordinatorEngineCount
+
     const responseBody = {
       success: true,
       running: effectivelyRunning,
       paused: isGloballyPaused,
       status: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : "stopped"),
-      activeEngineCount: coordinator?.getActiveEngineCount() || 0,
+      activeEngineCount,
       connections: connectionStatuses,
       summary,
     }

@@ -762,7 +762,7 @@ export function StatisticsOverviewV2() {
           // This is the crash-immune invariant — render code can read
           // `lp.leverage.toFixed(...)` without any defensive guard,
           // even when the server omits newer fields.
-          livePositions: Array.isArray(opLive.positions)
+          livePositions: (Array.isArray(opLive.positions)
             ? opLive.positions.map((p: any) => {
                 const leverage = Math.max(1, Number(p.leverage) || 1)
                 const volumeUsd = Number(p.volumeUsd) || 0
@@ -808,7 +808,33 @@ export function StatisticsOverviewV2() {
                   resolution:            (p.resolution === "real-fallback" || p.resolution === "unresolved" ? p.resolution : "pseudo") as "pseudo" | "real-fallback" | "unresolved",
                 }
               })
-            : [],
+            : []
+          )
+            // Dedupe by position id. The server payload can occasionally carry
+            // the SAME live position twice (e.g. an "adopted" exchange position
+            // that also matches a tracked Redis position), which produced
+            // duplicate React keys at render → React duplicates/omits children
+            // inconsistently between server and client (hydration error #418).
+            // Keep the most-recently-updated copy for each id; positions with an
+            // empty id fall back to a positional key so they are never collapsed.
+            .reduce((acc: { list: any[]; seen: Map<string, number> }, lp: any) => {
+              const id = lp.id || ""
+              if (!id) {
+                acc.list.push(lp)
+                return acc
+              }
+              const existingIdx = acc.seen.get(id)
+              if (existingIdx === undefined) {
+                acc.seen.set(id, acc.list.length)
+                acc.list.push(lp)
+              } else {
+                const prev = acc.list[existingIdx]
+                const prevTs = prev.updatedAt || prev.syncedAt || 0
+                const nextTs = lp.updatedAt || lp.syncedAt || 0
+                if (nextTs >= prevTs) acc.list[existingIdx] = lp
+              }
+              return acc
+            }, { list: [], seen: new Map<string, number>() }).list,
           liveResolution: {
             pseudo:       Number(opLive.resolution?.pseudo)       || 0,
             realFallback: Number(opLive.resolution?.realFallback) || 0,
@@ -1460,8 +1486,10 @@ export function StatisticsOverviewV2() {
               </span>
             </div>
             <div className="space-y-1">
-              {stats.livePositions.slice(0, 8).map((lp) => (
-                <ExchangePositionRow key={lp.id} lp={lp} />
+              {stats.livePositions.slice(0, 8).map((lp, i) => (
+                // Composite key (id + index) is collision-proof even if the
+                // server payload ever carries the same position id twice.
+                <ExchangePositionRow key={lp.id ? `${lp.id}#${i}` : `pos-${i}`} lp={lp} />
               ))}
               {stats.livePositions.length > 8 && (
                 <div className="text-[9px] text-muted-foreground text-center pt-0.5">

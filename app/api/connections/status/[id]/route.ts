@@ -4,6 +4,7 @@ import { getConnection, initRedis } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 
 // GET real-time status for a specific connection
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
