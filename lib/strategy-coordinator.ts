@@ -4963,6 +4963,7 @@ export class StrategyCoordinator {
       // coordIndex.base.byKey.get(parentSetKey).  Eliminates the primary
       // V8 heap driver (~80 000 object allocations per second).
       entries:         [],
+      ...(baseSet.trailingProfile && { trailingProfile: baseSet.trailingProfile }),
       ...(baseSet.prevPos && { prevPos: baseSet.prevPos }),
     }
   }
