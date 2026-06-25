@@ -38,7 +38,7 @@ export interface ExchangePositionCreateParams {
   // `LivePosition.setKey` etc. exactly — see live-stage.ts for docs.
   setKey?: string
   parentSetKey?: string
-  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
+  setVariant?: "default" | "trailing" | "block" | "dca"
   axisWindows?: { prev: number; last: number; cont: number; pause: number }
 }
 

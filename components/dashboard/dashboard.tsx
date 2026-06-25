@@ -9,6 +9,7 @@ import { DashboardActiveConnectionsManager } from "./dashboard-active-connection
 import { StatisticsOverviewV2 } from "./statistics-overview-v2"
 import { SystemMonitoringPanel } from "./system-monitoring-panel"
 import { EngineProgressionTestButton } from "./engine-progression-test-dialog"
+import { DetailedLogsButton } from "./detailed-logs-button"
 import { Card } from "@/components/ui/card"
 import { useIndicationGenerator } from "@/components/indication-generator-hook"
 
@@ -57,7 +58,8 @@ export function Dashboard() {
          * operators can trigger a full 7-phase engine progression test
          * without scrolling. `variant="header"` renders the slightly larger
          * primary-accent pill used for header actions.
-         */}
+        */}
+        <DetailedLogsButton />
         <EngineProgressionTestButton variant="header" />
       </PageHeader>
 

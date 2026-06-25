@@ -185,7 +185,7 @@ export class PositionCalculator {
 
   private getConfigurableRanges(): number[] {
     const settings = this.settings || {
-      indicationRangeMin: 3,
+      indicationRangeMin: 2,
       indicationRangeMax: 30,
       indicationRangeStep: 1,
       takeProfitRangeDivisor: 3,
@@ -200,7 +200,7 @@ export class PositionCalculator {
 
   private filterConfigsByTakeProfitCoordination(ranges: number[], type: string): number[] {
     const settings = this.settings || {
-      indicationRangeMin: 3,
+      indicationRangeMin: 2,
       indicationRangeMax: 30,
       indicationRangeStep: 1,
       takeProfitRangeDivisor: 3,

@@ -138,7 +138,7 @@ export const DEFAULT_SYMBOLS = ["BCHUSDT", "XRPUSDT", "ETHUSDT", "LINKUSDT", "DO
 export const FORCED_SYMBOLS = ["XRPUSDT", "BCHUSDT"]
 
 export const INDICATION_RANGES = {
-  min: 3,
+  min: 2,
   max: 30,
   step: 1,
 }
