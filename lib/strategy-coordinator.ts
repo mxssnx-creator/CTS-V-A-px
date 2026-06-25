@@ -4077,7 +4077,7 @@ export class StrategyCoordinator {
                 if (liveResult.status === "open" || liveResult.status === "filled" || liveResult.status === "partially_filled") {
                   filled++
                   placed++
-                } else if (liveResult.status === "placed") {
+                } else if (liveResult.status === "placed" || liveResult.status === "pending_fill") {
                   placed++
                 } else if (liveResult.status === "rejected") {
                   rejected++
