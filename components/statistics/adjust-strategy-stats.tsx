@@ -251,7 +251,7 @@ export function AdjustStrategyStats({
       {/* Block Profit Factor Analysis by Time Interval */}
       <Card>
         <CardHeader>
-          <CardTitle>Block Profit Factor by Time Interval</CardTitle>
+          <CardTitle>Block Avg R by Time Interval</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -268,7 +268,7 @@ export function AdjustStrategyStats({
                     <div className="flex items-center justify-between">
                       <CardTitle className="text-lg">{stat.interval} Hours</CardTitle>
                       <Badge variant={stat.avgProfitFactor >= 1 ? "default" : "destructive"}>
-                        PF: {stat.avgProfitFactor.toFixed(2)}
+                        Avg R: {stat.blocks.length > 0 ? stat.avgProfitFactor.toFixed(2) : "—"}
                       </Badge>
                     </div>
                   </CardHeader>
@@ -286,7 +286,7 @@ export function AdjustStrategyStats({
                             <div
                               className={`text-sm font-bold ${block.avgPF >= 1 ? "text-green-600" : "text-red-600"}`}
                             >
-                              {block.avgPF.toFixed(2)}
+                              {block.count > 0 ? block.avgPF.toFixed(2) : "—"}
                             </div>
                             {block.avgPF >= 1 ? (
                               <TrendingUp className="h-4 w-4 text-green-600" />
@@ -309,7 +309,7 @@ export function AdjustStrategyStats({
       {blockChartData.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle>Block Profit Factor Trend (Block Size 4)</CardTitle>
+            <CardTitle>Block Avg R Trend (Block Size 4)</CardTitle>
           </CardHeader>
           <CardContent>
             <ResponsiveContainer width="100%" height={300}>
@@ -317,7 +317,7 @@ export function AdjustStrategyStats({
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis dataKey="blockNumber" />
                 <YAxis />
-                <Tooltip formatter={(value: number) => [value.toFixed(2), "Profit Factor"]} />
+                <Tooltip formatter={(value: number) => [value.toFixed(2), "Avg R"]} />
                 <Bar dataKey="profitFactor" fill="#3b82f6" />
               </BarChart>
             </ResponsiveContainer>

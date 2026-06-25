@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server"
 
+export const dynamic = "force-dynamic"
 export async function POST() {
   try {
     console.log("[v0] Database initialization requested (Redis auto-initializes)")

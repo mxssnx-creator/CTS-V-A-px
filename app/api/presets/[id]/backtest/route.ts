@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { runPresetBacktest } from "@/lib/backtest-engine"
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

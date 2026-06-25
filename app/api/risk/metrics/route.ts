@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()

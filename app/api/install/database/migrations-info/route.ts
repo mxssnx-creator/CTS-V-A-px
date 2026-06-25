@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { initRedis } from "@/lib/redis-db"
 import { getMigrationStatus, runMigrations } from "@/lib/redis-migrations"
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     await initRedis()

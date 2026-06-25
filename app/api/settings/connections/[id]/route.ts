@@ -21,6 +21,7 @@ const maskConnectionSecrets = (conn: Record<string, any>) => ({
 // overwrite the stored secret.
 const isMaskedOrEmpty = (v: unknown) => typeof v === "string" && (v === "" || v.includes("••••"))
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
