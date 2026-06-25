@@ -1941,6 +1941,10 @@ export class StrategyCoordinator {
           setKey,
           indicationType: group.indicationType,
           direction: group.direction,
+          // Base Sets now carry an explicit variant tag so trailing-lineage
+          // survives Base → Main → Real → Live instead of falling through
+          // fallback accounting as "default".
+          variant: variant ? "trailing" : "default",
           strategyType: "standard",  // NEW: Base sets are always "standard" type
           avgProfitFactor: avgPF,
           avgConfidence: avgConf,
@@ -2396,6 +2400,18 @@ export class StrategyCoordinator {
       // Base Sets must not also fan out a trailing variant or the trailing
       // calculations/statistics get duplicated and mixed into default lineage.
       const variantsForThisBase = baseSet.trailingProfile
+        ? activeVariants
+            .filter((p) => p.name === "default")
+            .map((p) => ({
+              ...p,
+              // Multi-step trailing Base Sets already carry their concrete
+              // trailingProfile ratios. Promote them through Main as the
+              // trailing family while reusing the default entry configs, so
+              // they do not become default Main/Real/Live Sets or default
+              // strategy_variant stats.
+              name: "trailing" as const,
+            }))
+        : activeVariants
         ? activeVariants.filter((p) => p.name === "trailing")
         : activeVariants.filter((p) => p.name !== "trailing")
 
