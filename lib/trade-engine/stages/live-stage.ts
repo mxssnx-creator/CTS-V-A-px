@@ -2327,12 +2327,14 @@ export async function executeLivePosition(
       // Set averageExecutionPrice before calling computeDesiredProtectionPrices
       // because that function uses it as the fill price for SL/TP calculation.
       livePosition.averageExecutionPrice = simEntryPrice
-      // Compute SL/TP prices for the simulated position so reconcile and
-      // checkAndForceCloseOnSltpCross have valid price targets.
+      // Compute absolute SL/TP prices for the simulated position so reconcile
+      // and checkAndForceCloseOnSltpCross have valid price targets. Keep
+      // assignedStopLoss/assignedTakeProfit as the normalized percentage
+      // contract mirrored from the originating real position.
       if (simEntryPrice > 0) {
         const simProtection = computeDesiredProtectionPrices(livePosition)
-        if (simProtection.desiredSl > 0) livePosition.assignedStopLoss  = simProtection.desiredSl
-        if (simProtection.desiredTp > 0) livePosition.assignedTakeProfit = simProtection.desiredTp
+        if (simProtection.desiredSl > 0) livePosition.stopLossPrice = simProtection.desiredSl
+        if (simProtection.desiredTp > 0) livePosition.takeProfitPrice = simProtection.desiredTp
       }
       livePosition.executedQuantity = simQty
       livePosition.remainingQuantity = 0
