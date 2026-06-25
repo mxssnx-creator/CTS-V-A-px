@@ -3,6 +3,7 @@ import { initRedis, getSettings, setSettings, getConnection, getRedisClient } fr
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 
 export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
 
 /**
  * GET /api/market-data

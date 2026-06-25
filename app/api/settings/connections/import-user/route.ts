@@ -7,6 +7,7 @@ import { createConnection, getConnection, initRedis } from "@/lib/redis-db"
  * Import user-configured connections into Redis
  * POST /api/settings/connections/import-user
  */
+export const dynamic = "force-dynamic"
 export async function POST() {
   try {
     await initRedis()
