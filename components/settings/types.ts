@@ -23,6 +23,7 @@ export interface Settings {
   validationTimeoutSeconds: number
   mainTradeInterval: number
   presetTradeInterval: number
+  /** Percent of account balance budgeted per position. Range/default floor: 0.02% - 1.0%. */
   positionCost: number
   useMaximalLeverage: boolean
   min_volume_enforcement: boolean

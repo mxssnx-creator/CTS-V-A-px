@@ -14,6 +14,7 @@ import { isTruthyFlag } from "@/lib/boolean-utils"
  * 4. Preserve base is_enabled state from Settings
  * 5. Reset trade flags (is_live_trade, is_preset_trade to false)
  */
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     const { connectionId } = await request.json()

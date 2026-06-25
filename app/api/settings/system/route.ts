@@ -38,6 +38,7 @@ async function writeMirroredSystem(value: Record<string, any>): Promise<void> {
   await bumpSettingsVersion()
 }
 
+export const dynamic = "force-dynamic"
 export async function GET(_request: NextRequest) {
   try {
     const settings = await readMergedSystem()

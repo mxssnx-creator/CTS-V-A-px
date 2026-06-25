@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { initRedis, getRedisClient, getAllConnections } from "@/lib/redis-db"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     await initRedis()
