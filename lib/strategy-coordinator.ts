@@ -430,6 +430,58 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
+type LiveDispatchSelection = {
+  selected: StrategySet[]
+  suppressed: StrategySet[]
+}
+
+function getLiveDispatchBucket(set: StrategySet): "new" | "block" | "dca" {
+  if (set.variant === "block") return "block"
+  if (set.variant === "dca") return "dca"
+  return "new"
+}
+
+function selectLiveDispatchSets(qualifying: StrategySet[]): LiveDispatchSelection {
+  const selected: StrategySet[] = []
+  const selectedRefs = new Set<StrategySet>()
+  const seen = new Set<string>()
+
+  for (const set of qualifying) {
+    const bucket = `${set.direction}:${getLiveDispatchBucket(set)}`
+    if (seen.has(bucket)) continue
+
+    selected.push(set)
+    selectedRefs.add(set)
+    seen.add(bucket)
+
+    if (
+      seen.has("long:new") &&
+      seen.has("short:new") &&
+      seen.has("long:block") &&
+      seen.has("short:block") &&
+      seen.has("long:dca") &&
+      seen.has("short:dca")
+    ) {
+      break
+    }
+  }
+
+  return {
+    selected,
+    suppressed: qualifying.filter((set) => !selectedRefs.has(set)),
+  }
+}
+
+function summarizeLiveDispatchBuckets(sets: StrategySet[]): string {
+  const counts: Record<string, number> = {}
+  for (const set of sets) {
+    const key = `${getLiveDispatchBucket(set)}:${set.direction}`
+    counts[key] = (counts[key] ?? 0) + 1
+  }
+  return Object.entries(counts)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, count]) => `${key}=${count}`)
+    .join(" ")
 type LiveSuppressionReason = "connector_unavailable" | "balance_unavailable"
 
 interface LiveDispatchSuppressedEntry {
@@ -4745,6 +4797,12 @@ export class StrategyCoordinator {
     // and pseudo positions aligned with what can actually dispatch.
     await this.createPseudoPositionsFromRealSets(symbol, dispatchSets)
 
+    // Select the small subset that can actually be dispatched before any
+    // console output. The persisted detail hash remains the primary UI/API
+    // diagnostics source; console logging below is opt-in debug only.
+    const liveDispatchSelection = selectLiveDispatchSets(qualifying)
+    const dispatchSets = liveDispatchSelection.selected
+
     // Write live set count into progression hash — use hset so count reflects current cycle snapshot.
     // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
     // Previously this block fired 7 sequential Redis round-trips (hset × 2, set, expire × 3, + a
@@ -5271,6 +5329,9 @@ export class StrategyCoordinator {
             // Without this rule, block/dca sets targeting e.g. long were
             // always dropped because `sawLong=true` was already set by the
             // default set, meaning block strategy NEVER dispatched.
+            if (process.env.DEBUG_LIVE_DISPATCH_SELECTION === "1") {
+              console.log(
+                `[v0] [StrategyFlow] ${symbol} LIVE dispatch selection — selected=${dispatchSets.length} (${summarizeLiveDispatchBuckets(dispatchSets) || "none"}) suppressed=${liveDispatchSelection.suppressed.length} (${summarizeLiveDispatchBuckets(liveDispatchSelection.suppressed) || "none"})`
             // Reuse the precomputed compact dispatch selection above; it is also persisted to strategy_detail live stats.
 
             const dispatchSets = liveDispatchSelection.dispatchSets
@@ -5599,6 +5660,7 @@ export class StrategyCoordinator {
               }
             }
 
+            if (process.env.DEBUG_LIVE_DISPATCH_SELECTION === "1" && (placed > 0 || errored > 0)) {
             if (dispatchSuppressed.length > 0) {
               const suppressedByReason = dispatchSuppressed.reduce<Record<LiveSuppressionReason, number>>(
                 (acc, entry) => {
@@ -5634,7 +5696,7 @@ export class StrategyCoordinator {
               console.log(
                 `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} errored=${errored}`
               )
-            } else if (rejected > 0 && (this as any)._liveRejectLogThrottle?.[symbol] !== Math.floor(Date.now() / 30000)) {
+            } else if (process.env.DEBUG_LIVE_DISPATCH_SELECTION === "1" && rejected > 0 && (this as any)._liveRejectLogThrottle?.[symbol] !== Math.floor(Date.now() / 30000)) {
               // Throttle pure-rejection summaries (common in dev/test with no real exchange balance) — log at most once per 30s per symbol
               if (!(this as any)._liveRejectLogThrottle) (this as any)._liveRejectLogThrottle = {}
               ;(this as any)._liveRejectLogThrottle[symbol] = Math.floor(Date.now() / 30000)
