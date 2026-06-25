@@ -664,6 +664,26 @@ function resolveLiveExecutionCostProfile(exchange: string, connSettings: Record<
   }
 }
 
+
+function deriveConfiguredStatsFromProfitFactor(
+  profitFactor: number,
+  positionCostPct: number,
+): { takeProfitPct: number; stopLossPct: number; tpR: number; slR: number; rewardRisk: number } {
+  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
+  const posCost = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  // Mirrors the live pseudo-position TP/SL configuration so configured
+  // reward/risk stays separate from realized performance factor.
+  const takeProfitPct = Math.max(0.5, (pf - 1) * 100)
+  const stopLossPct = Math.min(5, 100 / Math.max(1, pf) * 0.5)
+  return {
+    takeProfitPct,
+    stopLossPct,
+    tpR: takeProfitPct / posCost,
+    slR: stopLossPct / posCost,
+    rewardRisk: stopLossPct > 0 ? takeProfitPct / stopLossPct : 0,
+  }
+}
+
 const AXIS_KEY_TABLE: ReadonlyMap<string, string> = (() => {
   const m = new Map<string, string>()
   for (const prev of AXIS_PREV) {
@@ -2521,8 +2541,14 @@ export class StrategyCoordinator {
     // 4 intermediate result allocations per symbol per cycle.
     type VariantAgg = {
       sumPF: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
+      configuredTp?: number; configuredSl?: number; configuredTpR?: number; configuredSlR?: number; configuredRR?: number
     }
     const variantAgg: Record<string, VariantAgg> = {
+      default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+      trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+      block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+      dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+      pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
       default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
@@ -3778,6 +3804,15 @@ export class StrategyCoordinator {
       // much of Real is Default vs Adjust{Block, DCA} vs Trailing?"
       // without re-scanning every set on read.
       type RealVariantAgg = {
+        sumPF: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
+        configuredTp: number; configuredSl: number; configuredTpR: number; configuredSlR: number; configuredRR: number
+      }
+      const realVariantAgg: Record<string, RealVariantAgg> = {
+        default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
         sumPFByEntries: number; sumPFBySets: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
       }
       const realVariantAgg: Record<string, RealVariantAgg> = {
@@ -3806,6 +3841,12 @@ export class StrategyCoordinator {
         agg.sumPFByEntries += set.avgProfitFactor * ec
         agg.sumPFBySets    += set.avgProfitFactor
         agg.sumDDT         += (set.avgDrawdownTime || 0) * ec
+        const configured = deriveConfiguredStatsFromProfitFactor(set.avgProfitFactor, 0.1)
+        agg.configuredTp  += configured.takeProfitPct * Math.max(1, ec)
+        agg.configuredSl  += configured.stopLossPct * Math.max(1, ec)
+        agg.configuredTpR += configured.tpR * Math.max(1, ec)
+        agg.configuredSlR += configured.slR * Math.max(1, ec)
+        agg.configuredRR  += configured.rewardRisk * Math.max(1, ec)
       }
       for (const variant of ["default", "trailing", "block", "dca"] as const) {
         const agg = realVariantAgg[variant]
@@ -3827,6 +3868,15 @@ export class StrategyCoordinator {
           client.hset(vKey, { updated_at: new Date().toISOString() }),
           client.hincrby(vKey, "sum_pf_x1000",   Math.round(agg.sumPF * 1000)),
           client.hincrby(vKey, "sum_ddt_x10",    Math.round(agg.sumDDT * 10)),
+          client.hset(vKey, {
+            updated_at: new Date().toISOString(),
+            configured_sample_size: String(agg.entries || agg.setsContaining),
+            configured_take_profit_pct: String(agg.entries > 0 ? agg.configuredTp / agg.entries : 0),
+            configured_stop_loss_pct: String(agg.entries > 0 ? agg.configuredSl / agg.entries : 0),
+            configured_tp_r: String(agg.entries > 0 ? agg.configuredTpR / agg.entries : 0),
+            configured_sl_r: String(agg.entries > 0 ? agg.configuredSlR / agg.entries : 0),
+            configured_reward_risk: String(agg.entries > 0 ? agg.configuredRR / agg.entries : 0),
+          }),
           client.hset(vKey, { updated_at: new Date().toISOString(), generation, epoch: generation }),
           client.hset(vKey, { generation: statsGeneration, engine_generation: statsGeneration, updated_at: new Date().toISOString() }),
           client.expire(vKey, 7 * 24 * 60 * 60),
@@ -3940,6 +3990,11 @@ export class StrategyCoordinator {
                 generation,
                 epoch: generation,
                 avg_profit_factor: avgPF.toFixed(4),
+                realized_profit_factor: avgPF.toFixed(4),
+                realized_avg_signed_r: "0",
+                realized_net_r: "0",
+                realized_win_rate: passRate.toFixed(4),
+                realized_sample_size: String(entriesCount),
                 avg_drawdown_time: avgDDT.toFixed(2),
                 generation: statsGeneration,
                 engine_generation: statsGeneration,
@@ -4286,6 +4341,15 @@ export class StrategyCoordinator {
       // contributing Sets to the live mirror. Kept as a single Promise.all
       // so we still land in one network hop.
       type LiveVariantAgg = {
+        sumPF: number; sumDDT: number; entries: number; setsContaining: number
+        configuredTp: number; configuredSl: number; configuredTpR: number; configuredSlR: number; configuredRR: number
+      }
+      const liveVariantAgg: Record<string, LiveVariantAgg> = {
+        default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
         sumPFByEntries: number; sumPFBySets: number; sumDDT: number; entries: number; setsContaining: number
       }
       const liveVariantAgg: Record<string, LiveVariantAgg> = {
@@ -4306,6 +4370,15 @@ export class StrategyCoordinator {
         const lv = liveVariantAgg[variant] ?? liveVariantAgg["default"]
         const ec = set.entryCount || set.entries.length
         lv.setsContaining += 1
+        lv.entries += ec
+        lv.sumPF   += set.avgProfitFactor * ec
+        lv.sumDDT  += (set.avgDrawdownTime || 0) * ec
+        const configured = deriveConfiguredStatsFromProfitFactor(set.avgProfitFactor, livePositionCostPct)
+        lv.configuredTp  += configured.takeProfitPct * Math.max(1, ec)
+        lv.configuredSl  += configured.stopLossPct * Math.max(1, ec)
+        lv.configuredTpR += configured.tpR * Math.max(1, ec)
+        lv.configuredSlR += configured.slR * Math.max(1, ec)
+        lv.configuredRR  += configured.rewardRisk * Math.max(1, ec)
         lv.entries        += ec
         lv.sumPFByEntries += set.avgProfitFactor * ec
         lv.sumPFBySets    += set.avgProfitFactor
@@ -4359,8 +4432,19 @@ export class StrategyCoordinator {
             created_sets:      String(agg.setsContaining),
             entries_count:     String(agg.entries),
             avg_profit_factor: avgPF.toFixed(4),
+            realized_profit_factor: avgPF.toFixed(4),
+            realized_avg_signed_r: "0",
+            realized_net_r: "0",
+            realized_win_rate: "0",
+            realized_sample_size: String(agg.entries || agg.setsContaining),
             avg_drawdown_time: avgDDT.toFixed(2),
             avg_pos_per_set:   (agg.entries / agg.setsContaining).toFixed(2),
+            configured_sample_size: String(agg.entries || agg.setsContaining),
+            configured_take_profit_pct: String(agg.entries > 0 ? agg.configuredTp / agg.entries : 0),
+            configured_stop_loss_pct: String(agg.entries > 0 ? agg.configuredSl / agg.entries : 0),
+            configured_tp_r: String(agg.entries > 0 ? agg.configuredTpR / agg.entries : 0),
+            configured_sl_r: String(agg.entries > 0 ? agg.configuredSlR / agg.entries : 0),
+            configured_reward_risk: String(agg.entries > 0 ? agg.configuredRR / agg.entries : 0),
             updated_at:        String(Date.now()),
           }),
           client.expire(vKey, 7 * 24 * 60 * 60),

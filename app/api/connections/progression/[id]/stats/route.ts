@@ -1282,6 +1282,51 @@ export async function GET(
     // the dashboard quietly missed the count. Adding it here surfaces
     // those entries in `strategyVariants.pause` of the response.
     const variantKeys = ["default", "trailing", "block", "dca", "pause"] as const
+    type VariantStats = Record<string, number>
+    const readVariantDetail = async (stage: "real" | "live" | "legacy"): Promise<Record<string, VariantStats>> => {
+      const out: Record<string, VariantStats> = {}
+      await Promise.all(
+        variantKeys.map(async (variant) => {
+          const key = stage === "legacy"
+            ? `strategy_variant:${connectionId}:${variant}`
+            : `strategy_variant_${stage}:${connectionId}:${variant}`
+          const h = ((await client.hgetall(key).catch(() => null)) || {}) as Record<string, string>
+          const createdSets      = n(h.created_sets)
+          const passedSets       = n(h.passed_sets)
+          const entriesCount     = n(h.entries_count)
+          const sampleSize       = n(h.configured_sample_size) || entriesCount || createdSets
+          const avgPosPerSet     = parseFloat(h.avg_pos_per_set   || "0")
+          const realizedPF       = parseFloat(h.realized_profit_factor || h.avg_profit_factor || "0")
+          const avgDrawdownTime  = parseFloat(h.avg_drawdown_time || "0")
+          const passRateRaw      = parseFloat(h.pass_rate         || "0")
+          const realizedWinRateRaw = parseFloat(h.realized_win_rate || "0")
+          out[variant] = {
+            createdSets,
+            passedSets,
+            entriesCount,
+            avgPosPerSet:     isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100      : 0,
+            // Backward-compatible alias. Do not write configured reward/risk here.
+            avgProfitFactor:  isFinite(realizedPF) ? Math.round(realizedPF * 1000) / 1000 : 0,
+            avgDrawdownTime:  isFinite(avgDrawdownTime) ? Math.round(avgDrawdownTime * 10) / 10     : 0,
+            passRate:         passRateRaw > 0
+              ? Math.round(passRateRaw * 1000) / 10
+              : createdSets > 0
+                ? Math.round((passedSets / createdSets) * 1000) / 10
+                : 0,
+            configuredTakeProfitPct: nf(h.configured_take_profit_pct, 6),
+            configuredStopLossPct:   nf(h.configured_stop_loss_pct, 6),
+            configuredTpR:           nf(h.configured_tp_r, 6),
+            configuredSlR:           nf(h.configured_sl_r, 6),
+            configuredRewardRisk:    nf(h.configured_reward_risk, 6),
+            realizedProfitFactor:    isFinite(realizedPF) ? Math.round(realizedPF * 1000) / 1000 : 0,
+            realizedAvgSignedR:      nf(h.realized_avg_signed_r, 6),
+            realizedNetR:            nf(h.realized_net_r, 6),
+            realizedWinRate:         realizedWinRateRaw > 0 ? Math.round(realizedWinRateRaw * 1000) / 10 : 0,
+            realizedSampleSize:      n(h.realized_sample_size) || sampleSize,
+          }
+        })
+      )
+      return out
     // Pause is not a strategy variant; it is exposed below as a
     // position-count axis (`axisAccumulation.pause`).
     const variantKeys = ["default", "trailing", "block", "dca"] as const
@@ -1361,6 +1406,58 @@ export async function GET(
         ? Math.round((variantTotals.passedSets / variantTotals.createdSets) * 1000) / 10
         : 0,
     }
+    const buildVariantOverall = (detail: Record<string, VariantStats>): VariantStats => {
+      const totals = variantKeys.reduce(
+        (acc, v) => {
+          const row = detail[v]
+          acc.createdSets  += row.createdSets
+          acc.passedSets   += row.passedSets
+          acc.entriesCount += row.entriesCount
+          const w = row.realizedSampleSize || row.entriesCount || row.createdSets
+          if (w > 0) {
+            acc.weightSum += w
+            acc.weightedPF += row.realizedProfitFactor * w
+            acc.weightedDDT += row.avgDrawdownTime * w
+            acc.weightedTp += row.configuredTakeProfitPct * w
+            acc.weightedSl += row.configuredStopLossPct * w
+            acc.weightedTpR += row.configuredTpR * w
+            acc.weightedSlR += row.configuredSlR * w
+            acc.weightedRR += row.configuredRewardRisk * w
+            acc.weightedAvgR += row.realizedAvgSignedR * w
+            acc.weightedWin += row.realizedWinRate * w
+            acc.netR += row.realizedNetR
+          }
+          return acc
+        },
+        { createdSets: 0, passedSets: 0, entriesCount: 0, weightSum: 0, weightedPF: 0, weightedDDT: 0, weightedTp: 0, weightedSl: 0, weightedTpR: 0, weightedSlR: 0, weightedRR: 0, weightedAvgR: 0, weightedWin: 0, netR: 0 },
+      )
+      return {
+        createdSets: totals.createdSets,
+        passedSets: totals.passedSets,
+        entriesCount: totals.entriesCount,
+        avgProfitFactor: totals.weightSum > 0 ? Math.round((totals.weightedPF / totals.weightSum) * 1000) / 1000 : 0,
+        avgDrawdownTime: totals.weightSum > 0 ? Math.round((totals.weightedDDT / totals.weightSum) * 10) / 10 : 0,
+        passRate: totals.createdSets > 0 ? Math.round((totals.passedSets / totals.createdSets) * 1000) / 10 : 0,
+        configuredTakeProfitPct: totals.weightSum > 0 ? Math.round((totals.weightedTp / totals.weightSum) * 1_000_000) / 1_000_000 : 0,
+        configuredStopLossPct: totals.weightSum > 0 ? Math.round((totals.weightedSl / totals.weightSum) * 1_000_000) / 1_000_000 : 0,
+        configuredTpR: totals.weightSum > 0 ? Math.round((totals.weightedTpR / totals.weightSum) * 1_000_000) / 1_000_000 : 0,
+        configuredSlR: totals.weightSum > 0 ? Math.round((totals.weightedSlR / totals.weightSum) * 1_000_000) / 1_000_000 : 0,
+        configuredRewardRisk: totals.weightSum > 0 ? Math.round((totals.weightedRR / totals.weightSum) * 1_000_000) / 1_000_000 : 0,
+        realizedProfitFactor: totals.weightSum > 0 ? Math.round((totals.weightedPF / totals.weightSum) * 1000) / 1000 : 0,
+        realizedAvgSignedR: totals.weightSum > 0 ? Math.round((totals.weightedAvgR / totals.weightSum) * 1_000_000) / 1_000_000 : 0,
+        realizedNetR: Math.round(totals.netR * 1_000_000) / 1_000_000,
+        realizedWinRate: totals.weightSum > 0 ? Math.round((totals.weightedWin / totals.weightSum) * 10) / 10 : 0,
+        realizedSampleSize: totals.weightSum,
+      }
+    }
+    const variantDetailReal = await readVariantDetail("real")
+    const variantDetailLive = await readVariantDetail("live")
+    const variantDetailLegacy = await readVariantDetail("legacy")
+    const hasRealVariantData = variantKeys.some((v) => variantDetailReal[v].createdSets > 0 || variantDetailReal[v].entriesCount > 0)
+    const variantDetail = hasRealVariantData ? variantDetailReal : variantDetailLegacy
+    const variantOverall = buildVariantOverall(variantDetail)
+    const variantOverallReal = buildVariantOverall(variantDetailReal)
+    const variantOverallLive = buildVariantOverall(variantDetailLive)
 
     // ── STRATEGY DETAIL fields ───────────────────────────────────────────────
     // Per-stage avg positions per set, created sets, avg profit factor, avg processing time
@@ -2718,7 +2815,24 @@ export async function GET(
         trailing: variantDetail.trailing,
         block:    variantDetail.block,
         dca:      variantDetail.dca,
+        pause:    variantDetail.pause,
         overall:  variantOverall,
+      },
+      strategyVariantsReal: {
+        default:  variantDetailReal.default,
+        trailing: variantDetailReal.trailing,
+        block:    variantDetailReal.block,
+        dca:      variantDetailReal.dca,
+        pause:    variantDetailReal.pause,
+        overall:  variantOverallReal,
+      },
+      strategyVariantsLive: {
+        default:  variantDetailLive.default,
+        trailing: variantDetailLive.trailing,
+        block:    variantDetailLive.block,
+        dca:      variantDetailLive.dca,
+        pause:    variantDetailLive.pause,
+        overall:  variantOverallLive,
       },
 
       // ── Main-stage COORDINATION snapshot ────────��────────────────────────
