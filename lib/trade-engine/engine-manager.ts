@@ -3921,6 +3921,23 @@ export class TradeEngineManager {
   private async applyHotReload(_changedFields: string[]): Promise<void> {
     this.settingsVersion++
     try {
+      const changedFields = Array.isArray(_changedFields) ? _changedFields : []
+      const symbolRelatedFields = new Set([
+        "active_symbols",
+        "force_symbols",
+        "symbol_count",
+        "symbolCount",
+        "symbol_order",
+        "symbols",
+      ])
+      const shouldRefreshSymbols =
+        // PATCH /settings emits a durable generic `connection_settings`
+        // reload because the payload is nested/partial. Treat that as
+        // symbol-affecting here so correctness does not depend on the
+        // same-process API fast-path invalidation.
+        changedFields.includes("connection_settings") ||
+        changedFields.some((field) => symbolRelatedFields.has(field))
+
       const { getConnection } = await import("@/lib/redis-db")
       const fresh = await getConnection(this.connectionId)
       if (!fresh) {
@@ -3949,6 +3966,29 @@ export class TradeEngineManager {
         }
         if (Number.isFinite(Number(cs.realtimeTimeInterval))) {
           this.startConfig.realtimeInterval = Number(cs.realtimeTimeInterval)
+        }
+      }
+
+      if (shouldRefreshSymbols) {
+        // Durable cross-process cache bust: the settings API still
+        // invalidates the local manager as a latency optimization, but a
+        // production manager may live in a different process. On the reload
+        // event itself, force the next symbol lookup to re-read the durable
+        // sources (`trade_engine_state:{id}` first, then connection settings)
+        // and prime the cache before the next indication/strategy/realtime
+        // tick can reuse stale active-symbol state.
+        this.invalidateSymbolsCache()
+        try {
+          const symbols = await this.getSymbols()
+          console.log(
+            `[v0] [Engine ${this.connectionId}] hot-reload refreshed active-symbol cache (${symbols.length} symbols)`,
+          )
+        } catch (symbolErr) {
+          // getSymbols() has its own fallback path; keep hot-reload best-effort.
+          console.warn(
+            `[v0] [Engine ${this.connectionId}] hot-reload symbol-cache refresh failed:`,
+            symbolErr instanceof Error ? symbolErr.message : String(symbolErr),
+          )
         }
       }
 

@@ -548,8 +548,13 @@ export async function PATCH(
             config_set_symbols_total: resolved.length,
             updated_at: new Date().toISOString(),
           })
-          // 3. Invalidate the running engine's in-memory symbol cache so the
-          //    change takes effect on the next tick without a restart.
+          // 3. Fast-path only: invalidate the running engine's in-memory
+          //    symbol cache in this process so the change takes effect on the
+          //    next tick without waiting for the durable reload event.
+          //    Correctness does NOT depend on this call: production may run
+          //    the API route and engine manager in different processes, so
+          //    the manager also invalidates its cache when it consumes the
+          //    Redis-backed connection_settings reload event below.
           try {
             getTradeEngine()?.getEngineManager(id)?.invalidateSymbolsCache()
           } catch { /* engine may not be running yet — state above is enough */ }
