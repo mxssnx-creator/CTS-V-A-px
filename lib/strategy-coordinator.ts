@@ -4608,6 +4608,43 @@ export class StrategyCoordinator {
       })
     }
 
+    // Select the active Live dispatch model once and use it for both counters and
+    // exchange dispatch. `qualifying` is the candidate pool; `dispatchSets` is the
+    // selected active set list after applying the per-direction / per-variant Live
+    // model. Cumulative Live totals intentionally count selected active sets, not
+    // every candidate considered by the model.
+    const dispatchSets: StrategySet[] = []
+    {
+      let sawNewLong  = false
+      let sawNewShort = false
+      let sawBlockLong  = false
+      let sawBlockShort = false
+      let sawDcaLong    = false
+      let sawDcaShort   = false
+      for (const s of qualifying) {
+        const isBlock = s.variant === "block"
+        const isDca   = s.variant === "dca"
+        const isNew   = !isBlock && !isDca // default / trailing / pause
+        if (s.direction === "long") {
+          if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
+          if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
+          if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
+        } else {
+          if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
+          if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
+          if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
+        }
+        if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
+      }
+    }
+    const dispatchSuppressedCount = Math.max(0, qualifying.length - dispatchSets.length)
+
+    // Create pseudo positions from the LIVE-qualifying subset only.
+    // Previously received all `realSets` (up to 3000/symbol), causing N×3 Redis
+    // writes for sets that never reach live dispatch. `qualifying` is the capped
+    // Live candidate subset (typically ≤500/symbol) — dispatch selection is
+    // tracked separately below so the UI can compare candidates vs selected sets.
+    await this.createPseudoPositionsFromRealSets(symbol, qualifying)
     // Create pseudo positions from the actually selected LIVE dispatch subset only.
     // `qualifying` remains the candidate pool after PF/DDT/maxLive; `dispatchSets`
     // is the dedup-aware subset that may actually run this cycle.
@@ -4627,6 +4664,10 @@ export class StrategyCoordinator {
       const redisKey = `progression:${this.connectionId}`
       const liveDetailKey = `strategy_detail:${this.connectionId}:live`
       const liveCountKey = `strategies:${this.connectionId}:live:count`
+
+      const liveAvgPF  = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + st.avgProfitFactor, 0) / dispatchSets.length : 0
+      const liveAvgDDT = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / dispatchSets.length : 0
+      const passRatioLive = realSets.length > 0 ? dispatchSets.length / realSets.length : 0
       const generation = await this.currentStatsGeneration(client)
       const statsGeneration = await this.getStatsGeneration(client)
 
@@ -4768,6 +4809,8 @@ export class StrategyCoordinator {
         dispatchSets.length > 0
           ? client.hincrby(redisKey, "strategies_live_total", dispatchSets.length)
           : Promise.resolve(),
+        qualifying.length > 0
+          ? client.hincrby(redisKey, "strategies_live_candidates_total", qualifying.length)
         realSets.length > 0
           ? client.hincrby(redisKey, "strategies_live_evaluated", realSets.length)
           : Promise.resolve(),
@@ -4803,6 +4846,14 @@ export class StrategyCoordinator {
           created_sets:      String(dispatchSets.length),
           avg_profit_factor: String(liveAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(liveAvgDDT)),
+          evaluated:         String(realSets.length),
+          passed_sets:       String(dispatchSets.length),
+          pass_rate:         String(passRatioLive.toFixed(4)),
+          dispatch_candidates:       String(qualifying.length),
+          dispatch_selected_count:   String(dispatchSets.length),
+          dispatch_suppressed_count: String(dispatchSuppressedCount),
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
+          //   Live's `dispatchSets` are the selected active orders. They
           input_sets:        String(realSets.length),
           evaluated:         String(qualifying.length),
           passed_sets:       String(qualifying.length),
@@ -4858,8 +4909,8 @@ export class StrategyCoordinator {
           //   the real-stage input pool being ranked & capped this
           //   cycle (i.e. candidates currently progressing toward live
           //   execution).
-          sets_running_now:         String(qualifying.length),
-          sets_with_open_positions: String(qualifying.length),
+          sets_running_now:         String(dispatchSets.length),
+          sets_with_open_positions: String(dispatchSets.length),
           sets_progressing:         String(realSets.length),
           updated_at:        String(Date.now()),
           // Per-symbol fields — see createBaseSets for rationale.
@@ -4867,6 +4918,8 @@ export class StrategyCoordinator {
           // those keys are intentionally omitted from the per-symbol
           // bundle so /stats's weighted-mean calculator skips them.
           [`s:${symbol}:created`]:    String(dispatchSets.length),
+          [`s:${symbol}:entries`]:    String(dispatchSets.reduce((s, st) => s + (st.entryCount || 0), 0)),
+          [`s:${symbol}:running`]:    String(dispatchSets.length),
           [`s:${symbol}:entries`]:    String(dispatchEntryCount),
           [`s:${symbol}:running`]:    String(dispatchSets.length),
           [`s:${symbol}:progressing`]: String(qualifying.length),
@@ -4881,7 +4934,7 @@ export class StrategyCoordinator {
           [`s:${symbol}:entries`]:    String(qualifying.reduce((s, st) => s + (st.entryCount || 0), 0)),
           [`s:${symbol}:running`]:    String(qualifying.length),
           [`s:${symbol}:progressing`]: String(realSets.length),
-          [`s:${symbol}:passed`]:     String(qualifying.length),
+          [`s:${symbol}:passed`]:     String(dispatchSets.length),
           [`s:${symbol}:evaluated`]:  String(realSets.length),
           [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(liveAvgDDT)),
