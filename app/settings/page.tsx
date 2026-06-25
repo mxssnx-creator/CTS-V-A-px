@@ -395,7 +395,7 @@ const initialSettings: Settings = {
   validationTimeoutSeconds: 15,
   mainTradeInterval: 1,
   presetTradeInterval: 2,
-  positionCost: 0.1, // Fixed default to 0.1 (representing 0.1%)
+  positionCost: 0.02, // Fixed default to 0.02 (representing 0.02%)
   useMaximalLeverage: true,
   min_volume_enforcement: true, // Added missing min_volume_enforcement property
 
@@ -740,10 +740,14 @@ export default function SettingsPage() {
   const [newMainSymbol, setNewMainSymbol] = useState("")
   const [newForcedSymbol, setNewForcedSymbol] = useState("")
 
-  // FIX: positionCost default to 0.001 meaning 0.1% (displayed as 0.1%, not 10%)
+  // FIX: positionCost default to 0.02 meaning 0.02% (displayed as 0.02%, not 2%)
   const [settings, setSettings] = useState<Settings>({
     ...initialSettings,
     // Ensure defaults are applied if not present in initialSettings
+    positionCost: initialSettings.positionCost ?? 0.02, // 0.02% default (slider value)
+    exchangePositionCost: initialSettings.exchangePositionCost ?? 0.02, // Sync with positionCost
+    baseVolumeFactorLive: initialSettings.baseVolumeFactorLive ?? 1.0,
+    baseVolumeFactorPreset: initialSettings.baseVolumeFactorPreset ?? 1.0,
     positionCost: initialSettings.positionCost ?? 0.1, // 0.1% default (slider value)
     exchangePositionCost: initialSettings.exchangePositionCost ?? 0.1, // Sync with positionCost
     baseVolumeFactorLive: initialSettings.baseVolumeFactorLive ?? MIN_VOLUME_FACTOR,
@@ -991,7 +995,7 @@ export default function SettingsPage() {
           }
           // FIX: Ensure positionCost default is applied if not present in loaded data
           if (data.settings.positionCost === undefined) {
-            updatedSettings.positionCost = 0.1
+            updatedSettings.positionCost = 0.02
           }
           if (data.settings.negativeChangePercent === undefined) {
             updatedSettings.negativeChangePercent = 20
@@ -1711,7 +1715,7 @@ export default function SettingsPage() {
                 updatedSettings.maxActiveBasePseudoPositionsPerDirection = 1
               if (data.settings.maxConcurrentOperations === undefined) updatedSettings.maxConcurrentOperations = 100
               // Position cost default
-              if (data.settings.positionCost === undefined) updatedSettings.positionCost = 0.1
+              if (data.settings.positionCost === undefined) updatedSettings.positionCost = 0.02
               if (data.settings.negativeChangePercent === undefined) updatedSettings.negativeChangePercent = 20
               if (data.settings.leveragePercentage === undefined) updatedSettings.leveragePercentage = 100
               // Merge exchange-specific settings

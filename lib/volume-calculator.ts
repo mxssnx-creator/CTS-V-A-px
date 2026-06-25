@@ -496,9 +496,11 @@ export class VolumeCalculator {
         settings.exchange_position_cost ??
         "0.02"
       const positionCostPercent = parseFloat(String(positionCostRaw))
-      const positionCost = (Number.isFinite(positionCostPercent) && positionCostPercent > 0)
-        ? positionCostPercent / 100
-        : 0.02 / 100  // 0.02% absolute fallback
+      const clampedPositionCostPercent =
+        Number.isFinite(positionCostPercent) && positionCostPercent > 0
+          ? Math.max(0.02, Math.min(1.0, positionCostPercent))
+          : 0.02
+      const positionCost = clampedPositionCostPercent / 100  // 0.02% absolute fallback
 
       // ── Positions-average resolution ─────────────────────────────────
       // Same priority stack: connection_settings overlay → app_settings → default 2.
