@@ -6583,6 +6583,11 @@ export class StrategyCoordinator {
       avgConfidence:   avgCnf,
       avgDrawdownTime: avgDDT,
       entryCount:      count,
+      // EMPTY entries[] — Base entries resolved at dispatch via
+      // coordIndex.base.byKey.get(parentSetKey).  Eliminates the primary
+      // V8 heap driver (~80 000 object allocations per second).
+      entries:         [],
+      ...(baseSet.trailingProfile && { trailingProfile: baseSet.trailingProfile }),
       // Slim representative entry — keep exactly the variant config values
       // live dispatch needs for sizing/leverage/state, while avoiding the old
       // full baseEntry × profile.configs materialisation.
