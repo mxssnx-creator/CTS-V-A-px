@@ -393,6 +393,70 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
+type LiveSuppressionReason = "connector_unavailable" | "balance_unavailable"
+
+interface LiveDispatchSuppressedEntry {
+  setKey: string
+  symbol: string
+  direction: "long" | "short"
+  status: string
+  statusReason: string
+  reason: LiveSuppressionReason
+}
+
+const LIVE_DISPATCH_SUCCESS_STATUSES = new Set(["open", "filled", "partially_filled", "placed"])
+
+function classifyLiveSuppression(statusReason?: string): LiveSuppressionReason | null {
+  const reason = String(statusReason || "").toLowerCase()
+  if (!reason) return null
+
+  if (
+    reason.includes("balance") ||
+    reason.includes("margin") ||
+    reason.includes("insufficient") ||
+    reason.includes("notional") ||
+    reason.includes("quantity") ||
+    reason.includes("volume") ||
+    reason.includes("size") ||
+    reason.includes("minimum order")
+  ) {
+    return "balance_unavailable"
+  }
+
+  if (
+    reason.includes("connector") ||
+    reason.includes("preflight") ||
+    reason.includes("circuit breaker") ||
+    reason.includes("market price") ||
+    reason.includes("current price") ||
+    reason.includes("placeorder") ||
+    reason.includes("exchange") ||
+    reason.includes("api")
+  ) {
+    return "connector_unavailable"
+  }
+
+  return null
+}
+
+function fallbackLiveSuppression(statusReason?: string): LiveSuppressionReason {
+  const reason = String(statusReason || "").toLowerCase()
+  if (
+    reason.includes("balance") ||
+    reason.includes("margin") ||
+    reason.includes("insufficient") ||
+    reason.includes("notional") ||
+    reason.includes("quantity") ||
+    reason.includes("volume") ||
+    reason.includes("size") ||
+    reason.includes("minimum order")
+  ) {
+    return "balance_unavailable"
+  }
+
+  return "connector_unavailable"
+}
+
 // ─����������������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
@@ -3963,6 +4027,7 @@ export class StrategyCoordinator {
             let filled = 0
             let rejected = 0
             let errored = 0
+            const dispatchSuppressed: LiveDispatchSuppressedEntry[] = []
 
             for (const set of dispatchSets) {
               try {
@@ -4074,14 +4139,15 @@ export class StrategyCoordinator {
                 )
 
                 if (!liveResult) continue
-                if (liveResult.status === "open" || liveResult.status === "filled" || liveResult.status === "partially_filled") {
+                const liveStatus = String((liveResult as any).status || "unknown")
+                if (liveStatus === "open" || liveStatus === "filled" || liveStatus === "partially_filled") {
                   filled++
                   placed++
-                } else if (liveResult.status === "placed") {
+                } else if (liveStatus === "placed") {
                   placed++
-                } else if (liveResult.status === "rejected") {
+                } else if (liveStatus === "rejected") {
                   rejected++
-                } else if (liveResult.status === "error") {
+                } else if (liveStatus === "error") {
                   // 101204 (Insufficient margin) and other recoverable margin/rejection
                   // errors are counted as "rejected" not "errored" for accurate stats.
                   // Only truly exceptional errors (circuit breaker, API down, etc.) count as errored.
@@ -4091,6 +4157,20 @@ export class StrategyCoordinator {
                     errored++
                   }
                 }
+
+                if (!LIVE_DISPATCH_SUCCESS_STATUSES.has(liveStatus)) {
+                  const statusReason = String((liveResult as any).statusReason || (liveResult as any).reason || "")
+                  const suppressionReason =
+                    classifyLiveSuppression(statusReason) ?? fallbackLiveSuppression(statusReason)
+                  dispatchSuppressed.push({
+                    setKey: set.setKey,
+                    symbol,
+                    direction: set.direction,
+                    status: liveStatus,
+                    statusReason,
+                    reason: suppressionReason,
+                  })
+                }
               } catch (err) {
                 errored++
                 console.warn(
@@ -4098,6 +4178,27 @@ export class StrategyCoordinator {
                   err instanceof Error ? err.message : String(err)
                 )
               }
+            }
+
+            if (dispatchSuppressed.length > 0) {
+              const suppressedByReason = dispatchSuppressed.reduce<Record<LiveSuppressionReason, number>>(
+                (acc, entry) => {
+                  acc[entry.reason] = (acc[entry.reason] || 0) + 1
+                  return acc
+                },
+                { connector_unavailable: 0, balance_unavailable: 0 },
+              )
+              await logProgressionEvent(
+                this.connectionId,
+                "live_trading",
+                "warning",
+                `${symbol} live dispatch suppressed for ${dispatchSuppressed.length} selected set(s)`,
+                {
+                  symbol,
+                  dispatchSuppressed,
+                  suppressedByReason,
+                },
+              ).catch(() => {})
             }
 
             if (placed > 0 || errored > 0) {
