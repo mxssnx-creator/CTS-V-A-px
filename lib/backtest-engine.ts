@@ -15,6 +15,7 @@ interface BacktestTrade {
   entry_time: Date
   exit_time: Date
   profit_loss: number
+  signedResultR: number
   profit_factor: number
   signed_result_r: number
   strategy_config: any
@@ -355,6 +356,11 @@ export class BacktestEngine {
       exitTime = currentTime
     }
 
+    // Calculate P&L and cost-normalized signed return (R)
+    const profitLoss = side === "long" ? exitPrice - entryPrice : entryPrice - exitPrice
+    const signedPricePercent = (profitLoss / entryPrice) * 100
+    const positionCostPct = this.getPositionCostPct(strategy)
+    const signedResultR = signedPricePercent / positionCostPct
     // Calculate P&L and signed, cost-normalized return (R).
     const profitLoss = side === "long" ? exitPrice - entryPrice : entryPrice - exitPrice
     const signedResultR = calculateSignedResultR(entryPrice, exitPrice, side)
@@ -367,10 +373,23 @@ export class BacktestEngine {
       entry_time: entryTime,
       exit_time: exitTime,
       profit_loss: profitLoss,
+      signedResultR,
       profit_factor: Math.max(0, signedResultR),
       signed_result_r: signedResultR,
       strategy_config: strategy,
     }
+  }
+
+  private getPositionCostPct(strategy: any): number {
+    const rawPositionCostPct = Number(
+      strategy?.positionCostPct ??
+        strategy?.position_cost_pct ??
+        strategy?.position_cost ??
+        strategy?.positionCost ??
+        0.1,
+    )
+
+    return Number.isFinite(rawPositionCostPct) && rawPositionCostPct > 0 ? rawPositionCostPct : 0.1
   }
 
   /**
@@ -382,8 +401,8 @@ export class BacktestEngine {
     const losingTrades = trades.filter((t) => t.profit_loss <= 0).length
     const winRate = totalTrades > 0 ? (winningTrades / totalTrades) * 100 : 0
 
-    const totalProfit = trades.filter((t) => t.profit_loss > 0).reduce((sum, t) => sum + t.profit_loss, 0)
-    const totalLoss = Math.abs(trades.filter((t) => t.profit_loss <= 0).reduce((sum, t) => sum + t.profit_loss, 0))
+    const totalProfit = trades.filter((t) => t.signedResultR > 0).reduce((sum, t) => sum + t.signedResultR, 0)
+    const totalLoss = Math.abs(trades.filter((t) => t.signedResultR <= 0).reduce((sum, t) => sum + t.signedResultR, 0))
     const netProfit = totalProfit - totalLoss
     
     // Cost-adjusted PF: totalProfit / (totalLoss + totalPositionCosts)
@@ -416,7 +435,7 @@ export class BacktestEngine {
     const drawdownMetrics = this.calculateDrawdown(trades)
 
     // Calculate Sharpe and Sortino ratios
-    const returns = trades.map((t) => t.profit_loss)
+    const returns = trades.map((t) => t.signedResultR)
     const avgReturn = returns.reduce((sum, r) => sum + r, 0) / returns.length
     const stdDev = Math.sqrt(returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length)
     const sharpeRatio = stdDev > 0 ? avgReturn / stdDev : 0

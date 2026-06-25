@@ -216,6 +216,8 @@ export class IndicationEngine {
       entry_price: entryPrice,
       current_price: entryPrice,
       profit_factor: 0,
+      signedResultR: 0,
+      costNormalizedReturn: 0,
       position_cost: positionCost,
       status: "open",
       created_at: new Date().toISOString(),
@@ -226,12 +228,21 @@ export class IndicationEngine {
   // Update pseudo positions with current market data
   updatePseudoPositions(positions: PseudoPosition[], currentPrice: number): PseudoPosition[] {
     return positions.map((position) => {
+      const direction = position.direction === "short" ? "short" : "long"
+      const signedPricePercent =
+        direction === "long"
+          ? ((currentPrice - position.entry_price) / position.entry_price) * 100
+          : ((position.entry_price - currentPrice) / position.entry_price) * 100
+      const positionCostPct = Number.isFinite(position.position_cost) && position.position_cost > 0 ? position.position_cost : 0.1
+      const signedResultR = signedPricePercent / positionCostPct
       const direction = position.direction || "long"
       const signedResultR = calculateSignedResultR(position.entry_price, currentPrice, direction, position.position_cost)
 
       return {
         ...position,
         current_price: currentPrice,
+        signedResultR,
+        costNormalizedReturn: signedResultR,
         profit_factor: Math.max(0, signedResultR),
         signed_result_r: signedResultR,
         updated_at: new Date().toISOString(),
@@ -241,15 +252,15 @@ export class IndicationEngine {
 
   // Get indication statistics
   getIndicationStats(positions: PseudoPosition[]) {
-    const profitable = positions.filter((p) => p.profit_factor > 0).length
+    const profitable = positions.filter((p) => (p.signedResultR ?? p.costNormalizedReturn ?? p.profit_factor) > 0).length
     const total = positions.length
-    const avgProfitFactor = positions.reduce((sum, p) => sum + p.profit_factor, 0) / total
+    const avgSignedResultR = positions.reduce((sum, p) => sum + (p.signedResultR ?? p.costNormalizedReturn ?? p.profit_factor), 0) / total
 
     return {
       total_positions: total,
       profitable_positions: profitable,
       profit_ratio: profitable / total,
-      avg_profit_factor: avgProfitFactor,
+      avg_signed_result_r: avgSignedResultR,
       last_8_avg: this.calculateLastNAverage(positions, 8),
       last_20_avg: this.calculateLastNAverage(positions, 20),
       last_50_avg: this.calculateLastNAverage(positions, 50),
@@ -258,6 +269,6 @@ export class IndicationEngine {
 
   private calculateLastNAverage(positions: PseudoPosition[], n: number): number {
     const recent = positions.slice(-n)
-    return recent.reduce((sum, p) => sum + p.profit_factor, 0) / recent.length
+    return recent.reduce((sum, p) => sum + (p.signedResultR ?? p.costNormalizedReturn ?? p.profit_factor), 0) / recent.length
   }
 }
