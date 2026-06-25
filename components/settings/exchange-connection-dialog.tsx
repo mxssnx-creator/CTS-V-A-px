@@ -1,5 +1,6 @@
 "use client"
 
+import { MIN_VOLUME_FACTOR } from "@/lib/constants"
 import { useState, useEffect } from "react"
 import {
   Dialog,
@@ -452,9 +453,9 @@ export function ExchangeConnectionDialog({
         ...form,
         connection_settings: {
           // Volume factor only for active connections (not predefined)
-          baseVolumeFactor: globalSettings?.base_volume_factor || 1.0,
-          baseVolumeFactorLive: 1.0,
-          baseVolumeFactorPreset: 1.0,
+          baseVolumeFactor: globalSettings?.base_volume_factor ?? MIN_VOLUME_FACTOR,
+          baseVolumeFactorLive: MIN_VOLUME_FACTOR,
+          baseVolumeFactorPreset: MIN_VOLUME_FACTOR,
           
           // Use indication settings as defaults
           indicationTimeInterval: indicationSettings?.direction?.interval || 1,

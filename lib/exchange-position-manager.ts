@@ -38,7 +38,7 @@ export interface ExchangePositionCreateParams {
   // `LivePosition.setKey` etc. exactly — see live-stage.ts for docs.
   setKey?: string
   parentSetKey?: string
-  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
+  setVariant?: "default" | "trailing" | "block" | "dca"
   axisWindows?: { prev: number; last: number; cont: number; pause: number }
 }
 
@@ -373,7 +373,19 @@ export class ExchangePositionManager {
 
       const totalWins = closedPositions.filter((p) => (p.realized_pnl || 0) > 0).reduce((sum, p) => sum + (p.realized_pnl || 0), 0)
       const totalLosses = Math.abs(closedPositions.filter((p) => (p.realized_pnl || 0) < 0).reduce((sum, p) => sum + (p.realized_pnl || 0), 0))
-      const profitFactor = totalLosses > 0 ? totalWins / totalLosses : totalWins > 0 ? 999 : 0
+      
+      // Cost-adjusted PF: totalWinPnL / (totalLossPnL + totalPositionCosts)
+      // Position cost = entry_price × quantity × 0.001 (0.1% maker fee)
+      const totalPositionCosts = closedPositions.reduce((sum, p) => {
+        if (Number.isFinite(p.entry_price) && Number.isFinite(p.quantity) && 
+            p.entry_price > 0 && p.quantity > 0) {
+          return sum + (p.entry_price * p.quantity * 0.001)
+        }
+        return sum
+      }, 0)
+      
+      const adjustedDenominator = totalLosses + totalPositionCosts
+      const profitFactor = adjustedDenominator > 0 ? totalWins / adjustedDenominator : totalWins > 0 ? 999 : 0
 
       const statsKey = `exchange_stats:${connectionId}:${symbol}:${indicationType || "preset"}:${tradeMode}`
       await setSettings(statsKey, {

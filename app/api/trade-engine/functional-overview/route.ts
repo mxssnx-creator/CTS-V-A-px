@@ -3,6 +3,7 @@ import { initRedis, getRedisClient, getAllConnections, getSettings, getAssignedA
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
+export const dynamic = "force-dynamic"
 export const revalidate = 0
 export const fetchCache = "force-no-store"
 

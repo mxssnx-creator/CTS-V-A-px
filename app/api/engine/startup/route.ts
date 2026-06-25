@@ -8,6 +8,7 @@ import { TradeEngineManager } from "@/lib/trade-engine/engine-manager"
 import { getSettings, setSettings, initRedis } from "@/lib/redis-db"
 import { loadMarketDataForEngine } from "@/lib/market-data-loader"
 
+export const dynamic = "force-dynamic"
 export const maxDuration = 60
 
 export async function POST(request: NextRequest) {
