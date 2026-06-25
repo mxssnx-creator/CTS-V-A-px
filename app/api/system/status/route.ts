@@ -8,6 +8,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import { ConnectionCoordinator } from "@/lib/connection-coordinator"
 import { BatchProcessor } from "@/lib/batch-processor"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const coordinator = ConnectionCoordinator.getInstance()
