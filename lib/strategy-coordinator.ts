@@ -528,6 +528,66 @@ function axisKeyOf(prev: number, last: number, cont: number, outcome: AxisOutcom
   return AXIS_KEY_TABLE.get(`${prev}|${last}|${cont}|${outcome}|${dir}`)!
 }
 
+export type LiveSuppressionReason =
+  | "insufficient_margin"
+  | "balance_unavailable"
+  | "unknown"
+
+/**
+ * Classify LIVE-stage suppression text into stable operator-facing reasons.
+ *
+ * Margin failures intentionally run before balance/volume checks: BingX code
+ * 101204 and explicit "insufficient margin" messages mean the exchange rejected
+ * margin availability, even if the same payload also mentions balance.
+ */
+export function classifyLiveSuppression(payload: unknown): LiveSuppressionReason {
+  let text = ""
+  if (typeof payload === "string") {
+    text = payload
+  } else if (payload instanceof Error) {
+    text = payload.message
+  } else if (payload && typeof payload === "object") {
+    const obj = payload as Record<string, unknown>
+    text = [
+      obj.code,
+      obj.errorCode,
+      obj.error,
+      obj.message,
+      obj.reason,
+      obj.details,
+    ]
+      .filter((part) => part !== undefined && part !== null)
+      .map(String)
+      .join(" ")
+  } else if (payload !== undefined && payload !== null) {
+    text = String(payload)
+  }
+
+  const lc = text.toLowerCase()
+  if (!lc) return "unknown"
+
+  if (
+    /\b101204\b/.test(lc) ||
+    lc.includes("insufficient margin") ||
+    lc.includes("not enough margin")
+  ) {
+    return "insufficient_margin"
+  }
+
+  if (
+    lc.includes("insufficient balance") ||
+    lc.includes("not enough balance") ||
+    lc.includes("computedvolume=0") ||
+    lc.includes("calculator returned no usable quantity") ||
+    lc.includes("volume calc") ||
+    lc.includes("volume calculation")
+  ) {
+    return "balance_unavailable"
+  }
+
+  return "unknown"
+}
+
 export interface StrategyCoordinatorConfig {
   maxEntriesPerSet?: number   // Default 250 (entries inside one Set)
   maxLiveSets?: number        // Default: max per exchange type (e.g. 500 for bybit, 150 for okx)
