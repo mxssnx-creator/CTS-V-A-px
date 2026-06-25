@@ -2522,12 +2522,83 @@ export async function executeLivePosition(
     // the leverage and retry ONCE — this is often enough to get the
     // minimum margin requirement below the available balance.
     if (!orderResult?.success && isNonRecoverableExchangeError(orderResult)) {
+      const originalRetryDiagnostics = {
+        leverage: livePosition.leverage,
+        quantity: computedVolume,
+        notional: computedVolume * currentPrice,
+      }
       const reducedLev = Math.max(1, Math.floor(livePosition.leverage / 2))
       if (reducedLev < livePosition.leverage) {
         console.warn(
-          `${LOG_PREFIX} 101204 on ${realPosition.symbol} — retrying with halved leverage ` +
+          `${LOG_PREFIX} 101204 on ${realPosition.symbol} — recalculating volume for reduced leverage ` +
           `${livePosition.leverage}x → ${reducedLev}x`,
         )
+
+        const reducedVolumeResult = await VolumeCalculator.calculateVolumeForConnection(
+          connectionId,
+          realPosition.symbol,
+          currentPrice,
+          {
+            tradeMode: liveTradeMode,
+            sizeMultiplier: realPosition.sizeMultiplier,
+            leverageOverride: reducedLev,
+          },
+        ).catch(err => {
+          console.error(`${LOG_PREFIX} reduced leverage volume calc error:`, err)
+          return null
+        })
+
+        const reducedComputedVolume = reducedVolumeResult?.finalVolume || reducedVolumeResult?.volume || 0
+        const reducedNotional = reducedComputedVolume * currentPrice
+        const riskBudgetNotional = originalRetryDiagnostics.notional
+        const retryDiagnostics = {
+          original: originalRetryDiagnostics,
+          reduced: {
+            leverage: reducedLev,
+            quantity: reducedComputedVolume,
+            notional: reducedNotional,
+            calculatedQuantity: reducedVolumeResult?.calculatedVolume,
+            adjustmentReason: reducedVolumeResult?.adjustmentReason,
+          },
+          final: { accepted: false, reason: "pending" },
+        }
+        livePosition.exchangeData = {
+          ...(livePosition.exchangeData || {}),
+          leverageReductionRetry: retryDiagnostics,
+        }
+
+        const calculatedQty = reducedVolumeResult?.calculatedVolume ?? reducedComputedVolume
+        const belowExchangeMinimum = !!reducedVolumeResult?.volumeAdjusted &&
+          Number.isFinite(calculatedQty) &&
+          calculatedQty > 0 &&
+          reducedComputedVolume > calculatedQty
+        const exceedsRiskBudget = reducedNotional > riskBudgetNotional * 1.000001
+        const invalidReducedQty = reducedComputedVolume <= 0 || !Number.isFinite(reducedComputedVolume)
+
+        if (invalidReducedQty || belowExchangeMinimum || exceedsRiskBudget) {
+          const reason = invalidReducedQty
+            ? "reduced_leverage_volume_invalid"
+            : belowExchangeMinimum
+              ? "reduced_leverage_quantity_below_exchange_minimum"
+              : "reduced_leverage_notional_exceeds_strategy_risk_budget"
+          retryDiagnostics.final = { accepted: false, reason }
+          livePosition.status = "rejected"
+          livePosition.statusReason = `${reason}: original ${originalRetryDiagnostics.leverage}x qty=${originalRetryDiagnostics.quantity} notional=${originalRetryDiagnostics.notional.toFixed(2)}, reduced ${reducedLev}x qty=${reducedComputedVolume} notional=${reducedNotional.toFixed(2)}`
+          pushStep(livePosition, "leverage_reduce_retry", false, livePosition.statusReason)
+          await savePosition(livePosition)
+          await incrementMetric(connectionId, "live_orders_rejected_count")
+          await logProgressionEvent(connectionId, "live_trading", "warning", livePosition.statusReason, {
+            symbol: realPosition.symbol,
+            diagnostics: retryDiagnostics,
+          }).catch(() => {})
+          return livePosition
+        }
+
+        computedVolume = reducedComputedVolume
+        livePosition.quantity = computedVolume
+        livePosition.remainingQuantity = computedVolume
+        livePosition.volumeUsd = reducedNotional
+
         try {
           if (typeof exchangeConnector.setLeverage === "function") {
             await exchangeConnector.setLeverage(realPosition.symbol, reducedLev)
@@ -2549,7 +2620,7 @@ export async function executeLivePosition(
                 strategySetKey: livePosition.setKey,
                 realPositionId: realPosition.id,
                 attempt: placeAttempt,
-                label: "leverage-halved",
+                label: "leverage-recalculated",
               },
               () => exchangeConnector.placeOrder(
                 realPosition.symbol,
@@ -2568,102 +2639,20 @@ export async function executeLivePosition(
         )
 
         if (retryResult?.success && (retryResult.orderId || retryResult.id)) {
-          // Succeeded with reduced leverage — update livePosition and continue.
           livePosition.leverage = reducedLev
+          retryDiagnostics.final = { accepted: true, reason: "accepted_recalculated_reduced_leverage" }
           orderResult = retryResult
+          pushStep(livePosition, "leverage_reduce_retry", true, `accepted recalculated qty=${computedVolume} notional=${reducedNotional.toFixed(2)} lev=${reducedLev}x`)
           console.log(
-            `${LOG_PREFIX} Entry succeeded after leverage reduction to ${reducedLev}x for ${realPosition.symbol}`,
+            `${LOG_PREFIX} Entry succeeded after recalculating volume at reduced leverage ${reducedLev}x for ${realPosition.symbol}`,
           )
-        } else if (isNonRecoverableExchangeError(retryResult)) {
-          // Both the original and the halved-leverage attempt failed with
-          // 101204. Try one last time at leverage=1 with the smallest known
-          // per-symbol quantity (lowest possible margin requirement).
-          //
-          // Prefer the stored exchange minimum from the 101400 handler
-          // (`settings:trading_pair:{sym}` → `min_order_size`). Fall back to
-          // $5/price. At lev=1 the required margin equals the full notional,
-          // so even a tiny qty has the best chance of fitting in the available
-          // free margin.
-          let minQtyForSymbol = currentPrice > 0 ? 5 / currentPrice : 0
-          try {
-            const redisClient = getRedisClient()
-            if (redisClient) {
-              const storedMin = await redisClient.hget(
-                `settings:trading_pair:${realPosition.symbol}`,
-                "min_order_size",
-              )
-              const parsedStoredMin = storedMin ? parseFloat(storedMin) : 0
-              if (parsedStoredMin > 0) {
-                // Use the stored exchange minimum — it is guaranteed to pass
-                // the exchange qty gate; only margin may still fail.
-                minQtyForSymbol = parsedStoredMin
-              }
-            }
-          } catch { /* non-critical; fall back to $5/price */ }
-
-          // Only attempt if the quantity is meaningfully different from what
-          // we already tried (tolerance: 0.1% difference).
-          const quantityDiffPct = computedVolume > 0
-            ? Math.abs(minQtyForSymbol - computedVolume) / computedVolume
-            : 1
-          if (minQtyForSymbol > 0 && quantityDiffPct > 0.001) {
-            console.warn(
-              `${LOG_PREFIX} 101204 at ${reducedLev}x still fails on ${realPosition.symbol} — ` +
-              `trying lev=1 with min notional qty=${minQtyForSymbol.toFixed(8)}`,
-            )
-            try {
-              if (typeof exchangeConnector.setLeverage === "function") {
-                await exchangeConnector.setLeverage(realPosition.symbol, 1)
-              }
-            } catch { /* non-critical */ }
-            placeAttempt += 1
-            const minResult: any = await withLiveOrderLogging(
-              orderTrace,
-              {
-                quantity: minQtyForSymbol,
-                price: currentPrice,
-                leverage: 1,
-                marginType: livePosition.marginType ?? "unknown",
-                orderType: "market",
-                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
-                strategySetKey: livePosition.setKey,
-                realPositionId: realPosition.id,
-                attempt: placeAttempt,
-                label: "min-notional-lev1",
-              },
-              async () => {
-                const r = await exchangeConnector.placeOrder(
-                  realPosition.symbol,
-                  exchangeSide,
-                  minQtyForSymbol,
-                  undefined,
-                  "market",
-                  { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
-                )
-                return r
-              },
-            ).then(({ raw }) => raw).catch(() => null)
-            if (minResult?.success && (minResult.orderId || minResult.id)) {
-              livePosition.leverage = 1
-              computedVolume = minQtyForSymbol
-              orderResult = minResult
-              console.log(
-                `${LOG_PREFIX} Entry succeeded at lev=1 min-notional for ${realPosition.symbol}`,
-              )
-            } else {
-              console.warn(
-                `${LOG_PREFIX} 101204 at lev=1 min-notional also failed for ${realPosition.symbol} — recording margin error`,
-              )
-              recordMarginError(connectionId)
-              orderResult = minResult ?? retryResult ?? orderResult
-            }
-          } else {
-            // qty would be the same as before — no point retrying.
-            recordMarginError(connectionId)
-            orderResult = retryResult ?? orderResult
-          }
         } else {
-          // Non-margin failure after leverage reduction — give up normally.
+          retryDiagnostics.final = {
+            accepted: false,
+            reason: isNonRecoverableExchangeError(retryResult)
+              ? "recalculated_reduced_leverage_insufficient_margin"
+              : "recalculated_reduced_leverage_rejected",
+          }
           recordMarginError(connectionId)
           orderResult = retryResult ?? orderResult
         }

@@ -445,6 +445,11 @@ export class VolumeCalculator {
       // Block/DCA variant multiplier from RealPosition.sizeMultiplier.
       // Absent / undefined → treated as 1.0 (no Block/DCA scaling).
       sizeMultiplier?: number
+      // Live-stage margin retries can ask for a concrete leverage target
+      // after an exchange-side leverage reduction. This keeps quantity
+      // sizing coupled to the new margin target instead of blindly
+      // resubmitting the quantity calculated for the original leverage.
+      leverageOverride?: number
     } = {},
   ): Promise<VolumeCalculationResult> {
     try {
@@ -547,9 +552,12 @@ export class VolumeCalculator {
                             settings.useMaximalLeverage === "true" ||
                             settings.useMaximalLeverage === undefined  // default on
       const levPct        = Math.max(1, Math.min(100, parseFloat(String(settings.leveragePercentage ?? "100"))))
-      const rawLeverage   = useMaximal
-        ? exchangeMax
-        : Math.max(1, Math.round(exchangeMax * (levPct / 100)))
+      const overrideLeverage = Number(options.leverageOverride)
+      const rawLeverage   = Number.isFinite(overrideLeverage) && overrideLeverage > 0
+        ? Math.max(1, Math.floor(overrideLeverage))
+        : useMaximal
+          ? exchangeMax
+          : Math.max(1, Math.round(exchangeMax * (levPct / 100)))
 
       // Delegate balance-fetch + leverage-cap to the helper method so the
       // logic lives in its own clean scope (no let mutation, no TDZ risk).
