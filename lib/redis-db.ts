@@ -404,13 +404,15 @@ export class InlineLocalRedis {
     // Total safe limit: 400MB heap + 1.6GB persistent = 2GB, leaving 2GB system buffer.
     const HEAP_PRESSURE_MB = 400
 
-    // Run an immediate targeted flush at startup to clear volatile key families
-    // that accumulate across hot-reload cycles (the globalThis Map persists
-    // between Next.js hot-reloads without a full process restart). This runs
-    // UNCONDITIONALLY in dev — even if totalKeys is low — because the OOM-
-    // causing families (strategies: lists, indication: strings, pseudo_position:
-    // hashes) can hold 20+ MB each while only occupying a few hundred key slots.
-    setTimeout(() => {
+    // Run an immediate targeted flush SYNCHRONOUSLY before migrations at startup
+    // to clear volatile key families that accumulate across hot-reload cycles
+    // (the globalThis Map persists between Next.js hot-reloads without a full
+    // process restart). This MUST run in dev BEFORE migrations are called, not
+    // after, to ensure migrations see a clean state. This runs UNCONDITIONALLY
+    // in dev — even if totalKeys is low — because the OOM-causing families
+    // (strategies: lists, indication: strings, pseudo_position: hashes) can hold
+    // 20+ MB each while only occupying a few hundred key slots.
+    try {
       try {
         if (process.env.NODE_ENV === "development") {
           let flushed = 0
@@ -558,8 +560,9 @@ export class InlineLocalRedis {
                         this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
           console.log(`[v0] [Redis Memory] Startup eviction complete: ${totalKeys} → ${after} keys`)
         }
-      } catch (_) {}
-    }, 500)
+      } catch (err) {
+        console.warn(`[v0] [Redis Memory] Dev startup flush error:`, err)
+      }
 
     const ttlCleanupTimer = setInterval(() => {
       try {
@@ -1899,7 +1902,7 @@ export async function getConnection(id: string): Promise<any | null> {
   return parseHash(hash)
 }
 
-// ──────────�����─────────────────────────────────────────────��───────────────────
+// ──────────�������─────────────────────────────────────────────��───────────────────
 // PERF: in-memory TTL cache for `getAllConnections`.
 // The dashboard polls every ~8s and each active card fans out multiple
 // per-connection requests. Without this cache we issue N KEYS + N HGETALL
