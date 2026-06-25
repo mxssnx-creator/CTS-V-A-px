@@ -61,6 +61,17 @@ interface VolumeCalculationResult {
   volumeAdjusted: boolean
   adjustmentReason?: string
   riskAmount?: number
+  /** Pure strategy notional before exchange/universal minimum floors. */
+  intendedNotionalUsd?: number
+  /** Exchange/universal minimum notional implied by the effective quantity floor. */
+  exchangeMinNotionalUsd?: number
+  /** Raw sizing inputs echoed for live-stage risk validation and diagnostics. */
+  accountBalance?: number
+  positionCost?: number
+  positionsAverage?: number
+  liveEngineFactor?: number
+  sizeMultiplier?: number
+  exchangeMinVolume?: number
 }
 
 export class VolumeCalculator {
@@ -303,6 +314,14 @@ export class VolumeCalculator {
         leverage,
         volumeAdjusted: adjusted || liveEngineFactor !== 1 || variantMult !== 1,
         adjustmentReason: composedReason,
+        intendedNotionalUsd: positionSizeUsd,
+        exchangeMinNotionalUsd: effectiveMin * currentPrice,
+        accountBalance,
+        positionCost,
+        positionsAverage: posAvg,
+        liveEngineFactor,
+        sizeMultiplier: variantMult,
+        exchangeMinVolume: effectiveMin,
       }
     }
 
@@ -329,6 +348,14 @@ export class VolumeCalculator {
       volumeAdjusted: adjusted,
       adjustmentReason: reason,
       riskAmount: adjustedRisk,
+      intendedNotionalUsd: rawVolume * currentPrice,
+      exchangeMinNotionalUsd: effectiveMin * currentPrice,
+      accountBalance,
+      positionCost,
+      positionsAverage,
+      liveEngineFactor,
+      sizeMultiplier: 1,
+      exchangeMinVolume: effectiveMin,
     }
   }
 
@@ -445,6 +472,11 @@ export class VolumeCalculator {
       // Block/DCA variant multiplier from RealPosition.sizeMultiplier.
       // Absent / undefined → treated as 1.0 (no Block/DCA scaling).
       sizeMultiplier?: number
+      // Live-stage margin retries can ask for a concrete leverage target
+      // after an exchange-side leverage reduction. This keeps quantity
+      // sizing coupled to the new margin target instead of blindly
+      // resubmitting the quantity calculated for the original leverage.
+      leverageOverride?: number
     } = {},
   ): Promise<VolumeCalculationResult> {
     try {
@@ -549,9 +581,12 @@ export class VolumeCalculator {
                             settings.useMaximalLeverage === "true" ||
                             settings.useMaximalLeverage === undefined  // default on
       const levPct        = Math.max(1, Math.min(100, parseFloat(String(settings.leveragePercentage ?? "100"))))
-      const rawLeverage   = useMaximal
-        ? exchangeMax
-        : Math.max(1, Math.round(exchangeMax * (levPct / 100)))
+      const overrideLeverage = Number(options.leverageOverride)
+      const rawLeverage   = Number.isFinite(overrideLeverage) && overrideLeverage > 0
+        ? Math.max(1, Math.floor(overrideLeverage))
+        : useMaximal
+          ? exchangeMax
+          : Math.max(1, Math.round(exchangeMax * (levPct / 100)))
 
       // Delegate balance-fetch + leverage-cap to the helper method so the
       // logic lives in its own clean scope (no let mutation, no TDZ risk).
@@ -635,6 +670,13 @@ export class VolumeCalculator {
         volume_usd: calculation.volumeUsd,
         volume_adjusted: calculation.volumeAdjusted,
         adjustment_reason: calculation.adjustmentReason || null,
+        intended_notional_usd: calculation.intendedNotionalUsd,
+        exchange_min_notional_usd: calculation.exchangeMinNotionalUsd,
+        account_balance: calculation.accountBalance,
+        position_cost: calculation.positionCost,
+        positions_average: calculation.positionsAverage,
+        live_engine_factor: calculation.liveEngineFactor,
+        size_multiplier: calculation.sizeMultiplier,
         created_at: new Date().toISOString(),
       }))
 

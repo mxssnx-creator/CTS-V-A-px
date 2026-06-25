@@ -171,7 +171,11 @@ export interface StrategyStageTracking {
     setsRunningNow: number           // ★ alias of setsActive (running orders)
     setsWithOpenPositions: number    // alias of setsActive (real exchange orders)
     setsProgressing: number          // Sets being evaluated for live execution
-    setsTotal: number                 // best 500 ranked
+    setsTotal: number                 // cumulative selected/created Live sets
+    setsCandidatesTotal: number       // cumulative Live candidates before active model selection
+    dispatchCandidates: number        // latest cycle candidates before selection
+    dispatchSelectedCount: number     // latest cycle selected active Live sets
+    dispatchSuppressedCount: number   // latest cycle candidates not selected for dispatch
     avgProfitFactor: number
     cap: number                       // maxLiveSets, default 500
   }
@@ -578,6 +582,10 @@ export async function getStrategyTracking(
       setsWithOpenPositions: Number(liveDetail.sets_running_now || liveDetail.sets_with_open_positions || liveActive),
       setsProgressing: Number(liveDetail.sets_progressing || "0"),
       setsTotal: Number(prog.strategies_live_total || "0"),
+      setsCandidatesTotal: Number(prog.strategies_live_candidates_total || "0"),
+      dispatchCandidates: Number(liveDetail.dispatch_candidates || "0"),
+      dispatchSelectedCount: Number(liveDetail.dispatch_selected_count || liveDetail.sets_running_now || liveActive),
+      dispatchSuppressedCount: Number(liveDetail.dispatch_suppressed_count || "0"),
       avgProfitFactor: Number(prog.live_avg_profit_factor || "0"),
       cap: Number(settings.maxLiveSets || "500"),
     },

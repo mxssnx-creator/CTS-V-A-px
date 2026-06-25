@@ -32,6 +32,7 @@ import { VolumeCalculator } from "@/lib/volume-calculator"
 import { SystemLogger } from "@/lib/system-logger"
 import type { RealPosition } from "./real-stage"
 import { getEngineTimings } from "@/lib/engine-timings"
+import { aggregateLastXClosedPositions, type ClosedPositionLike } from "@/lib/trade-engine/closed-position-aggregation"
 import { withTimeout } from "@/lib/async-safety"
 import { getMaxLeverageForExchange } from "@/lib/leverage-policy"
 import {
@@ -43,6 +44,197 @@ import {
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
+const DEFAULT_ROUND_TRIP_FEE_PERCENT = 0.12
+const DEFAULT_SLIPPAGE_BUFFER_PERCENT = 0.05
+const DEFAULT_ATR_FLOOR_PERCENT = 0.25
+const MAX_PRACTICAL_TAKE_PROFIT_PERCENT = 22
+
+export interface LiveMicrostructureProtection {
+  stopLossPct: number
+  takeProfitPct: number
+  slFloorReason: string
+  netEffectivePF: number
+  viable: boolean
+  suppressReason?: "risk_reward_not_live_viable"
+  spreadPct: number
+  slippagePct: number
+  atrPct: number
+  feePct: number
+  maxTakeProfitPct: number
+}
+
+function parsePositiveNumber(value: unknown, fallback = 0): number {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+async function estimateRecentMicrostructure(symbol: string): Promise<{
+  spreadPct: number
+  slippagePct: number
+  atrPct: number
+}> {
+  const { getMarketData, getRedisClient } = await import("@/lib/redis-db")
+  let spreadPct = 0
+  let atrPct = 0
+  try {
+    const client = getRedisClient()
+    const mdHash = (await client.hgetall(`market_data:${symbol}`).catch(() => ({} as Record<string, string>))) || {}
+    const bid = parsePositiveNumber(mdHash.bid ?? mdHash.bestBid ?? mdHash.best_bid)
+    const ask = parsePositiveNumber(mdHash.ask ?? mdHash.bestAsk ?? mdHash.best_ask)
+    const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : parsePositiveNumber(mdHash.close ?? mdHash.price)
+    if (bid > 0 && ask > 0 && ask >= bid && mid > 0) {
+      spreadPct = ((ask - bid) / mid) * 100
+    }
+  } catch { /* best-effort */ }
+
+  try {
+    const data = await getMarketData(symbol, "1m").catch(() => null)
+    const rows = Array.isArray(data) ? data.slice(-20) : Array.isArray(data?.candles) ? data.candles.slice(-20) : []
+    const trs: number[] = []
+    let prevClose = 0
+    for (const row of rows) {
+      const high = parsePositiveNumber(row?.high ?? row?.[2])
+      const low = parsePositiveNumber(row?.low ?? row?.[3])
+      const close = parsePositiveNumber(row?.close ?? row?.[4] ?? row?.price)
+      if (high > 0 && low > 0 && close > 0) {
+        const tr = Math.max(high - low, prevClose > 0 ? Math.abs(high - prevClose) : 0, prevClose > 0 ? Math.abs(low - prevClose) : 0)
+        trs.push(tr)
+        prevClose = close
+      }
+    }
+    if (trs.length > 0 && prevClose > 0) {
+      atrPct = (trs.reduce((s, v) => s + v, 0) / trs.length / prevClose) * 100
+    }
+  } catch { /* best-effort */ }
+
+  if (!Number.isFinite(spreadPct) || spreadPct <= 0) spreadPct = 0.03
+  if (!Number.isFinite(atrPct) || atrPct <= 0) atrPct = DEFAULT_ATR_FLOOR_PERCENT
+  return {
+    spreadPct,
+    slippagePct: Math.max(DEFAULT_SLIPPAGE_BUFFER_PERCENT, spreadPct * 0.5),
+    atrPct,
+  }
+}
+
+export async function assessLiveMicrostructureProtection(args: {
+  connectionId: string
+  symbol: string
+  stopLossPct: number
+  takeProfitPct: number
+  profitFactor: number
+}): Promise<LiveMicrostructureProtection> {
+  const micro = await estimateRecentMicrostructure(args.symbol)
+  const exchangeFloor = MIN_EXCHANGE_STOP_LOSS_PERCENT
+  const costFloor = DEFAULT_ROUND_TRIP_FEE_PERCENT + micro.spreadPct + micro.slippagePct
+  const volatilityFloor = Math.max(DEFAULT_ATR_FLOOR_PERCENT, micro.atrPct)
+  const stopLossPct = Math.max(args.stopLossPct, exchangeFloor, costFloor, volatilityFloor)
+  const pf = Math.max(1, parsePositiveNumber(args.profitFactor, args.takeProfitPct / Math.max(args.stopLossPct, 0.000001)))
+  const takeProfitPct = stopLossPct * pf
+  const feeAndFriction = DEFAULT_ROUND_TRIP_FEE_PERCENT + micro.spreadPct + micro.slippagePct
+  const netEffectivePF = Math.max(0, takeProfitPct - feeAndFriction) / Math.max(0.000001, stopLossPct + feeAndFriction)
+  const floorMap = [
+    { name: "exchange_min_sl", value: exchangeFloor },
+    { name: "fee_spread_slippage", value: costFloor },
+    { name: "atr_volatility_floor", value: volatilityFloor },
+    { name: "strategy_sl", value: args.stopLossPct },
+  ].sort((a, b) => b.value - a.value)
+  const slFloorReason = `${floorMap[0].name}: SL ${args.stopLossPct.toFixed(4)}% → ${stopLossPct.toFixed(4)}% ` +
+    `(fee=${DEFAULT_ROUND_TRIP_FEE_PERCENT.toFixed(4)}%, spread=${micro.spreadPct.toFixed(4)}%, ` +
+    `slippage=${micro.slippagePct.toFixed(4)}%, atr=${micro.atrPct.toFixed(4)}%)`
+  const viable = takeProfitPct <= MAX_PRACTICAL_TAKE_PROFIT_PERCENT
+  return {
+    stopLossPct,
+    takeProfitPct,
+    slFloorReason,
+    netEffectivePF,
+    viable,
+    suppressReason: viable ? undefined : "risk_reward_not_live_viable",
+    spreadPct: micro.spreadPct,
+    slippagePct: micro.slippagePct,
+    atrPct: micro.atrPct,
+    feePct: DEFAULT_ROUND_TRIP_FEE_PERCENT,
+    maxTakeProfitPct: MAX_PRACTICAL_TAKE_PROFIT_PERCENT,
+  }
+}
+
+const DEFAULT_MIN_NOTIONAL_RISK_TOLERANCE_PCT = 25
+const MIN_NOTIONAL_RISK_REASON = "min_notional_exceeds_strategy_risk"
+
+function parseMinNotionalRiskTolerance(settings: Record<string, unknown> | null | undefined): number {
+  const raw = settings?.min_notional_risk_tolerance_pct
+    ?? settings?.minNotionalRiskTolerancePct
+    ?? settings?.min_notional_tolerance_pct
+    ?? settings?.minNotionalTolerancePct
+    ?? DEFAULT_MIN_NOTIONAL_RISK_TOLERANCE_PCT
+  const pct = Number(raw)
+  if (!Number.isFinite(pct) || pct < 0) return DEFAULT_MIN_NOTIONAL_RISK_TOLERANCE_PCT / 100
+  return pct / 100
+}
+
+function buildMinNotionalRiskDetail(args: {
+  volumeResult: any
+  currentPrice: number
+  computedVolume: number
+  tolerance: number
+}): { shouldSuppress: boolean; detail: Record<string, unknown> } {
+  const { volumeResult, currentPrice, computedVolume, tolerance } = args
+  const calculatedVolume = Number(volumeResult?.calculatedVolume)
+  const explicitIntended = Number(volumeResult?.intendedNotionalUsd)
+  const accountBalance = Number(volumeResult?.accountBalance)
+  const positionCost = Number(volumeResult?.positionCost)
+  const positionsAverage = Number(volumeResult?.positionsAverage)
+  const liveEngineFactor = Number(volumeResult?.liveEngineFactor)
+  const sizeMultiplier = Number(volumeResult?.sizeMultiplier)
+  const recomputedIntended =
+    Number.isFinite(accountBalance) && accountBalance > 0 &&
+    Number.isFinite(positionCost) && positionCost > 0 &&
+    Number.isFinite(positionsAverage) && positionsAverage > 0
+      ? (
+          accountBalance *
+          positionCost *
+          (Number.isFinite(liveEngineFactor) && liveEngineFactor > 0 ? liveEngineFactor : 1) *
+          (Number.isFinite(sizeMultiplier) && sizeMultiplier > 0 ? sizeMultiplier : 1)
+        ) / positionsAverage
+      : 0
+  const calculatedIntended =
+    Number.isFinite(calculatedVolume) && calculatedVolume > 0 && currentPrice > 0
+      ? calculatedVolume * currentPrice
+      : 0
+  const intendedNotional = explicitIntended > 0
+    ? explicitIntended
+    : recomputedIntended > 0
+      ? recomputedIntended
+      : calculatedIntended
+  const intendedNotionalSource = explicitIntended > 0
+    ? "volume_result"
+    : recomputedIntended > 0
+      ? "volume_result_inputs"
+      : calculatedIntended > 0
+        ? "calculated_volume"
+        : "unavailable"
+  const exchangeMinimum = Number(volumeResult?.exchangeMinNotionalUsd) > 0
+    ? Number(volumeResult.exchangeMinNotionalUsd)
+    : (currentPrice > 0 ? computedVolume * currentPrice : 0)
+  const detail = {
+    reason: MIN_NOTIONAL_RISK_REASON,
+    intendedNotionalUsd: intendedNotional,
+    intendedNotionalSource,
+    exchangeMinNotionalUsd: exchangeMinimum,
+    computedVolume,
+    currentPrice,
+    tolerancePct: tolerance * 100,
+    calculatedVolume: volumeResult?.calculatedVolume,
+    accountBalance: volumeResult?.accountBalance,
+    positionCost: volumeResult?.positionCost,
+    positionsAverage: volumeResult?.positionsAverage,
+    liveEngineFactor: volumeResult?.liveEngineFactor,
+    sizeMultiplier: volumeResult?.sizeMultiplier,
+  }
+  return {
+    shouldSuppress: intendedNotional > 0 && exchangeMinimum > intendedNotional * (1 + tolerance),
+    detail,
+  }
+}
 
 // ── Exchange call timeouts ────────────────────────────────────────────────
 // Target: syncWithExchange completes in <1 s on the hot path.
@@ -56,6 +248,8 @@ const EXCHANGE_TIMEOUT_PLACE_ENTRY_MS   =  8_000  // market entries must never b
 const EXCHANGE_TIMEOUT_GET_POSITIONS_MS =  4_000  // was 10 s
 const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  3_000  // was 10 s
 
+type ProtectionState = "unprotected" | "partial" | "protected" | "protection_failed"
+
 /**
  * Live position as it flows through the live-stage pipeline and is
  * persisted in Redis.  This is the local definition; the external
@@ -63,6 +257,24 @@ const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  3_000  // was 10 s
  * is intentionally kept separate (it represents the cached exchange API
  * shape, not the stage pipeline shape).
  */
+
+interface ProtectionAudit {
+  entryPrice: number
+  exchangeFillPrice: number
+  direction: "long" | "short"
+  assignedTakeProfitPct: number
+  assignedStopLossPct: number
+  intendedTakeProfitPrice: number
+  intendedStopLossPrice: number
+  exchangeTakeProfitOrderPrice: number
+  exchangeStopLossOrderPrice: number
+  takeProfitPriceDiffPct: number
+  stopLossPriceDiffPct: number
+  positionCostPct: number
+  configuredTpR: number
+  configuredSlR: number
+}
+
 interface LivePosition {
   id: string
   connectionId: string
@@ -74,7 +286,17 @@ interface LivePosition {
   remainingQuantity: number
   averageExecutionPrice: number
   volumeUsd?: number
+  positionCostPct?: number
   leverage: number
+  /**
+   * Internal coordination leverage emitted by the strategy/variant layer before
+   * live execution applies the venue-max exchange policy.
+   */
+  coordinationLeverage?: number
+  /** Diagnostic-only leverage returned by VolumeCalculator; not applied to venue. */
+  volumeCalculatedLeverage?: number
+  /** Final leverage sent to the exchange for the primary live order path. */
+  exchangeLeverageApplied?: number
   marginType: "cross" | "isolated"
   unrealized_pnl?: number
   unrealized_pnl_percent?: number
@@ -96,10 +318,17 @@ interface LivePosition {
   fills: FillRecord[]
   stopLoss?: number
   takeProfit?: number
+  slFloorReason?: string
+  netEffectivePF?: number
   stopLossPrice?: number
   takeProfitPrice?: number
+  desiredStopLossPrice?: number
+  desiredTakeProfitPrice?: number
   stopLossOrderId?: string
   takeProfitOrderId?: string
+  protectionState?: ProtectionState
+  protectionFailureReason?: string
+  protectionFailureAt?: number
   // Epoch-ms timestamps of the last successful SL/TP placement on the venue.
   // Used by the MIN_REARM_MS cooldown to prevent repeated cancel-replace
   // storms when a position's price oscillates at the 0.25% drift boundary.
@@ -108,6 +337,7 @@ interface LivePosition {
   assignedStopLoss?: number
   assignedTakeProfit?: number
   protectionArmedQuantity?: number
+  protectionAudit?: ProtectionAudit
   // ── Trailing stop state ────────────────────────────────────────────────
   // Written by syncLiveFromPseudo when the pseudo position's trailing machine
   // is armed. These fields make the ratcheted absolute stop price available to
@@ -121,12 +351,15 @@ interface LivePosition {
   //   when trailing becomes inactive so the static stopLoss % takes over again.
   trailingActive?: boolean
   trailingStopPrice?: number
-  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "pending_fill" | "placed_unconfirmed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending" | "pending_fill"
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending" | "blocked"
   statusReason?: string
   closeReason?: string
   setKey?: string
   exchangeData?: Record<string, unknown>
   orderId?: string
+  liveOrderAuditTraceId?: string
   connection_id?: string
   entry_price?: number
   current_price?: number
@@ -135,12 +368,110 @@ interface LivePosition {
   // Variant size multiplier mirrored from RealPosition (block=1.5-2.0,
   // dca=0.5, others=1.0). Stored so accumulation can match original sizing.
   sizeMultiplier?: number
+  // Exchange-cost-aware protection diagnostics produced before Live
+  // dispatch. Persisted with the LivePosition so UI/detail views can explain
+  // widened TP/SL bands after the order leaves the strategy coordinator.
+  protectionCost?: Record<string, unknown>
   parentSetKey?: string
   setVariant?: "default" | "trailing" | "block" | "dca"
   trailingProfile?: { startRatio: number; stopRatio: number; stepRatio: number }
   accumulatedSetKeys?: string[]
   
   progression?: { step: string; timestamp: number; success: boolean; details: string }[]
+}
+
+
+interface LiveOrderAudit {
+  traceId: string
+  connectionId: string
+  symbol: string
+  direction: string
+  exchangeSide: string
+  quantityRequested: number
+  quantityAccepted: number
+  entryOrderId: string | null
+  entryOrderStatus: string | null
+  averageFillPrice: number
+  assignedStopLossPct: number
+  assignedTakeProfitPct: number
+  intendedStopLossPrice: number
+  intendedTakeProfitPrice: number
+  stopLossOrderId: string | null
+  takeProfitOrderId: string | null
+  protectionState: "pending" | "not_applicable" | "unprotected" | "partial" | "armed"
+  exchangeErrorCode: string | number | null
+  exchangeErrorMessage: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+function liveOrderAuditKey(connectionId: string, traceId: string): string {
+  return `live_order_audit:${connectionId}:${traceId}`
+}
+
+function extractExchangeError(result: any): { code: string | number | null; message: string | null } {
+  if (!result) return { code: null, message: null }
+  return {
+    code: result.errorCode ?? result.code ?? result.error_code ?? result.statusCode ?? null,
+    message: result.error ?? result.message ?? result.msg ?? null,
+  }
+}
+
+function resolveProtectionState(audit: LiveOrderAudit): LiveOrderAudit["protectionState"] {
+  const wantsSl = audit.intendedStopLossPrice > 0
+  const wantsTp = audit.intendedTakeProfitPrice > 0
+  const hasSl = !!audit.stopLossOrderId
+  const hasTp = !!audit.takeProfitOrderId
+  if (!wantsSl && !wantsTp) return "not_applicable"
+  if ((wantsSl && hasSl) && (wantsTp && hasTp)) return "armed"
+  if (hasSl || hasTp) return "partial"
+  return "unprotected"
+}
+
+async function persistLiveOrderAudit(audit: LiveOrderAudit): Promise<void> {
+  try {
+    const client = getRedisClient()
+    audit.updatedAt = new Date().toISOString()
+    audit.protectionState = resolveProtectionState(audit)
+    const key = liveOrderAuditKey(audit.connectionId, audit.traceId)
+    await client.set(key, JSON.stringify(audit), { EX: 30 * 24 * 60 * 60 })
+    await client.zadd(`live_order_audit:${audit.connectionId}:recent`, Date.parse(audit.updatedAt), audit.traceId).catch(() => 0)
+    await client.zremrangebyscore(`live_order_audit:${audit.connectionId}:recent`, "-inf", Date.now() - 30 * 24 * 60 * 60 * 1000).catch(() => 0)
+  } catch {
+    // Audit persistence must never block exchange execution.
+  }
+}
+
+function buildLiveOrderAudit(args: {
+  trace: LiveOrderTrace
+  livePosition: LivePosition
+  exchangeSide: "buy" | "sell"
+  quantityRequested: number
+}): LiveOrderAudit {
+  const now = new Date().toISOString()
+  return {
+    traceId: args.trace.traceId,
+    connectionId: args.trace.connectionId,
+    symbol: args.trace.symbol,
+    direction: args.trace.direction,
+    exchangeSide: args.exchangeSide,
+    quantityRequested: args.quantityRequested,
+    quantityAccepted: 0,
+    entryOrderId: null,
+    entryOrderStatus: null,
+    averageFillPrice: 0,
+    assignedStopLossPct: Number(args.livePosition.assignedStopLoss ?? args.livePosition.stopLoss ?? 0) || 0,
+    assignedTakeProfitPct: Number(args.livePosition.assignedTakeProfit ?? args.livePosition.takeProfit ?? 0) || 0,
+    intendedStopLossPrice: 0,
+    intendedTakeProfitPrice: 0,
+    stopLossOrderId: null,
+    takeProfitOrderId: null,
+    protectionState: "pending",
+    exchangeErrorCode: null,
+    exchangeErrorMessage: null,
+    createdAt: now,
+    updatedAt: now,
+  }
 }
 
 interface FillRecord {
@@ -150,6 +481,108 @@ interface FillRecord {
   timestamp?: number
   fee?: number
   feeAsset?: string
+}
+
+interface LivePreflightResult {
+  ok: boolean
+  reason?: string
+  cached?: boolean
+}
+
+const LIVE_PREFLIGHT_CACHE_TTL_MS = 30_000
+const LIVE_PREFLIGHT_TIMEOUT_MS = 3_000
+const livePreflightCache = new Map<string, { result: LivePreflightResult; checkedAt: number }>()
+
+function hasLiveCredentials(settings: Record<string, any> | null | undefined, connector: any): boolean {
+  const sources = [
+    settings,
+    connector,
+    connector?.config,
+    connector?.credentials,
+    connector?.options,
+  ].filter(Boolean)
+
+  return sources.some((source: any) => {
+    const apiKey = source.api_key ?? source.apiKey ?? source.key
+    const apiSecret = source.api_secret ?? source.apiSecret ?? source.secret
+    return typeof apiKey === "string" && apiKey.trim().length > 0 &&
+      typeof apiSecret === "string" && apiSecret.trim().length > 0
+  })
+}
+
+async function runLiveOrderPreflight(
+  connectionId: string,
+  exchangeConnector: any,
+  connSettings: Record<string, any> | null | undefined,
+): Promise<LivePreflightResult> {
+  if (!exchangeConnector || typeof exchangeConnector.placeOrder !== "function") {
+    return { ok: false, reason: "Exchange connector not available or missing placeOrder" }
+  }
+
+  if (!hasLiveCredentials(connSettings, exchangeConnector)) {
+    return { ok: false, reason: "Exchange credentials missing" }
+  }
+
+  const cacheKey = connectionId
+  const cached = livePreflightCache.get(cacheKey)
+  const now = Date.now()
+  if (cached && now - cached.checkedAt < LIVE_PREFLIGHT_CACHE_TTL_MS) {
+    return { ...cached.result, cached: true }
+  }
+
+  try {
+    let balanceChecked = false
+    if (typeof exchangeConnector.testConnection === "function") {
+      const result: any = await withTimeout(
+        exchangeConnector.testConnection(),
+        LIVE_PREFLIGHT_TIMEOUT_MS,
+        "live-preflight-testConnection",
+      )
+      if (result && result.success === false) {
+        const reason = result.error || result.message || "Exchange transport test failed"
+        const failed = { ok: false, reason: String(reason) }
+        livePreflightCache.set(cacheKey, { result: failed, checkedAt: now })
+        return failed
+      }
+    } else if (typeof exchangeConnector.getPositions === "function") {
+      await withTimeout(
+        exchangeConnector.getPositions(),
+        LIVE_PREFLIGHT_TIMEOUT_MS,
+        "live-preflight-getPositions",
+      )
+    } else if (typeof exchangeConnector.getBalance === "function") {
+      await withTimeout(
+        exchangeConnector.getBalance(),
+        LIVE_PREFLIGHT_TIMEOUT_MS,
+        "live-preflight-getBalance",
+      )
+      balanceChecked = true
+    } else {
+      return { ok: false, reason: "Exchange connector has no transport health probe" }
+    }
+
+    // Optional account balance endpoint probe.  If the connector exposes it,
+    // verify that authenticated account REST calls are reachable before any
+    // order, SL, or TP is attempted.
+    if (!balanceChecked && typeof exchangeConnector.getBalance === "function") {
+      await withTimeout(
+        exchangeConnector.getBalance(),
+        LIVE_PREFLIGHT_TIMEOUT_MS,
+        "live-preflight-getBalance",
+      )
+    }
+
+    const ok = { ok: true }
+    livePreflightCache.set(cacheKey, { result: ok, checkedAt: now })
+    return ok
+  } catch (err) {
+    const failed = {
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+    }
+    livePreflightCache.set(cacheKey, { result: failed, checkedAt: now })
+    return failed
+  }
 }
 
 // ── Helper function stubs (defined in adjacent modules) ──────────────
@@ -165,6 +598,52 @@ function pushStep(position: LivePosition, step: string, ok: boolean, detail: str
   } catch {
     // non-critical
   }
+}
+
+function pctDiff(actual: number, intended: number): number {
+  if (!Number.isFinite(actual) || !Number.isFinite(intended) || intended <= 0) return 0
+  return Math.round(((actual - intended) / intended) * 100 * 1e6) / 1e6
+}
+
+function buildProtectionAudit(
+  pos: LivePosition,
+  intended: { desiredSl: number; desiredTp: number },
+  exchangePrices: { stopLoss?: number; takeProfit?: number } = {},
+): ProtectionAudit {
+  const entryPrice = Number(pos.entryPrice || 0)
+  const exchangeFillPrice = Number(pos.averageExecutionPrice || pos.entryPrice || 0)
+  const assignedTakeProfitPct = Number(pos.assignedTakeProfit ?? pos.takeProfit ?? 0) || 0
+  const assignedStopLossPct = Number(pos.assignedStopLoss ?? pos.stopLoss ?? 0) || 0
+  const exchangeTakeProfitOrderPrice = Number(exchangePrices.takeProfit ?? pos.takeProfitPrice ?? 0) || 0
+  const exchangeStopLossOrderPrice = Number(exchangePrices.stopLoss ?? pos.stopLossPrice ?? 0) || 0
+  const positionCostPct = Number((pos as any).positionCostPct ?? 0) || 0
+  return {
+    entryPrice,
+    exchangeFillPrice,
+    direction: (pos.direction === "short" ? "short" : "long"),
+    assignedTakeProfitPct,
+    assignedStopLossPct,
+    intendedTakeProfitPrice: intended.desiredTp || 0,
+    intendedStopLossPrice: intended.desiredSl || 0,
+    exchangeTakeProfitOrderPrice,
+    exchangeStopLossOrderPrice,
+    takeProfitPriceDiffPct: pctDiff(exchangeTakeProfitOrderPrice, intended.desiredTp),
+    stopLossPriceDiffPct: pctDiff(exchangeStopLossOrderPrice, intended.desiredSl),
+    positionCostPct,
+    configuredTpR: Number(pos.takeProfit ?? assignedTakeProfitPct) || 0,
+    configuredSlR: Number(pos.stopLoss ?? assignedStopLossPct) || 0,
+  }
+}
+
+function refreshProtectionAudit(
+  pos: LivePosition,
+  intended?: { desiredSl: number; desiredTp: number },
+  exchangePrices: { stopLoss?: number; takeProfit?: number } = {},
+): ProtectionAudit {
+  const desired = intended ?? computeDesiredProtectionPrices(pos)
+  const audit = buildProtectionAudit(pos, desired, exchangePrices)
+  pos.protectionAudit = audit
+  return audit
 }
 
 function normalizeStopLossPercent(rawStopLoss: unknown): { value: number; adjusted: boolean; reason?: string } {
@@ -308,7 +787,8 @@ async function findOpenLivePositionByDir(connId: string, symbol: string, side: s
   const norm = String(symbol || "").toUpperCase().replace(/[-_]/g, "")
   for (const p of positions) {
     const psym = String(p.symbol || "").toUpperCase().replace(/[-_]/g, "")
-    if (psym === norm && p.direction === side && (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed")) {
+    if (psym === norm && p.direction === side && (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed")) {
+    if (psym === norm && p.direction === side && (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill")) {
       return p
     }
   }
@@ -1111,6 +1591,7 @@ async function placeProtectionOrder(
   triggerPrice: number,
   orderLabel: "StopLoss" | "TakeProfit",
   positionDirection: "long" | "short",
+): Promise<{ orderId: string; orderPrice: number } | null> {
   trackingBase?: string,
 ): Promise<string | null> {
   // ── Structured trace context ────────────────────────────────────────
@@ -1319,7 +1800,7 @@ async function placeProtectionOrder(
       console.log(
         `${tag} PLACED: orderId=${orderId} @ trigger=${triggerPrice} qty=${effectiveQty}${effectiveQty !== quantity ? ` (requested=${quantity}, adjusted)` : ""} latency=${latencyMs}ms`,
       )
-      return orderId
+      return { orderId, orderPrice: parseFloat(String(result.orderPrice ?? result.stopPrice ?? result.price ?? triggerPrice)) || triggerPrice }
     }
     // result.error is the connector's normalized venue-side message
     // (e.g. "BingX stop order error (code=110413): Take Profit price
@@ -1482,6 +1963,103 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   }
 
   return { desiredSl, desiredTp }
+}
+
+function deriveProtectionState(
+  desiredSl: number,
+  desiredTp: number,
+  stopLossOrderId?: string | null,
+  takeProfitOrderId?: string | null,
+  placementFailed = false,
+): ProtectionState {
+  if (placementFailed) return "protection_failed"
+
+  const requiresSl = desiredSl > 0
+  const requiresTp = desiredTp > 0
+  const requiredCount = (requiresSl ? 1 : 0) + (requiresTp ? 1 : 0)
+  if (requiredCount === 0) return "unprotected"
+
+  const armedCount =
+    (requiresSl && !!stopLossOrderId ? 1 : 0) +
+    (requiresTp && !!takeProfitOrderId ? 1 : 0)
+
+  if (armedCount === requiredCount) return "protected"
+  if (armedCount > 0) return "partial"
+  return "unprotected"
+}
+
+async function exposeProtectionFailure(
+  connectionId: string,
+  position: LivePosition,
+  message: string,
+  details: Record<string, unknown>,
+): Promise<void> {
+  const failureAt = Date.now()
+  position.protectionState = "protection_failed"
+  position.protectionFailureReason = message
+  position.protectionFailureAt = failureAt
+
+  await incrementMetric(connectionId, "live_protection_failed_count")
+  try {
+    const client = getRedisClient()
+    await client.hset(`progression:${connectionId}`, {
+      live_protection_state: position.protectionState,
+      live_protection_last_failure: JSON.stringify({
+        timestamp: new Date(failureAt).toISOString(),
+        livePositionId: position.id,
+        symbol: position.symbol,
+        direction: position.direction,
+        message,
+        details,
+      }),
+    })
+  } catch {
+    // Stats/UI exposure is best-effort; the progression log below is the
+    // durable operator-facing source of truth.
+  }
+
+  await logProgressionEvent(connectionId, "live_trading", "error", message, {
+    severity: "high",
+    livePositionId: position.id,
+    symbol: position.symbol,
+    direction: position.direction,
+    protectionState: position.protectionState,
+    ...details,
+  })
+function readAbsoluteProtectionPrices(pos: LivePosition): {
+  desiredSl: number
+  desiredTp: number
+} {
+  const desiredSl =
+    Number(pos.desiredStopLossPrice) > 0
+      ? Number(pos.desiredStopLossPrice)
+      : Number(pos.stopLossPrice) > 0
+        ? Number(pos.stopLossPrice)
+        : computeDesiredProtectionPrices(pos).desiredSl
+  const desiredTp =
+    Number(pos.desiredTakeProfitPrice) > 0
+      ? Number(pos.desiredTakeProfitPrice)
+      : Number(pos.takeProfitPrice) > 0
+        ? Number(pos.takeProfitPrice)
+        : computeDesiredProtectionPrices(pos).desiredTp
+  return { desiredSl, desiredTp }
+}
+
+function detectSltpCross(
+  pos: Pick<LivePosition, "direction">,
+  markPrice: number,
+  desiredSl: number,
+  desiredTp: number,
+): "sl_hit" | "tp_hit" | null {
+  if (desiredSl <= 0 && desiredTp <= 0) return null
+  if (pos.direction === "long") {
+    if (desiredSl > 0 && markPrice <= desiredSl) return "sl_hit"
+    if (desiredTp > 0 && markPrice >= desiredTp) return "tp_hit"
+  } else {
+    if (desiredSl > 0 && markPrice >= desiredSl) return "sl_hit"
+    if (desiredTp > 0 && markPrice <= desiredTp) return "tp_hit"
+  }
+  return null
 }
 
 /**
@@ -1674,6 +2252,8 @@ async function updateProtectionOrders(
   }
 
   const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
+  pos.desiredStopLossPrice = desiredSl > 0 ? desiredSl : undefined
+  pos.desiredTakeProfitPrice = desiredTp > 0 ? desiredTp : undefined
   const closeSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
 
   // ── Quantity drift detection ──────────────────────────────────��───────
@@ -1781,6 +2361,7 @@ async function updateProtectionOrders(
         }
       }
       if (oldGone) {
+        const placed = await placeProtectionOrder(
         const trackingBase = String(pos.exchangeData?.trackingId || pos.exchangeData?.exchangeTrackingId || pos.id)
         rememberExchangeClientOrderId(
           pos,
@@ -1802,9 +2383,9 @@ async function updateProtectionOrders(
         // on a failed placement would make the next pass think the
         // level is live (priceDrifted compares < 0.25%) and skip
         // retry — leaving the position permanently unprotected.
-        if (id) {
-          pos.stopLossOrderId = id
-          pos.stopLossPrice = desiredSl
+        if (placed) {
+          pos.stopLossOrderId = placed.orderId
+          pos.stopLossPrice = placed.orderPrice || desiredSl
           pos.stopLossLastArmedAt = Date.now()
           result.changed = true
           result.slPlaced = true
@@ -1850,6 +2431,7 @@ async function updateProtectionOrders(
         }
       }
       if (oldGone) {
+        const placed = await placeProtectionOrder(
         const trackingBase = String(pos.exchangeData?.trackingId || pos.exchangeData?.exchangeTrackingId || pos.id)
         rememberExchangeClientOrderId(
           pos,
@@ -1866,9 +2448,9 @@ async function updateProtectionOrders(
           pos.direction!,
           trackingBase,
         )
-        if (id) {
-          pos.takeProfitOrderId = id
-          pos.takeProfitPrice = desiredTp
+        if (placed) {
+          pos.takeProfitOrderId = placed.orderId
+          pos.takeProfitPrice = placed.orderPrice || desiredTp
           pos.takeProfitLastArmedAt = Date.now()
           result.changed = true
           result.tpPlaced = true
@@ -1882,6 +2464,22 @@ async function updateProtectionOrders(
 
   await Promise.all([slLeg, tpLeg])
 
+  const previousProtectionState = pos.protectionState
+  const nextProtectionState = deriveProtectionState(
+    desiredSl,
+    desiredTp,
+    pos.stopLossOrderId,
+    pos.takeProfitOrderId,
+  )
+  pos.protectionState = nextProtectionState
+  if (previousProtectionState !== nextProtectionState) {
+    result.changed = true
+  }
+  if (nextProtectionState === "protected") {
+    delete pos.protectionFailureReason
+    delete pos.protectionFailureAt
+  }
+
   // Record the qty we armed for only when at least one leg was actually
   // (re-)placed on the exchange. A liveness-verify clear sets result.changed
   // but may not result in a successful placement (venue reject, timeout).
@@ -1892,13 +2490,17 @@ async function updateProtectionOrders(
     pos.protectionArmedQuantity = effectiveQty
   }
 
+  const protectionAudit = refreshProtectionAudit(pos, { desiredSl, desiredTp })
+
   if (result.changed) {
     pushStep(
       pos,
       "update_sl_tp",
       true,
       `[${reason}] SL ${pos.stopLoss}% → ${pos.stopLossPrice ? pos.stopLossPrice.toFixed(6) : "—"} (${pos.stopLossOrderId || "—"}) | ` +
-      `TP ${pos.takeProfit}% → ${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"})`,
+      `TP ${pos.takeProfit}% → ${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"}) | ` +
+      `state=${pos.protectionState}`,
+      `TP ${pos.takeProfit}% → ${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"}) | audit=${JSON.stringify(protectionAudit)}`,
     )
     await logProgressionEvent(
       pos.connectionId,
@@ -1920,6 +2522,8 @@ async function updateProtectionOrders(
         tpOrderId: pos.takeProfitOrderId,
         tpPrice: pos.takeProfitPrice,
         fillPrice: pos.averageExecutionPrice,
+        protectionState: pos.protectionState,
+        protectionAudit,
       },
     )
   }
@@ -1975,6 +2579,7 @@ export async function executeLivePosition(
       setVariant:     realPosition.setVariant,
       axisWindows:    realPosition.axisWindows,
       sizeMultiplier: realPosition.sizeMultiplier,
+      protectionCost: realPosition.protectionCost,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
     }
     pushStep(cbSkipped, "preflight", false, cbSkipped.statusReason!)
@@ -2031,6 +2636,7 @@ export async function executeLivePosition(
       setVariant:     realPosition.setVariant,
       axisWindows:    realPosition.axisWindows,
       sizeMultiplier: realPosition.sizeMultiplier,
+      protectionCost: realPosition.protectionCost,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
     }
     pushStep(skipped, "preflight", false, skipped.statusReason!)
@@ -2061,10 +2667,15 @@ export async function executeLivePosition(
     stopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
     takeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
     takeProfit: realPosition.takeProfit,
+    slFloorReason: (realPosition as any).slFloorReason,
+    netEffectivePF: (realPosition as any).netEffectivePF,
     // Immutable assignment snapshot — preserved across overrides so the
     // progression panel and post-trade stats can always recover what the
     // upstream Set originally specified. Mirrors `stopLoss`/`takeProfit`
     // at creation; never mutated thereafter.
+    assignedStopLoss: realPosition.stopLoss,
+    assignedTakeProfit: realPosition.takeProfit,
+    protectionState: "unprotected",
     assignedStopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
     assignedTakeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
     status: "pending",
@@ -2085,6 +2696,7 @@ export async function executeLivePosition(
     setVariant:     realPosition.setVariant,
     axisWindows:    realPosition.axisWindows,
     sizeMultiplier: realPosition.sizeMultiplier,
+    protectionCost: realPosition.protectionCost,
     trailingProfile: realPosition.trailingProfile,
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
   }
@@ -2353,11 +2965,27 @@ export async function executeLivePosition(
       // because that function uses it as the fill price for SL/TP calculation.
       livePosition.averageExecutionPrice = simEntryPrice
       // Compute SL/TP prices for the simulated position so reconcile and
-      // checkAndForceCloseOnSltpCross have valid price targets.
+      // checkAndForceCloseOnSltpCross have valid absolute price targets.
+      // Keep assignedStopLoss/assignedTakeProfit as the original percentages;
+      // the absolute prices live in the dedicated price fields.
       if (simEntryPrice > 0) {
         const simProtection = computeDesiredProtectionPrices(livePosition)
-        if (simProtection.desiredSl > 0) livePosition.assignedStopLoss  = simProtection.desiredSl
-        if (simProtection.desiredTp > 0) livePosition.assignedTakeProfit = simProtection.desiredTp
+        if (simProtection.desiredSl > 0) {
+          livePosition.stopLossPrice = simProtection.desiredSl
+          livePosition.desiredStopLossPrice = simProtection.desiredSl
+        }
+        if (simProtection.desiredTp > 0) {
+          livePosition.takeProfitPrice = simProtection.desiredTp
+          livePosition.desiredTakeProfitPrice = simProtection.desiredTp
+        }
+      // Compute absolute SL/TP prices for the simulated position so reconcile
+      // and checkAndForceCloseOnSltpCross have valid price targets. Keep
+      // assignedStopLoss/assignedTakeProfit as the normalized percentage
+      // contract mirrored from the originating real position.
+      if (simEntryPrice > 0) {
+        const simProtection = computeDesiredProtectionPrices(livePosition)
+        if (simProtection.desiredSl > 0) livePosition.stopLossPrice = simProtection.desiredSl
+        if (simProtection.desiredTp > 0) livePosition.takeProfitPrice = simProtection.desiredTp
       }
       livePosition.executedQuantity = simQty
       livePosition.remainingQuantity = 0
@@ -2397,20 +3025,20 @@ export async function executeLivePosition(
       return livePosition
     }
 
-    if (!exchangeConnector || typeof exchangeConnector.placeOrder !== "function") {
-      livePosition.status = "error"
-      livePosition.statusReason = "Exchange connector not available or missing placeOrder"
-      pushStep(livePosition, "connector_check", false, livePosition.statusReason)
+    const initialPreflight = await runLiveOrderPreflight(connectionId, exchangeConnector, connSettings)
+    if (!initialPreflight.ok) {
+      livePosition.status = "blocked"
+      livePosition.statusReason = initialPreflight.reason || "Live order preflight failed"
+      pushStep(livePosition, "preflight_connector", false, livePosition.statusReason)
       await savePosition(livePosition)
-      await incrementMetric(connectionId, "live_orders_failed_count")
-      await logProgressionEvent(connectionId, "live_trading", "error", "Live order failed — no connector", {
-        symbol: realPosition.symbol,
-      })
-      // Release the dedup lock we acquired at the top of this function so
-      // the next signal isn't blocked for the full 5-min TTL on a non-
-      // recoverable connector failure (operator likely didn't configure a
-      // connector — they need to be able to retry once they do).
+      await incrementMetric(connectionId, "live_orders_blocked_count")
       await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      await logProgressionEvent(connectionId, "live_trading", "warning", "live_trade_blocked_reason", {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+        reason: livePosition.statusReason,
+        cached: initialPreflight.cached === true,
+      })
       return livePosition
     }
 
@@ -2438,6 +3066,40 @@ export async function executeLivePosition(
     livePosition.entryPrice = currentPrice
     pushStep(livePosition, "price_fetch", true, `price=${currentPrice}`)
 
+    const riskReward = await assessLiveMicrostructureProtection({
+      connectionId,
+      symbol: realPosition.symbol,
+      stopLossPct: livePosition.stopLoss || 0,
+      takeProfitPct: livePosition.takeProfit || 0,
+      profitFactor: (livePosition.takeProfit || 0) / Math.max(livePosition.stopLoss || 0, 0.000001),
+    })
+    livePosition.stopLoss = riskReward.stopLossPct
+    livePosition.takeProfit = riskReward.takeProfitPct
+    livePosition.slFloorReason = riskReward.slFloorReason
+    livePosition.netEffectivePF = riskReward.netEffectivePF
+    pushStep(
+      livePosition,
+      "microstructure_risk",
+      riskReward.viable,
+      `${riskReward.slFloorReason}; netEffectivePF=${riskReward.netEffectivePF.toFixed(4)}; TP=${riskReward.takeProfitPct.toFixed(4)}%`,
+    )
+    if (!riskReward.viable) {
+      livePosition.status = "rejected"
+      livePosition.statusReason = "risk_reward_not_live_viable"
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_rejected_count")
+      await logProgressionEvent(connectionId, "live_trading", "warning", "Live order suppressed: risk_reward_not_live_viable", {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+        slFloorReason: riskReward.slFloorReason,
+        netEffectivePF: riskReward.netEffectivePF,
+        takeProfitPct: riskReward.takeProfitPct,
+        maxTakeProfitPct: riskReward.maxTakeProfitPct,
+      })
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      return livePosition
+    }
+
     // ── Operator policy: ALWAYS use venue max leverage ─────────────────
     // realPosition.leverage carries the per-variant coordination signal
     // (1, 2, 3, 5x from expandSizeLeverageVariants). That is an INTERNAL
@@ -2459,12 +3121,14 @@ export async function executeLivePosition(
       const { getConnection: _getConnLev } = await import("@/lib/redis-db")
       const connRecord = await _getConnLev(connectionId).catch(() => null)
       const venueMax = getMaxLeverageForExchange(connRecord?.exchange)
+      livePosition.coordinationLeverage = previous
       livePosition.leverage = venueMax
+      livePosition.exchangeLeverageApplied = venueMax
       pushStep(
         livePosition,
         "leverage_override",
         true,
-        `coordination=${previous}x → venue_max=${venueMax}x (operator policy)`,
+        `coordinationLeverage=${previous}x exchangeLeverageApplied=${venueMax}x (operator policy)`,
       )
     }
 
@@ -2551,6 +3215,28 @@ export async function executeLivePosition(
       )
     }
 
+    const minNotionalTolerance = parseMinNotionalRiskTolerance(connSettings as Record<string, unknown>)
+    const minNotionalRisk = buildMinNotionalRiskDetail({
+      volumeResult,
+      currentPrice,
+      computedVolume,
+      tolerance: minNotionalTolerance,
+    })
+
+    if (minNotionalRisk.shouldSuppress) {
+      livePosition.status = "rejected"
+      livePosition.statusReason = MIN_NOTIONAL_RISK_REASON
+      livePosition.quantity = computedVolume
+      livePosition.remainingQuantity = computedVolume
+      livePosition.volumeUsd = computedVolume * currentPrice
+      pushStep(
+        livePosition,
+        "volume_risk_check",
+        false,
+        JSON.stringify(minNotionalRisk.detail),
+      )
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_blocked_count")
     const intendedNotionalUsd = getPositiveNotional(volumeResult?.calculatedVolume, currentPrice)
     const fallbackNotionalUsd = getPositiveNotional(computedVolume, currentPrice)
     const minNotionalRiskTolerance = resolveMinNotionalRiskTolerance(connSettings as Record<string, unknown>)
@@ -2577,6 +3263,12 @@ export async function executeLivePosition(
         connectionId,
         "live_trading",
         "warning",
+        `Live order suppressed: ${MIN_NOTIONAL_RISK_REASON} for ${realPosition.symbol}`,
+        { symbol: realPosition.symbol, direction: realPosition.direction, ...minNotionalRisk.detail },
+      ).catch(() => {})
+      console.warn(
+        `${LOG_PREFIX} [RISK_SUPPRESSED] ${realPosition.symbol} ${realPosition.direction} ${JSON.stringify(minNotionalRisk.detail)}`
+      )
         `Live order rejected — minimum notional exceeds strategy risk for ${realPosition.symbol}`,
         {
           reason: livePosition.statusReason,
@@ -2607,6 +3299,12 @@ export async function executeLivePosition(
     livePosition.quantity = computedVolume
     livePosition.remainingQuantity = computedVolume
     livePosition.volumeUsd = computedVolume * currentPrice
+    livePosition.volumeCalculatedLeverage = Number.isFinite(Number(volumeResult?.leverage))
+      ? Number(volumeResult?.leverage)
+      : undefined
+    const positionCostRawForAudit = (connSettings as any).exchangePositionCost ?? (connSettings as any).positionCost ?? (connSettings as any).exchange_position_cost
+    const parsedPositionCostPct = parseFloat(String(positionCostRawForAudit ?? "0"))
+    livePosition.positionCostPct = Number.isFinite(parsedPositionCostPct) && parsedPositionCostPct > 0 ? parsedPositionCostPct : 0
     livePosition.leverage = volumeResult?.leverage || livePosition.leverage
 
     // If the volume calculator clamped the quantity UP to the exchange
@@ -2622,11 +3320,27 @@ export async function executeLivePosition(
       livePosition,
       "volume_calc",
       true,
-      `qty=${computedVolume.toFixed(6)} usd=${livePosition.volumeUsd.toFixed(2)} lev=${livePosition.leverage}x${clampNote}${volumeNote}`
+      `qty=${computedVolume.toFixed(6)} usd=${livePosition.volumeUsd.toFixed(2)} ` +
+      `coordinationLeverage=${livePosition.coordinationLeverage ?? "unknown"}x ` +
+      `volumeCalculatedLeverage=${livePosition.volumeCalculatedLeverage ?? "n/a"}x ` +
+      `exchangeLeverageApplied=${livePosition.exchangeLeverageApplied ?? livePosition.leverage}x${clampNote}${volumeNote}`
     )
     if (volumeResult) {
       await VolumeCalculator.logVolumeCalculation(connectionId, realPosition.symbol, volumeResult).catch(() => {})
     }
+    await logProgressionEvent(
+      connectionId,
+      "live_trading",
+      "info",
+      `Live order leverage diagnostics for ${realPosition.symbol}`,
+      {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+        coordinationLeverage: livePosition.coordinationLeverage,
+        volumeCalculatedLeverage: livePosition.volumeCalculatedLeverage,
+        exchangeLeverageApplied: livePosition.exchangeLeverageApplied ?? livePosition.leverage,
+      },
+    ).catch(() => {})
 
     // ── Step 4: Configure leverage + margin type on exchange ───────────────
     // T2.3 perf: parallelize the two pre-flight venue calls. They are
@@ -2643,10 +3357,10 @@ export async function executeLivePosition(
     const setLeveragePromise: Promise<{ ok: boolean; note: string }> =
       typeof exchangeConnector.setLeverage === "function"
         ? exchangeConnector
-            .setLeverage(realPosition.symbol, livePosition.leverage)
+            .setLeverage(realPosition.symbol, livePosition.exchangeLeverageApplied ?? livePosition.leverage)
             .then((lev: any) => ({
               ok: !!lev?.success,
-              note: lev?.error || `leverage=${livePosition.leverage}`,
+              note: lev?.error || `exchangeLeverageApplied=${livePosition.exchangeLeverageApplied ?? livePosition.leverage}`,
             }))
             .catch((err: unknown) => ({ ok: false, note: String(err) }))
         : Promise.resolve({
@@ -2689,6 +3403,14 @@ export async function executeLivePosition(
       direction: realPosition.direction,
       exchangeSide,
     })
+    livePosition.liveOrderAuditTraceId = orderTrace.traceId
+    const liveOrderAudit = buildLiveOrderAudit({
+      trace: orderTrace,
+      livePosition,
+      exchangeSide,
+      quantityRequested: computedVolume,
+    })
+    await persistLiveOrderAudit(liveOrderAudit)
     livePosition.exchangeData = {
       ...(livePosition.exchangeData || {}),
       trackingId: orderTrace.exchangeTrackingId,
@@ -2727,6 +3449,11 @@ export async function executeLivePosition(
       livePosition.statusReason =
         `Control Orders disabled (is_live_trade=false) — order blocked before exchange placement`
       pushStep(livePosition, "entry", false, livePosition.statusReason)
+      const blockedError = extractExchangeError({ code: "LIVE_TRADE_DISABLED", message: livePosition.statusReason })
+      liveOrderAudit.entryOrderStatus = livePosition.status
+      liveOrderAudit.exchangeErrorCode = blockedError.code
+      liveOrderAudit.exchangeErrorMessage = blockedError.message
+      await persistLiveOrderAudit(liveOrderAudit)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_blocked_count")
       await logProgressionEvent(
@@ -2736,6 +3463,42 @@ export async function executeLivePosition(
         livePosition.statusReason,
         { symbol: realPosition.symbol, direction: realPosition.direction },
       ).catch(() => {})
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      return livePosition
+    }
+
+    const liveOrderPreflight = await runLiveOrderPreflight(connectionId, exchangeConnector, freshSettings)
+    if (!liveOrderPreflight.ok) {
+      livePosition.status = "blocked"
+      livePosition.statusReason = liveOrderPreflight.reason || "Live order preflight failed"
+      pushStep(livePosition, "preflight_exchange", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_blocked_count")
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        "live_trade_blocked_reason",
+        {
+          symbol: realPosition.symbol,
+          direction: realPosition.direction,
+          reason: livePosition.statusReason,
+          cached: liveOrderPreflight.cached === true,
+        },
+      ).catch(() => {})
+      await releaseLock(
+        connectionId,
+        realPosition.symbol,
+        realPosition.direction + _lockDirSuffix,
+      ).catch(() => {})
+      pushStep(
+        livePosition,
+        "lock_release",
+        true,
+        `Released ${realPosition.symbol} ${realPosition.direction}${_lockDirSuffix} lock after blocked live order`,
+      )
+      await savePosition(livePosition)
       return livePosition
     }
 
@@ -2746,6 +3509,9 @@ export async function executeLivePosition(
     // This ensures entry fill price aligns with coordinator expectations.
     console.log(
       `${LOG_PREFIX} [REAL_ORDER_ATTEMPT] conn=${connectionId} sym=${realPosition.symbol} dir=${realPosition.direction} ` +
+      `computedVol=${computedVolume} price=${currentPrice} lev=${livePosition.leverage} ` +
+      `intendedNotional=${minNotionalRisk.detail.intendedNotionalUsd} exchangeMinNotional=${minNotionalRisk.detail.exchangeMinNotionalUsd} ` +
+      `setKey=${livePosition.setKey} trace=${orderTrace.traceId}`
       `computedVol=${computedVolume} entryPrice=${currentPrice} leverage=${livePosition.leverage} ` +
       `sizeMultiplier=${realPosition.sizeMultiplier} setKey=${livePosition.setKey} trace=${orderTrace.traceId}`
     )
@@ -2769,6 +3535,8 @@ export async function executeLivePosition(
           {
             quantity: computedVolume,
             price: currentPrice,
+            intendedNotionalUsd: Number(minNotionalRisk.detail.intendedNotionalUsd),
+            exchangeMinNotionalUsd: Number(minNotionalRisk.detail.exchangeMinNotionalUsd),
             leverage: livePosition.leverage,
             marginType: livePosition.marginType ?? "unknown",
             orderType: "market",
@@ -2806,12 +3574,83 @@ export async function executeLivePosition(
     // the leverage and retry ONCE — this is often enough to get the
     // minimum margin requirement below the available balance.
     if (!orderResult?.success && isNonRecoverableExchangeError(orderResult)) {
+      const originalRetryDiagnostics = {
+        leverage: livePosition.leverage,
+        quantity: computedVolume,
+        notional: computedVolume * currentPrice,
+      }
       const reducedLev = Math.max(1, Math.floor(livePosition.leverage / 2))
       if (reducedLev < livePosition.leverage) {
         console.warn(
-          `${LOG_PREFIX} 101204 on ${realPosition.symbol} — retrying with halved leverage ` +
+          `${LOG_PREFIX} 101204 on ${realPosition.symbol} — recalculating volume for reduced leverage ` +
           `${livePosition.leverage}x → ${reducedLev}x`,
         )
+
+        const reducedVolumeResult = await VolumeCalculator.calculateVolumeForConnection(
+          connectionId,
+          realPosition.symbol,
+          currentPrice,
+          {
+            tradeMode: liveTradeMode,
+            sizeMultiplier: realPosition.sizeMultiplier,
+            leverageOverride: reducedLev,
+          },
+        ).catch(err => {
+          console.error(`${LOG_PREFIX} reduced leverage volume calc error:`, err)
+          return null
+        })
+
+        const reducedComputedVolume = reducedVolumeResult?.finalVolume || reducedVolumeResult?.volume || 0
+        const reducedNotional = reducedComputedVolume * currentPrice
+        const riskBudgetNotional = originalRetryDiagnostics.notional
+        const retryDiagnostics = {
+          original: originalRetryDiagnostics,
+          reduced: {
+            leverage: reducedLev,
+            quantity: reducedComputedVolume,
+            notional: reducedNotional,
+            calculatedQuantity: reducedVolumeResult?.calculatedVolume,
+            adjustmentReason: reducedVolumeResult?.adjustmentReason,
+          },
+          final: { accepted: false, reason: "pending" },
+        }
+        livePosition.exchangeData = {
+          ...(livePosition.exchangeData || {}),
+          leverageReductionRetry: retryDiagnostics,
+        }
+
+        const calculatedQty = reducedVolumeResult?.calculatedVolume ?? reducedComputedVolume
+        const belowExchangeMinimum = !!reducedVolumeResult?.volumeAdjusted &&
+          Number.isFinite(calculatedQty) &&
+          calculatedQty > 0 &&
+          reducedComputedVolume > calculatedQty
+        const exceedsRiskBudget = reducedNotional > riskBudgetNotional * 1.000001
+        const invalidReducedQty = reducedComputedVolume <= 0 || !Number.isFinite(reducedComputedVolume)
+
+        if (invalidReducedQty || belowExchangeMinimum || exceedsRiskBudget) {
+          const reason = invalidReducedQty
+            ? "reduced_leverage_volume_invalid"
+            : belowExchangeMinimum
+              ? "reduced_leverage_quantity_below_exchange_minimum"
+              : "reduced_leverage_notional_exceeds_strategy_risk_budget"
+          retryDiagnostics.final = { accepted: false, reason }
+          livePosition.status = "rejected"
+          livePosition.statusReason = `${reason}: original ${originalRetryDiagnostics.leverage}x qty=${originalRetryDiagnostics.quantity} notional=${originalRetryDiagnostics.notional.toFixed(2)}, reduced ${reducedLev}x qty=${reducedComputedVolume} notional=${reducedNotional.toFixed(2)}`
+          pushStep(livePosition, "leverage_reduce_retry", false, livePosition.statusReason)
+          await savePosition(livePosition)
+          await incrementMetric(connectionId, "live_orders_rejected_count")
+          await logProgressionEvent(connectionId, "live_trading", "warning", livePosition.statusReason, {
+            symbol: realPosition.symbol,
+            diagnostics: retryDiagnostics,
+          }).catch(() => {})
+          return livePosition
+        }
+
+        computedVolume = reducedComputedVolume
+        livePosition.quantity = computedVolume
+        livePosition.remainingQuantity = computedVolume
+        livePosition.volumeUsd = reducedNotional
+
         try {
           if (typeof exchangeConnector.setLeverage === "function") {
             await exchangeConnector.setLeverage(realPosition.symbol, reducedLev)
@@ -2828,6 +3667,8 @@ export async function executeLivePosition(
               {
                 quantity: computedVolume,
                 price: currentPrice,
+                intendedNotionalUsd: Number(minNotionalRisk.detail.intendedNotionalUsd),
+                exchangeMinNotionalUsd: Number(minNotionalRisk.detail.exchangeMinNotionalUsd),
                 leverage: reducedLev,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
@@ -2835,7 +3676,7 @@ export async function executeLivePosition(
                 strategySetKey: livePosition.setKey,
                 realPositionId: realPosition.id,
                 attempt: placeAttempt,
-                label: "leverage-halved",
+                label: "leverage-recalculated",
               },
               () => withTimeout<Record<string, any>>(
                 exchangeConnector.placeOrder(
@@ -2858,11 +3699,12 @@ export async function executeLivePosition(
         )
 
         if (retryResult?.success && (retryResult.orderId || retryResult.id)) {
-          // Succeeded with reduced leverage — update livePosition and continue.
           livePosition.leverage = reducedLev
+          retryDiagnostics.final = { accepted: true, reason: "accepted_recalculated_reduced_leverage" }
           orderResult = retryResult
+          pushStep(livePosition, "leverage_reduce_retry", true, `accepted recalculated qty=${computedVolume} notional=${reducedNotional.toFixed(2)} lev=${reducedLev}x`)
           console.log(
-            `${LOG_PREFIX} Entry succeeded after leverage reduction to ${reducedLev}x for ${realPosition.symbol}`,
+            `${LOG_PREFIX} Entry succeeded after recalculating volume at reduced leverage ${reducedLev}x for ${realPosition.symbol}`,
           )
         } else if (isNonRecoverableExchangeError(retryResult)) {
           // Both the original and the halved-leverage attempt failed with
@@ -2897,6 +3739,38 @@ export async function executeLivePosition(
             ? Math.abs(minQtyForSymbol - computedVolume) / computedVolume
             : 1
           if (minQtyForSymbol > 0 && quantityDiffPct > 0.001) {
+            const lev1MinNotional = minQtyForSymbol * currentPrice
+            const lev1Risk = buildMinNotionalRiskDetail({
+              volumeResult: {
+                ...volumeResult,
+                exchangeMinNotionalUsd: lev1MinNotional,
+              },
+              currentPrice,
+              computedVolume: minQtyForSymbol,
+              tolerance: minNotionalTolerance,
+            })
+            if (lev1Risk.shouldSuppress) {
+              livePosition.status = "rejected"
+              livePosition.statusReason = MIN_NOTIONAL_RISK_REASON
+              livePosition.quantity = minQtyForSymbol
+              livePosition.remainingQuantity = minQtyForSymbol
+              livePosition.volumeUsd = lev1MinNotional
+              pushStep(livePosition, "entry", false, JSON.stringify(lev1Risk.detail))
+              await savePosition(livePosition)
+              await incrementMetric(connectionId, "live_orders_blocked_count")
+              await logProgressionEvent(
+                connectionId,
+                "live_trading",
+                "warning",
+                `Live order suppressed: ${MIN_NOTIONAL_RISK_REASON} for ${realPosition.symbol}`,
+                { symbol: realPosition.symbol, direction: realPosition.direction, ...lev1Risk.detail },
+              ).catch(() => {})
+              console.warn(
+                `${LOG_PREFIX} [RISK_SUPPRESSED] ${realPosition.symbol} ${realPosition.direction} ${JSON.stringify(lev1Risk.detail)}`
+              )
+              await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+              return livePosition
+            }
             console.warn(
               `${LOG_PREFIX} 101204 at ${reducedLev}x still fails on ${realPosition.symbol} — ` +
               `trying lev=1 with min notional qty=${minQtyForSymbol.toFixed(8)}`,
@@ -2914,6 +3788,8 @@ export async function executeLivePosition(
               {
                 quantity: minQtyForSymbol,
                 price: currentPrice,
+                intendedNotionalUsd: Number(minNotionalRisk.detail.intendedNotionalUsd),
+                exchangeMinNotionalUsd: Number(minNotionalRisk.detail.exchangeMinNotionalUsd),
                 leverage: 1,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
@@ -2962,7 +3838,12 @@ export async function executeLivePosition(
             orderResult = retryResult ?? orderResult
           }
         } else {
-          // Non-margin failure after leverage reduction — give up normally.
+          retryDiagnostics.final = {
+            accepted: false,
+            reason: isNonRecoverableExchangeError(retryResult)
+              ? "recalculated_reduced_leverage_insufficient_margin"
+              : "recalculated_reduced_leverage_rejected",
+          }
           recordMarginError(connectionId)
           orderResult = retryResult ?? orderResult
         }
@@ -3059,6 +3940,11 @@ export async function executeLivePosition(
       livePosition.status = "error"
       livePosition.statusReason = `Exchange circuit breaker active for ${realPosition.symbol} — retrying in <5min`
       pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      const circuitError = extractExchangeError(orderResult)
+      liveOrderAudit.entryOrderStatus = livePosition.status
+      liveOrderAudit.exchangeErrorCode = circuitError.code
+      liveOrderAudit.exchangeErrorMessage = circuitError.message || livePosition.statusReason
+      await persistLiveOrderAudit(liveOrderAudit)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_failed_count")
       await logProgressionEvent(connectionId, "live_trading", "warning", livePosition.statusReason, {
@@ -3138,6 +4024,11 @@ export async function executeLivePosition(
       livePosition.status = "rejected"
       livePosition.statusReason = String(reason)
       pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      const rejectError = extractExchangeError(orderResult)
+      liveOrderAudit.entryOrderStatus = livePosition.status
+      liveOrderAudit.exchangeErrorCode = rejectError.code
+      liveOrderAudit.exchangeErrorMessage = rejectError.message || livePosition.statusReason
+      await persistLiveOrderAudit(liveOrderAudit)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_failed_count")
       await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "failed")
@@ -3173,6 +4064,10 @@ export async function executeLivePosition(
     }
     livePosition.orderId = String(entryOrderId)
     livePosition.status = "placed"
+    liveOrderAudit.entryOrderId = livePosition.orderId
+    liveOrderAudit.entryOrderStatus = String(orderResult?.status ?? livePosition.status)
+    liveOrderAudit.quantityAccepted = computedVolume
+    await persistLiveOrderAudit(liveOrderAudit)
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
     await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "placed")
@@ -3238,10 +4133,12 @@ export async function executeLivePosition(
     //     successfully-opened position IS the proof of fill; its size and
     //     entry price are reliable even when getOrder() lags.
     //
-    // After all three layers, if executedQty is still 0 we use computedVolume
-    // as a last-resort quantity so SL/TP can be placed on the exchange. The
-    // protection order itself being "reduce-only" ensures it can't add new
-    // risk; the reconcile cycle will correct the stored qty on next tick.
+    // After all three layers, if executedQty is still 0 we do one final
+    // position read immediately before deciding whether to assign
+    // executedQuantity. If the venue still does not confirm a size, we keep
+    // the Redis record in a pending state and defer initial SL/TP placement
+    // until reconcile sees a real exchange position. This avoids arming
+    // protection from guessed computedVolume/currentPrice values.
     const inlineFillQty   = parseFloat(String(orderResult.filledQty  ?? orderResult.executedQty ?? orderResult.cumQty   ?? "0")) || 0
     const inlineFillPrice = parseFloat(String(orderResult.filledPrice ?? orderResult.avgPrice   ?? orderResult.price    ?? "0")) || 0
     const inlineStatus    = String(orderResult.status ?? "").toLowerCase()
@@ -3313,6 +4210,12 @@ export async function executeLivePosition(
         feeAsset: "USDT",
       })
       livePosition.status = livePosition.remainingQuantity <= 0.000001 ? "filled" : "partially_filled"
+      livePosition.statusReason = fill.status === "filled_via_position"
+        ? `confirmed_position_fallback: exchange position size=${fill.filledQty} avg=${fill.filledPrice || currentPrice}`
+        : `confirmed_fill: order fill status=${fill.status} qty=${fill.filledQty}`
+      pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice} via=${fill.status} reason=${livePosition.statusReason}`)
+        ? "position_confirmed_after_order_poll_timeout"
+        : "fill_confirmed"
       pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice} via=${fill.status}`)
       await incrementMetric(connectionId, "live_orders_filled_count")
       await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "filled")
@@ -3330,6 +4233,10 @@ export async function executeLivePosition(
         reason: `fill via=${fill.status}`,
         extra: { orderId: livePosition.orderId, attempts: placeAttempt },
       })
+      liveOrderAudit.quantityAccepted = fill.filledQty
+      liveOrderAudit.entryOrderStatus = fill.status
+      liveOrderAudit.averageFillPrice = fill.filledPrice || currentPrice
+      await persistLiveOrderAudit(liveOrderAudit)
       // BingX hedge-mode positions need a brief settling period after a
       // market order fills before a STOP/TP_MARKET can reference them.
       // Even when the fill is confirmed by pollOrderFill / getPosition,
@@ -3340,33 +4247,88 @@ export async function executeLivePosition(
       // PROD FIX: Increased from 1s to 2s to ensure position registry consistency
       await new Promise((r) => setTimeout(r, 2000))
     } else {
-      // D) Final guard: fill unconfirmed but order was accepted �� treat as filled
-      // with computedVolume so SL/TP can be placed. The position is "open" on the
-      // exchange (order went to market); protection orders are reduce-only so no
-      // new risk is added. Reconcile will correct executedQty on next tick.
-      console.warn(
-        `${LOG_PREFIX} Fill unconfirmed for ${realPosition.symbol} after all detection layers — ` +
-        `using computedVolume=${computedVolume} as protection qty. Reconcile will sync.`
-      )
-      livePosition.executedQuantity = computedVolume
-      livePosition.remainingQuantity = 0
-      livePosition.averageExecutionPrice = currentPrice
-      livePosition.fills!.push({
-        timestamp: Date.now(),
-        quantity: computedVolume,
-        price: currentPrice,
-        fee: 0,
-        feeAsset: "USDT",
-      })
-      livePosition.status = "filled" // treat as filled so SL/TP proceeds
-      pushStep(livePosition, "poll_fill", false, `fill unconfirmed — using computedVolume=${computedVolume} as fallback qty for SL/TP`)
+      // D) Protection-deferred guard: if neither order polling nor direct
+      // exchange-position reads confirm a position size, do NOT synthesize a
+      // fill from computedVolume. Persist an unconfirmed status and let
+      // reconcile arm SL/TP immediately once the venue position appears.
+      const deferredStatus: LivePosition["status"] = livePosition.orderId ? "pending_fill" : "placed_unconfirmed"
+      livePosition.executedQuantity = 0
+      livePosition.remainingQuantity = computedVolume
+      livePosition.averageExecutionPrice = 0
+      livePosition.status = deferredStatus
+      livePosition.statusReason =
+        `protection_deferred: fill unconfirmed after pollStatus=${fill.status}; direct position lookup found no size`
+      pushStep(livePosition, "poll_fill", false, livePosition.statusReason)
+      // D) Final guard: fill unconfirmed but order was accepted. Read the
+      // exchange position one more time immediately before assigning
+      // executedQuantity. Only a confirmed venue size may become the local
+      // fill quantity; otherwise protection is deferred until reconcile.
+      let finalExSize = 0
+      let finalExEntry = 0
+      if (typeof exchangeConnector.getPosition === "function") {
+        try {
+          const exPos = await exchangeConnector.getPosition(realPosition.symbol)
+          finalExSize = parseFloat(String(exPos?.size ?? exPos?.positionAmt ?? exPos?.quantity ?? exPos?.contracts ?? "0")) || 0
+          finalExEntry = parseFloat(String(exPos?.entryPrice ?? exPos?.avgPrice ?? exPos?.averagePrice ?? "0")) || 0
+        } catch {
+          /* final position confirmation is best-effort; reconcile retries */
+        }
+      }
+
+      if (Math.abs(finalExSize) > 0) {
+        const confirmedQty = Math.abs(finalExSize)
+        const confirmedPrice = finalExEntry || currentPrice
+        console.warn(
+          `${LOG_PREFIX} Fill unconfirmed by order polling for ${realPosition.symbol}, ` +
+          `but getPosition() confirmed size=${confirmedQty} entry=${confirmedPrice}; using exchange size for protection.`,
+        )
+        livePosition.executedQuantity = confirmedQty
+        livePosition.remainingQuantity = Math.max(0, computedVolume - confirmedQty)
+        livePosition.averageExecutionPrice = confirmedPrice
+        livePosition.fills!.push({
+          timestamp: Date.now(),
+          quantity: confirmedQty,
+          price: confirmedPrice,
+          fee: 0,
+          feeAsset: "USDT",
+        })
+        livePosition.status = livePosition.remainingQuantity <= 0.000001 ? "filled" : "partially_filled"
+        livePosition.statusReason = "position_confirmed_after_order_poll_timeout"
+        pushStep(livePosition, "poll_fill", true, `position confirmed after poll timeout — size=${confirmedQty} @ ${confirmedPrice}`)
+        await incrementMetric(connectionId, "live_orders_filled_count")
+        await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "filled")
+      } else {
+        console.warn(
+          `${LOG_PREFIX} Fill unconfirmed for ${realPosition.symbol} after order polling and final getPosition() — ` +
+          "deferring initial SL/TP until reconcile confirms exchange size.",
+        )
+        livePosition.executedQuantity = 0
+        livePosition.remainingQuantity = computedVolume
+        livePosition.averageExecutionPrice = 0
+        livePosition.status = livePosition.orderId ? "placed" : "pending_fill"
+        livePosition.statusReason = "fill_unconfirmed_protection_deferred"
+        pushStep(livePosition, "poll_fill", false, "fill unconfirmed — protection deferred until exchange position confirms size")
+        await savePosition(livePosition)
+      }
       await logProgressionEvent(
         connectionId,
         "live_trading",
         "warning",
-        `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP will use order qty as fallback`,
-        { orderId: livePosition.orderId, status: fill.status, fallbackQty: computedVolume }
+        `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP deferred until exchange position appears`,
+        { orderId: livePosition.orderId, status: fill.status, requestedQty: computedVolume, savedStatus: deferredStatus }
       )
+      await savePosition(livePosition)
+        livePosition.executedQuantity > 0
+          ? `Entry position confirmed for ${realPosition.symbol} after order poll timeout`
+          : `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP deferred until reconcile confirms size`,
+        {
+          orderId: livePosition.orderId,
+          status: fill.status,
+          confirmedQty: livePosition.executedQuantity,
+          statusReason: livePosition.statusReason,
+        }
+      )
+      if (livePosition.executedQuantity > 0) await new Promise((r) => setTimeout(r, 2000))
       // BingX hedge-mode positions need time after market order acceptance
       // before a STOP/TP_MARKET can reference them — 109420 "position not exist"
       // fires if SL/TP is submitted too quickly (confirmed in DOGE/ADA/AAVE/BNB/SOL logs).
@@ -3376,13 +4338,21 @@ export async function executeLivePosition(
       // Reconcile arms protection on the next tick if both attempts still fail.
       await new Promise((r) => setTimeout(r, 5000))
       await logLiveOrderFinal(orderTrace, {
-        status: "placed",
+        status: livePosition.executedQuantity > 0 ? "filled" : "placed",
         livePositionId: livePosition.id,
-        executedQuantity: computedVolume,
-        averagePrice: currentPrice,
-        reason: `fill unconfirmed — using computedVolume as fallback (pollStatus=${fill.status})`,
+        executedQuantity: 0,
+        averagePrice: 0,
+        reason: livePosition.statusReason,
+        extra: { orderId: livePosition.orderId, attempts: placeAttempt, requestedQty: computedVolume },
+        executedQuantity: livePosition.executedQuantity,
+        averagePrice: livePosition.averageExecutionPrice || currentPrice,
+        reason: livePosition.statusReason,
         extra: { orderId: livePosition.orderId, attempts: placeAttempt },
       })
+      liveOrderAudit.quantityAccepted = computedVolume
+      liveOrderAudit.entryOrderStatus = fill.status
+      liveOrderAudit.averageFillPrice = currentPrice
+      await persistLiveOrderAudit(liveOrderAudit)
     }
 
     // ── Step 7: Place Stop Loss and Take Profit orders ─��───────────────────
@@ -3398,6 +4368,10 @@ export async function executeLivePosition(
       const sideClose: "buy" | "sell" = realPosition.direction === "long" ? "sell" : "buy"
       const { desiredSl: slPrice, desiredTp: tpPrice } =
         computeDesiredProtectionPrices(livePosition)
+      liveOrderAudit.intendedStopLossPrice = slPrice || 0
+      liveOrderAudit.intendedTakeProfitPrice = tpPrice || 0
+      await persistLiveOrderAudit(liveOrderAudit)
+      livePosition.protectionState = "unprotected"
       // Duplicate-prevention is handled inside the Promise.all below:
       // each leg resolves to the existing orderId when an order is already
       // present (`!livePosition.stopLossOrderId` guard on the ternary),
@@ -3419,6 +4393,39 @@ export async function executeLivePosition(
       // for that leg. A failed placement leaves it at 0, which
       // `priceDrifted(0, desired)` correctly classifies as "needs arming"
       // on the next reconcile pass.
+      // BingX hedge-mode: placing SL and TP concurrently (Promise.all) causes
+      // the second order to receive code=109420 "position not exist" while the
+      // first order is still being registered by the exchange.  Serialise SL
+      // first, wait 500 ms, then place TP.  The 500 ms gap is enough for the
+      // exchange registry to reflect the first stop order.  The existing 4 s
+      // retry inside placeProtectionOrder handles any residual 109420s.
+      const slPlaced = (slPrice > 0 && !livePosition.stopLossOrderId)
+        ? await placeProtectionOrder(
+            exchangeConnector,
+            realPosition.symbol,
+            sideClose,
+            livePosition.executedQuantity,
+            slPrice,
+            "StopLoss",
+            realPosition.direction,
+          )
+        : (livePosition.stopLossOrderId ? { orderId: livePosition.stopLossOrderId, orderPrice: livePosition.stopLossPrice || slPrice } : null)
+
+      if (slPrice > 0 && tpPrice > 0 && !livePosition.takeProfitOrderId) {
+        await new Promise((r) => setTimeout(r, 500))
+      }
+
+      const tpPlaced = (tpPrice > 0 && !livePosition.takeProfitOrderId)
+        ? await placeProtectionOrder(
+            exchangeConnector,
+            realPosition.symbol,
+            sideClose,
+            livePosition.executedQuantity,
+            tpPrice,
+            "TakeProfit",
+            realPosition.direction,
+          )
+        : (livePosition.takeProfitOrderId ? { orderId: livePosition.takeProfitOrderId, orderPrice: livePosition.takeProfitPrice || tpPrice } : null)
       // OPTIMIZATION: Batch SL and TP placement to reduce API calls.
       // Instead of sequential placement (SL → wait 500ms → TP),
       // attempt batch placement first if the connector supports it.
@@ -3516,39 +4523,84 @@ export async function executeLivePosition(
         ) || null
       }
 
+      const slRequired = slPrice > 0
+      const tpRequired = tpPrice > 0
+      const slFailed = slRequired && !slOrderId
+      const tpFailed = tpRequired && !tpOrderId
+
       if (slOrderId) {
         livePosition.stopLossOrderId = slOrderId
         livePosition.stopLossPrice = slPrice
+      } else if (slFailed) {
+      const slOrderId = slPlaced?.orderId || null
+      const tpOrderId = tpPlaced?.orderId || null
+      if (slPlaced) {
+        livePosition.stopLossOrderId = slPlaced.orderId
+        livePosition.stopLossPrice = slPlaced.orderPrice || slPrice
       } else if (slPrice > 0) {
         // Surface the protection gap loudly so operators and the
         // dashboard see it; the next reconcile will retry.
         console.error(
           `${LOG_PREFIX} INITIAL StopLoss placement FAILED for ${realPosition.symbol} — position is LIVE without SL until next reconcile tick`,
         )
-        await logProgressionEvent(
+        await exposeProtectionFailure(
           connectionId,
-          "live_trading",
-          "error",
+          livePosition,
           `StopLoss NOT placed for ${realPosition.symbol} — reconcile will retry`,
-          { livePositionId: livePosition.id, desiredSl: slPrice, executedQty: livePosition.executedQuantity },
+          {
+            failedLeg: "stop_loss",
+            desiredSl: slPrice,
+            desiredTp: tpPrice,
+            stopLossOrderId: livePosition.stopLossOrderId ?? null,
+            takeProfitOrderId: livePosition.takeProfitOrderId ?? null,
+            executedQty: livePosition.executedQuantity,
+          },
         )
         pushStep(livePosition, "place_stop_loss", false, `initial SL placement failed @ ${slPrice}`)
       }
       if (tpOrderId) {
         livePosition.takeProfitOrderId = tpOrderId
         livePosition.takeProfitPrice = tpPrice
+      } else if (tpFailed) {
+      if (tpPlaced) {
+        livePosition.takeProfitOrderId = tpPlaced.orderId
+        livePosition.takeProfitPrice = tpPlaced.orderPrice || tpPrice
       } else if (tpPrice > 0) {
         console.error(
           `${LOG_PREFIX} INITIAL TakeProfit placement FAILED for ${realPosition.symbol} — position is LIVE without TP until next reconcile tick`,
         )
-        await logProgressionEvent(
+        await exposeProtectionFailure(
           connectionId,
-          "live_trading",
-          "error",
+          livePosition,
           `TakeProfit NOT placed for ${realPosition.symbol} — reconcile will retry`,
-          { livePositionId: livePosition.id, desiredTp: tpPrice, executedQty: livePosition.executedQuantity },
+          {
+            failedLeg: "take_profit",
+            desiredSl: slPrice,
+            desiredTp: tpPrice,
+            stopLossOrderId: livePosition.stopLossOrderId ?? null,
+            takeProfitOrderId: livePosition.takeProfitOrderId ?? null,
+            executedQty: livePosition.executedQuantity,
+          },
         )
         pushStep(livePosition, "place_take_profit", false, `initial TP placement failed @ ${tpPrice}`)
+      }
+      liveOrderAudit.stopLossOrderId = livePosition.stopLossOrderId || null
+      liveOrderAudit.takeProfitOrderId = livePosition.takeProfitOrderId || null
+      await persistLiveOrderAudit(liveOrderAudit)
+
+      if (!slFailed && !tpFailed) {
+        livePosition.protectionState = deriveProtectionState(
+          slPrice,
+          tpPrice,
+          livePosition.stopLossOrderId,
+          livePosition.takeProfitOrderId,
+        )
+        delete livePosition.protectionFailureReason
+        delete livePosition.protectionFailureAt
+      } else if (slOrderId || tpOrderId) {
+        // Preserve the failure state for stats/UI, while the available order ID
+        // fields make the partial exchange-side coverage explicit.
+        livePosition.protectionState = "protection_failed"
       }
       // Record the qty SL/TP were armed for so the next reconcile
       // pass can detect quantity drift (delayed partial fills,
@@ -3568,6 +4620,8 @@ export async function executeLivePosition(
         if (tpOrderId) livePosition.takeProfitLastArmedAt = nowMs
       }
 
+      const protectionAudit = refreshProtectionAudit(livePosition, { desiredSl: slPrice, desiredTp: tpPrice })
+
       // Step record + progression log carry BOTH the assigned percent
       // and the resulting absolute trigger price, so an operator
       // reading the timeline never has to mentally reconstruct one
@@ -3577,15 +4631,17 @@ export async function executeLivePosition(
       pushStep(
         livePosition,
         "place_sl_tp",
-        !!(slOrderId || tpOrderId),
+        livePosition.protectionState === "protected",
         `SL ${livePosition.stopLoss}% → ${slPrice ? slPrice.toFixed(6) : "—"} (${slOrderId || "—"}) | ` +
-        `TP ${livePosition.takeProfit}% → ${tpPrice ? tpPrice.toFixed(6) : "—"} (${tpOrderId || "—"})`
+        `TP ${livePosition.takeProfit}% → ${tpPrice ? tpPrice.toFixed(6) : "—"} (${tpOrderId || "—"}) | ` +
+        `state=${livePosition.protectionState}`
+        `TP ${livePosition.takeProfit}% → ${tpPrice ? tpPrice.toFixed(6) : "—"} (${tpOrderId || "—"}) | audit=${JSON.stringify(protectionAudit)}`
       )
       await logProgressionEvent(
         connectionId,
         "live_trading",
-        "info",
-        `SL/TP placed for ${realPosition.symbol} at assigned values`,
+        livePosition.protectionState === "protected" ? "info" : "warning",
+        `${livePosition.protectionState === "protected" ? "SL/TP placed" : "SL/TP not fully protected"} for ${realPosition.symbol} at assigned values`,
         {
           // Assigned (immutable strategy contract) and current
           // (mutable, override-aware) percent pairs — equal on first
@@ -3599,10 +4655,13 @@ export async function executeLivePosition(
           tpOrderId,
           tpPrice,
           fillPrice: livePosition.averageExecutionPrice,
+          protectionState: livePosition.protectionState,
+          protectionAudit,
         },
       )
     } else {
       pushStep(livePosition, "place_sl_tp", false, "skipped — no fill yet")
+      livePosition.protectionState = "unprotected"
     }
 
     // ── Step 8: Sync with exchange for position data ───────────────────────
@@ -3651,6 +4710,12 @@ export async function executeLivePosition(
       )
     }
 
+    liveOrderAudit.entryOrderStatus = livePosition.status || liveOrderAudit.entryOrderStatus
+    liveOrderAudit.quantityAccepted = livePosition.executedQuantity || liveOrderAudit.quantityAccepted
+    liveOrderAudit.averageFillPrice = livePosition.averageExecutionPrice || liveOrderAudit.averageFillPrice
+    liveOrderAudit.stopLossOrderId = livePosition.stopLossOrderId || liveOrderAudit.stopLossOrderId
+    liveOrderAudit.takeProfitOrderId = livePosition.takeProfitOrderId || liveOrderAudit.takeProfitOrderId
+    await persistLiveOrderAudit(liveOrderAudit)
     await savePosition(livePosition)
 
     // Only count this as a real "position created" when the entry
@@ -3697,6 +4762,7 @@ export async function executeLivePosition(
       realParentSetKey: realPosition.parentSetKey,
       realSetVariant: realPosition.setVariant,
       realAxisWindows: realPosition.axisWindows,
+      realProtectionCost: realPosition.protectionCost,
       // ── Entry metrics ──
       leverage: realPosition.leverage,
       quantity: realPosition.quantity,
@@ -4167,6 +5233,7 @@ export async function closeLivePosition(
       realParentSetKey: position.parentSetKey,
       realSetVariant: position.setVariant,
       realAxisWindows: position.axisWindows,
+      realProtectionCost: position.protectionCost,
       pnl,
       roi,
       closePrice,
@@ -4177,6 +5244,7 @@ export async function closeLivePosition(
       marginAtRisk: margin,
       exchangeCloseSucceeded: exchangeCloseSuccess,
       exchangeCloseClassification: exchangeCloseReason,
+      protectionAudit: position.protectionAudit,
     })
 
     const closeStatus =
@@ -4324,30 +5392,26 @@ export async function calculateLivePositionStats(
       p => p.status === "open" || p.status === "filled" || p.status === "partially_filled"
     )
 
-    let totalPnL = 0
-    let winCount = 0
-    for (const pos of closed) {
+    const closedWithExit = closed.map((pos) => {
       const lastStep = pos.progression?.find(s => s.step === "close")
       const exitPx = lastStep ? parseFloat(lastStep.details?.split("@ ")[1] || "0") : 0
-      if (exitPx > 0 && pos.averageExecutionPrice > 0) {
-        const pnl = Math.round(
-          pos.executedQuantity *
-          (pos.direction === "long"
-            ? exitPx - pos.averageExecutionPrice
-            : pos.averageExecutionPrice - exitPx) * 100
-        ) / 100
-        totalPnL = Math.round((totalPnL + pnl) * 100) / 100
-        if (pnl > 0) winCount++
-      }
-    }
+      return exitPx > 0 ? { ...pos, closePrice: exitPx } : pos
+    })
+    const lastX = aggregateLastXClosedPositions(closedWithExit as ClosedPositionLike[], closedWithExit.length)
+    const totalPnL = closedWithExit.reduce((sum, pos) => {
+      const storedPnl = Number(pos.realizedPnL)
+      const stepPnl = Number(pos.progression?.find(s => s.step === "close")?.details?.match(/pnl=([-0-9.]+)/)?.[1])
+      const pnl = Number.isFinite(storedPnl) ? storedPnl : Number.isFinite(stepPnl) ? stepPnl : 0
+      return Math.round((sum + pnl) * 100) / 100
+    }, 0)
 
     return {
       totalFilled: allPositions.filter(p => p.status === "filled" || p.status === "open").length,
       totalOpen: open.length,
       totalClosed: closed.length,
       totalPnL,
-      averageROI: closed.length > 0 ? Math.round((totalPnL / closed.length) * 100) / 100 : 0,
-      winRate: closed.length > 0 ? Math.round((winCount / closed.length) * 100) / 100 : 0,
+      averageROI: lastX.avgSignedR,
+      winRate: lastX.winRate,
     }
   } catch (err) {
     console.error(`${LOG_PREFIX} Error calculating stats:`, err)
@@ -4397,19 +5461,19 @@ async function checkAndForceCloseOnSltpCross(
   if (pos.executedQuantity <= 0) return null
   // Skip positions whose entry order has not confirmed yet — using entryPrice
   // as a proxy for the fill price would produce incorrect SL/TP cross signals.
-  // The `placed` skip is the most operationally significant — a position
-  // stuck in `placed` is never evaluated for close. The stuck-placed
+  // The `placed` / `pending_fill` skip is the most operationally significant
+  // — an unconfirmed entry is never evaluated for close. The stuck-placed
   // detector in syncWithExchange handles the safety net; this is
   // intentionally silent for terminal statuses to avoid log spam.
   if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error") return null
-  if (pos.status === "placed") {
+  if (pos.status === "placed" || pos.status === "pending_fill") {
     // Rate-limit to once-per-minute per position by using updatedAt as
     // the throttle key — prevents log spam while still surfacing the
     // skip during diagnosis.
     const since = Date.now() - (pos.updatedAt || 0)
     if (since > 60_000) {
       console.log(
-        `${LOG_PREFIX} [cross-check skip] ${pos.symbol} (id=${pos.id}) status='placed' — entry order not filled yet; SL/TP cross check deferred`,
+        `${LOG_PREFIX} [cross-check skip] ${pos.symbol} (id=${pos.id}) status='${pos.status}' — entry order not filled yet; SL/TP cross check deferred`,
       )
     }
     return null
@@ -4421,6 +5485,8 @@ async function checkAndForceCloseOnSltpCross(
   // confirmed filled yet; skip until it is.
   if (!fillPrice || fillPrice <= 0) return null
 
+  const { desiredSl, desiredTp } = readAbsoluteProtectionPrices(pos)
+  const crossReason = detectSltpCross(pos, markPrice, desiredSl, desiredTp)
   // Use the exact same pure helper as exchange control-order placement. Keeping
   // the venue order prices and the proactive software close thresholds on a
   // single code path prevents the "control order says one price but system close
@@ -4705,7 +5771,8 @@ export async function reconcileLivePositions(
     // Load live-positions index (single Redis round-trip, filtered in-memory)
     const allOpen = await getLivePositions(connectionId)
     const openPositions = allOpen.filter(
-      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
+      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed",
+      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill",
     )
     if (openPositions.length === 0 && !reconcileMode) {
       await orphanCloseExpiredPositions(connectionId, exchangeConnector, summary)
@@ -4861,8 +5928,10 @@ export async function reconcileLivePositions(
 
           // ── Entry-order fill detection (reconcile path) ───────────────
           let justFilled = false
-          if (pos.status === "placed") {
-            const exSize  = parseFloat(String(exPos.size ?? exPos.positionAmt ?? exPos.quantity ?? "0")) || 0
+          if (pos.status === "placed" || pos.status === "pending_fill" || pos.status === "placed_unconfirmed") {
+            const exSize  = Math.abs(parseFloat(String(exPos.size ?? exPos.positionAmt ?? exPos.quantity ?? "0"))) || 0
+          if (pos.status === "placed" || pos.status === "pending_fill") {
+            const exSize  = Math.abs(parseFloat(String(exPos.size ?? exPos.positionAmt ?? exPos.quantity ?? "0")) || 0)
             const exEntry = parseFloat(String(exPos.entryPrice ?? exPos.avgPrice ?? exPos.markPrice ?? "0")) || 0
             if (exSize > 0) {
               if (pos.executedQuantity <= 0) {
@@ -4871,6 +5940,9 @@ export async function reconcileLivePositions(
                 pos.averageExecutionPrice = exEntry || pos.entryPrice
               }
               pos.status = "open"
+              pos.statusReason = `confirmed_position_fallback: reconcile saw exchange position size=${exSize} avg=${pos.averageExecutionPrice}`
+              pushStep(pos, "reconcile_fill_detected", true, pos.statusReason)
+              pos.statusReason = "position_confirmed_after_order_poll_timeout"
               pos.updatedAt = Date.now()
               justFilled = true
               await incrementMetric(connectionId, "live_orders_filled_count")
@@ -4889,6 +5961,9 @@ export async function reconcileLivePositions(
                     pos.averageExecutionPrice = parseFloat(String(order.filledPrice ?? order.avgPrice ?? "0")) || pos.averageExecutionPrice || pos.entryPrice
                   }
                   pos.status = "open"
+                  pos.statusReason = `confirmed_fill: reconcile order status=${statusLower} qty=${pos.executedQuantity}`
+                  pushStep(pos, "reconcile_fill_detected", true, pos.statusReason)
+                  pos.statusReason = pos.statusReason || "fill_confirmed"
                   pos.updatedAt = Date.now()
                   if (!justFilled) {
                     justFilled = true
@@ -4910,7 +5985,8 @@ export async function reconcileLivePositions(
             }
           }
 
-          if (pos.status === "placed") {
+          if (pos.status === "placed" || pos.status === "pending_fill" || pos.status === "placed_unconfirmed") {
+          if (pos.status === "placed" || pos.status === "pending_fill") {
             await savePosition(pos)
             delta.updated++
             return delta
@@ -4989,6 +6065,27 @@ export async function reconcileLivePositions(
           await savePosition(pos)
           delta.updated++
         } else {
+          if (pos.status === "placed" || pos.status === "pending_fill" || pos.status === "placed_unconfirmed") {
+            let terminalEntryStatus = ""
+            if (pos.orderId && typeof exchangeConnector.getOrder === "function") {
+              try {
+                const order = await exchangeConnector.getOrder(pos.symbol, pos.orderId)
+                terminalEntryStatus = String(order?.status ?? "").toLowerCase()
+              } catch { /* transient getOrder failure — keep waiting for position visibility */ }
+            }
+            if (terminalEntryStatus === "cancelled" || terminalEntryStatus === "canceled" || terminalEntryStatus === "rejected") {
+              pos.status = "rejected"
+              pos.statusReason = `entry_order_${terminalEntryStatus}`
+              pos.closeReason = pos.statusReason
+              pos.closedAt = Date.now()
+            } else {
+              pos.statusReason = pos.statusReason || "protection_deferred: awaiting exchange position size"
+            }
+            pos.updatedAt = Date.now()
+            await savePosition(pos)
+            delta.updated++
+            return delta
+          }
           // Position closed externally — compute PnL, move to archive.
           let exitPrice: number = Number(pos.exchangeData?.markPrice) || pos.averageExecutionPrice || 0
           if (exitPrice <= 0) {
@@ -5260,6 +6357,12 @@ export async function processSimulatedPositions(
   }
 }
 
+export const __liveStageTest = {
+  computeDesiredProtectionPrices,
+  readAbsoluteProtectionPrices,
+  detectSltpCross,
+}
+
 /**
  * Sync live positions with exchange data (mark price, liq price, unrealized PnL).
  * Called periodically by the engine monitoring loop.
@@ -5349,7 +6452,8 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // just to bucket by status. Load once, then filter in memory.
     const allOpen = await getLivePositions(connectionId)
     const openPositions = allOpen.filter(
-      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
+      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed",
+      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill",
     )
 
     // If the operator requested live trading but the transport test failed,
@@ -5437,9 +6541,12 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       acc[s] = (acc[s] || 0) + 1
       return acc
     }, {})
-    const placedCount = statusBreakdown.placed || 0
+    const placedCount = (statusBreakdown.placed || 0) + (statusBreakdown.pending_fill || 0) + (statusBreakdown.placed_unconfirmed || 0)
     const simCount = statusBreakdown.simulated || 0
-    const totalLive = openPositions.filter((p) => p.status !== "placed").length
+    const totalLive = openPositions.filter((p) => p.status !== "placed" && p.status !== "pending_fill" && p.status !== "placed_unconfirmed").length
+    const placedCount = (statusBreakdown.placed || 0) + (statusBreakdown.pending_fill || 0)
+    const simCount = statusBreakdown.simulated || 0
+    const totalLive = openPositions.filter((p) => p.status !== "placed" && p.status !== "pending_fill").length
     console.log(
       `${LOG_PREFIX} [sync-tick] conn=${connectionId} tracked=${allOpen.length} open=${totalLive} placed=${placedCount} simulated=${simCount} statuses=${JSON.stringify(statusBreakdown)}`,
     )
@@ -5808,6 +6915,17 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             syncedAt: Date.now(),
           }
           position.updatedAt = Date.now()
+          if (position.status === "placed" || position.status === "pending_fill") {
+            const exSize = Math.abs(parseFloat(String(exchangePos.size ?? (exchangePos as any).positionAmt ?? exchangePos.quantity ?? "0")) || 0)
+            const exEntry = parseFloat(String(exchangePos.entryPrice ?? (exchangePos as any).avgPrice ?? exchangePos.averagePrice ?? "0")) || 0
+            if (exSize > 0) {
+              position.executedQuantity = exSize
+              position.remainingQuantity = Math.max(0, (position.quantity || exSize) - exSize)
+              position.averageExecutionPrice = exEntry || position.entryPrice
+              position.status = "open"
+              position.statusReason = "position_confirmed_after_order_poll_timeout"
+            }
+          }
         } else if (
           // ── Externally-closed branch (THE missing close path) ──────
           // Exchange no longer reports the (symbol|direction) we have
@@ -5888,6 +7006,27 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           return // closeLivePosition persisted terminal state — skip per-position setex
         }
 
+        let justFilled = false
+        if (
+          exchangePos &&
+          (position.status === "placed" || position.status === "pending_fill" || position.status === "placed_unconfirmed")
+        ) {
+          const exSize = Math.abs(parseFloat(String(exchangePos.size ?? (exchangePos as any).positionAmt ?? exchangePos.quantity ?? "0"))) || 0
+          const exEntry = parseFloat(String(exchangePos.entryPrice ?? (exchangePos as any).avgPrice ?? exchangePos.markPrice ?? "0")) || 0
+          if (exSize > 0) {
+            position.executedQuantity = exSize
+            position.remainingQuantity = Math.max(0, (position.quantity || exSize) - exSize)
+            position.averageExecutionPrice = exEntry || position.entryPrice
+            position.status = "open"
+            position.statusReason = `confirmed_position_fallback: sync saw exchange position size=${exSize} avg=${position.averageExecutionPrice}`
+            position.updatedAt = Date.now()
+            justFilled = true
+            incrementMetric(connectionId, "live_orders_filled_count").catch(() => {})
+            incrementOrdersBySymbol(connectionId, position.symbol, position.direction || position.side || "long", "filled").catch(() => {})
+            pushStep(position, "sync_fill_detected", true, position.statusReason)
+          }
+        }
+
         // ── Delayed-fill SL/TP arming ────���────────────────────���───────
         // If the entry order was still pending when `executeLivePosition`
         // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
@@ -5897,8 +7036,9 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // an open exchange position with zero stop-loss / take-profit
         // protection. This was a real bug the user reported as
         // "TP/SL control orders are not working".
+        if ((position.status === "placed" || position.status === "pending_fill" || position.status === "placed_unconfirmed") && position.orderId) {
         let justFilled = false
-        if (position.status === "placed" && position.orderId) {
+        if ((position.status === "placed" || position.status === "pending_fill") && position.orderId) {
           try {
             // Bounded — a hanging getOrder would block this position's
             // entire sync slot and delay every downstream close/heal step.
@@ -5914,6 +7054,9 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               position.remainingQuantity = Math.max(0, position.quantity! - position.executedQuantity)
               position.averageExecutionPrice = order.filledPrice || position.entryPrice
               position.status = "open"
+              position.statusReason = `confirmed_fill: sync order status=${order.status} qty=${position.executedQuantity}`
+              pushStep(position, "sync_fill_detected", true, position.statusReason)
+              position.statusReason = position.statusReason || "fill_confirmed"
               position.updatedAt = Date.now()
               justFilled = true
               // Fire-and-forget metric + log — don't block the fast path.
@@ -5972,7 +7115,8 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // Promise.allSettled batch after the for loop so that N stuck
         // positions don't serialize for EXCHANGE_TIMEOUT_CANCEL_ORDER_MS × N
         // and block protection-order updates for all healthy positions.
-        if (position.status === "placed" && (position.executedQuantity ?? 0) === 0) {
+        if ((position.status === "placed" || position.status === "pending_fill" || position.status === "placed_unconfirmed") && (position.executedQuantity ?? 0) === 0) {
+        if ((position.status === "placed" || position.status === "pending_fill") && (position.executedQuantity ?? 0) === 0) {
           const STUCK_PLACED_MAX_MS = 5 * 60_000 // 5 minutes
           const placedAgeMs = Date.now() - (position.createdAt || position.updatedAt || Date.now())
           if (placedAgeMs > STUCK_PLACED_MAX_MS) {

@@ -225,6 +225,7 @@ export class PseudoPositionManager {
     takeprofitFactor: number
     stoplossRatio: number
     profitFactor: number
+    effectiveProfitFactor?: number
     trailingEnabled: boolean
     configSetKey?: string  // unique fingerprint of the config combination
     strategyConfigId?: string  // StrategyConfig.id (DB primary key) — optional link into the historic-fill Set keyspace
@@ -370,6 +371,7 @@ export class PseudoPositionManager {
         stoploss_ratio: String(params.stoplossRatio),
         stoploss_price: String(stopLossPrice),
         profit_factor: String(params.profitFactor),
+        effective_profit_factor: String(params.effectiveProfitFactor ?? params.profitFactor),
         trailing_enabled: effectiveTrailing ? "1" : "0",
         trailing_stop_price: "0",
         // Multi-step trailing state machine — see

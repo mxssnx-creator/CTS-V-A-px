@@ -26,6 +26,37 @@ import {
   type CompactionConfig,
 } from "@/lib/sets-compaction"
 
+
+interface LiveExchangeFeedbackStats {
+  sampleSize: number
+  wins: number
+  losses: number
+  netPnl: number
+  grossProfit: number
+  grossLoss: number
+  fees: number
+  profitFactor: number
+  feeAdjustedProfitFactor: number
+  winRate: number
+}
+
+interface LiveExchangeFeedbackThresholds {
+  enabled: boolean
+  minSamples: number
+  recentLimit: number
+  minProfitFactor: number
+  minWinRate: number
+  minNetPnl: number
+  minFeeAdjustedProfitFactor: number
+}
+
+interface LiveExchangeFeedbackDecision {
+  suppress: boolean
+  reasons: string[]
+  stats: LiveExchangeFeedbackStats
+  thresholds: LiveExchangeFeedbackThresholds
+}
+
 export interface EvaluationMetrics {
   maxDrawdownTime: number
   minProfitFactor: number
@@ -40,6 +71,11 @@ export interface StrategyEvaluation {
   totalCreated: number      // number of Sets created/evaluated
   passedEvaluation: number  // number of Sets that passed the filter
   failedEvaluation: number  // number of Sets that failed
+  // LIVE-only dispatch counters. `passedEvaluation` remains the candidate gate count;
+  // these distinguish candidates selected for exchange dispatch from candidates suppressed
+  // by per-direction/per-variant dispatch throttling.
+  dispatchSelected?: number
+  dispatchSuppressed?: number
   avgProfitFactor: number
   avgDrawdownTime: number
 }
@@ -425,6 +461,120 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
+type LiveDispatchSelection = {
+  selected: StrategySet[]
+  suppressed: StrategySet[]
+}
+
+function getLiveDispatchBucket(set: StrategySet): "new" | "block" | "dca" {
+  if (set.variant === "block") return "block"
+  if (set.variant === "dca") return "dca"
+  return "new"
+}
+
+function selectLiveDispatchSets(qualifying: StrategySet[]): LiveDispatchSelection {
+  const selected: StrategySet[] = []
+  const selectedRefs = new Set<StrategySet>()
+  const seen = new Set<string>()
+
+  for (const set of qualifying) {
+    const bucket = `${set.direction}:${getLiveDispatchBucket(set)}`
+    if (seen.has(bucket)) continue
+
+    selected.push(set)
+    selectedRefs.add(set)
+    seen.add(bucket)
+
+    if (
+      seen.has("long:new") &&
+      seen.has("short:new") &&
+      seen.has("long:block") &&
+      seen.has("short:block") &&
+      seen.has("long:dca") &&
+      seen.has("short:dca")
+    ) {
+      break
+    }
+  }
+
+  return {
+    selected,
+    suppressed: qualifying.filter((set) => !selectedRefs.has(set)),
+  }
+}
+
+function summarizeLiveDispatchBuckets(sets: StrategySet[]): string {
+  const counts: Record<string, number> = {}
+  for (const set of sets) {
+    const key = `${getLiveDispatchBucket(set)}:${set.direction}`
+    counts[key] = (counts[key] ?? 0) + 1
+  }
+  return Object.entries(counts)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, count]) => `${key}=${count}`)
+    .join(" ")
+type LiveSuppressionReason = "connector_unavailable" | "balance_unavailable"
+
+interface LiveDispatchSuppressedEntry {
+  setKey: string
+  symbol: string
+  direction: "long" | "short"
+  status: string
+  statusReason: string
+  reason: LiveSuppressionReason
+}
+
+const LIVE_DISPATCH_SUCCESS_STATUSES = new Set(["open", "filled", "partially_filled", "placed"])
+
+function classifyLiveSuppression(statusReason?: string): LiveSuppressionReason | null {
+  const reason = String(statusReason || "").toLowerCase()
+  if (!reason) return null
+
+  if (
+    reason.includes("balance") ||
+    reason.includes("margin") ||
+    reason.includes("insufficient") ||
+    reason.includes("notional") ||
+    reason.includes("quantity") ||
+    reason.includes("volume") ||
+    reason.includes("size") ||
+    reason.includes("minimum order")
+  ) {
+    return "balance_unavailable"
+  }
+
+  if (
+    reason.includes("connector") ||
+    reason.includes("preflight") ||
+    reason.includes("circuit breaker") ||
+    reason.includes("market price") ||
+    reason.includes("current price") ||
+    reason.includes("placeorder") ||
+    reason.includes("exchange") ||
+    reason.includes("api")
+  ) {
+    return "connector_unavailable"
+  }
+
+  return null
+}
+
+function fallbackLiveSuppression(statusReason?: string): LiveSuppressionReason {
+  const reason = String(statusReason || "").toLowerCase()
+  if (
+    reason.includes("balance") ||
+    reason.includes("margin") ||
+    reason.includes("insufficient") ||
+    reason.includes("notional") ||
+    reason.includes("quantity") ||
+    reason.includes("volume") ||
+    reason.includes("size") ||
+    reason.includes("minimum order")
+  ) {
+    return "balance_unavailable"
+  }
+
+  return "connector_unavailable"
 /** Materialize a lightweight StrategySet view from a coord record only when a downstream consumer needs it. */
 function coordRecordToSetView(idx: CoordIndex, rec: SetCoordRecord): StrategySet | null {
   if (rec._setView) return rec._setView
@@ -548,6 +698,65 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
+type ProtectionCostModel = {
+  takerFeeBpsPerSide: number
+  estimatedSpreadBps: number
+  estimatedMarketSlippageBps: number
+  fundingHoldCostBufferBps?: number
+  source?: string
+}
+
+type DerivedProtection = {
+  takeProfitPct: number
+  stopLossPct: number
+  grossPF: number
+  netPF: number
+  costBufferPct: number
+  effectiveTpPct: number
+  effectiveSlPct: number
+}
+
+function conservativeCostFallbackForExchange(exchange: string): ProtectionCostModel {
+  const ex = exchange.toLowerCase()
+  if (ex === "binance" || ex === "binanceusdm") {
+    return { takerFeeBpsPerSide: 5, estimatedSpreadBps: 2, estimatedMarketSlippageBps: 4, fundingHoldCostBufferBps: 2, source: "fallback:binance" }
+  }
+  if (ex === "okx" || ex === "okex") {
+    return { takerFeeBpsPerSide: 5, estimatedSpreadBps: 3, estimatedMarketSlippageBps: 5, fundingHoldCostBufferBps: 2, source: "fallback:okx" }
+  }
+  if (ex === "bybit") {
+    return { takerFeeBpsPerSide: 6, estimatedSpreadBps: 3, estimatedMarketSlippageBps: 5, fundingHoldCostBufferBps: 2, source: "fallback:bybit" }
+  }
+  if (ex === "bingx") {
+    return { takerFeeBpsPerSide: 7, estimatedSpreadBps: 5, estimatedMarketSlippageBps: 8, fundingHoldCostBufferBps: 3, source: "fallback:bingx" }
+  }
+  return { takerFeeBpsPerSide: 8, estimatedSpreadBps: 6, estimatedMarketSlippageBps: 10, fundingHoldCostBufferBps: 4, source: "fallback:generic" }
+}
+
+function pickFiniteBps(settings: Record<string, unknown>, keys: string[], fallback: number): number {
+  for (const key of keys) {
+    const n = Number(settings[key])
+    if (Number.isFinite(n) && n >= 0) return n
+  }
+  return fallback
+}
+
+function resolveProtectionCostModel(exchange: string, settings: Record<string, unknown>): ProtectionCostModel {
+  const fallback = conservativeCostFallbackForExchange(exchange)
+  const hasExplicit = (...keys: string[]) => keys.some((k) => settings[k] !== undefined && settings[k] !== null && settings[k] !== "")
+  return {
+    takerFeeBpsPerSide: pickFiniteBps(settings, ["takerFeeBpsPerSide", "takerFeeBps", "exchangeTakerFeeBps", "taker_fee_bps"], fallback.takerFeeBpsPerSide),
+    estimatedSpreadBps: pickFiniteBps(settings, ["estimatedSpreadBps", "spreadBps", "exchangeSpreadBps", "estimated_spread_bps"], fallback.estimatedSpreadBps),
+    estimatedMarketSlippageBps: pickFiniteBps(settings, ["estimatedMarketSlippageBps", "marketSlippageBps", "slippageBps", "estimated_market_slippage_bps"], fallback.estimatedMarketSlippageBps),
+    fundingHoldCostBufferBps: pickFiniteBps(settings, ["fundingHoldCostBufferBps", "fundingBufferBps", "holdCostBufferBps", "funding_hold_cost_buffer_bps"], fallback.fundingHoldCostBufferBps ?? 0),
+    source: hasExplicit(
+      "takerFeeBpsPerSide", "takerFeeBps", "exchangeTakerFeeBps", "taker_fee_bps",
+      "estimatedSpreadBps", "spreadBps", "exchangeSpreadBps", "estimated_spread_bps",
+      "estimatedMarketSlippageBps", "marketSlippageBps", "slippageBps", "estimated_market_slippage_bps",
+      "fundingHoldCostBufferBps", "fundingBufferBps", "holdCostBufferBps", "funding_hold_cost_buffer_bps",
+    ) ? "settings" : fallback.source,
+  }
+}
 export function sanitizeLiveProfitFactor(profitFactor: unknown, fallback = 1): number {
   const pf = Number(profitFactor)
   const fb = Number.isFinite(fallback) && fallback > 0 ? fallback : 1
@@ -600,6 +809,8 @@ function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
   sizeMultiplier = 1,
+  costModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic"),
+): DerivedProtection {
 ): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
   const pf = sanitizeLiveProfitFactor(profitFactor, 1)
 ): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number; feeBufferPct: number } {
@@ -612,6 +823,25 @@ function deriveProtectionFromProfitFactor(
   // Tie SL to the actual position-cost budget, then apply variant scaling.
   // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
   const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
+  const costBufferPct = (
+    (costModel.takerFeeBpsPerSide * 2) +
+    costModel.estimatedSpreadBps +
+    (costModel.estimatedMarketSlippageBps * 2) +
+    (costModel.fundingHoldCostBufferBps ?? 0)
+  ) / 100
+  // Gross TP includes the full round-trip friction budget. After entry/exit
+  // taker fees, spread, market slippage, and optional hold-cost buffer, the
+  // net reward still approximates pf × stopLossPct unless the venue cap binds.
+  const takeProfitPct = clampNumber((stopLossPct * Math.max(1, pf)) + costBufferPct, 0.2, 22)
+  const effectiveTpPct = Math.max(0, takeProfitPct - costBufferPct)
+  return {
+    takeProfitPct,
+    stopLossPct,
+    grossPF: takeProfitPct / stopLossPct,
+    netPF: effectiveTpPct / stopLossPct,
+    costBufferPct,
+    effectiveTpPct,
+    effectiveSlPct: stopLossPct,
   // Live exchange PnL includes entry/exit fees, spread, and protection-order
   // slippage that the Real-stage PF model does not see. Add a small TP buffer
   // so a Real-positive PF remains positive after round-trip exchange costs.
@@ -664,6 +894,34 @@ function resolveLiveExecutionCostProfile(exchange: string, connSettings: Record<
   }
 }
 
+
+function deriveConfiguredStatsFromProfitFactor(
+  profitFactor: number,
+  positionCostPct: number,
+): { takeProfitPct: number; stopLossPct: number; tpR: number; slR: number; rewardRisk: number } {
+  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
+  const posCost = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  // Mirrors the live pseudo-position TP/SL configuration so configured
+  // reward/risk stays separate from realized performance factor.
+  const takeProfitPct = Math.max(0.5, (pf - 1) * 100)
+  const stopLossPct = Math.min(5, 100 / Math.max(1, pf) * 0.5)
+  return {
+    takeProfitPct,
+    stopLossPct,
+    tpR: takeProfitPct / posCost,
+    slR: stopLossPct / posCost,
+    rewardRisk: stopLossPct > 0 ? takeProfitPct / stopLossPct : 0,
+  }
+}
+
+function hasVariantSizingEntry(entry: StrategySetEntry | undefined): entry is StrategySetEntry {
+  return !!entry &&
+    Number.isFinite(entry.sizeMultiplier) &&
+    Number.isFinite(entry.leverage) &&
+    typeof entry.positionState === "string" &&
+    entry.positionState.length > 0
+}
+
 const AXIS_KEY_TABLE: ReadonlyMap<string, string> = (() => {
   const m = new Map<string, string>()
   for (const prev of AXIS_PREV) {
@@ -684,6 +942,66 @@ function axisKeyOf(prev: number, last: number, cont: number, outcome: AxisOutcom
   return AXIS_KEY_TABLE.get(`${prev}|${last}|${cont}|${outcome}|${dir}`)!
 }
 
+export type LiveSuppressionReason =
+  | "insufficient_margin"
+  | "balance_unavailable"
+  | "unknown"
+
+/**
+ * Classify LIVE-stage suppression text into stable operator-facing reasons.
+ *
+ * Margin failures intentionally run before balance/volume checks: BingX code
+ * 101204 and explicit "insufficient margin" messages mean the exchange rejected
+ * margin availability, even if the same payload also mentions balance.
+ */
+export function classifyLiveSuppression(payload: unknown): LiveSuppressionReason {
+  let text = ""
+  if (typeof payload === "string") {
+    text = payload
+  } else if (payload instanceof Error) {
+    text = payload.message
+  } else if (payload && typeof payload === "object") {
+    const obj = payload as Record<string, unknown>
+    text = [
+      obj.code,
+      obj.errorCode,
+      obj.error,
+      obj.message,
+      obj.reason,
+      obj.details,
+    ]
+      .filter((part) => part !== undefined && part !== null)
+      .map(String)
+      .join(" ")
+  } else if (payload !== undefined && payload !== null) {
+    text = String(payload)
+  }
+
+  const lc = text.toLowerCase()
+  if (!lc) return "unknown"
+
+  if (
+    /\b101204\b/.test(lc) ||
+    lc.includes("insufficient margin") ||
+    lc.includes("not enough margin")
+  ) {
+    return "insufficient_margin"
+  }
+
+  if (
+    lc.includes("insufficient balance") ||
+    lc.includes("not enough balance") ||
+    lc.includes("computedvolume=0") ||
+    lc.includes("calculator returned no usable quantity") ||
+    lc.includes("volume calc") ||
+    lc.includes("volume calculation")
+  ) {
+    return "balance_unavailable"
+  }
+
+  return "unknown"
+}
+
 export interface StrategyCoordinatorConfig {
   maxEntriesPerSet?: number   // Default 250 (entries inside one Set)
   maxLiveSets?: number        // Default: max per exchange type (e.g. 500 for bybit, 150 for okx)
@@ -700,10 +1018,26 @@ export interface StrategyCoordinatorConfig {
 }
 
 export class StrategyCoordinator {
+  private static _settingsReloadGenerationByConnection: Map<string, number> = new Map()
+
+  /**
+   * Cross-manager hot-reload hook. Called by TradeEngineManager when a
+   * settings PATCH is observed in a different worker/process from the
+   * strategy loop. The next StrategyCoordinator cycle for this connection
+   * must bypass its short TTLs and re-read PF thresholds, DDT thresholds,
+   * trailing/min-step settings, and coordination toggles immediately.
+   */
+  static forceNextSettingsReload(connectionId: string): number {
+    const next = (StrategyCoordinator._settingsReloadGenerationByConnection.get(connectionId) || 0) + 1
+    StrategyCoordinator._settingsReloadGenerationByConnection.set(connectionId, next)
+    return next
+  }
+
   private connectionId: string
   constructor(connectionId: string) {
     this.connectionId = connectionId
   }
+  private _seenSettingsReloadGeneration = 0
   private config: StrategyCoordinatorConfig = {
     maxEntriesPerSet: 250,
     // Live Sets default is now per-exchange (see setExchangeMaxLive).
@@ -858,6 +1192,26 @@ export class StrategyCoordinator {
   // Dev-mode real:sets write throttle — only persists every 5th cycle to keep
   // the InlineLocalRedis heap bounded. Initialised lazily in createRealSets.
   private _realSetWriteCounter = 0
+
+  private _statsGenerationCache: { value: string; at: number } | null = null
+
+  private async getStatsGeneration(client: any): Promise<string> {
+    const cached = this._statsGenerationCache
+    if (cached && Date.now() - cached.at < 1_000) return cached.value
+    let generation = ""
+    try {
+      const prog = ((await client.hgetall(`progression:${this.connectionId}`).catch(() => null)) || {}) as Record<string, string>
+      generation = String(prog.engine_generation || prog.epoch || "").trim()
+    } catch { /* non-critical */ }
+    if (!generation) {
+      try {
+        const state = ((await getSettings(`trade_engine_state:${this.connectionId}`).catch(() => ({}))) || {}) as Record<string, any>
+        generation = String(state.engine_generation || state.epoch || "").trim()
+      } catch { /* non-critical */ }
+    }
+    this._statsGenerationCache = { value: generation, at: Date.now() }
+    return generation
+  }
 
   /**
    * ── Plan-perf Tier 1: parsed-fingerprint LRU ───────────────────────
@@ -1063,6 +1417,105 @@ export class StrategyCoordinator {
     },
   }
 
+  private parseLiveFeedbackThresholds(raw: Record<string, any> = {}): LiveExchangeFeedbackThresholds {
+    const boolish = (v: any, fallback: boolean) => {
+      if (v === undefined || v === null || v === "") return fallback
+      const s = String(v).toLowerCase()
+      return s === "1" || s === "true" || s === "yes" || s === "on"
+    }
+    const num = (v: any, fallback: number) => {
+      const n = Number(v)
+      return Number.isFinite(n) ? n : fallback
+    }
+    return {
+      enabled: boolish(raw.liveFeedbackFilterEnabled ?? raw.liveStageFeedbackFilterEnabled, true),
+      minSamples: Math.max(1, Math.floor(num(raw.liveFeedbackMinSamples ?? raw.liveRecentMinSamples, 3))),
+      recentLimit: Math.max(10, Math.floor(num(raw.liveFeedbackRecentLimit ?? raw.liveRecentStatsLimit, 200))),
+      minProfitFactor: num(raw.liveFeedbackMinProfitFactor ?? raw.liveRecentMinProfitFactor, this.METRICS.real.minProfitFactor),
+      minWinRate: num(raw.liveFeedbackMinWinRate ?? raw.liveRecentMinWinRate, 0),
+      minNetPnl: num(raw.liveFeedbackMinNetPnl ?? raw.liveRecentMinNetPnl, 0),
+      minFeeAdjustedProfitFactor: num(
+        raw.liveFeedbackMinFeeAdjustedProfitFactor ?? raw.liveFeeAdjustedMinProfitFactor,
+        this.METRICS.live.minProfitFactor,
+      ),
+    }
+  }
+
+  private axisWindowsEqual(a: StrategySet["axisWindows"] | undefined, b: StrategySet["axisWindows"] | undefined): boolean {
+    if (!a && !b) return true
+    if (!a || !b) return false
+    return (
+      a.prev === b.prev &&
+      a.last === b.last &&
+      a.cont === b.cont &&
+      a.pause === b.pause &&
+      (a.direction || "") === (b.direction || "") &&
+      (a.axisKey || "") === (b.axisKey || "") &&
+      (a.outcome || "") === (b.outcome || "")
+    )
+  }
+
+  private calculateLiveExchangeFeedback(
+    set: StrategySet,
+    symbol: string,
+    closedPositions: any[],
+    thresholds: LiveExchangeFeedbackThresholds,
+  ): LiveExchangeFeedbackDecision {
+    const matched = closedPositions
+      .filter((p: any) => {
+        const keys = new Set<string>([
+          String(p?.setKey || ""),
+          String(p?.parentSetKey || ""),
+          ...((Array.isArray(p?.accumulatedSetKeys) ? p.accumulatedSetKeys : []) as any[]).map((k) => String(k || "")),
+        ].filter(Boolean))
+        const keyMatch = keys.has(set.setKey) || (!!set.parentSetKey && keys.has(set.parentSetKey))
+        return (
+          keyMatch &&
+          String(p?.symbol || "") === symbol &&
+          String(p?.direction || p?.side || "") === set.direction &&
+          String(p?.setVariant || p?.variant || "default") === String(set.variant || "default") &&
+          this.axisWindowsEqual(p?.axisWindows, set.axisWindows)
+        )
+      })
+      .slice(0, thresholds.recentLimit)
+
+    let grossProfit = 0
+    let grossLoss = 0
+    let fees = 0
+    let wins = 0
+    for (const p of matched) {
+      const pnl = Number(p?.realizedPnL ?? p?.realized_pnl ?? p?.pnl ?? 0)
+      const fee = Math.abs(Number(p?.fee ?? p?.fees ?? p?.commission ?? 0) || 0)
+      fees += fee
+      if (pnl > 0) { grossProfit += pnl; wins++ }
+      else if (pnl < 0) grossLoss += Math.abs(pnl)
+    }
+    const netPnl = grossProfit - grossLoss - fees
+    const losses = matched.length - wins
+    const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 999 : 0
+    const feeAdjustedProfitFactor = (grossLoss + fees) > 0 ? grossProfit / (grossLoss + fees) : grossProfit > 0 ? 999 : 0
+    const stats: LiveExchangeFeedbackStats = {
+      sampleSize: matched.length,
+      wins,
+      losses,
+      netPnl,
+      grossProfit,
+      grossLoss,
+      fees,
+      profitFactor,
+      feeAdjustedProfitFactor,
+      winRate: matched.length > 0 ? wins / matched.length : 0,
+    }
+    const reasons: string[] = []
+    if (stats.sampleSize >= thresholds.minSamples) {
+      if (stats.profitFactor < thresholds.minProfitFactor) reasons.push("live_pf_below_real_threshold")
+      if (stats.netPnl < thresholds.minNetPnl) reasons.push("live_recent_net_negative")
+      if (stats.feeAdjustedProfitFactor < thresholds.minFeeAdjustedProfitFactor) reasons.push("live_fee_adjusted_pf_low")
+      if (thresholds.minWinRate > 0 && stats.winRate < thresholds.minWinRate) reasons.push("live_win_rate_below_threshold")
+    }
+    return { suppress: thresholds.enabled && reasons.length > 0, reasons, stats, thresholds }
+  }
+
   /**
    * Hydrate PF thresholds from operator settings.
    *
@@ -1220,6 +1673,19 @@ export class StrategyCoordinator {
   }
 
   /**
+   * Current engine generation stamped onto stats hashes. The progression
+   * epoch is the canonical generation token for this connection; readers can
+   * discard stale hashes left behind by an older engine run.
+   */
+  private async currentStatsGeneration(client = getRedisClient()): Promise<string> {
+    try {
+      const epoch = await client.hget(`progression:${this.connectionId}`, "epoch")
+      if (epoch && Number.isFinite(Number(epoch)) && Number(epoch) > 0) return String(epoch)
+    } catch { /* non-critical */ }
+    return "0"
+  }
+
+  /**
    * Load coordination settings from app settings with per-connection overlay.
    *
    * Reads axis enable flags, variant toggles, and block strategy settings.
@@ -1270,15 +1736,37 @@ export class StrategyCoordinator {
         const n = Number(val)
         return Number.isFinite(n) ? n : def
       }
+      const hasSetting = (key: string): boolean =>
+        Object.prototype.hasOwnProperty.call(s, key) && s[key] !== undefined && s[key] !== null && s[key] !== ""
+      const axisDefaults = {
+        axisPrevEnabled: true,
+        axisPrevMaxWindow: 12,
+        axisLastEnabled: true,
+        axisLastMaxWindow: 4,
+        axisContEnabled: true,
+        axisContMaxWindow: 8,
+        axisPauseEnabled: true,
+        axisPauseMaxWindow: 8,
+      } as const
+      const missingAxisDefaults = Object.keys(axisDefaults).filter((key) => !hasSetting(key))
+      if (missingAxisDefaults.length > 0) {
+        console.info(
+          `[v0] [StrategyCoordinator] ${this.connectionId} coordination axis settings absent; using defaults`,
+          {
+            missing: missingAxisDefaults,
+            defaults: axisDefaults,
+          },
+        )
+      }
 
-      this._coordinationSettings.axes.prev.enabled   = bool(s.axisPrevEnabled,   false)
-      this._coordinationSettings.axes.prev.maxWindow  = num(s.axisPrevMaxWindow,   0)
-      this._coordinationSettings.axes.last.enabled   = bool(s.axisLastEnabled,   false)
-      this._coordinationSettings.axes.last.maxWindow  = num(s.axisLastMaxWindow,   0)
-      this._coordinationSettings.axes.cont.enabled   = bool(s.axisContEnabled,   false)
-      this._coordinationSettings.axes.cont.maxWindow  = num(s.axisContMaxWindow,   0)
-      this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  false)
-      this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  0)
+      this._coordinationSettings.axes.prev.enabled   = bool(s.axisPrevEnabled,   axisDefaults.axisPrevEnabled)
+      this._coordinationSettings.axes.prev.maxWindow  = num(s.axisPrevMaxWindow,   axisDefaults.axisPrevMaxWindow)
+      this._coordinationSettings.axes.last.enabled   = bool(s.axisLastEnabled,   axisDefaults.axisLastEnabled)
+      this._coordinationSettings.axes.last.maxWindow  = num(s.axisLastMaxWindow,   axisDefaults.axisLastMaxWindow)
+      this._coordinationSettings.axes.cont.enabled   = bool(s.axisContEnabled,   axisDefaults.axisContEnabled)
+      this._coordinationSettings.axes.cont.maxWindow  = num(s.axisContMaxWindow,   axisDefaults.axisContMaxWindow)
+      this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  axisDefaults.axisPauseEnabled)
+      this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  axisDefaults.axisPauseMaxWindow)
 
       // Variant toggles. Defaults: trailing=true, block=true, dca=false.
       // Pause is an axis/position-count window, not a general strategy type.
@@ -1361,6 +1849,18 @@ export class StrategyCoordinator {
     this._stratCycleCount++
 
     try {
+      const requestedSettingsGeneration =
+        StrategyCoordinator._settingsReloadGenerationByConnection.get(this.connectionId) || 0
+      if (requestedSettingsGeneration !== this._seenSettingsReloadGeneration) {
+        this._seenSettingsReloadGeneration = requestedSettingsGeneration
+        this._pfThresholdsLoadedAt = 0
+        this._coordinationLoadedAt = 0
+        this._hedgeLoadedAt = 0
+        this._prevPosMinCountAt = 0
+        this._prevPosWindowAt = 0
+        ;(this as any)._trailingVariantsCache = undefined
+      }
+
       // ── Hydrate PF thresholds + Coordination settings + stage thresholds + normalise ─
       await Promise.all([
         this.loadAppPFThresholds(),
@@ -1738,6 +2238,10 @@ export class StrategyCoordinator {
           setKey,
           indicationType: group.indicationType,
           direction: group.direction,
+          // Base Sets now carry an explicit variant tag so trailing-lineage
+          // survives Base → Main → Real → Live instead of falling through
+          // fallback accounting as "default".
+          variant: variant ? "trailing" : "default",
           strategyType: "standard",  // NEW: Base sets are always "standard" type
           avgProfitFactor: avgPF,
           avgConfidence: avgConf,
@@ -1789,6 +2293,7 @@ export class StrategyCoordinator {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
       const detailKey  = `strategy_detail:${this.connectionId}:base`
+      const generation = await this.currentStatsGeneration(client)
       const baseAvgPF  = baseSets.length > 0 ? baseSets.reduce((s, st) => s + st.avgProfitFactor, 0) / baseSets.length : 0
       const baseAvgDDT = baseSets.length > 0 ? baseSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / baseSets.length : 0
       // Average config entries per Set — the canonical "positions per Set"
@@ -1815,6 +2320,7 @@ export class StrategyCoordinator {
       )
       this._activeKeysCache = { keys: activeKeys, cycleAt: Date.now() }
       const baseRunningNow = baseSets.filter((s) => activeKeys.has(s.setKey)).length
+      const statsGeneration = await this.getStatsGeneration(client)
 
       // Fan-out all independent writes. The awaited chain used to add ~8 Redis
       // round-trips to every BASE cycle even when nothing had changed; issuing
@@ -1822,6 +2328,8 @@ export class StrategyCoordinator {
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_base_current", String(baseSets.length)),
         client.hset(detailKey, {
+          generation,
+          epoch: generation,
           // ── Legacy per-cycle aggregate fields ─────────────────────────
           // These hold THIS-symbol's values and are overwritten on every
           // (symbol, cycle). They remain for backwards compatibility but
@@ -1831,8 +2339,11 @@ export class StrategyCoordinator {
           avg_profit_factor: String(baseAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(baseAvgDDT)),
           avg_pos_per_set:   String(baseAvgPosPerSet.toFixed(2)),
+          input_sets:        String(baseSets.length),
           evaluated:         String(baseSets.length),
-          passed_sets:       "0",   // will be updated by createMainSets
+          passed_sets:       String(baseSets.length),
+          output_sets:       String(baseSets.length),
+          previous_stage_output_sets: "0",
           entries_total:     String(baseEntriesTotal),
           // ── ACTIVELY-RUNNING metrics (operator spec) ──────────────
           //   sets_running_now         = canonical "alive" count: Sets
@@ -1850,6 +2361,8 @@ export class StrategyCoordinator {
           sets_progressing:         String(
             baseSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
+          generation:        statsGeneration,
+          engine_generation: statsGeneration,
           updated_at:        String(Date.now()),
           // ── Per-symbol fields (cross-symbol aggregation source) ──────
           // The legacy fields above are overwritten by every symbol's
@@ -1866,12 +2379,14 @@ export class StrategyCoordinator {
           [`s:${symbol}:progressing`]: String(
             baseSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
-          [`s:${symbol}:passed`]:     "0",  // updated when Main runs
+          [`s:${symbol}:passed`]:     String(baseSets.length),
           [`s:${symbol}:evaluated`]:  String(baseSets.length),
           [`s:${symbol}:apf`]:        String(baseAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(baseAvgDDT)),
           [`s:${symbol}:apps`]:       String(baseAvgPosPerSet.toFixed(2)),
+          [`s:${symbol}:generation`]: statsGeneration,
           [`s:${symbol}:ts`]:         String(Date.now()),
+          [`s:${symbol}:generation`]: generation,
         }),
         client.expire(detailKey, 86400),
         client.set(`strategies:${this.connectionId}:base:count`, String(baseSets.length)),
@@ -1902,9 +2417,13 @@ export class StrategyCoordinator {
       // hgetalls this hash and aggregates by stage.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
+          generation,
+          epoch: generation,
+          [`${symbol}:base:generation`]: generation,
           [`${symbol}:base`]:          String(baseSets.length),
           // base:evaluated = same as base (every Base Set IS evaluated at Base stage)
           [`${symbol}:base:evaluated`]: String(baseSets.length),
+          [`${symbol}:base:generation`]: statsGeneration,
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
@@ -2070,7 +2589,26 @@ export class StrategyCoordinator {
       ...ctx,
       continuousCount: ctx.perSymbolOpen[symbol] ?? 0,
     }
+
+    const rawBlockProfile = this.variantProfiles().find((p) => p.name === "block")
+    const blockRawSizes = rawBlockProfile?.configs.map((c) => c.size) ?? []
+    const blockGatePassed = Boolean(
+      rawBlockProfile?.gate(symbolCtx) && this._coordinationSettings.variants.block === true
+    )
     const activeVariants = this.selectActiveVariants(symbolCtx)
+    const activeBlockProfile = activeVariants.find((p) => p.name === "block")
+    const blockMul = 1 + (Math.max(1, symbolCtx.continuousCount | 0) - 1) * this._coordinationSettings.blockVolumeRatio
+    const blockDiagnosticBase = {
+      symbol,
+      blockVolumeRatio: this._coordinationSettings.blockVolumeRatio,
+      blockMaxStack: this._coordinationSettings.blockMaxStack,
+      continuousCount: symbolCtx.continuousCount,
+      blockMul: Number(blockMul.toFixed(6)),
+      rawBlockConfigSizes: blockRawSizes,
+      finalScaledBlockSizes: (activeBlockProfile?.configs ?? rawBlockProfile?.configs ?? []).map((c) => c.size),
+      blockGatePassed,
+      updatedAt: Date.now(),
+    }
 
     // Per-cycle Block diagnostics: expose the exact open-position count,
     // operator ratio, computed multiplier, and final scaled sizes used for
@@ -2178,6 +2716,18 @@ export class StrategyCoordinator {
       // Base Sets must not also fan out a trailing variant or the trailing
       // calculations/statistics get duplicated and mixed into default lineage.
       const variantsForThisBase = baseSet.trailingProfile
+        ? activeVariants
+            .filter((p) => p.name === "default")
+            .map((p) => ({
+              ...p,
+              // Multi-step trailing Base Sets already carry their concrete
+              // trailingProfile ratios. Promote them through Main as the
+              // trailing family while reusing the default entry configs, so
+              // they do not become default Main/Real/Live Sets or default
+              // strategy_variant stats.
+              name: "trailing" as const,
+            }))
+        : activeVariants
         ? activeVariants.filter((p) => p.name === "trailing")
         : activeVariants.filter((p) => p.name !== "trailing")
 
@@ -2448,8 +2998,14 @@ export class StrategyCoordinator {
     // 4 intermediate result allocations per symbol per cycle.
     type VariantAgg = {
       sumPF: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
+      configuredTp?: number; configuredSl?: number; configuredTpR?: number; configuredSlR?: number; configuredRR?: number
     }
     const variantAgg: Record<string, VariantAgg> = {
+      default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+      trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+      block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+      dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+      pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
       default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
@@ -2546,6 +3102,8 @@ export class StrategyCoordinator {
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
+      const generation = await this.currentStatsGeneration(client)
+      const statsGeneration = await this.getStatsGeneration(client)
 
       // ── Running-now resolution for Main (cloned/filtered Sets) ──
       const cache = this._activeKeysCache
@@ -2574,6 +3132,11 @@ export class StrategyCoordinator {
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_main_current", String(n)),
         client.hset(mainDetailKey, {
+          generation,
+          epoch: generation,
+          generation:        statsGeneration,
+          engine_generation: statsGeneration,
+          created_sets:      String(mainSets.length),
           created_sets:      String(n),
           avg_profit_factor: String(mainAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(mainAvgDDT)),
@@ -2581,6 +3144,11 @@ export class StrategyCoordinator {
           entries_total:     String(mainEntriesTotal),
           entries_count:     String(mainEntriesTotal),
           axis_sets:         String(axisSetsAdded),
+          input_sets:        String(baseSets.length),
+          evaluated:         String(baseSets.length),
+          passed_sets:       String(uniqueBaseSetsProduced.size),
+          output_sets:       String(mainSets.length),
+          previous_stage_output_sets: String(baseSets.length),
           evaluated:         String(n),
           passed_sets:       String(n),
           pass_rate:         String(passRatioMain.toFixed(4)),
@@ -2593,18 +3161,30 @@ export class StrategyCoordinator {
           [`s:${symbol}:entries`]:    String(mainEntriesTotal),
           [`s:${symbol}:running`]:    String(mainRunningNow),
           [`s:${symbol}:progressing`]: String(mainProgressing),
+          [`s:${symbol}:passed`]:     String(uniqueBaseSetsProduced.size),
+          [`s:${symbol}:evaluated`]:  String(baseSets.length),
           [`s:${symbol}:passed`]:     String(n),
           [`s:${symbol}:evaluated`]:  String(n),
           [`s:${symbol}:apf`]:        String(mainAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(mainAvgDDT)),
           [`s:${symbol}:apps`]:       String(mainAvgPosPerSet.toFixed(2)),
+          [`s:${symbol}:generation`]: statsGeneration,
           [`s:${symbol}:ts`]:         String(Date.now()),
+          [`s:${symbol}:generation`]: generation,
         }),
         client.expire(mainDetailKey, 86400),
         client.hset(`strategy_detail:${this.connectionId}:base`, {
+          generation,
+          epoch: generation,
+          generation: statsGeneration,
+          engine_generation: statsGeneration,
           passed_sets: String(baseSets.length),
+          output_sets: String(baseSets.length),
+          pass_rate:   "1.0000",
           pass_rate:   String(passRatioMain.toFixed(4)),
+          [`s:${symbol}:generation`]: statsGeneration,
           [`s:${symbol}:passed`]: String(baseSets.length),
+          [`s:${symbol}:generation`]: generation,
         }).catch(() => {}),
         client.set(`strategies:${this.connectionId}:main:count`, String(n)),
         client.set(`strategies:${this.connectionId}:main:evaluated`, String(n)),
@@ -2622,15 +3202,26 @@ export class StrategyCoordinator {
       // bucket was always 0, making the Main column on the dashboard empty.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
+          generation,
+          epoch: generation,
+          [`${symbol}:main:generation`]: generation,
+          [`${symbol}:main`]:           String(mainSets.length),
           [`${symbol}:main`]:           String(n),
           // main:evaluated = Base Sets that entered Main filter (= candidates)
           [`${symbol}:main:evaluated`]: String(baseSets.length),
+          [`${symbol}:main:generation`]: statsGeneration,
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
 
       const relatedCreated = n - reused
       const activeVariantNames = activeVariants.map((p) => p.name)
+      const blockDiagnostic = {
+        ...blockDiagnosticBase,
+        blockSetsCreated: variantAgg.block.setsContaining,
+        blockSetsPassed: variantAgg.block.passedSets,
+        blockSetsDispatched: 0,
+      }
       writes.push(
         client.hincrby(redisKey, "strategies_main_related_created", relatedCreated),
         client.hincrby(redisKey, "strategies_main_related_reused",  reused),
@@ -2647,6 +3238,12 @@ export class StrategyCoordinator {
           strategies_main_ctx_prev_total:       String(ctx.prevPosCount),
           strategies_main_ctx_updated_at:       String(Date.now()),
         }),
+        client.hset(`block_strategy:${this.connectionId}`, {
+          [`s:${symbol}`]: JSON.stringify(blockDiagnostic),
+          [`s:${symbol}:dispatched`]: "0",
+          updated_at: String(Date.now()),
+        }),
+        client.expire(`block_strategy:${this.connectionId}`, 600),
       )
 
       // ── Position count metrics for main stage ──
@@ -2697,6 +3294,9 @@ export class StrategyCoordinator {
   private async createPseudoPositionsFromRealSets(
     symbol: string,
     realSets: StrategySet[],
+    coordIndex?: CoordIndex,
+    positionCostPct = 0.1,
+    cachedMarketPrice = 0,
   ): Promise<void> {
     // DEV-MODE BYPASS: pseudo_position hashes are only used by the dashboard
     // "Positions" tile. Writing up to 3000 hashes per symbol per cycle (3 writes
@@ -2733,14 +3333,68 @@ export class StrategyCoordinator {
       const writeBatches: Promise<any>[] = []
       let createdCount = 0
 
+      const hasCachedMarketPrice = cachedMarketPrice > 0 && !isNaN(cachedMarketPrice)
+
       for (let i = 0; i < setMeta.length; i++) {
-        if (existing[i]) continue
         const { set, setKey, existingKey } = setMeta[i]
         try {
-          const avgPF       = set.avgProfitFactor || 1
+          const parentKey = set.parentSetKey || set.setKey.split("#")[0]
+          const effectiveEntries: StrategySetEntry[] =
+            set.entries.length > 0
+              ? set.entries
+              : coordIndex
+                ? (coordIndex.base.byKey.get(parentKey)?.entries ?? [])
+                : (realSets.find((s) => s.setKey === parentKey)?.entries ?? [])
+          const bestEntry = effectiveEntries.reduce(
+            (best, e) => (e.profitFactor > best.profitFactor ? e : best),
+            effectiveEntries[0],
+          )
+          const coordRec = coordIndex?.byCoordKey.get(set.setKey)
+          const baseSizeMult = bestEntry?.sizeMultiplier ?? 1
+          const effectiveSizeMult = coordRec?.sizeDelta !== undefined
+            ? Math.max(0.5, Math.min(2.0, baseSizeMult * (1 + coordRec.sizeDelta)))
+            : baseSizeMult
+          const effectivePF =
+            coordRec?.tunedAvgPF ??
+            set.avgProfitFactor ??
+            bestEntry?.profitFactor ??
+            1
+          const protection = deriveProtectionFromProfitFactor(
+            effectivePF,
+            positionCostPct,
+            effectiveSizeMult,
+          )
+          const avgPF       = protection.effectiveProfitFactor || set.avgProfitFactor || 1
           const entryPrice  = Math.max(1, avgPF * 100)   // unitless proxy
+          const avgPF       = set.avgProfitFactor || 1
+          // Prefer the same market-price snapshot used by live exchange dispatch
+          // so dashboard pseudo positions and live orders align on entry basis.
+          // Standalone/test callers can still omit it and use the legacy PF proxy.
+          const entryPrice  = hasCachedMarketPrice
+            ? cachedMarketPrice
+            : Math.max(1, avgPF * 100)   // unitless proxy fallback
           const quantity    = set.entryCount || 1
           const positionCost = entryPrice * quantity
+
+          // Existing mappings are intentionally idempotent, but when a valid
+          // cached market price is available we still refresh the stored entry
+          // basis. That makes this alignment take effect for pseudo positions
+          // created by earlier cycles that used the old PF proxy.
+          const existingMapping = existing[i] as { posId?: unknown } | null
+          if (existingMapping) {
+            const existingPosId = typeof existingMapping.posId === "string" ? existingMapping.posId : null
+            if (hasCachedMarketPrice && existingPosId) {
+              writeBatches.push(
+                setSettings(`pseudo_position:${this.connectionId}:${existingPosId}`, {
+                  entry_price: entryPrice,
+                  position_cost: positionCost,
+                }).catch((err) => {
+                  console.warn(`[StrategyFlow] Failed to refresh pseudo position price for set ${setKey}:`, err)
+                })
+              )
+            }
+            continue
+          }
 
           const pseudoPos = {
             id: `pseudo-${this.connectionId}-${setKey}-${nowMs}`,
@@ -2761,6 +3415,10 @@ export class StrategyCoordinator {
             source_set_key: setKey,
             created_at: createdAtIso,
             profit_factor: set.avgProfitFactor || 0,
+            effective_profit_factor: protection.effectiveProfitFactor,
+            takeprofit_factor: protection.takeProfitPct,
+            stoploss_ratio: protection.stopLossPct,
+            size_multiplier: effectiveSizeMult,
             confidence: set.avgConfidence || 0,
           }
 
@@ -3419,6 +4077,22 @@ export class StrategyCoordinator {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
       const realDetailKey = `strategy_detail:${this.connectionId}:real`
+      const generation = await this.currentStatsGeneration(client)
+      // Single pass over realSets — replaces 4 separate .reduce() calls that each
+      // allocated an intermediate result and iterated the full array independently.
+      let _sumPF = 0, _sumDDT = 0, _sumConf = 0, _sumEC = 0
+      for (const st of realSets) {
+        _sumPF   += st.avgProfitFactor
+        _sumDDT  += st.avgDrawdownTime  || 0
+        _sumConf += st.avgConfidence    || 0
+        _sumEC   += st.entryCount       || 0
+      }
+      const n = realSets.length
+      const realAvgPF        = n > 0 ? _sumPF   / n : 0
+      const realAvgDDT       = n > 0 ? _sumDDT  / n : 0
+      const realAvgConf      = n > 0 ? _sumConf / n : 0
+      const realEntriesTotal = _sumEC
+      const realAvgPosPerSet = n > 0 ? _sumEC   / n : 0
       const n = realSetCount
       const realAvgPF        = realAvgPFAll
       const realAvgDDT       = realAvgDDTAll
@@ -3493,11 +4167,17 @@ export class StrategyCoordinator {
         }
       } catch { /* fallback: 0 */ }
 
+      const statsGeneration = await this.getStatsGeneration(client)
+
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
         client.hset(realDetailKey, {
+          generation,
+          epoch: generation,
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
           // for backwards compat; /stats prefers per-symbol sums below.
+          generation:         statsGeneration,
+          engine_generation:  statsGeneration,
           created_sets:       String(realSets.length),
           avg_profit_factor:  String(realAvgPF.toFixed(4)),
           avg_drawdown_time:  String(Math.round(realAvgDDT)),
@@ -3505,8 +4185,11 @@ export class StrategyCoordinator {
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
           // evaluated = Sets that entered the PF/DDT gate (not pre-gated by pos-count).
           // Using mainSets.length inflates this by the full axis fan-out.
+          input_sets:         String(mainSets.length),
           evaluated:          String(mainPFEligible),
           passed_sets:        String(realSets.length),
+          output_sets:        String(realSets.length),
+          previous_stage_output_sets: String(mainSets.length),
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
           entries_total:      String(realEntriesTotal),
@@ -3538,7 +4221,9 @@ export class StrategyCoordinator {
           [`s:${symbol}:addt`]:       String(Math.round(realAvgDDT)),
           [`s:${symbol}:apps`]:       String(realAvgPosPerSet.toFixed(2)),
           [`s:${symbol}:aper`]:       String(realAvgPosEval.toFixed(4)),
+          [`s:${symbol}:generation`]: statsGeneration,
           [`s:${symbol}:ts`]:         String(Date.now()),
+          [`s:${symbol}:generation`]: generation,
         }),
         client.expire(realDetailKey, 86400),
         // NOTE: do NOT patch strategy_detail:{conn}:main here. The Main detail
@@ -3613,7 +4298,15 @@ export class StrategyCoordinator {
       // forward to Live evaluation — not the raw post-filter count.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
+          generation,
+          epoch: generation,
+          [`${symbol}:real:generation`]: generation,
           [`${symbol}:real`]:           String(realSets.length),
+          // real:evaluated = Main Sets that entered PF evaluation (excludes
+          // pos-count pre-gated Sets). Cross-symbol sum in stats route will
+          // match stratCounts.real denominator exactly.
+          [`${symbol}:real:evaluated`]: String(mainPFEligible),
+          [`${symbol}:real:generation`]: statsGeneration,
           // Keep this current-snapshot numerator in the same scope as
           // `${symbol}:real` so aggregated UI counts obey evaluated <= count.
           // The input denominator (`mainPFEligible`) is still tracked in
@@ -3654,8 +4347,22 @@ export class StrategyCoordinator {
       // without re-scanning every set on read.
       type RealVariantAgg = {
         sumPF: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
+        configuredTp: number; configuredSl: number; configuredTpR: number; configuredSlR: number; configuredRR: number
       }
       const realVariantAgg: Record<string, RealVariantAgg> = {
+        default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        sumPFByEntries: number; sumPFBySets: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
+      }
+      const realVariantAgg: Record<string, RealVariantAgg> = {
+        default:  { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        trailing: { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        block:    { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        dca:      { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        pause:    { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
@@ -3673,8 +4380,15 @@ export class StrategyCoordinator {
         agg.setsContaining += 1
         agg.passedSets     += 1
         agg.entries        += ec
-        agg.sumPF          += set.avgProfitFactor * ec
+        agg.sumPFByEntries += set.avgProfitFactor * ec
+        agg.sumPFBySets    += set.avgProfitFactor
         agg.sumDDT         += (set.avgDrawdownTime || 0) * ec
+        const configured = deriveConfiguredStatsFromProfitFactor(set.avgProfitFactor, 0.1)
+        agg.configuredTp  += configured.takeProfitPct * Math.max(1, ec)
+        agg.configuredSl  += configured.stopLossPct * Math.max(1, ec)
+        agg.configuredTpR += configured.tpR * Math.max(1, ec)
+        agg.configuredSlR += configured.slR * Math.max(1, ec)
+        agg.configuredRR  += configured.rewardRisk * Math.max(1, ec)
       }
       for (const variant of ["default", "trailing", "block", "dca"] as const) {
         const agg = realVariantAgg[variant]
@@ -3682,13 +4396,31 @@ export class StrategyCoordinator {
         // contribute their count metadata to the variant hash.
         if (agg.setsContaining === 0) continue
         const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
+        const existingGeneration = String(await client.hget(vKey, "generation").catch(() => "") || "").trim()
+        if (existingGeneration && statsGeneration && existingGeneration !== statsGeneration) {
+          await client.del(vKey).catch(() => {})
+        }
         writes.push(
           client.hincrby(vKey, "entries_count",  agg.entries),
           client.hincrby(vKey, "created_sets",   agg.setsContaining),
           client.hincrby(vKey, "passed_sets",    agg.passedSets),
+          client.hincrby(vKey, "sum_pf_x1000",         Math.round(agg.sumPFByEntries * 1000)),
+          client.hincrby(vKey, "sum_pf_sets_x1000",    Math.round(agg.sumPFBySets * 1000)),
+          client.hincrby(vKey, "sum_ddt_x10",          Math.round(agg.sumDDT * 10)),
+          client.hset(vKey, { updated_at: new Date().toISOString() }),
           client.hincrby(vKey, "sum_pf_x1000",   Math.round(agg.sumPF * 1000)),
           client.hincrby(vKey, "sum_ddt_x10",    Math.round(agg.sumDDT * 10)),
-          client.hset(vKey, { updated_at: new Date().toISOString() }),
+          client.hset(vKey, {
+            updated_at: new Date().toISOString(),
+            configured_sample_size: String(agg.entries || agg.setsContaining),
+            configured_take_profit_pct: String(agg.entries > 0 ? agg.configuredTp / agg.entries : 0),
+            configured_stop_loss_pct: String(agg.entries > 0 ? agg.configuredSl / agg.entries : 0),
+            configured_tp_r: String(agg.entries > 0 ? agg.configuredTpR / agg.entries : 0),
+            configured_sl_r: String(agg.entries > 0 ? agg.configuredSlR / agg.entries : 0),
+            configured_reward_risk: String(agg.entries > 0 ? agg.configuredRR / agg.entries : 0),
+          }),
+          client.hset(vKey, { updated_at: new Date().toISOString(), generation, epoch: generation }),
+          client.hset(vKey, { generation: statsGeneration, engine_generation: statsGeneration, updated_at: new Date().toISOString() }),
           client.expire(vKey, 7 * 24 * 60 * 60),
         )
       }
@@ -3787,15 +4519,27 @@ export class StrategyCoordinator {
               const h = ((await client.hgetall(vKey).catch(() => null)) || {}) as Record<string, string>
               const entriesCount = Number(h.entries_count  || "0")
               const createdSets  = Number(h.created_sets   || "0")
-              const sumPfX1000   = Number(h.sum_pf_x1000   || "0")
-              const sumDdtX10    = Number(h.sum_ddt_x10    || "0")
-              const avgPF  = entriesCount > 0 ? (sumPfX1000  / 1000) / entriesCount : 0
+              const sumPfX1000     = Number(h.sum_pf_x1000      || "0")
+              const sumPfSetsX1000 = Number(h.sum_pf_sets_x1000 || "0")
+              const sumDdtX10      = Number(h.sum_ddt_x10       || "0")
+              const avgPF  = entriesCount > 0
+                ? (sumPfX1000 / 1000) / entriesCount
+                : createdSets > 0 ? (sumPfSetsX1000 / 1000) / createdSets : 0
               const avgDDT = entriesCount > 0 ? (sumDdtX10   / 10)   / entriesCount : 0
               const avgPosPerSet = createdSets > 0 ? entriesCount / createdSets : 0
               const passRate = createdSets > 0 ? (Number(h.passed_sets || "0") / createdSets) : 0
               await client.hset(vKey, {
+                generation,
+                epoch: generation,
                 avg_profit_factor: avgPF.toFixed(4),
+                realized_profit_factor: avgPF.toFixed(4),
+                realized_avg_signed_r: "0",
+                realized_net_r: "0",
+                realized_win_rate: passRate.toFixed(4),
+                realized_sample_size: String(entriesCount),
                 avg_drawdown_time: avgDDT.toFixed(2),
+                generation: statsGeneration,
+                engine_generation: statsGeneration,
                 avg_pos_per_set:   avgPosPerSet.toFixed(2),
                 pass_rate:         passRate.toFixed(4),
               })
@@ -3905,6 +4649,8 @@ export class StrategyCoordinator {
     let maxLive = this.config.maxLiveSets || 500
     let livePositionCostPct = 0.02
     let livePositionCostPct = 0.1
+    let liveFeedbackThresholds = this.parseLiveFeedbackThresholds()
+    let liveCostModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic")
     let liveExecutionCosts: LiveExecutionCostProfile = resolveLiveExecutionCostProfile("unknown", {})
     const dispatchSelected: LiveDispatchDecision[] = []
     const dispatchSuppressed: LiveDispatchDecision[] = []
@@ -3915,6 +4661,7 @@ export class StrategyCoordinator {
         getRedisClient().hgetall(`connection_settings:${this.connectionId}`).catch(() => ({})),
       ])
       const exchange = String((conn as any)?.exchange || "").toLowerCase()
+      liveCostModel = resolveProtectionCostModel(exchange, connSettings as Record<string, unknown>)
       liveExecutionCosts = resolveLiveExecutionCostProfile(exchange || "unknown", connSettings as Record<string, unknown>)
       // BingX commonly enforces a 200-open-order ceiling. Each live position
       // can carry two reduce-only control orders (SL + TP), so cap dispatch to
@@ -3923,6 +4670,7 @@ export class StrategyCoordinator {
       if (exchange === "bingx") maxLive = Math.min(maxLive, 90)
       const rawCost = Number((connSettings as any)?.exchangePositionCost ?? (connSettings as any)?.positionCost ?? "")
       if (Number.isFinite(rawCost) && rawCost > 0) livePositionCostPct = rawCost
+      liveFeedbackThresholds = this.parseLiveFeedbackThresholds(connSettings as Record<string, any>)
     } catch (err) {
       console.warn(
         `[v0] [StrategyFlow] ${this.connectionId}:${symbol} live dispatch settings read failed:`,
@@ -3982,9 +4730,127 @@ export class StrategyCoordinator {
         }
       }
     } catch (e) { /* non-fatal */ }
+    type DispatchSelectionRow = {
+      bucket: string
+      direction: "long" | "short"
+      isTrailing: boolean
+      reason: string
+      count: number
+      detail?: string
+    }
+    const dispatchSelectionKey = (set: StrategySet) => {
+      const bucket = set.variant || "default"
+      const isTrailing = bucket === "trailing" || !!set.trailingProfile
+      return { bucket, isTrailing }
+    }
+    const bumpDispatchRow = (
+      rows: DispatchSelectionRow[],
+      set: StrategySet,
+      reason: string,
+      detail?: string,
+    ) => {
+      const { bucket, isTrailing } = dispatchSelectionKey(set)
+      const existing = rows.find((row) =>
+        row.bucket === bucket &&
+        row.direction === set.direction &&
+        row.isTrailing === isTrailing &&
+        row.reason === reason &&
+        row.detail === detail
+      )
+      if (existing) {
+        existing.count += 1
+      } else {
+        rows.push({
+          bucket,
+          direction: set.direction,
+          isTrailing,
+          reason,
+          count: 1,
+          ...(detail ? { detail } : {}),
+        })
+      }
+    }
+
+    // Compact live-dispatch selection summary. `qualifying` may contain many
+    // high-PF Sets per symbol/direction, but the live exchange dispatcher only
+    // attempts the top Set per executable bucket/direction to avoid per-cycle
+    // duplicate-lock overhead. Persist both sides of that selection decision
+    // into strategy_detail:{conn}:live so stats/UI can explain why Live counts
+    // differ from attempted dispatch counts without enabling noisy per-cycle logs.
+    const dispatchSets: StrategySet[] = []
+    const dispatchSelectedRows: DispatchSelectionRow[] = []
+    const dispatchSuppressedRows: DispatchSelectionRow[] = []
+    {
+      let sawNewLong  = false
+      let sawNewShort = false
+      let sawBlockLong  = false
+      let sawBlockShort = false
+      let sawDcaLong    = false
+      let sawDcaShort   = false
+      for (const s of qualifying) {
+        const isBlock = s.variant === "block"
+        const isDca   = s.variant === "dca"
+        const isNew   = !isBlock && !isDca // default / trailing / pause
+        let selected = false
+        let suppressReason = "duplicate_new_direction"
+        let detail = "A higher-ranked new/default/trailing/pause Set already targets this direction."
+        if (s.direction === "long") {
+          if (isNew && !sawNewLong) { selected = true; sawNewLong = true }
+          else if (isBlock && !sawBlockLong) { selected = true; sawBlockLong = true }
+          else if (isDca && !sawDcaLong) { selected = true; sawDcaLong = true }
+        } else {
+          if (isNew && !sawNewShort) { selected = true; sawNewShort = true }
+          else if (isBlock && !sawBlockShort) { selected = true; sawBlockShort = true }
+          else if (isDca && !sawDcaShort) { selected = true; sawDcaShort = true }
+        }
+        if (isBlock) {
+          suppressReason = "duplicate_block_direction"
+          detail = "A higher-ranked block Set already targets this direction."
+        } else if (isDca) {
+          suppressReason = "duplicate_dca_direction"
+          detail = "A higher-ranked DCA Set already targets this direction."
+        }
+        if (selected) {
+          dispatchSets.push(s)
+          bumpDispatchRow(dispatchSelectedRows, s, "selected", "Highest-ranked Set for this dispatch bucket and direction.")
+        } else {
+          bumpDispatchRow(dispatchSuppressedRows, s, suppressReason, detail)
+        }
+      }
+    }
 
 
+    // LIVE has two distinct sets after the PF/DDT candidate gate:
+    //   1. qualifying: candidates that passed the Live PF/DDT gate and are
+    //      tracked as Live-progressing candidates.
+    //   2. dispatchSets: candidates selected for the exchange-dispatch attempt
+    //      after per-direction/per-variant suppression.
+    // Keep the distinction explicit so downstream readers do not infer that
+    // returned `sets.length` is the candidate count.
+    const dispatchSets: StrategySet[] = []
+    {
+      let sawNewLong  = false
+      let sawNewShort = false
+    const {
+      dispatchSets,
+      dispatchSelected,
+      dispatchSuppressed,
+      dispatchSuppressedKeys,
+      dispatchSuppressedReasons,
+    } = this.preselectLiveDispatchSets(qualifying)
 
+    console.log(
+      `[v0] [StrategyFlow] ${this.connectionId}:${symbol} LIVE dispatch preselection`,
+      {
+        live_candidates: qualifying.length,
+        dispatchSelected,
+        dispatchSuppressed,
+        dispatchSuppressedKeys,
+        dispatchSuppressedReasons,
+      },
+    )
+
+    // Persist LIVE candidate sets — slim format (coord keys only). Skip in dev:
     // ── Live dispatch preselection ──────────────────────────────────────
     // `qualifying` is the Live candidate pool after PF/DDT/rank/cap. Only
     // `dispatchSets` are active/running targets for pseudo/live execution:
@@ -4017,6 +4883,25 @@ export class StrategyCoordinator {
       let sawBlockShort = false
       let sawDcaLong    = false
       let sawDcaShort   = false
+      for (const s of qualifying) {
+        const isBlock = s.variant === "block"
+        const isDca   = s.variant === "dca"
+        const isNew   = !isBlock && !isDca // default / trailing / pause
+        if (s.direction === "long") {
+          if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
+          if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
+          if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
+        } else {
+          if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
+          if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
+          if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
+        }
+        if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
+      }
+    }
+    const dispatchSelected = dispatchSets.length
+    const selectedSets = new Set<StrategySet>(dispatchSets)
+    const dispatchSuppressed = qualifying.filter((s) => !selectedSets.has(s))
 
       const selectDispatchSet = (s: StrategySet, bucket: "new" | "trailing" | "block" | "dca", isTrailing: boolean) => {
         dispatchSets.push(s)
@@ -4107,11 +4992,87 @@ export class StrategyCoordinator {
       })
     }
 
+    // Pre-fetch the current market price ONCE so both the live exchange dispatch
+    // and the pseudo-position creation below share the same price without
+    // duplicate Redis reads. The live-stage will still validate / re-fetch if
+    // we hand it 0, but providing a good seed eliminates the most common cause
+    // of "no market price" failures when market_data is just milliseconds stale.
+    let _cachedMarketPrice = 0
+    try {
+      const _priceClient = getRedisClient()
+      const _mdhash = await _priceClient.hgetall(`market_data:${symbol}`)
+      _cachedMarketPrice = parseFloat(String(_mdhash?.close ?? _mdhash?.price ?? _mdhash?.last ?? "0"))
+      if (!_cachedMarketPrice || isNaN(_cachedMarketPrice)) {
+        // Spec §7: prefer the canonical :1s envelope, fall back to :1m.
+        const _mdraw =
+          (await _priceClient.get(`market_data:${symbol}:1s`)) ??
+          (await _priceClient.get(`market_data:${symbol}:1m`))
+        if (_mdraw) {
+          const _mdobj = typeof _mdraw === "string" ? JSON.parse(_mdraw) : _mdraw
+          const _candles = _mdobj?.candles
+          if (Array.isArray(_candles) && _candles.length > 0) {
+            _cachedMarketPrice = parseFloat(String(_candles[_candles.length - 1]?.close ?? "0")) || 0
+          } else {
+            _cachedMarketPrice = parseFloat(String(_mdobj?.close ?? _mdobj?.price ?? _mdobj?.last ?? "0")) || 0
+          }
+        }
+      }
+    } catch { /* best-effort; live-stage falls back internally */ }
+    // Select the active Live dispatch model once and use it for both counters and
+    // exchange dispatch. `qualifying` is the candidate pool; `dispatchSets` is the
+    // selected active set list after applying the per-direction / per-variant Live
+    // model. Cumulative Live totals intentionally count selected active sets, not
+    // every candidate considered by the model.
+    const dispatchSets: StrategySet[] = []
+    {
+      let sawNewLong  = false
+      let sawNewShort = false
+      let sawBlockLong  = false
+      let sawBlockShort = false
+      let sawDcaLong    = false
+      let sawDcaShort   = false
+      for (const s of qualifying) {
+        const isBlock = s.variant === "block"
+        const isDca   = s.variant === "dca"
+        const isNew   = !isBlock && !isDca // default / trailing / pause
+        if (s.direction === "long") {
+          if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
+          if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
+          if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
+        } else {
+          if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
+          if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
+          if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
+        }
+        if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
+      }
+    }
+    const dispatchSuppressedCount = Math.max(0, qualifying.length - dispatchSets.length)
+
+    // Create pseudo positions from the LIVE-qualifying subset only.
+    // Previously received all `realSets` (up to 3000/symbol), causing N×3 Redis
+    // writes for sets that never reach live dispatch. `qualifying` is the capped
+    // Live subset (typically ≤500/symbol) — the only sets that semantically need
+    // pseudo-position records (they represent active dispatch candidates).
+    await this.createPseudoPositionsFromRealSets(symbol, qualifying, coordIndex, livePositionCostPct)
+    await this.createPseudoPositionsFromRealSets(symbol, qualifying, _cachedMarketPrice)
+    // Live candidate subset (typically ≤500/symbol) — dispatch selection is
+    // tracked separately below so the UI can compare candidates vs selected sets.
+    await this.createPseudoPositionsFromRealSets(symbol, qualifying)
+    // Create pseudo positions from the actually selected LIVE dispatch subset only.
+    // `qualifying` remains the candidate pool after PF/DDT/maxLive; `dispatchSets`
+    // is the dedup-aware subset that may actually run this cycle.
     // Create pseudo positions only for dispatch-selected LIVE Sets.
     // `qualifying` is the candidate pool; `dispatchSets` is the active/running
     // subset after duplicate-direction suppression. This keeps Live active logs
     // and pseudo positions aligned with what can actually dispatch.
     await this.createPseudoPositionsFromRealSets(symbol, dispatchSets)
+
+    // Select the small subset that can actually be dispatched before any
+    // console output. The persisted detail hash remains the primary UI/API
+    // diagnostics source; console logging below is opt-in debug only.
+    const liveDispatchSelection = selectLiveDispatchSets(qualifying)
+    const dispatchSets = liveDispatchSelection.selected
 
     // Write live set count into progression hash — use hset so count reflects current cycle snapshot.
     // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
@@ -4124,6 +5085,16 @@ export class StrategyCoordinator {
       const liveDetailKey = `strategy_detail:${this.connectionId}:live`
       const liveCountKey = `strategies:${this.connectionId}:live:count`
 
+      const liveAvgPF  = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + st.avgProfitFactor, 0) / dispatchSets.length : 0
+      const liveAvgDDT = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / dispatchSets.length : 0
+      const passRatioLive = realSets.length > 0 ? dispatchSets.length / realSets.length : 0
+      const generation = await this.currentStatsGeneration(client)
+      const statsGeneration = await this.getStatsGeneration(client)
+
+      const liveAvgPF  = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + st.avgProfitFactor, 0) / dispatchSets.length : 0
+      const liveAvgDDT = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / dispatchSets.length : 0
+      const candidateAvgPF  = qualifying.length > 0 ? qualifying.reduce((s, st) => s + st.avgProfitFactor, 0) / qualifying.length : 0
+      const candidateAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
       const liveAvgPF  = dispatchAvgPF
       const liveAvgDDT = dispatchAvgDDT
       const passRatioLive = realSets.length > 0 ? qualifying.length / realSets.length : 0
@@ -4138,8 +5109,22 @@ export class StrategyCoordinator {
       // so we still land in one network hop.
       type LiveVariantAgg = {
         sumPF: number; sumDDT: number; entries: number; setsContaining: number
+        configuredTp: number; configuredSl: number; configuredTpR: number; configuredSlR: number; configuredRR: number
       }
       const liveVariantAgg: Record<string, LiveVariantAgg> = {
+        default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, configuredTp: 0, configuredSl: 0, configuredTpR: 0, configuredSlR: 0, configuredRR: 0 },
+        sumPFByEntries: number; sumPFBySets: number; sumDDT: number; entries: number; setsContaining: number
+      }
+      const liveVariantAgg: Record<string, LiveVariantAgg> = {
+        default:  { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        trailing: { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        block:    { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        dca:      { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        pause:    { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
@@ -4155,6 +5140,16 @@ export class StrategyCoordinator {
         lv.entries += ec
         lv.sumPF   += set.avgProfitFactor * ec
         lv.sumDDT  += (set.avgDrawdownTime || 0) * ec
+        const configured = deriveConfiguredStatsFromProfitFactor(set.avgProfitFactor, livePositionCostPct)
+        lv.configuredTp  += configured.takeProfitPct * Math.max(1, ec)
+        lv.configuredSl  += configured.stopLossPct * Math.max(1, ec)
+        lv.configuredTpR += configured.tpR * Math.max(1, ec)
+        lv.configuredSlR += configured.slR * Math.max(1, ec)
+        lv.configuredRR  += configured.rewardRisk * Math.max(1, ec)
+        lv.entries        += ec
+        lv.sumPFByEntries += set.avgProfitFactor * ec
+        lv.sumPFBySets    += set.avgProfitFactor
+        lv.sumDDT         += (set.avgDrawdownTime || 0) * ec
       }
 
       // ── bumpValidPositions — Live-promoted Set counter ─────────────────
@@ -4191,21 +5186,39 @@ export class StrategyCoordinator {
         // still contributes count metadata. Avoids writing empty buckets.
         if (agg.setsContaining === 0) continue
         const vKey   = `strategy_variant_live:${this.connectionId}:${variant}`
-        const ec     = agg.entries || 1   // guard division — falls back to 1 if entryCount unset
-        const avgPF  = agg.sumPF  / ec
-        const avgDDT = agg.sumDDT / ec
+        const avgPF  = agg.entries > 0
+          ? agg.sumPFByEntries / agg.entries
+          : agg.sumPFBySets / agg.setsContaining
+        const avgDDT = agg.entries > 0 ? agg.sumDDT / agg.entries : 0
         liveVariantWrites.push(
           client.hset(vKey, {
+            generation,
+            epoch: generation,
+            generation:        statsGeneration,
+            engine_generation: statsGeneration,
             created_sets:      String(agg.setsContaining),
             entries_count:     String(agg.entries),
             avg_profit_factor: avgPF.toFixed(4),
+            realized_profit_factor: avgPF.toFixed(4),
+            realized_avg_signed_r: "0",
+            realized_net_r: "0",
+            realized_win_rate: "0",
+            realized_sample_size: String(agg.entries || agg.setsContaining),
             avg_drawdown_time: avgDDT.toFixed(2),
             avg_pos_per_set:   (agg.entries / agg.setsContaining).toFixed(2),
+            configured_sample_size: String(agg.entries || agg.setsContaining),
+            configured_take_profit_pct: String(agg.entries > 0 ? agg.configuredTp / agg.entries : 0),
+            configured_stop_loss_pct: String(agg.entries > 0 ? agg.configuredSl / agg.entries : 0),
+            configured_tp_r: String(agg.entries > 0 ? agg.configuredTpR / agg.entries : 0),
+            configured_sl_r: String(agg.entries > 0 ? agg.configuredSlR / agg.entries : 0),
+            configured_reward_risk: String(agg.entries > 0 ? agg.configuredRR / agg.entries : 0),
             updated_at:        String(Date.now()),
           }),
           client.expire(vKey, 7 * 24 * 60 * 60),
         )
       }
+
+      const dispatchEntryCount = dispatchSets.reduce((s, st) => s + (st.entryCount || 0), 0)
 
       // strategies_live_total must be CUMULATIVE (hincrby), not a per-cycle
       // snapshot (hset). All other stage _total fields use hincrby; using hset
@@ -4213,8 +5226,13 @@ export class StrategyCoordinator {
       // cycle, so the dashboard always showed a tiny snapshot instead of the
       // true accumulated lifetime count.
       await Promise.all([
+        dispatchSets.length > 0
+          ? client.hincrby(redisKey, "strategies_live_total", dispatchSets.length)
+          : Promise.resolve(),
         qualifying.length > 0
-          ? client.hincrby(redisKey, "strategies_live_total", qualifying.length)
+          ? client.hincrby(redisKey, "strategies_live_candidates_total", qualifying.length)
+        realSets.length > 0
+          ? client.hincrby(redisKey, "strategies_live_evaluated", realSets.length)
           : Promise.resolve(),
         // ── ACTIVE-NOW snapshot for Live stage ────────────────────────────
         // Without {symbol}:live fields the `stratCounts.live` bucket in the
@@ -4223,18 +5241,84 @@ export class StrategyCoordinator {
           [`${symbol}:live`]:           String(dispatchSets.length),
           // live:evaluated = Real Sets that entered Live selection (= candidates)
           [`${symbol}:live:evaluated`]: String(realSets.length),
+          [`${symbol}:live:candidates`]: String(qualifying.length),
+          // live:evaluated = Real Sets that entered Live selection (= candidates)
+          [`${symbol}:live:evaluated`]: String(realSets.length),
+          [`${symbol}:live:candidates`]: String(qualifying.length),
+          generation,
+          epoch: generation,
+          [`${symbol}:live:generation`]: generation,
+          [`${symbol}:live`]:           String(qualifying.length),
+          [`${symbol}:live`]:           String(dispatchSets.length),
+          // live:evaluated = Real Sets that entered Live selection (= candidates)
+          [`${symbol}:live:evaluated`]: String(realSets.length),
+          [`${symbol}:live:generation`]: statsGeneration,
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(liveDetailKey, {
+          generation,
+          epoch: generation,
+          generation:        statsGeneration,
+          engine_generation: statsGeneration,
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
           // for backwards compat; /stats prefers per-symbol sums below.
           created_sets:      String(dispatchSets.length),
           avg_profit_factor: String(liveAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(liveAvgDDT)),
           evaluated:         String(realSets.length),
-          passed_sets:       String(qualifying.length),
+          passed_sets:       String(dispatchSets.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
+          dispatch_candidates:       String(qualifying.length),
+          dispatch_selected_count:   String(dispatchSets.length),
+          dispatch_suppressed_count: String(dispatchSuppressedCount),
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
+          //   Live's `dispatchSets` are the selected active orders. They
+          input_sets:        String(realSets.length),
+          evaluated:         String(qualifying.length),
+          passed_sets:       String(qualifying.length),
+          output_sets:       String(qualifying.length),
+          previous_stage_output_sets: String(realSets.length),
+          pass_rate:         String(passRatioLive.toFixed(4)),
+          dispatch_selected: String(dispatchSelected),
+          dispatch_suppressed: String(dispatchSuppressed.length),
+          // ── ACTIVELY-RUNNING metrics (operator spec) ─────────────────
+          //   Keep the legacy candidate-based running/open fields stable for
+          //   existing stats readers; the dispatch-specific fields above
+          //   expose the stricter exchange-dispatch subset.
+          //   `sets_progressing` remains the real-stage input pool being
+          //   ranked and capped toward live candidate selection.
+          sets_running_now:         String(qualifying.length),
+          sets_with_open_positions: String(qualifying.length),
+          live_candidates:   String(qualifying.length),
+          dispatch_candidates: String(qualifying.length),
+          dispatchSelected: String(dispatchSelected),
+          dispatchSuppressed: String(dispatchSuppressed),
+          dispatch_selected: String(dispatchSelected),
+          dispatch_suppressed: String(dispatchSuppressed),
+          dispatch_suppressed_keys: dispatchSuppressedKeys.join(","),
+          dispatch_suppressed_reasons: JSON.stringify(dispatchSuppressedReasons),
+          candidate_avg_profit_factor: String(candidateAvgPF.toFixed(4)),
+          candidate_avg_drawdown_time: String(Math.round(candidateAvgDDT)),
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
+          // `qualifying` is the Live candidate pool after PF/DDT/maxLive.
+          // `dispatchSets` is the subset selected to actually run after
+          // per-direction/variant preselection.
+          sets_running_now:         String(dispatchSets.length),
+          sets_with_open_positions: String(dispatchSets.length),
+          sets_progressing:         String(qualifying.length),
+          dispatch_selected: String(dispatchSelected),
+          dispatch_suppressed: String(dispatchSuppressed),
+          dispatch_suppressed_keys: dispatchSuppressedKeys.join(","),
+          candidate_avg_profit_factor: String(candidateAvgPF.toFixed(4)),
+          candidate_avg_drawdown_time: String(Math.round(candidateAvgDDT)),
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
+          // `qualifying` is the Live candidate pool after PF/DDT/maxLive.
+          // `dispatchSets` is the subset selected to actually run after
+          // per-direction/variant preselection.
+          sets_running_now:         String(dispatchSets.length),
+          sets_with_open_positions: String(dispatchSets.length),
+          sets_progressing:         String(qualifying.length),
           dispatch_candidates: String(qualifying.length),
           dispatch_selected_count: String(dispatchSets.length),
           dispatch_suppressed_count: String(dispatchSuppressed.length),
@@ -4255,8 +5339,8 @@ export class StrategyCoordinator {
           //   the real-stage input pool being ranked & capped this
           //   cycle (i.e. candidates currently progressing toward live
           //   execution).
-          sets_running_now:         String(qualifying.length),
-          sets_with_open_positions: String(qualifying.length),
+          sets_running_now:         String(dispatchSets.length),
+          sets_with_open_positions: String(dispatchSets.length),
           sets_progressing:         String(realSets.length),
           updated_at:        String(Date.now()),
           // Per-symbol fields — see createBaseSets for rationale.
@@ -4264,6 +5348,11 @@ export class StrategyCoordinator {
           // those keys are intentionally omitted from the per-symbol
           // bundle so /stats's weighted-mean calculator skips them.
           [`s:${symbol}:created`]:    String(dispatchSets.length),
+          [`s:${symbol}:entries`]:    String(dispatchSets.reduce((s, st) => s + (st.entryCount || 0), 0)),
+          [`s:${symbol}:running`]:    String(dispatchSets.length),
+          [`s:${symbol}:entries`]:    String(dispatchEntryCount),
+          [`s:${symbol}:running`]:    String(dispatchSets.length),
+          [`s:${symbol}:progressing`]: String(qualifying.length),
           [`s:${symbol}:entries`]:    String(dispatchEntries),
           [`s:${symbol}:running`]:    String(dispatchSets.length),
           [`s:${symbol}:progressing`]: String(realSets.length),
@@ -4276,10 +5365,19 @@ export class StrategyCoordinator {
           [`s:${symbol}:running`]:    String(qualifying.length),
           [`s:${symbol}:progressing`]: String(realSets.length),
           [`s:${symbol}:passed`]:     String(qualifying.length),
+          [`s:${symbol}:dispatch_selected`]: String(dispatchSelected),
+          [`s:${symbol}:dispatch_suppressed`]: String(dispatchSuppressed.length),
+          [`s:${symbol}:passed`]:     String(dispatchSets.length),
           [`s:${symbol}:evaluated`]:  String(realSets.length),
           [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(liveAvgDDT)),
+          dispatch_selected:    JSON.stringify(dispatchSelectedRows),
+          dispatch_suppressed:  JSON.stringify(dispatchSuppressedRows),
+          [`s:${symbol}:dispatch_selected`]:   JSON.stringify(dispatchSelectedRows),
+          [`s:${symbol}:dispatch_suppressed`]: JSON.stringify(dispatchSuppressedRows),
+          [`s:${symbol}:generation`]: statsGeneration,
           [`s:${symbol}:ts`]:         String(Date.now()),
+          [`s:${symbol}:generation`]: generation,
         }),
         client.expire(liveDetailKey, 86400),
         // `set` with EX in a single command avoids the separate expire round-trip.
@@ -4291,33 +5389,6 @@ export class StrategyCoordinator {
     } catch (err: any) {
       console.error(`[v0] [Coordinator] Error in createLiveSets for ${symbol}:`, err?.message)
     }
-
-    // Pre-fetch the current market price ONCE so both the live exchange dispatch
-    // and the pseudo-position creation below share the same price without
-    // duplicate Redis reads. The live-stage will still validate / re-fetch if
-    // we hand it 0, but providing a good seed eliminates the most common cause
-    // of "no market price" failures when market_data is just milliseconds stale.
-    let _cachedMarketPrice = 0
-    try {
-      const _priceClient = getRedisClient()
-      const _mdhash = await _priceClient.hgetall(`market_data:${symbol}`)
-      _cachedMarketPrice = parseFloat(String(_mdhash?.close ?? _mdhash?.price ?? _mdhash?.last ?? "0"))
-      if (!_cachedMarketPrice || isNaN(_cachedMarketPrice)) {
-        // Spec §7: prefer the canonical :1s envelope, fall back to :1m.
-        const _mdraw =
-          (await _priceClient.get(`market_data:${symbol}:1s`)) ??
-          (await _priceClient.get(`market_data:${symbol}:1m`))
-        if (_mdraw) {
-          const _mdobj = typeof _mdraw === "string" ? JSON.parse(_mdraw) : _mdraw
-          const _candles = _mdobj?.candles
-          if (Array.isArray(_candles) && _candles.length > 0) {
-            _cachedMarketPrice = parseFloat(String(_candles[_candles.length - 1]?.close ?? "0")) || 0
-          } else {
-            _cachedMarketPrice = parseFloat(String(_mdobj?.close ?? _mdobj?.price ?? _mdobj?.last ?? "0")) || 0
-          }
-        }
-      }
-    } catch { /* best-effort; live-stage falls back internally */ }
 
     // Attempt real exchange trading for qualifying LIVE sets when the connection has live trading enabled.
     // This is guarded by is_live_trade flag on the connection — if disabled, only pseudo positions are created.
@@ -4331,6 +5402,80 @@ export class StrategyCoordinator {
     // executeReadyStrategiesAsLiveOrders path, producing double-IDs with "#axis-synth" suffixes.
     // The real pipeline now produces qualifying sets reliably (REAL bootstrap relaxes
     // minProfitFactor to 0.75 on first run), so this workaround is no longer needed.
+
+    const liveDispatchCycleAt = new Date().toISOString()
+    const writeLiveDispatchSnapshot = async (snapshot: {
+      cycleAt: string
+      symbol: string
+      connectionId: string
+      qualifiedSets: string[]
+      dispatchSelected: string[]
+      dispatchSuppressed: string[]
+      suppressionCounts: Record<string, number>
+      placed?: number
+      filled?: number
+      rejected?: number
+      errored?: number
+    }) => {
+      try {
+        const client = getRedisClient()
+        const payload = JSON.stringify(snapshot)
+        await Promise.all([
+          client.hset(`realtime:${this.connectionId}`, {
+            live_dispatch_latest: payload,
+            [`live_dispatch_latest:${symbol}`]: payload,
+          }),
+          client.set(`realtime:${this.connectionId}:liveDispatch:latest`, payload, { EX: 600 } as any),
+          client.set(`realtime:${this.connectionId}:liveDispatch:${symbol}:latest`, payload, { EX: 600 } as any),
+        ])
+      } catch { /* non-critical visibility snapshot */ }
+    }
+
+    const selectLiveDispatchSets = (sets: StrategySet[]) => {
+      const dispatchSets: StrategySet[] = []
+      const dispatchSuppressed: string[] = []
+      const suppressionCounts: Record<string, number> = {}
+      let sawNewLong  = false
+      let sawNewShort = false
+      let sawBlockLong  = false
+      let sawBlockShort = false
+      let sawDcaLong    = false
+      let sawDcaShort   = false
+      for (const s of sets) {
+        const isBlock = s.variant === "block"
+        const isDca   = s.variant === "dca"
+        const isNew   = !isBlock && !isDca // default / trailing / pause
+        const bucket = `${isBlock ? "block" : isDca ? "dca" : "new"}:${s.direction}`
+        let selected = false
+        if (s.direction === "long") {
+          if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true; selected = true }
+          if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true; selected = true }
+          if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true; selected = true }
+        } else {
+          if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true; selected = true }
+          if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true; selected = true }
+          if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true; selected = true }
+        }
+        if (!selected) {
+          dispatchSuppressed.push(s.setKey)
+          suppressionCounts[bucket] = (suppressionCounts[bucket] || 0) + 1
+        }
+      }
+      return { dispatchSets, dispatchSuppressed, suppressionCounts }
+    }
+
+    const liveDispatchSelection = selectLiveDispatchSets(qualifying)
+    const baseLiveDispatchSnapshot = {
+      cycleAt: liveDispatchCycleAt,
+      symbol,
+      connectionId: this.connectionId,
+      qualifiedSets: qualifying.map((s) => s.setKey),
+      dispatchSelected: liveDispatchSelection.dispatchSets.map((s) => s.setKey),
+      dispatchSuppressed: liveDispatchSelection.dispatchSuppressed,
+      suppressionCounts: liveDispatchSelection.suppressionCounts,
+    }
+
+    await writeLiveDispatchSnapshot(baseLiveDispatchSnapshot)
 
     if (qualifying.length === 0) {
       try {
@@ -4415,7 +5560,7 @@ export class StrategyCoordinator {
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
         const isLiveTrade = isTruthyFlag(connData?.is_live_trade) || isTruthyFlag(connData?.live_trade_enabled)
         if (isLiveTrade) {
-          const { executeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
+          const { executeLivePosition, assessLiveMicrostructureProtection } = await import("@/lib/trade-engine/stages/live-stage")
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
           const connector = await exchangeConnectorFactory.getOrCreateConnector(this.connectionId)
           if (connector) {
@@ -4455,6 +5600,12 @@ export class StrategyCoordinator {
             // Without this rule, block/dca sets targeting e.g. long were
             // always dropped because `sawLong=true` was already set by the
             // default set, meaning block strategy NEVER dispatched.
+            if (process.env.DEBUG_LIVE_DISPATCH_SELECTION === "1") {
+              console.log(
+                `[v0] [StrategyFlow] ${symbol} LIVE dispatch selection — selected=${dispatchSets.length} (${summarizeLiveDispatchBuckets(dispatchSets) || "none"}) suppressed=${liveDispatchSelection.suppressed.length} (${summarizeLiveDispatchBuckets(liveDispatchSelection.suppressed) || "none"})`
+            // Reuse the precomputed compact dispatch selection above; it is also persisted to strategy_detail live stats.
+
+            const dispatchSets = liveDispatchSelection.dispatchSets
             const dispatchSets: StrategySet[] = []
             {
               let sawNewLong  = false
@@ -4519,10 +5670,34 @@ export class StrategyCoordinator {
               )
             }
 
+            let recentClosedLivePositions: any[] = []
+            if (liveFeedbackThresholds.enabled && dispatchSets.length > 0) {
+              try {
+                const { getClosedLivePositions } = await import("@/lib/trade-engine/stages/live-stage")
+                recentClosedLivePositions = await getClosedLivePositions(this.connectionId, liveFeedbackThresholds.recentLimit)
+              } catch (feedbackErr) {
+                console.warn(
+                  `[v0] [StrategyFlow] ${symbol} live feedback stats read failed:`,
+                  feedbackErr instanceof Error ? feedbackErr.message : String(feedbackErr),
+                )
+              }
+            }
+            const blockSetsDispatched = dispatchSets.filter((s) => s.variant === "block").length
+            try {
+              await getRedisClient().hset(`block_strategy:${this.connectionId}`, {
+                [`s:${symbol}:dispatched`]: String(blockSetsDispatched),
+                updated_at: String(Date.now()),
+              })
+              await getRedisClient().expire(`block_strategy:${this.connectionId}`, 600)
+            } catch { /* non-critical diagnostics */ }
+
             let placed = 0
             let filled = 0
             let rejected = 0
             let errored = 0
+            let costSuppressed = 0
+            let lastProtectionDetail: Record<string, string> = {}
+            const dispatchSuppressed: LiveDispatchSuppressedEntry[] = []
             const blockExecutionStats = {
               connectionId: this.connectionId,
               symbol,
@@ -4556,6 +5731,44 @@ export class StrategyCoordinator {
 
             for (const set of dispatchSets) {
               try {
+                const feedback = this.calculateLiveExchangeFeedback(set, symbol, recentClosedLivePositions, liveFeedbackThresholds)
+                const feedbackDetails = {
+                  symbol,
+                  direction: set.direction,
+                  setKey: set.setKey,
+                  parentSetKey: set.parentSetKey,
+                  variant: set.variant || "default",
+                  axisWindows: set.axisWindows,
+                  realProfitFactor: set.avgProfitFactor,
+                  liveRealizedProfitFactor: feedback.stats.profitFactor,
+                  liveFeeAdjustedProfitFactor: feedback.stats.feeAdjustedProfitFactor,
+                  liveWinRate: feedback.stats.winRate,
+                  liveNetPnl: feedback.stats.netPnl,
+                  liveSampleSize: feedback.stats.sampleSize,
+                  liveFeedbackThresholds: feedback.thresholds,
+                }
+                if (feedback.suppress) {
+                  rejected++
+                  await logProgressionEvent(
+                    this.connectionId,
+                    "live_trading",
+                    "warning",
+                    `dispatchSuppressed ${symbol} ${set.direction}`,
+                    {
+                      ...feedbackDetails,
+                      suppressionReasons: feedback.reasons,
+                    },
+                  ).catch(() => {})
+                  continue
+                }
+                await logProgressionEvent(
+                  this.connectionId,
+                  "live_trading",
+                  "info",
+                  `dispatchSelected ${symbol} ${set.direction}`,
+                  feedbackDetails,
+                ).catch(() => {})
+
                 const isBlockDispatch = set.variant === "block"
                 if (isBlockDispatch) {
                   blockExecutionStats.attempted++
@@ -4574,9 +5787,10 @@ export class StrategyCoordinator {
                 //   2. coordIndex.base.byKey.get(parentKey).entries  ← O(1)
                 //   3. realSets.find() linear scan  ← only when no coordIndex
                 const parentKey = set.parentSetKey || set.setKey.split("#")[0]
+                const setRepresentativeEntry = set.entries.find(hasVariantSizingEntry)
                 const effectiveEntries: StrategySetEntry[] =
-                  set.entries.length > 0
-                    ? set.entries
+                  setRepresentativeEntry
+                    ? [setRepresentativeEntry]
                     : coordIndex
                       ? (coordIndex.base.byKey.get(parentKey)?.entries ?? [])
                       : (realSets.find((s) => s.setKey === parentKey)?.entries ?? [])
@@ -4599,6 +5813,7 @@ export class StrategyCoordinator {
                   : (bestEntry.sizeMultiplier ?? 1)
                 // Use tunedAvgPF for SL/TP derivation when available — reflects the
                 // Real-stage tuner's per-variant performance bias.
+                const effectivePF = dispatchCoordRec?.tunedAvgPF ?? set.avgProfitFactor ?? bestEntry.profitFactor
                 const rawEffectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
                 const effectivePF = sanitizeLiveProfitFactor(rawEffectivePF, bestEntry.profitFactor)
                 const effectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
@@ -4612,8 +5827,38 @@ export class StrategyCoordinator {
                   effectivePF,
                   livePositionCostPct,
                   effectiveSizeMult,
+                  liveCostModel,
                   liveExecutionCosts.costBufferPct,
                 )
+                const liveProtection = await assessLiveMicrostructureProtection({
+                  connectionId: this.connectionId,
+                  symbol,
+                  stopLossPct: protection.stopLossPct,
+                  takeProfitPct: protection.takeProfitPct,
+                  profitFactor: effectivePF,
+                })
+                if (!liveProtection.viable) {
+                  rejected++
+                  await logProgressionEvent(
+                    this.connectionId,
+                    "live_trading",
+                    "warning",
+                    `Live order suppressed for ${symbol}: risk_reward_not_live_viable`,
+                    {
+                      symbol,
+                      direction: set.direction,
+                      setKey: set.setKey,
+                      slFloorReason: liveProtection.slFloorReason,
+                      netEffectivePF: liveProtection.netEffectivePF,
+                      stopLossPct: liveProtection.stopLossPct,
+                      takeProfitPct: liveProtection.takeProfitPct,
+                      maxTakeProfitPct: liveProtection.maxTakeProfitPct,
+                    },
+                  ).catch(() => {})
+                  continue
+                }
+                const tp = liveProtection.takeProfitPct
+                const sl = liveProtection.stopLossPct
                 const protectionDispatch: LiveDispatchDecision = {
                   setKey: set.setKey,
                   parentSetKey: set.parentSetKey,
@@ -4641,6 +5886,43 @@ export class StrategyCoordinator {
                 dispatchSelected.push(protectionDispatch)
                 const tp = protection.takeProfitPct
                 const sl = protection.stopLossPct
+                const protectionDetail = {
+                  grossPF: protection.grossPF,
+                  netPF: protection.netPF,
+                  costBufferPct: protection.costBufferPct,
+                  effectiveTpPct: protection.effectiveTpPct,
+                  effectiveSlPct: protection.effectiveSlPct,
+                  takerFeeBpsPerSide: liveCostModel.takerFeeBpsPerSide,
+                  estimatedSpreadBps: liveCostModel.estimatedSpreadBps,
+                  estimatedMarketSlippageBps: liveCostModel.estimatedMarketSlippageBps,
+                  fundingHoldCostBufferBps: liveCostModel.fundingHoldCostBufferBps ?? 0,
+                  costModelSource: liveCostModel.source ?? "unknown",
+                }
+                lastProtectionDetail = {
+                  [`s:${symbol}:last_set_key`]: set.setKey,
+                  [`s:${symbol}:gross_pf`]: protection.grossPF.toFixed(4),
+                  [`s:${symbol}:net_pf`]: protection.netPF.toFixed(4),
+                  [`s:${symbol}:cost_buffer_pct`]: protection.costBufferPct.toFixed(4),
+                  [`s:${symbol}:effective_tp_pct`]: protection.effectiveTpPct.toFixed(4),
+                  [`s:${symbol}:effective_sl_pct`]: protection.effectiveSlPct.toFixed(4),
+                  [`s:${symbol}:cost_model_source`]: protectionDetail.costModelSource,
+                }
+
+                if (protection.netPF < this.METRICS.real.minProfitFactor) {
+                  rejected++
+                  costSuppressed++
+                  await logProgressionEvent(this.connectionId, "live_trading", "warning", "Live dispatch suppressed by exchange-cost net PF gate", {
+                    symbol,
+                    setKey: set.setKey,
+                    direction: set.direction,
+                    realStageMinPF: this.METRICS.real.minProfitFactor,
+                    ...protectionDetail,
+                  }).catch(() => {})
+                  console.log(
+                    `[v0] [StrategyFlow] ${symbol} LIVE suppressed ${set.setKey}: netPF=${protection.netPF.toFixed(4)} < realMinPF=${this.METRICS.real.minProfitFactor.toFixed(4)} costBuffer=${protection.costBufferPct.toFixed(4)}%`
+                  )
+                  continue
+                }
 
                 const liveResult = await executeLivePosition(
                   this.connectionId,
@@ -4660,6 +5942,8 @@ export class StrategyCoordinator {
                     rewardTarget: 0,
                     stopLoss: sl,
                     takeProfit: tp,
+                    slFloorReason: liveProtection.slFloorReason,
+                    netEffectivePF: liveProtection.netEffectivePF,
                     mainPositionCount: set.entryCount,
                     evaluationScore: bestEntry.confidence,
                     ratioMet: bestEntry.confidence >= 0.65,
@@ -4667,6 +5951,8 @@ export class StrategyCoordinator {
                     ratios: {
                       // Use effectivePF (coord-record tuned) so risk ratios reflect
                       // the Real-stage performance bias rather than raw Base entry PF.
+                      profitabilityRatio: liveProtection.netEffectivePF,
+                      profitabilityRatio: protection.netPF,
                       profitabilityRatio: protection.netEffectivePF,
                       accountRiskRatio: sl / 100,
                       successRateRatio: bestEntry.confidence,
@@ -4696,10 +5982,21 @@ export class StrategyCoordinator {
                     // already incorporated the CoordRecord sizeDelta from the
                     // Real-stage tuner — no extra entry scan needed.
                     sizeMultiplier: effectiveSizeMult,
+                    protectionCost: protectionDetail,
                   },
                   connector
                 )
 
+                if (!liveResult) continue
+                const liveStatus = String((liveResult as any).status || "unknown")
+                if (liveStatus === "open" || liveStatus === "filled" || liveStatus === "partially_filled") {
+                  filled++
+                  placed++
+                } else if (liveStatus === "placed") {
+                  placed++
+                } else if (liveStatus === "rejected") {
+                  rejected++
+                } else if (liveStatus === "error") {
                 if (!liveResult) {
                   suppressDispatchSet(set, "connector_unavailable", "live pipeline returned no result")
                   continue
@@ -4716,6 +6013,8 @@ export class StrategyCoordinator {
                 if (liveResult.status === "open" || liveResult.status === "filled" || liveResult.status === "partially_filled") {
                   filled++
                   placed++
+                } else if (liveResult.status === "placed" || liveResult.status === "pending_fill" || liveResult.status === "placed_unconfirmed") {
+                } else if (liveResult.status === "placed" || liveResult.status === "pending_fill") {
                   if (isBlockDispatch) { blockExecutionStats.filled++; blockExecutionStats.placed++ }
                 } else if (liveResult.status === "placed") {
                   placed++
@@ -4735,6 +6034,20 @@ export class StrategyCoordinator {
                     if (isBlockDispatch) blockExecutionStats.errored++
                   }
                 }
+
+                if (!LIVE_DISPATCH_SUCCESS_STATUSES.has(liveStatus)) {
+                  const statusReason = String((liveResult as any).statusReason || (liveResult as any).reason || "")
+                  const suppressionReason =
+                    classifyLiveSuppression(statusReason) ?? fallbackLiveSuppression(statusReason)
+                  dispatchSuppressed.push({
+                    setKey: set.setKey,
+                    symbol,
+                    direction: set.direction,
+                    status: liveStatus,
+                    statusReason,
+                    reason: suppressionReason,
+                  })
+                }
               } catch (err) {
                 if (set.variant === "block") blockExecutionStats.errored++
                 errored++
@@ -4745,6 +6058,33 @@ export class StrategyCoordinator {
               }
             }
 
+            if (Object.keys(lastProtectionDetail).length > 0 || costSuppressed > 0) {
+              await getRedisClient().hset(`strategy_detail:${this.connectionId}:live`, {
+                [`s:${symbol}:cost_suppressed`]: String(costSuppressed),
+                [`s:${symbol}:dispatch_selected`]: String(dispatchSets.length),
+                ...lastProtectionDetail,
+                updated_at: String(Date.now()),
+              }).catch(() => {})
+            if (process.env.DEBUG_LIVE_DISPATCH_SELECTION === "1" && (placed > 0 || errored > 0)) {
+            if (dispatchSuppressed.length > 0) {
+              const suppressedByReason = dispatchSuppressed.reduce<Record<LiveSuppressionReason, number>>(
+                (acc, entry) => {
+                  acc[entry.reason] = (acc[entry.reason] || 0) + 1
+                  return acc
+                },
+                { connector_unavailable: 0, balance_unavailable: 0 },
+              )
+              await logProgressionEvent(
+                this.connectionId,
+                "live_trading",
+                "warning",
+                `${symbol} live dispatch suppressed for ${dispatchSuppressed.length} selected set(s)`,
+                {
+                  symbol,
+                  dispatchSuppressed,
+                  suppressedByReason,
+                },
+              ).catch(() => {})
             if (blockExecutionStats.attempted > 0) {
               try {
                 const compactBlockExec = JSON.stringify(blockExecutionStats)
@@ -4759,16 +6099,24 @@ export class StrategyCoordinator {
 
             if (placed > 0 || errored > 0) {
               console.log(
-                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} errored=${errored}`
+                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} costSuppressed=${costSuppressed} errored=${errored}`
               )
-            } else if (rejected > 0 && (this as any)._liveRejectLogThrottle?.[symbol] !== Math.floor(Date.now() / 30000)) {
+            } else if (process.env.DEBUG_LIVE_DISPATCH_SELECTION === "1" && rejected > 0 && (this as any)._liveRejectLogThrottle?.[symbol] !== Math.floor(Date.now() / 30000)) {
               // Throttle pure-rejection summaries (common in dev/test with no real exchange balance) — log at most once per 30s per symbol
               if (!(this as any)._liveRejectLogThrottle) (this as any)._liveRejectLogThrottle = {}
               ;(this as any)._liveRejectLogThrottle[symbol] = Math.floor(Date.now() / 30000)
               console.log(
-                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} errored=${errored} (throttled)`
+                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} costSuppressed=${costSuppressed} errored=${errored} (throttled)`
               )
             }
+
+            await writeLiveDispatchSnapshot({
+              ...baseLiveDispatchSnapshot,
+              placed,
+              filled,
+              rejected,
+              errored,
+            })
           } else {
             for (const set of qualifying) suppressDispatchSet(set, "connector_unavailable")
             console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: live_trade=true but connector not available`)
@@ -4859,7 +6207,7 @@ export class StrategyCoordinator {
     // Create EXACTLY ONE pseudo position per Set (one per indication_type × direction combination).
     // Each Set represents a unique (indication_type × direction) coordinate.
     // We pick the highest-profitFactor entry from the Set as the representative config for the position.
-    if (qualifying.length > 0) {
+    if (dispatchSets.length > 0) {
       try {
         const posManager = new PseudoPositionManager(this.connectionId)
 
@@ -4895,16 +6243,17 @@ export class StrategyCoordinator {
           // enforced inside createPosition (one active pseudo position per Set).
           // Safe to fan out in parallel — no exchange calls, no shared balance.
           const creations = await Promise.all(
-            qualifying.map(async (set) => {
+            dispatchSets.map(async (set) => {
               try {
                 // Axis Sets carry one synthetic representative entry; for SL/TP
                 // derivation we need the full entries[] from the Base Set.
                 // Priority: set.entries (non-empty profile-variant sets) →
                 //   coordIndex.base.byKey O(1) lookup → O(N) realSets.find() fallback.
                 const _pseudoParentKey = set.parentSetKey || set.setKey.split("#")[0]
+                const setRepresentativeEntry = set.entries.find(hasVariantSizingEntry)
                 const effectiveEntries =
-                  set.entries.length > 0
-                    ? set.entries
+                  setRepresentativeEntry
+                    ? [setRepresentativeEntry]
                     : coordIndex
                       ? (coordIndex.base.byKey.get(_pseudoParentKey)?.entries ?? [])
                       : (realSets.find((s) => s.setKey === _pseudoParentKey)?.entries ?? [])
@@ -4914,6 +6263,21 @@ export class StrategyCoordinator {
                 )
                 if (!bestEntry) return false
 
+                const pseudoCoordRec = coordIndex?.byCoordKey.get(set.setKey)
+                const effectiveSizeMult = pseudoCoordRec?.sizeDelta !== undefined
+                  ? Math.max(0.5, Math.min(2.0, (bestEntry.sizeMultiplier ?? 1) * (1 + pseudoCoordRec.sizeDelta)))
+                  : (bestEntry.sizeMultiplier ?? 1)
+                const effectivePF =
+                  pseudoCoordRec?.tunedAvgPF ??
+                  set.avgProfitFactor ??
+                  bestEntry.profitFactor
+                const protection = deriveProtectionFromProfitFactor(
+                  effectivePF,
+                  livePositionCostPct,
+                  effectiveSizeMult,
+                )
+                const tp = protection.takeProfitPct
+                const sl = protection.stopLossPct
                 const pseudoPF = sanitizeLiveProfitFactor(bestEntry.profitFactor, set.avgProfitFactor || 1)
                 const pseudoProtection = deriveProtectionFromProfitFactor(pseudoPF, livePositionCostPct, bestEntry.sizeMultiplier ?? 1)
                 const tp = pseudoProtection.takeProfitPct
@@ -4952,6 +6316,8 @@ export class StrategyCoordinator {
                   entryPrice,
                   takeprofitFactor: tp,
                   stoplossRatio: sl,
+                  profitFactor: bestEntry.profitFactor,
+                  effectiveProfitFactor: protection.effectiveProfitFactor,
                   profitFactor: pseudoProtection.effectiveProfitFactor,
                   trailingEnabled: trailing,
                   configSetKey,
@@ -4984,6 +6350,8 @@ export class StrategyCoordinator {
         totalCreated: realSets.length,
         passedEvaluation: qualifying.length,
         failedEvaluation: realSets.length - qualifying.length,
+        dispatchSelected,
+        dispatchSuppressed: dispatchSuppressed.length,
         avgProfitFactor: dispatchAvgPF,
         avgDrawdownTime: dispatchAvgDDT,
         failedEvaluation: realCount - qualifying.length,
@@ -4991,6 +6359,145 @@ export class StrategyCoordinator {
         avgDrawdownTime: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgDrawdownTime, 0) / qualifying.length : 0,
       },
       sets: dispatchSets,
+    }
+  }
+
+  /**
+   * Select the Live candidate Sets that may actually dispatch this cycle.
+   *
+   * `qualifying` is the Live candidate pool after PF/DDT/maxLive filtering.
+   * The exchange path can only make progress for the first highest-PF Set in
+   * each direction/variant dispatch lane, so active/running metrics must use
+   * this selected subset rather than the wider candidate count.
+   */
+  private preselectLiveDispatchSets(qualifying: StrategySet[]): {
+    dispatchSets: StrategySet[]
+    dispatchSelected: number
+    dispatchSuppressed: number
+    dispatchSuppressedKeys: string[]
+  } {
+    const dispatchSets: StrategySet[] = []
+    const dispatchSuppressedKeys: string[] = []
+    let sawNewLong  = false
+    let sawNewShort = false
+    let sawBlockLong  = false
+    let sawBlockShort = false
+    let sawDcaLong    = false
+    let sawDcaShort   = false
+
+    for (const s of qualifying) {
+      const isBlock = s.variant === "block"
+      const isDca   = s.variant === "dca"
+      const isNew   = !isBlock && !isDca // default / trailing / pause
+      let selected = false
+
+      if (s.direction === "long") {
+        if (isNew && !sawNewLong) {
+          sawNewLong = true
+          selected = true
+        } else if (isBlock && !sawBlockLong) {
+          sawBlockLong = true
+          selected = true
+        } else if (isDca && !sawDcaLong) {
+          sawDcaLong = true
+          selected = true
+        }
+      } else {
+        if (isNew && !sawNewShort) {
+          sawNewShort = true
+          selected = true
+        } else if (isBlock && !sawBlockShort) {
+          sawBlockShort = true
+          selected = true
+        } else if (isDca && !sawDcaShort) {
+          sawDcaShort = true
+          selected = true
+        }
+      }
+
+      if (selected) dispatchSets.push(s)
+      else dispatchSuppressedKeys.push(s.setKey)
+    }
+
+    return {
+      dispatchSets,
+      dispatchSelected: dispatchSets.length,
+      dispatchSuppressed: dispatchSuppressedKeys.length,
+      dispatchSuppressedKeys,
+    }
+  }
+
+  /**
+   * Select the Live candidate Sets that may actually dispatch this cycle.
+   *
+   * `qualifying` is the Live candidate pool after PF/DDT/maxLive filtering.
+   * The exchange path can only make progress for the first highest-PF Set in
+   * each direction/variant dispatch lane, so active/running metrics must use
+   * this selected subset rather than the wider candidate count.
+   */
+  private preselectLiveDispatchSets(qualifying: StrategySet[]): {
+    dispatchSets: StrategySet[]
+    dispatchSelected: number
+    dispatchSuppressed: number
+    dispatchSuppressedKeys: string[]
+    dispatchSuppressedReasons: Record<string, number>
+  } {
+    const dispatchSets: StrategySet[] = []
+    const dispatchSuppressedKeys: string[] = []
+    const dispatchSuppressedReasons: Record<string, number> = {}
+    let sawNewLong  = false
+    let sawNewShort = false
+    let sawBlockLong  = false
+    let sawBlockShort = false
+    let sawDcaLong    = false
+    let sawDcaShort   = false
+
+    for (const s of qualifying) {
+      const isBlock = s.variant === "block"
+      const isDca   = s.variant === "dca"
+      const isNew   = !isBlock && !isDca // default / trailing / pause
+      const lane = isBlock ? "block" : isDca ? "dca" : "new"
+      const direction = s.direction === "short" ? "short" : "long"
+      let selected = false
+
+      if (direction === "long") {
+        if (isNew && !sawNewLong) {
+          sawNewLong = true
+          selected = true
+        } else if (isBlock && !sawBlockLong) {
+          sawBlockLong = true
+          selected = true
+        } else if (isDca && !sawDcaLong) {
+          sawDcaLong = true
+          selected = true
+        }
+      } else {
+        if (isNew && !sawNewShort) {
+          sawNewShort = true
+          selected = true
+        } else if (isBlock && !sawBlockShort) {
+          sawBlockShort = true
+          selected = true
+        } else if (isDca && !sawDcaShort) {
+          sawDcaShort = true
+          selected = true
+        }
+      }
+
+      if (selected) dispatchSets.push(s)
+      else {
+        const reason = `${lane}_${direction}_lane_already_selected`
+        dispatchSuppressedKeys.push(s.setKey)
+        dispatchSuppressedReasons[reason] = (dispatchSuppressedReasons[reason] ?? 0) + 1
+      }
+    }
+
+    return {
+      dispatchSets,
+      dispatchSelected: dispatchSets.length,
+      dispatchSuppressed: dispatchSuppressedKeys.length,
+      dispatchSuppressedKeys,
+      dispatchSuppressedReasons,
     }
   }
 
@@ -5699,6 +7206,8 @@ export class StrategyCoordinator {
     // Base entries via coordIndex.base.byKey.get(parentSetKey) when needed,
     // while Block/DCA/Trailing retain their live size/leverage metadata.
     let sumPF = 0, sumDDT = 0, sumCnf = 0, count = 0
+    let selectedCfg: (typeof profile.configs)[number] | null = null
+    let selectedScore = Number.NEGATIVE_INFINITY
     const baseDDTFallback = baseSet.avgDrawdownTime || 0
     const profileKey = profile.rangeTag ? `${profile.name}:${profile.rangeTag}` : profile.name
     let representativeEntry: StrategySetEntry | null = null
@@ -5713,6 +7222,10 @@ export class StrategyCoordinator {
         const confidence = Math.min(0.99, baseEntry.confidence)
         sumPF  += pf
         sumDDT += ddt
+        sumCnf += Math.min(0.99, baseEntry.confidence)
+        if (pf > selectedScore) {
+          selectedScore = pf
+          selectedCfg = cfg
         sumCnf += confidence
         if (!representativeEntry || pf > representativeEntry.profitFactor) {
           // Keep a single variant-scoped representative entry. The slim Set
@@ -5738,6 +7251,13 @@ export class StrategyCoordinator {
 
     const avgDDT = sumDDT / count
     const avgCnf = sumCnf / count
+    const representativeCfg = selectedCfg ?? profile.configs[0] ?? {
+      size: 1,
+      leverage: 1,
+      state: "new",
+      pfBias: 1,
+      ddtBias: 0,
+    }
 
     const axisWindows = ctx
       ? {
@@ -5772,6 +7292,23 @@ export class StrategyCoordinator {
       avgConfidence:   avgCnf,
       avgDrawdownTime: avgDDT,
       entryCount:      count,
+      // EMPTY entries[] — Base entries resolved at dispatch via
+      // coordIndex.base.byKey.get(parentSetKey).  Eliminates the primary
+      // V8 heap driver (~80 000 object allocations per second).
+      entries:         [],
+      ...(baseSet.trailingProfile && { trailingProfile: baseSet.trailingProfile }),
+      // Slim representative entry — keep exactly the variant config values
+      // live dispatch needs for sizing/leverage/state, while avoiding the old
+      // full baseEntry × profile.configs materialisation.
+      entries:         [{
+        id:             `${baseSet.setKey}#${profile.name}:representative`,
+        sizeMultiplier: representativeCfg.size,
+        leverage:       representativeCfg.leverage,
+        positionState:  representativeCfg.state,
+        profitFactor:   avgPF,
+        drawdownTime:   avgDDT,
+        confidence:     avgCnf,
+      }],
       // One representative entry keeps the slim path cheap while preserving
       // the active variant's size/leverage/positionState for Live dispatch.
       // Without this, Block's 1.5–2.0x × blockVolumeRatio multiplier was
@@ -5839,9 +7376,11 @@ export class StrategyCoordinator {
       stages: results.map((r) => ({
         type: r.type,
         sets: r.passedEvaluation,
+        ...(r.type === "live" ? { dispatchSelected: r.dispatchSelected ?? 0, dispatchSuppressed: r.dispatchSuppressed ?? 0 } : {}),
         avgPF: r.avgProfitFactor.toFixed(2),
       })),
       totalLiveSets: results.find((r) => r.type === "live")?.passedEvaluation || 0,
+      totalLiveDispatchSelected: results.find((r) => r.type === "live")?.dispatchSelected || 0,
     }
 
     try {

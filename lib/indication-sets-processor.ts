@@ -134,6 +134,7 @@ export class IndicationSetsProcessor {
   private factorMultipliers: number[] = [0.9, 1.0, 1.1]
   private activeThresholds: number[] = [0.5, 1.0, 1.5, 2.0, 2.5]
   private activeTimeRatios: number[] = [0.5, 1.0]
+  private shortPriceHistoryWarnings: Set<string> = new Set()
   private outcomeHorizonCandles = 12
   private outcomeTakeProfitPct = 0.01
   private outcomeStopLossPct = 0.01
@@ -317,6 +318,9 @@ export class IndicationSetsProcessor {
         })
         return
       }
+
+      this.normalizePriceHistory(marketData)
+      await this.warnIfPriceHistoryTooShort(symbol, marketData)
 
       // Process all 4 main types in parallel with independent logic.
       // Use per-type isolation so an Optimal/Auto calculation failure never
@@ -965,7 +969,9 @@ export class IndicationSetsProcessor {
     const prices = this.getPriceHistory(marketData, range)
     if (!prices || prices.length < range) return null
 
-    const movement = Math.abs(prices[0] - prices[range - 1]) / prices[range - 1]
+    const oldestPrice = prices[0]
+    const newestPrice = prices[range - 1]
+    const movement = Math.abs(newestPrice - oldestPrice) / oldestPrice
     const volatility = this.calculateVolatility(prices)
     const drawdownPenalty = movement / Math.max(drawdownRatio * 10, 1)
     const tailWeight = 1 + lastPartRatio
@@ -994,7 +1000,9 @@ export class IndicationSetsProcessor {
     const prices = this.getPriceHistory(marketData, 10)
     if (!prices || prices.length < 2) return null
 
-    const priceChange = Math.abs((prices[0] - prices[prices.length - 1]) / prices[prices.length - 1]) * 100
+    const oldestPrice = prices[0]
+    const newestPrice = prices[prices.length - 1]
+    const priceChange = Math.abs((newestPrice - oldestPrice) / oldestPrice) * 100
 
     if (priceChange >= threshold) {
       const normalizedChange = priceChange / Math.max(threshold, 0.1)
@@ -1050,6 +1058,73 @@ export class IndicationSetsProcessor {
    */
 
   private getPriceHistory(marketData: any, count: number): number[] | null {
+    const normalizedOldestFirst = this.normalizePriceHistory(marketData)
+    if (normalizedOldestFirst.length === 0) return null
+
+    // All calculators receive oldest-first windows: prices[0] is oldest and
+    // prices[prices.length - 1] is newest/current.
+    return normalizedOldestFirst.slice(-count)
+  }
+
+  private normalizePriceHistory(marketData: any): number[] {
+    if (Array.isArray(marketData?.__normalizedPricesOldestFirst)) {
+      return marketData.__normalizedPricesOldestFirst
+    }
+
+    const rawPrices = Array.isArray(marketData?.prices)
+      ? marketData.prices
+      : Array.isArray(marketData?.candles)
+        ? [...marketData.candles]
+            .sort((a: any, b: any) => Number(a?.timestamp ?? 0) - Number(b?.timestamp ?? 0))
+            .map((c: any) => c?.close ?? c?.price ?? c?.last ?? c?.markPrice)
+        : []
+
+    const parsedPrices = rawPrices
+      .map((p: any) => Number.parseFloat(String(p)))
+      .filter((p: number) => Number.isFinite(p))
+
+    const order = marketData?.priceOrder || marketData?.pricesOrder || marketData?.order
+    const oldestFirst = order === "oldest-first" || order === "oldestFirst" || order === "asc"
+    const normalizedOldestFirst = oldestFirst ? parsedPrices : [...parsedPrices].reverse()
+    if (marketData && typeof marketData === "object") {
+      marketData.__normalizedPricesOldestFirst = normalizedOldestFirst
+      marketData.priceOrder = "oldest-first"
+    }
+    return normalizedOldestFirst
+  }
+
+  private getAvailablePriceCount(marketData: any): number {
+    if (Array.isArray(marketData?.prices)) return marketData.prices.length
+    if (Array.isArray(marketData?.candles)) return marketData.candles.length
+    return 0
+  }
+
+  private getLargestConfiguredRange(): number {
+    return Math.max(
+      10,
+      ...this.directionMoveRanges.map((range) => range * 2),
+      ...this.optimalRanges.map((range) => range * 3),
+    )
+  }
+
+  private async warnIfPriceHistoryTooShort(symbol: string, marketData: any): Promise<void> {
+    const availablePrices = this.normalizePriceHistory(marketData).length
+    const requiredPrices = this.getLargestConfiguredRange()
+    if (availablePrices >= requiredPrices) return
+
+    const warningKey = `${symbol}:${availablePrices}:${requiredPrices}`
+    if (this.shortPriceHistoryWarnings.has(warningKey)) return
+    this.shortPriceHistoryWarnings.add(warningKey)
+
+    console.warn(
+      `[v0] [IndicationSets] ${symbol}: only ${availablePrices} price(s) available; largest configured range requires ${requiredPrices}. Some sets may not be produced.`,
+    )
+    await logProgressionEvent(this.connectionId, "indications_sets", "warning", `Insufficient price history for ${symbol}`, {
+      symbol,
+      availablePrices,
+      requiredPrices,
+      reason: "insufficient_price_history",
+    }).catch(() => {})
     const prices = marketData.prices || []
     if (!Array.isArray(prices) || prices.length === 0) return null
     

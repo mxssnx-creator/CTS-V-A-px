@@ -3,7 +3,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import { updateConnection, initRedis, getConnection, getRedisClient, setSettings, getSettings, persistNow } from "@/lib/redis-db"
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
-import { getTradeEngine } from "@/lib/trade-engine"
+import { getGlobalTradeEngineCoordinator, getTradeEngine } from "@/lib/trade-engine"
 import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { toRedisFlag } from "@/lib/boolean-utils"
@@ -590,6 +590,13 @@ export async function PATCH(
             config_set_symbols_total: resolved.length,
             updated_at: new Date().toISOString(),
           })
+          // 3. Fast-path only: invalidate the running engine's in-memory
+          //    symbol cache in this process so the change takes effect on the
+          //    next tick without waiting for the durable reload event.
+          //    Correctness does NOT depend on this call: production may run
+          //    the API route and engine manager in different processes, so
+          //    the manager also invalidates its cache when it consumes the
+          //    Redis-backed connection_settings reload event below.
           await setSettings(settingsConnectionKey, {
             ...prevSettingsConnection,
             connection_id: id,
@@ -692,9 +699,66 @@ export async function PATCH(
       scalarChanged("is_testnet", (connection as Record<string, unknown>).is_testnet, (updated as Record<string, unknown>).is_testnet) ||
       scalarChanged("is_preset_trade", (connection as Record<string, unknown>).is_preset_trade, (updated as Record<string, unknown>).is_preset_trade) ||
       scalarChanged("connection_method", (connection as Record<string, unknown>).connection_method, (updated as Record<string, unknown>).connection_method)
+    let progressionChangedForActualOne = false
     if (symbolsModeChanged) {
       try {
-        await ProgressionStateManager.recoordinateForActualOne(id)
+        const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
+        progressionChangedForActualOne = recoordination.changed
+
+        // If recoordination archived/recreated progression state, a running
+        // manager must not continue through the normal hot-reload path while
+        // still holding the previous epoch/ownership. Restarting rebinds it to
+        // the fresh progression lock before processors can write again.
+        if (recoordination.changed) {
+          const coordinator = getGlobalTradeEngineCoordinator()
+          if (coordinator.isEngineRunning(id)) {
+            console.log(
+              `[v0] [Settings PATCH] Progression re-coordinated for ${id} (${recoordination.reason ?? "changed"}); restarting running engine instead of hot reload.`,
+            )
+            await coordinator.restartEngine(id)
+    let progressionRestartHandled = false
+    if (symbolsModeChanged) {
+      try {
+        const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
+        if (recoordination.changed) {
+          progressionRestartHandled = true
+
+          // The progression epoch/lock changed, so this is no longer a safe
+          // in-place hot reload for a running manager. Publish a restart-class
+          // settings event and explicitly restart an active manager so it binds
+          // to the newly-created progression instead of continuing to write
+          // underneath an archived epoch.
+          try {
+            const { notifySettingsChanged } = await import("@/lib/settings-coordinator")
+            await notifySettingsChanged(
+              id,
+              ["progression_epoch", "connection_settings"],
+              { ...connection, connection_settings: current },
+              { ...connection, connection_settings: merged, updated_at: updated.updated_at },
+            )
+          } catch (notifyErr) {
+            console.warn(
+              `[v0] [Settings PATCH] restart-class notify failed for ${id}:`,
+              notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
+            )
+          }
+
+          try {
+            const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+            const coordinator = getGlobalTradeEngineCoordinator()
+            if (coordinator.isEngineRunning(id)) {
+              console.log(
+                `[v0] [Settings PATCH] Restarting ${id} after progression recoordination (${recoordination.reason || "changed"})`,
+              )
+              await coordinator.restartEngine(id)
+            }
+          } catch (restartErr) {
+            console.warn(
+              `[v0] [Settings PATCH] engine restart after progression recoordination failed for ${id}:`,
+              restartErr instanceof Error ? restartErr.message : String(restartErr),
+            )
+          }
+        }
       } catch (recoordErr) {
         console.warn(
           `[v0] [Settings PATCH] recoordinateForActualOne failed for ${id} (non-fatal):`,
@@ -753,6 +817,18 @@ export async function PATCH(
     // would report zero changes — pass an explicit override listing the
     // settings keys the caller touched, so the recoordinator knows
     // something inside `connection_settings` actually changed.
+    if (!progressionChangedForActualOne) {
+    if (!progressionRestartHandled) {
+      await recoordinateAfterSettingsChange(
+        id,
+        { ...connection, connection_settings: current },
+        { ...connection, connection_settings: merged, updated_at: updated.updated_at },
+        {
+          logTag: "PATCH /settings",
+          changedFieldsOverride: Object.keys(settings).length > 0 ? ["connection_settings"] : [],
+        },
+      )
+    }
     await recoordinateAfterSettingsChange(
       id,
       { ...connection, connection_settings: current },

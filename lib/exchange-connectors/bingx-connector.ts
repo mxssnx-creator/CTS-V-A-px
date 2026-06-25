@@ -701,7 +701,7 @@ export class BingXConnector extends BaseExchangeConnector {
     price?: number,
     orderType: "limit" | "market" = "limit",
     options: PlaceOrderOptions = {},
-  ): Promise<{ success: boolean; orderId?: string; error?: string }> {
+  ): Promise<{ success: boolean; orderId?: string; error?: string; filledPrice?: number; avgPrice?: number; price?: number; filledQty?: number; executedQty?: number; status?: string }> {
     try {
       // Sync server time before any signed request to prevent timestamp errors
       await this.syncServerTime()
@@ -828,6 +828,20 @@ export class BingXConnector extends BaseExchangeConnector {
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
           const tsRetryData = await this.safeJson(tsRetryResp)
+          if (this.isBingXSuccess(tsRetryData.code)) {
+            const info = tsRetryData.data?.order || tsRetryData.data || {}
+            const id = info.orderId || info.id || tsRetryData.data?.orderId
+            this.log(`✓ Order placed on retry (timestamp resync): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined, filledPrice: Number(info.avgPrice ?? info.price ?? info.filledPrice ?? 0) || undefined, avgPrice: Number(info.avgPrice ?? 0) || undefined, price: Number(info.price ?? 0) || undefined, filledQty: Number(info.executedQty ?? info.filledQty ?? info.cumQty ?? 0) || undefined, executedQty: Number(info.executedQty ?? 0) || undefined, status: info.status }
+          }
+          // Resync didn't fix it; fall through with the retry response
+          // so the operator sees the real underlying error.
+          Object.assign(data, tsRetryData)
+          if (this.isBingXSuccess(data.code)) {
+            const info = data.data?.order || data.data || {}
+            const id = info.orderId || info.id || data.data?.orderId
+            return { success: true, orderId: id ? String(id) : undefined, filledPrice: Number(info.avgPrice ?? info.price ?? info.filledPrice ?? 0) || undefined, avgPrice: Number(info.avgPrice ?? 0) || undefined, price: Number(info.price ?? 0) || undefined, filledQty: Number(info.executedQty ?? info.filledQty ?? info.cumQty ?? 0) || undefined, executedQty: Number(info.executedQty ?? 0) || undefined, status: info.status }
+          }
 	          if (this.isBingXSuccess(tsRetryData.code)) {
 	            const info = tsRetryData.data?.order || tsRetryData.data || {}
 	            const id = info.orderId || info.id || tsRetryData.data?.orderId
@@ -908,6 +922,11 @@ export class BingXConnector extends BaseExchangeConnector {
 
       // BingX wraps the order payload inconsistently: sometimes data.data.order,
       // sometimes data.data, sometimes data.data.orderId directly.
+      const orderInfo = data.data?.order || data.data || {}
+      const orderId = orderInfo.orderId || orderInfo.id || data.data?.orderId
+      this.log(`✓ Order placed successfully: ${orderId}`)
+
+      return { success: true, orderId: orderId ? String(orderId) : undefined, filledPrice: Number(orderInfo.avgPrice ?? orderInfo.price ?? orderInfo.filledPrice ?? 0) || undefined, avgPrice: Number(orderInfo.avgPrice ?? 0) || undefined, price: Number(orderInfo.price ?? 0) || undefined, filledQty: Number(orderInfo.executedQty ?? orderInfo.filledQty ?? orderInfo.cumQty ?? 0) || undefined, executedQty: Number(orderInfo.executedQty ?? 0) || undefined, status: orderInfo.status }
 	      const orderInfo = data.data?.order || data.data || {}
 	      const orderId = orderInfo.orderId || orderInfo.id || data.data?.orderId
 	      this.log(`✓ Order placed successfully: ${orderId}`)
@@ -941,7 +960,7 @@ export class BingXConnector extends BaseExchangeConnector {
     triggerPrice: number,
     kind: "stop_loss" | "take_profit",
     options: PlaceOrderOptions = {},
-  ): Promise<{ success: boolean; orderId?: string; error?: string }> {
+  ): Promise<{ success: boolean; orderId?: string; error?: string; orderPrice?: number; stopPrice?: number; price?: number }> {
     try {
       // Sync server time before any signed request
       await this.syncServerTime()
@@ -1039,6 +1058,10 @@ export class BingXConnector extends BaseExchangeConnector {
           if (this.isBingXSuccess(tsData.code)) {
             const info = tsData.data?.order || tsData.data || {}
             const id = info.orderId || info.orderID || tsData.data?.orderId
+            if (id) {
+              this.log(`✓ ${orderType} placed on timestamp retry: ${id}`)
+              return { success: true, orderId: String(id), orderPrice: stopRounded, stopPrice: stopRounded }
+            }
 	            if (id) {
 	              this.log(`✓ ${orderType} placed on timestamp retry: ${id}`)
 	              return { success: true, orderId: String(id), clientOrderId: params.clientOrderId } as any
@@ -1067,6 +1090,10 @@ export class BingXConnector extends BaseExchangeConnector {
           if (this.isBingXSuccess(retryData2.code)) {
             const info2 = retryData2.data?.order || retryData2.data || {}
             const id2 = info2.orderId || info2.id || retryData2.data?.orderId
+            if (id2) {
+              this.log(`✓ ${orderType} placed on reduceOnly hedge retry: ${id2}`)
+              return { success: true, orderId: String(id2), orderPrice: stopRounded, stopPrice: stopRounded }
+            }
 	            if (id2) {
 	              this.log(`✓ ${orderType} placed on reduceOnly hedge retry: ${id2}`)
 	              return { success: true, orderId: String(id2), clientOrderId: params.clientOrderId } as any
@@ -1094,6 +1121,10 @@ export class BingXConnector extends BaseExchangeConnector {
           if (this.isBingXSuccess(retryData.code)) {
             const info = retryData.data?.order || retryData.data || {}
             const id = info.orderId || info.id || retryData.data?.orderId
+            if (id) {
+              this.log(`✓ ${orderType} placed on one-way retry: ${id}`)
+              return { success: true, orderId: String(id), orderPrice: stopRounded, stopPrice: stopRounded }
+            }
 	            if (id) {
 	              this.log(`✓ ${orderType} placed on one-way retry: ${id}`)
 	              return { success: true, orderId: String(id), clientOrderId: params.clientOrderId } as any
@@ -1114,6 +1145,9 @@ export class BingXConnector extends BaseExchangeConnector {
         const errorMsg = `BingX returned success but orderId was missing/empty from response`
         this.logError(`✗ ${orderType} placement failed: ${errorMsg}`)
         return { success: false, error: errorMsg }
+      }
+      this.log(`✓ ${orderType} placed: ${orderId} @ ${stopStr}`)
+      return { success: true, orderId: String(orderId), orderPrice: stopRounded, stopPrice: stopRounded }
 	      }
 	      this.log(`✓ ${orderType} placed: ${orderId} @ ${stopStr}`)
 	      return { success: true, orderId: String(orderId), clientOrderId: params.clientOrderId } as any

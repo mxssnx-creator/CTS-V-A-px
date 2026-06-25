@@ -2541,6 +2541,17 @@ const migrations: Migration[] = [
   },
 
   // ── Migration 041 ──────────────────────────────────────────────────────────
+  // Repair legacy live_volume_factor values on connection:bingx-x01 and clear
+  // the prehistoric_loaded:bingx-x01 cache gate that prevents re-runs when the
+  // DB is wiped but the marker survives.
+  //
+  // Problem 1 — legacy liveVolumeFactor defaults in stats:
+  //   Older migrations and write paths disagreed on the volume-factor default:
+  //   some wrote operator-spec values (2.2/1.0), some wrote boolean/non-numeric
+  //   placeholders, and newer minimal-default policy uses 0.1. Migration 042
+  //   now supersedes this connection-specific repair and normalizes only
+  //   missing/legacy-default values to the minimal default while preserving
+  //   user-configured factors that differ from those defaults.
   // Validate malformed live_volume_factor values on connection:bingx-x01 and
   // clear the prehistoric_loaded cache gate that prevents re-runs when the DB
   // is wiped but the marker survives.
@@ -2569,6 +2580,15 @@ const migrations: Migration[] = [
       const CONN_ID = "bingx-x01"
       const now = new Date().toISOString()
 
+      // 1. Historical repair retained for already-versioned DBs. Migration 042
+      //    runs immediately after this one and supersedes the old 2.2/1.0
+      //    defaults with the current minimal 0.1 policy.
+      await client.hset(`connection:${CONN_ID}`, {
+        live_volume_factor:   "2.2",
+        preset_volume_factor: "1.0",
+        updated_at:           now,
+      }).catch(() => {})
+      console.log(`[v0] Migration 041: set live_volume_factor=2.2 on connection:${CONN_ID}`)
       // 1. Validate stale volume factors without clobbering operator stress-test values.
       //    A positive numeric value (for example 0.1 during low-volume dev tests)
       //    is intentional and must survive migrations. Only invalid/missing values
@@ -2602,6 +2622,89 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "40")
     },
   },
+  {
+    // Supersedes the earlier operator-spec migrations that seeded 2.2/1.0
+    // volume-factor defaults (notably 034, 040, and the connection-specific
+    // repair in 041). Running after them guarantees fresh and upgraded Redis
+    // stores converge on the minimal-default policy.
+    version: 42,
+    name: "042-minimal-volume-factor-defaults",
+    description: "Normalize legacy/default volume factors to the minimal 0.1 policy without clobbering explicit user values",
+    up: async (client: any) => {
+      // NOTE: do NOT stamp _schema_version here — the runner stamps on success only.
+      const now = new Date().toISOString()
+      const VOLUME_FACTOR_FIELDS = [
+        "volume_factor",
+        "live_volume_factor",
+        "preset_volume_factor",
+        "volume_factor_live",
+        "volume_factor_preset",
+      ]
+
+      // Values that came from historical defaults rather than a distinguishable
+      // user choice. Anything outside this set is treated as explicit operator
+      // configuration and is left untouched.
+      const LEGACY_DEFAULT_VALUES = new Set(["", "true", "false", "1", "1.0", "2.2"])
+
+      const shouldNormalizeVolumeFactor = (value: unknown): boolean => {
+        if (value === undefined || value === null) return true
+        if (typeof value === "number") return value === 1 || value === 2.2 || !Number.isFinite(value)
+        const normalized = String(value).trim().toLowerCase()
+        if (LEGACY_DEFAULT_VALUES.has(normalized)) return true
+        const numeric = Number(normalized)
+        return Number.isFinite(numeric) && (numeric === 1 || numeric === 2.2)
+      }
+
+      const valueForRecord = (hash: Record<string, unknown>): string | number => {
+        // Redis hashes are normally string-valued, but the inline/local emulator
+        // can preserve numbers. If this record already stores any volume-factor
+        // field as a number, keep that format for the normalized default.
+        return VOLUME_FACTOR_FIELDS.some((field) => typeof hash[field] === "number") ? 0.1 : "0.1"
+      }
+
+      const keySet = new Set<string>(["app_settings"])
+      for (const pattern of [
+        "connection:*",
+        "connection_settings:*",
+        "settings:connection:*",
+        "settings:trade_engine_state:*",
+      ]) {
+        try {
+          const keys = (await client.keys(pattern)) || []
+          for (const key of keys) {
+            if (typeof key !== "string" || !key) continue
+            keySet.add(key)
+          }
+        } catch { /* keys() unavailable — keep the sources collected so far */ }
+      }
+
+      let recordsTouched = 0
+      let fieldsNormalized = 0
+      for (const key of keySet) {
+        const hash = (await client.hgetall(key).catch(() => null)) as Record<string, unknown> | null
+        if (!hash || typeof hash !== "object") continue
+
+        const minimalDefault = valueForRecord(hash)
+        const patch: Record<string, string | number> = {}
+        for (const field of VOLUME_FACTOR_FIELDS) {
+          if (shouldNormalizeVolumeFactor(hash[field])) patch[field] = minimalDefault
+        }
+
+        if (Object.keys(patch).length > 0) {
+          patch.updated_at = now
+          await client.hset(key, patch).catch(() => {})
+          recordsTouched++
+          fieldsNormalized += Object.keys(patch).length - 1
+        }
+      }
+
+      console.log(
+        `[v0] Migration 042: normalized ${fieldsNormalized} legacy/default volume-factor fields ` +
+        `across ${recordsTouched} connection/settings records to 0.1`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "41")
 
   // ── Migration 042 ──────────────────────────────────────────────────────────
   // Reconcile operator volume settings across raw + settings hashes without

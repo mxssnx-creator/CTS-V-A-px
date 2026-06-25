@@ -192,6 +192,7 @@ import { loadMarketDataForEngine } from "@/lib/market-data-loader"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { engineMonitor } from "@/lib/engine-performance-monitor"
 import { ConfigSetProcessor } from "./config-set-processor"
+import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { prefetchMarketDataBatch, getParsedCandlesCached } from "./market-data-cache"
 import {
   // ── Cross-process progression ownership (spec §"no multiple started
@@ -397,6 +398,35 @@ export interface ComponentHealth {
   errorCount: number
   successRate: number
   cycleCount: number
+}
+
+const SYMBOL_AFFECTING_SETTING_FIELDS = new Set([
+  "active_symbols",
+  "activeSymbols",
+  "symbols",
+  "symbol_mode",
+  "symbolMode",
+  "exchange_order_by",
+  "exchangeOrderBy",
+  "symbol_limit",
+  "symbolLimit",
+  "useMainSymbols",
+  "mainSymbols",
+])
+
+function isGenericConnectionSettingsReload(fields: readonly string[]): boolean {
+  return fields.length === 0 || fields.some((field) => field === "connection_settings")
+}
+
+function hasSymbolAffectingChange(fields: readonly string[]): boolean {
+  return fields.some((field) => {
+    if (SYMBOL_AFFECTING_SETTING_FIELDS.has(field)) return true
+    if (field.startsWith("connection_settings.")) {
+      const nested = field.slice("connection_settings.".length)
+      return SYMBOL_AFFECTING_SETTING_FIELDS.has(nested)
+    }
+    return false
+  })
 }
 
 export class TradeEngineManager {
@@ -4019,6 +4049,82 @@ export class TradeEngineManager {
   private async applyHotReload(_changedFields: string[]): Promise<void> {
     this.settingsVersion++
     try {
+      const changedFields = Array.isArray(_changedFields) ? _changedFields : []
+      const invalidatedCaches: string[] = []
+      const genericConnectionSettingsReload = isGenericConnectionSettingsReload(changedFields)
+      const symbolAffectingChange = genericConnectionSettingsReload || hasSymbolAffectingChange(changedFields)
+
+      if (symbolAffectingChange) {
+        this.invalidateSymbolsCache()
+        invalidatedCaches.push("engine.symbols")
+      }
+
+      clearFlowThrottleForConnection(this.connectionId)
+      invalidatedCaches.push("strategy.flowThrottle")
+
+      const coordinatorReloadGeneration = StrategyCoordinator.forceNextSettingsReload(this.connectionId)
+      invalidatedCaches.push(
+        "strategyCoordinator.PFThresholds",
+        "strategyCoordinator.DDTThresholds",
+        "strategyCoordinator.trailingSettings",
+        "strategyCoordinator.minStepSettings",
+        "strategyCoordinator.coordinationSettings",
+      )
+
+      try {
+        this.realtimeProcessor.invalidatePrevSet(undefined)
+        ;(this.realtimeProcessor as any).prevSetCache?.clear?.()
+        invalidatedCaches.push("realtime.prevSetCache")
+      } catch { /* best-effort */ }
+
+      try {
+        ;(this.pseudoPositionManager as any).invalidateCache?.()
+        invalidatedCaches.push("pseudoPosition.activePositions")
+      } catch { /* best-effort */ }
+
+      // Make the new generation visible to long-lived processors and to
+      // other workers that receive the Redis settings-change event before
+      // this in-process manager sees the API fast-path.
+      for (const processor of [
+        this.indicationProcessor,
+        this.strategyProcessor,
+        this.realtimeProcessor,
+        this.pseudoPositionManager,
+      ] as any[]) {
+        processor.settingsGeneration = this.settingsVersion
+      }
+
+      try {
+        const client = getRedisClient()
+        await client.hset(`engine:settings_generation:${this.connectionId}`, {
+          generation: String(this.settingsVersion),
+          updated_at: new Date().toISOString(),
+          changed_fields: JSON.stringify(changedFields),
+          coordinator_reload_generation: String(coordinatorReloadGeneration),
+        })
+        await client.set(`settings:generation:${this.connectionId}`, String(this.settingsVersion))
+      } catch (generationErr) {
+        console.warn(
+          `[v0] [Engine ${this.connectionId}] hot-reload generation publish failed:`,
+          generationErr instanceof Error ? generationErr.message : String(generationErr),
+        )
+      }
+      const symbolRelatedFields = new Set([
+        "active_symbols",
+        "force_symbols",
+        "symbol_count",
+        "symbolCount",
+        "symbol_order",
+        "symbols",
+      ])
+      const shouldRefreshSymbols =
+        // PATCH /settings emits a durable generic `connection_settings`
+        // reload because the payload is nested/partial. Treat that as
+        // symbol-affecting here so correctness does not depend on the
+        // same-process API fast-path invalidation.
+        changedFields.includes("connection_settings") ||
+        changedFields.some((field) => symbolRelatedFields.has(field))
+
       const { getConnection } = await import("@/lib/redis-db")
       const fresh = await getConnection(this.connectionId)
       if (!fresh) {
@@ -4050,12 +4156,37 @@ export class TradeEngineManager {
         }
       }
 
+      if (shouldRefreshSymbols) {
+        // Durable cross-process cache bust: the settings API still
+        // invalidates the local manager as a latency optimization, but a
+        // production manager may live in a different process. On the reload
+        // event itself, force the next symbol lookup to re-read the durable
+        // sources (`trade_engine_state:{id}` first, then connection settings)
+        // and prime the cache before the next indication/strategy/realtime
+        // tick can reuse stale active-symbol state.
+        this.invalidateSymbolsCache()
+        try {
+          const symbols = await this.getSymbols()
+          console.log(
+            `[v0] [Engine ${this.connectionId}] hot-reload refreshed active-symbol cache (${symbols.length} symbols)`,
+          )
+        } catch (symbolErr) {
+          // getSymbols() has its own fallback path; keep hot-reload best-effort.
+          console.warn(
+            `[v0] [Engine ${this.connectionId}] hot-reload symbol-cache refresh failed:`,
+            symbolErr instanceof Error ? symbolErr.message : String(symbolErr),
+          )
+        }
+      }
+
       // Best-effort: tell any subscribed processors to refresh. The
       // pseudo-position manager + config-set processor already re-read
       // fresh per cycle, so this is informational, but we still log
       // it for operator visibility.
       console.log(
-        `[v0] [Engine ${this.connectionId}] hot-reload applied (settingsVersion=${this.settingsVersion}, volume_factor=${(fresh as any).volume_factor})`,
+        `[v0] [Engine ${this.connectionId}] hot-reload applied ` +
+          `(settingsVersion=${this.settingsVersion}, volume_factor=${(fresh as any).volume_factor}, ` +
+          `invalidatedCaches=[${invalidatedCaches.join(",")}], changedFields=[${changedFields.join(",")}])`,
       )
 
       try {
@@ -4067,6 +4198,11 @@ export class TradeEngineManager {
           {
             settingsVersion: this.settingsVersion,
             connectionId: this.connectionId,
+            changedFields,
+            invalidatedCaches,
+            symbolAffectingChange,
+            genericConnectionSettingsReload,
+            coordinatorReloadGeneration,
           },
         )
       } catch { /* best-effort */ }
