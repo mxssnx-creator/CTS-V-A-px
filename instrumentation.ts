@@ -12,6 +12,17 @@ declare global { var totalStrategiesEvaluated: number }
 // real timer cleanup belongs to `EngineManager.stop()`. The clear is now
 // removed; in-flight engines keep running across module reload.
 
+function isNextBuildPhase(): boolean {
+  const npmLifecycle = process.env.npm_lifecycle_event || ""
+  const argv = process.argv.join(" ")
+  return (
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    npmLifecycle === "build" ||
+    npmLifecycle === "vercel-build" ||
+    /\bnext(\.js)?\s+build\b/.test(argv)
+  )
+}
+
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") {
     return
@@ -26,6 +37,7 @@ export async function register() {
       process.argv.includes("build")
 
   if (isNextBuild) {
+  if (isNextBuildPhase()) {
     // `next build` imports instrumentation while collecting page data. Running
     // Redis migrations/startup/auto-start here makes deployment builders spend
     // tens of seconds doing runtime work and can hit hosted builder deadlines

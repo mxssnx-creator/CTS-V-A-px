@@ -9,6 +9,7 @@ import { loadSettingsAsync } from "@/lib/settings-storage"
 
 // POST toggle connection active status (inserted/enabled) - INDEPENDENT from Settings
 // When enabling, also triggers engine start for this connection
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
