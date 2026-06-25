@@ -22,6 +22,7 @@ function parseSymbols(value: unknown): string[] {
   return []
 }
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     console.log("[v0] Fetching all trade engine statuses")

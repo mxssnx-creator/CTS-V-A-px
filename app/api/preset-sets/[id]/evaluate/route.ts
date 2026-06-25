@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { getSetEvaluator } from "@/lib/preset-set-evaluator"
 
 // POST /api/preset-sets/[id]/evaluate - Manually trigger Set evaluation
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

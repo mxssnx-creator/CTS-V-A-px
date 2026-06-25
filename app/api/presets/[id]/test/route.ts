@@ -4,6 +4,7 @@ import { PresetTester } from "@/lib/preset-tester"
 import { sql } from "@/lib/db"
 import type { Preset } from "@/lib/types"
 
+export const dynamic = "force-dynamic"
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
