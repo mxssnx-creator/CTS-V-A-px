@@ -979,7 +979,7 @@ export async function GET(
     // the STATS-VALIDATION "baseEvaluated > base" false positives that
     // occurred when a single-symbol standalone key was compared against
     // the cross-symbol active sum.
-    const activeStratEvaluated: Record<string, number> = { base: 0, main: 0, real: 0 }
+    const activeStratEvaluated: Record<string, number> = { base: 0, main: 0, real: 0, live: 0 }
     // Hoisted so the raw hash is accessible in the return block for `strategiesActive`.
     let stratActiveHash: Record<string, string> | null = null
     try {
@@ -1022,8 +1022,8 @@ export async function GET(
           // Fields ending in ":evaluated" are written by the engine to give cross-symbol
           // evaluated counts in the same scope as the stage counts. Aggregate them into
           // stratEvaluated so the STATS-VALIDATION check compares apples to apples.
-          if (suffix === "base:evaluated" || suffix === "main:evaluated" || suffix === "real:evaluated") {
-            const stage = suffix.replace(":evaluated", "") as "base" | "main" | "real"
+          if (suffix === "base:evaluated" || suffix === "main:evaluated" || suffix === "real:evaluated" || suffix === "live:evaluated") {
+            const stage = suffix.replace(":evaluated", "") as "base" | "main" | "real" | "live"
             activeStratEvaluated[stage] = (activeStratEvaluated[stage] ?? 0) + numVal
             continue
           }
@@ -1276,28 +1276,9 @@ export async function GET(
           ? weightedDDT / weightSum
           : parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
 
-        // Eval percentage per stage:
-        //   base:  100% — Base self-evaluates all its sets (no filter).
-        //   main:  evaluated/base, capped at 100 (expansion: 1 base → N main).
-        //   real:  evaluated/main, capped at 100 (filter: N main → M real).
-        //   live:  evaluated/real, capped at 100 (filter: M real → K live).
-        let evalPct = 0
-        if (stage === "base") {
-          // createdSets may be 0 if dh.created_sets absent; use stratCounts.base fallback
-          evalPct = (createdSets > 0 || (stratCounts.base || 0) > 0) ? 100 : 0
-        } else if (stage === "main") {
-          const base = stratCounts.base || 1
-          const raw = base > 0 ? (stratEvaluated.main / base) * 100 : 0
-          evalPct = Math.min(100, Math.round(raw * 10) / 10)
-        } else if (stage === "real") {
-          const main = stratCounts.main || 1
-          const raw = main > 0 ? (stratEvaluated.real / main) * 100 : 0
-          evalPct = Math.min(100, Math.round(raw * 10) / 10)
-        } else if (stage === "live") {
-          const real = stratCounts.real || 1
-          const raw = real > 0 ? (stratEvaluated.real / real) * 100 : 0
-          evalPct = Math.min(100, Math.round(raw * 10) / 10)
-        }
+        const pct = (num: number, den: number): number => den > 0
+          ? Math.min(100, Math.round((num / den) * 1000) / 10)
+          : 0
 
         // ── evaluated / passed / passRatio ───���────────────────────────
         // Source priority:
@@ -1345,6 +1326,19 @@ export async function GET(
           ? passRatioFromRate
           : passRatioFromCounts
 
+        const inputSets = useCross
+          ? (stage === "base" ? createdSets : stageEvaluated)
+          : n(dh.input_sets) || (stage === "base" ? createdSets : stratEvaluated[stage] || stageEvaluated)
+        const evaluatedSets = stageEvaluated
+        const passedSets = stagePassed
+        const outputSets = useCross ? createdSets : n(dh.output_sets) || createdSets
+        const previousStageOutputSets = useCross
+          ? (stage === "base" ? 0 : stage === "main" ? stratCounts.base : stratCounts.main) || 0
+          : n(dh.previous_stage_output_sets) || (stage === "base" ? 0 : stage === "main" ? stratCounts.base : stratCounts.main) || 0
+        const evalPct = pct(evaluatedSets, inputSets)
+        const passPct = pct(passedSets, evaluatedSets)
+        const transitionPct = stage === "base" ? 0 : pct(outputSets, previousStageOutputSets)
+
         // ── Actively-running counts (operator spec) ──
         // `sets_running_now` is written by strategy-coordinator using
         // membership in the `pseudo_positions:{conn}:active_config_keys`
@@ -1368,11 +1362,19 @@ export async function GET(
           avgPosEvalReal:      isFinite(avgPosEvalReal)  ? Math.round(avgPosEvalReal * 1000) / 1000  : 0,
           countPosEval:        countPosEval,
           avgDrawdownTime:     isFinite(avgDrawdownTime) ? Math.round(avgDrawdownTime * 10) / 10     : 0,
+          inputSets,
+          evaluatedSets,
+          passedSets,
+          outputSets,
+          openPositions: setsRunningNow,
+          closedPositions: 0,
           evalPct,
-          passRatio,
-          evaluated: stageEvaluated,
-          passed: stagePassed,
-          failed: Math.max(0, stageEvaluated - stagePassed),
+          passPct,
+          transitionPct,
+          passRatio: passPct,
+          evaluated: evaluatedSets,
+          passed: passedSets,
+          failed: Math.max(0, evaluatedSets - passedSets),
           setsRunningNow,
           setsProgressing,
           setsWithOpenPositions: setsRunningNow,
@@ -1551,28 +1553,41 @@ export async function GET(
       const passRate   = livePlaced > 0 ? liveFilled / livePlaced : 0
       const winRate    = liveClosed > 0 ? liveWins / liveClosed : 0
       const avgPosSize = liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
+      const liveInputSets = stratCounts.live || n(progHash.strategies_live_total) || 0
+      const liveEvaluatedSets = livePlaced
+      const livePassedSets = liveFilled
+      const liveOutputSets = liveCreated
+      const liveOpenPositions = Math.max(0, liveCreated - liveClosed)
+      const pct = (num: number, den: number): number => den > 0
+        ? Math.min(100, Math.round((num / den) * 1000) / 10)
+        : 0
 
       stratDetail.live = {
         // Same shape as base/main/real so the UI can reuse its row renderer:
         avgPosPerSet:        Math.round(avgPosSize * 100) / 100,        // avg position notional (USD)
         createdSets:         liveCreated,                               // positions actually created on exchange
+        inputSets:           liveInputSets,                             // Live candidates selected from Real output
+        evaluatedSets:       liveEvaluatedSets,                         // Orders dispatched to the exchange
+        passedSets:          livePassedSets,                            // Orders filled by exchange
+        outputSets:          liveOutputSets,                            // Positions created on exchange
         avgProfitFactor:     Math.round(profitFactor * 1000) / 1000,    // PF from realised PnL
         avgProcessingTimeMs: 0,                                         // not tracked for live — handled inline
         avgPosEvalReal:      Math.round(avgRoi * 10000) / 10000,        // avg ROI fraction
         countPosEval:        countSampled,
         avgDrawdownTime:     Math.round(avgHoldMin * 10) / 10,          // avg hold time in minutes
-        evalPct: n(progHash.strategies_real_total) > 0
-          ? Math.round((liveCreated / n(progHash.strategies_real_total)) * 1000) / 10
-          : 0,                                                          // how many Real sets became Live positions
-        passRatio: Math.round(passRate * 1000) / 10,                    // fill rate %
-        evaluated: livePlaced,
-        passed:    liveFilled,
-        failed:    Math.max(0, livePlaced - liveFilled),
+        openPositions:  liveOpenPositions,
+        closedPositions: liveClosed,
+        evalPct: pct(liveEvaluatedSets, liveInputSets),                 // Dispatched orders / Live candidates
+        passPct: pct(livePassedSets, liveEvaluatedSets),                // Filled orders / Dispatched orders
+        transitionPct: pct(liveOutputSets, stratCounts.real || n(progHash.strategies_real_total)),
+        passRatio: pct(livePassedSets, liveEvaluatedSets),              // fill rate %
+        evaluated: liveEvaluatedSets,
+        passed:    livePassedSets,
+        failed:    Math.max(0, liveEvaluatedSets - livePassedSets),
         // Live-exclusive fields for richer UI display:
         winRate:        Math.round(winRate * 1000) / 10,
         totalPnl:       Math.round(sumPnl * 100) / 100,
         avgPnl:         Math.round(avgPnl * 100) / 100,
-        openPositions:  Math.max(0, liveCreated - liveClosed),
         volumeUsdTotal: Math.round(liveVolumeUsd * 100) / 100,
       }
     }

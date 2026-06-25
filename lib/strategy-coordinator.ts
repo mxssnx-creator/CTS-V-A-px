@@ -1646,8 +1646,11 @@ export class StrategyCoordinator {
           avg_profit_factor: String(baseAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(baseAvgDDT)),
           avg_pos_per_set:   String(baseAvgPosPerSet.toFixed(2)),
+          input_sets:        String(baseSets.length),
           evaluated:         String(baseSets.length),
-          passed_sets:       "0",   // will be updated by createMainSets
+          passed_sets:       String(baseSets.length),
+          output_sets:       String(baseSets.length),
+          previous_stage_output_sets: "0",
           entries_total:     String(baseEntriesTotal),
           // ── ACTIVELY-RUNNING metrics (operator spec) ──────────────
           //   sets_running_now         = canonical "alive" count: Sets
@@ -1681,7 +1684,7 @@ export class StrategyCoordinator {
           [`s:${symbol}:progressing`]: String(
             baseSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
-          [`s:${symbol}:passed`]:     "0",  // updated when Main runs
+          [`s:${symbol}:passed`]:     String(baseSets.length),
           [`s:${symbol}:evaluated`]:  String(baseSets.length),
           [`s:${symbol}:apf`]:        String(baseAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(baseAvgDDT)),
@@ -2353,8 +2356,11 @@ export class StrategyCoordinator {
           entries_total:     String(mainEntriesTotal),
           entries_count:     String(mainEntriesTotal),
           axis_sets:         String(axisSetsAdded),
-          evaluated:         String(mainSets.length),
-          passed_sets:       String(mainSets.length),
+          input_sets:        String(baseSets.length),
+          evaluated:         String(baseSets.length),
+          passed_sets:       String(uniqueBaseSetsProduced.size),
+          output_sets:       String(mainSets.length),
+          previous_stage_output_sets: String(baseSets.length),
           pass_rate:         String(passRatioMain.toFixed(4)),
           count_pos_eval:    String(mainSets.length),
           sets_running_now:         String(mainRunningNow),
@@ -2365,8 +2371,8 @@ export class StrategyCoordinator {
           [`s:${symbol}:entries`]:    String(mainEntriesTotal),
           [`s:${symbol}:running`]:    String(mainRunningNow),
           [`s:${symbol}:progressing`]: String(mainProgressing),
-          [`s:${symbol}:passed`]:     String(mainSets.length),
-          [`s:${symbol}:evaluated`]:  String(mainSets.length),
+          [`s:${symbol}:passed`]:     String(uniqueBaseSetsProduced.size),
+          [`s:${symbol}:evaluated`]:  String(baseSets.length),
           [`s:${symbol}:apf`]:        String(mainAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(mainAvgDDT)),
           [`s:${symbol}:apps`]:       String(mainAvgPosPerSet.toFixed(2)),
@@ -2375,7 +2381,8 @@ export class StrategyCoordinator {
         client.expire(mainDetailKey, 86400),
         client.hset(`strategy_detail:${this.connectionId}:base`, {
           passed_sets: String(baseSets.length),
-          pass_rate:   String(passRatioMain.toFixed(4)),
+          output_sets: String(baseSets.length),
+          pass_rate:   "1.0000",
           [`s:${symbol}:passed`]: String(baseSets.length),
         }).catch(() => {}),
         client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length)),
@@ -3242,8 +3249,11 @@ export class StrategyCoordinator {
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
           // evaluated = Sets that entered the PF/DDT gate (not pre-gated by pos-count).
           // Using mainSets.length inflates this by the full axis fan-out.
+          input_sets:         String(mainSets.length),
           evaluated:          String(mainPFEligible),
           passed_sets:        String(realSets.length),
+          output_sets:        String(realSets.length),
+          previous_stage_output_sets: String(mainSets.length),
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
           entries_total:      String(realEntriesTotal),
@@ -3795,6 +3805,9 @@ export class StrategyCoordinator {
         qualifying.length > 0
           ? client.hincrby(redisKey, "strategies_live_total", qualifying.length)
           : Promise.resolve(),
+        realSets.length > 0
+          ? client.hincrby(redisKey, "strategies_live_evaluated", realSets.length)
+          : Promise.resolve(),
         // ── ACTIVE-NOW snapshot for Live stage ────────────────────────────
         // Without {symbol}:live fields the `stratCounts.live` bucket in the
         // stats route always returned 0, making the Live column empty.
@@ -3811,8 +3824,11 @@ export class StrategyCoordinator {
           created_sets:      String(qualifying.length),
           avg_profit_factor: String(liveAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(liveAvgDDT)),
-          evaluated:         String(realSets.length),
+          input_sets:        String(realSets.length),
+          evaluated:         String(qualifying.length),
           passed_sets:       String(qualifying.length),
+          output_sets:       String(qualifying.length),
+          previous_stage_output_sets: String(realSets.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
           // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
           //   Live's `qualifying` Sets ARE the executed orders. They
