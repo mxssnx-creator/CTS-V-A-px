@@ -100,8 +100,8 @@ export function PresetStrategiesView({ presets }: PresetStrategiesViewProps) {
             <div className="flex items-center gap-2">
               <TrendingUp className="h-5 w-5 text-purple-500" />
               <div>
-                <div className="text-2xl font-bold">{avgProfitFactor.toFixed(2)}</div>
-                <div className="text-sm text-muted-foreground">Avg Profit Factor</div>
+                <div className="text-2xl font-bold">{strategies.length > 0 ? avgProfitFactor.toFixed(2) : "—"}</div>
+                <div className="text-sm text-muted-foreground">Avg R</div>
               </div>
             </div>
           </CardContent>
@@ -151,7 +151,7 @@ export function PresetStrategiesView({ presets }: PresetStrategiesViewProps) {
                   </div>
                   <div className="flex items-center gap-4">
                     <div className="text-right">
-                      <div className="font-medium">PF: {strategy.profit_factor.toFixed(2)}</div>
+                      <div className="font-medium">Signed R: {strategy.profit_factor.toFixed(2)}</div>
                       <div className="text-sm text-muted-foreground">WR: {strategy.win_rate.toFixed(1)}%</div>
                     </div>
                     {strategy.is_validated ? (

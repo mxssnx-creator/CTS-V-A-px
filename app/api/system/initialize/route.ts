@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
 
+export const dynamic = "force-dynamic"
 export async function POST(req: NextRequest) {
   // Server-side bootstrap endpoint. This POST is intentionally idempotent
   // and safe to call from client mounts (EngineAutoInitializer). It will

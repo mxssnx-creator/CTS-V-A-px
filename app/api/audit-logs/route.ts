@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { auditLogger } from "@/lib/audit-logger"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
