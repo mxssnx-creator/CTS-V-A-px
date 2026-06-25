@@ -143,6 +143,7 @@ export async function GET(
       axisWindowsHashRaw,
       ordersBySymbolRaw,
       hedgePosAccHashRaw,
+      blockStrategyHashRaw,
       strategyDetailBaseHashRaw,
       strategyDetailMainHashRaw,
       strategyDetailRealHashRaw,
@@ -173,6 +174,10 @@ export async function GET(
       // in the Real stage tuner loop. Fields: `{parentSetKey}:{long|short|sets_long|sets_short|ts}`
       // Consumed to surface long/short hedge breakdown per base Set in strategyDetail.real.
       client.hgetall(`hedge_pos_acc:${connectionId}`).catch(() => null),
+      // Per-cycle Block-strategy diagnostics written by StrategyCoordinator.
+      // Fields: `s:{symbol}` JSON snapshots plus `s:{symbol}:dispatched`
+      // current-cycle live dispatch candidate counts.
+      client.hgetall(`block_strategy:${connectionId}`).catch(() => null),
       // Per-symbol strategy detail for the Base stage (performance tier source).
       // Previously this hash was never fetched — buildSpecPerformance for "base"
       // was incorrectly reading from the Main hash, causing the dashboard's Base
@@ -192,6 +197,7 @@ export async function GET(
     const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
     const ordersBySymbolHash: Record<string, string> = ordersBySymbolRaw || {}
     const hedgePosAccHash: Record<string, string> = (hedgePosAccHashRaw as Record<string, string>) || {}
+    const blockStrategyHash: Record<string, string> = (blockStrategyHashRaw as Record<string, string>) || {}
     const strategyDetailBaseHash: Record<string, string> = (strategyDetailBaseHashRaw as Record<string, string>) || {}
     const strategyDetailMainHash: Record<string, string> = (strategyDetailMainHashRaw as Record<string, string>) || {}
     const strategyDetailRealHash: Record<string, string> = (strategyDetailRealHashRaw as Record<string, string>) || {}
@@ -1176,6 +1182,26 @@ export async function GET(
         : 0,
     }
 
+    const blockStrategyDiagnostics = (() => {
+      const perSymbol: Record<string, any> = {}
+      for (const [field, raw] of Object.entries(blockStrategyHash)) {
+        const m = /^s:(.+)$/.exec(field)
+        if (!m || field.endsWith(":dispatched")) continue
+        try {
+          const parsed = JSON.parse(raw)
+          const sym = String(parsed?.symbol || m[1])
+          perSymbol[sym] = {
+            ...parsed,
+            blockSetsDispatched: n(blockStrategyHash[`s:${sym}:dispatched`] ?? parsed?.blockSetsDispatched),
+          }
+        } catch { /* ignore malformed diagnostic snapshot */ }
+      }
+      return {
+        updatedAt: n(blockStrategyHash.updated_at),
+        symbols: perSymbol,
+      }
+    })()
+
     // ── STRATEGY DETAIL fields ───────────────────────────────────────────────
     // Per-stage avg positions per set, created sets, avg profit factor, avg processing time
     // Written by strategy-processor as HSET strategy_detail:{connId}:{stage} ...
@@ -2127,6 +2153,7 @@ export async function GET(
           // `total` is the pipeline's final-stage output (Live when available, else Real).
           total: stratCounts.live || stratCounts.real || 0,
         },
+        blockStrategy: blockStrategyDiagnostics,
         positions: {
           opened:    n(progHash.live_positions_created_count),
           closed:    n(progHash.live_positions_closed_count),
@@ -2352,7 +2379,10 @@ export async function GET(
       strategyVariants: {
         default:  variantDetail.default,
         trailing: variantDetail.trailing,
-        block:    variantDetail.block,
+        block: {
+          ...variantDetail.block,
+          diagnostics: blockStrategyDiagnostics,
+        },
         dca:      variantDetail.dca,
         overall:  variantOverall,
       },
