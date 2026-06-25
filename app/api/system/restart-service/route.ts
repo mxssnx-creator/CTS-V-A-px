@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     const { service } = await request.json()

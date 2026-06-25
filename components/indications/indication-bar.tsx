@@ -91,7 +91,7 @@ export function IndicationBar({ indication, onToggle, minimalProfitFactor }: Ind
 
             <div className="flex-1 space-y-1 min-w-[200px]">
               <div className="flex justify-between text-sm">
-                <span className="truncate">Profit Factor: {indication.profitFactor.toFixed(3)}</span>
+                <span className="truncate">Avg R: {indication.profitFactor.toFixed(3)}</span>
                 <span className={`${isProfitable ? "text-green-600" : "text-gray-500"} shrink-0 ml-2`}>
                   {isProfitable ? "Profitable" : "Below Threshold"}
                 </span>

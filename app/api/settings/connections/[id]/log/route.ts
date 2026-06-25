@@ -15,6 +15,7 @@ function normalizeLogLevel(level: unknown): LogLevel {
   return "info"
 }
 
+export const dynamic = "force-dynamic"
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

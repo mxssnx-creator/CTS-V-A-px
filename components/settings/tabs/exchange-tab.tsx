@@ -181,27 +181,12 @@ export function ExchangeTab({
             <Separator />
 
             <div className="space-y-4">
-              <h3 className="text-lg font-semibold">Volume Configuration</h3>
+              <h3 className="text-lg font-semibold">Position Configuration</h3>
               <p className="text-sm text-muted-foreground">
-                Configure volume factors and position calculation settings
+                Configure pseudo-position range settings. Base strategy sizing is system-internal and ratio based.
               </p>
 
               <div className="grid md:grid-cols-2 gap-6">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <Label>Base Volume Factor</Label>
-                    <span className="text-sm font-medium">{settings.base_volume_factor || 1}</span>
-                  </div>
-                  <Slider
-                    min={0.5}
-                    max={10}
-                    step={0.5}
-                    value={[settings.base_volume_factor || 1]}
-                    onValueChange={([value]) => handleSettingChange("base_volume_factor", value)}
-                  />
-                  <p className="text-xs text-muted-foreground">Position volume multiplier (0.5-10)</p>
-                </div>
-
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
                     <Label>Range Percentage (Loss Trigger)</Label>
@@ -281,13 +266,13 @@ export function ExchangeTab({
               </p>
 
               <div className="space-y-2">
-                <Label>Position Cost Percentage (0.01% - 1.0%)</Label>
+                <Label>Position Cost Percentage (0.02% - 1.0%)</Label>
                 <div className="flex items-center gap-4">
                   <Slider
-                    min={0.01}
+                    min={0.02}
                     max={1.0}
                     step={0.01}
-                    value={[settings.exchangePositionCost ?? settings.positionCost ?? 0.1]}
+                    value={[settings.exchangePositionCost ?? settings.positionCost ?? 0.02]}
                     onValueChange={([value]) => {
                       handleSettingChange("exchangePositionCost", value)
                       handleSettingChange("positionCost", value)
@@ -295,13 +280,13 @@ export function ExchangeTab({
                     className="flex-1"
                   />
                   <span className="text-sm font-medium w-16 text-right">
-                    {(settings.exchangePositionCost ?? settings.positionCost ?? 0.1).toFixed(2)}%
+                    {(settings.exchangePositionCost ?? settings.positionCost ?? 0.02).toFixed(2)}%
                   </span>
                 </div>
                 <p className="text-xs text-muted-foreground">
                   Position cost ratio used for Base/Main/Real pseudo position calculations (count-based, no volume). Volume
                   is calculated at Exchange level: volume = (accountBalance × positionCost) / (entryPrice × leverage).
-                  Range: 0.01% - 1.0%, Default: 0.1%
+                  Range: 0.02% - 1.0%, Default: 0.02%
                 </p>
               </div>
             </div>

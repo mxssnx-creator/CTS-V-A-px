@@ -109,7 +109,7 @@ export function StrategyBar({ strategy, onToggle, onVolumeFactorChange, minimalP
 
             <div className="w-32 space-y-1 shrink-0">
               <div className="flex justify-between text-xs">
-                <span className="truncate">PF: {strategy.avg_profit_factor.toFixed(3)}</span>
+                <span className="truncate">Avg R: {strategy.stats.total_trades > 0 ? strategy.avg_profit_factor.toFixed(3) : "—"}</span>
                 <span className={`${isProfitable ? "text-green-600" : "text-gray-500"} ml-1`}>
                   {isProfitable ? "✓" : "✗"}
                 </span>
