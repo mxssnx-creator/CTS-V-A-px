@@ -4,6 +4,7 @@ import { generateConnectionIdFromApiKey, isApiKeyInUse } from "@/lib/connection-
 import { CONNECTION_PREDEFINITIONS } from "@/lib/connection-predefinitions"
 import { API_VERSIONS } from "@/lib/system-version"
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 const API_VERSION = API_VERSIONS.connections

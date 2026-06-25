@@ -146,12 +146,13 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   // the live exchange-positions cadence (~200 ms). Combined with the
   // `liveSyncPauseMs` post-cycle breath this gives ~5 close-path sweeps
   // per second while still letting each sweep finish cleanly.
-  // MUST stay at 200 ms — this is the start-to-start cadence for
-  // syncWithExchange (Loop C). 5 sweeps/sec is required to detect
-  // BingX-filled close orders within one realtime tick.
-  // Raising above 1000 ms risks stale position state and double-close.
-  liveSyncIntervalMs:          200,
-  liveSyncPauseMs:              50,
+  // Tuned to 120 ms (≈8 sweeps/sec) for fastest safe close/fill detection
+  // on short-hold trades. Stays above the 100 ms floor (below that, sweeps
+  // outrun the exchange price tick and just burn REST quota). This is the
+  // start-to-start cadence for syncWithExchange (Loop C); raising above
+  // 1000 ms risks stale position state and double-close.
+  liveSyncIntervalMs:          120,
+  liveSyncPauseMs:              30,
   heartbeatIntervalMs:       1_000,
   strategyFlowMinIntervalMs: 1_500,
   strategyFlowHardThrottleMs:  750,
@@ -167,9 +168,9 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   //   and let pending microtasks/I-O callbacks drain. Not a pacing timer.
   prehistoricIntervalMs:       1_000,  // Loop A: 1 s cadence
   prehistoricCyclePauseMs:        50,  // Loop A: post-completion breath
-  realtimeIntervalMs:            300,  // Loop B: 300 ms cadence
+  realtimeIntervalMs:            200,  // Loop B: 200 ms cadence (faster signal→dispatch)
   realtimeCyclePauseMs:           50,  // Loop B: post-completion breath
-  livePositionsCyclePauseMs:     300,  // Loop C: post-completion breath (interval = liveSyncIntervalMs 200 ms)
+  livePositionsCyclePauseMs:     150,  // Loop C: post-completion breath (interval = liveSyncIntervalMs 120 ms)
 // ── Hedge Accumulation defaults (disabled until opted-in) ────────────────
    neutralizeEnabled:               false,
    neutralizeThresholdPct:          10,   // 10 % imbalance before reducing
