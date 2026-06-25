@@ -89,6 +89,12 @@
 
 import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 
+export interface ProgressionRecoordinationResult {
+  changed: boolean
+  reason?: string
+  newEpoch?: number
+}
+
 export interface ProgressionState {
   connectionId: string
   // Session identity — increments each time a new progression starts
@@ -861,11 +867,11 @@ return {
    * Guarantees: previous progress is stopped (via archive + epoch bump), new one is
    * solid for the actual current configuration.
    */
-  static async recoordinateForActualOne(connectionId: string): Promise<void> {
+  static async recoordinateForActualOne(connectionId: string): Promise<ProgressionRecoordinationResult> {
     try {
       await initRedis()
       const client = getRedisClient()
-      if (!client) return
+      if (!client) return { changed: false, reason: "redis client unavailable" }
 
       const key = `progression:${connectionId}`
       const existing = await client.hgetall(key).catch(() => null)
@@ -877,7 +883,7 @@ return {
         // beginning the prehistoric phase.
         const epoch = Date.now()
         await this.archiveAndStartNewProgression(connectionId, epoch)
-        return
+        return { changed: true, reason: "no active progression", newEpoch: epoch }
       }
 
       // Resolve current live state
@@ -1011,9 +1017,17 @@ return {
           progress_settings_snapshot: JSON.stringify(liveSnapshot),
           prehistoric_phase_active: "false",
         }).catch(() => {})
+
+        return { changed: true, reason, newEpoch }
       }
+
+      return { changed: false, reason: "active progression already matches current state" }
     } catch (err) {
       console.warn(`[v0] [Progression] recoordinateForActualOne failed for ${connectionId}:`, err)
+      return {
+        changed: false,
+        reason: err instanceof Error ? err.message : String(err),
+      }
     }
   }
 
