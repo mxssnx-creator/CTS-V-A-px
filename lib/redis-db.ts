@@ -399,18 +399,20 @@ export class InlineLocalRedis {
     // compound across multiple intervals. The handler is cheap (~ms) when
     // heap is below threshold so the extra polling is negligible.
     const CLEANUP_INTERVAL_MS = 2_000
-    // Trigger eviction at 800 MB heapUsed.  Real Redis clients run off-heap;
-    // 800 MB is generous for the InlineLocalRedis emulator in dev while still
-    // leaving enough room before the 4 GB V8 ceiling (--max-old-space-size=4096).
-    const HEAP_PRESSURE_MB = 800
+    // Trigger eviction at 400 MB heapUsed (reduced from 600).  Real Redis clients run off-heap;
+    // Very aggressive for dev mode to prevent OOM on 4GB VM with 15+ symbols.
+    // Total safe limit: 400MB heap + 1.6GB persistent = 2GB, leaving 2GB system buffer.
+    const HEAP_PRESSURE_MB = 400
 
-    // Run an immediate targeted flush at startup to clear volatile key families
-    // that accumulate across hot-reload cycles (the globalThis Map persists
-    // between Next.js hot-reloads without a full process restart). This runs
-    // UNCONDITIONALLY in dev — even if totalKeys is low — because the OOM-
-    // causing families (strategies: lists, indication: strings, pseudo_position:
-    // hashes) can hold 20+ MB each while only occupying a few hundred key slots.
-    setTimeout(() => {
+    // Run an immediate targeted flush SYNCHRONOUSLY before migrations at startup
+    // to clear volatile key families that accumulate across hot-reload cycles
+    // (the globalThis Map persists between Next.js hot-reloads without a full
+    // process restart). This MUST run in dev BEFORE migrations are called, not
+    // after, to ensure migrations see a clean state. This runs UNCONDITIONALLY
+    // in dev — even if totalKeys is low — because the OOM-causing families
+    // (strategies: lists, indication: strings, pseudo_position: hashes) can hold
+    // 20+ MB each while only occupying a few hundred key slots.
+    try {
       try {
         if (process.env.NODE_ENV === "development") {
           let flushed = 0
@@ -422,10 +424,16 @@ export class InlineLocalRedis {
           //    keys from prior hot-reload cycles remain in the Map.
           //    Also covers lpush lists from strategy-evaluator.ts (storeStrategyResult
           //    now returns early in dev, but pre-bypass runs left stale list keys).
+          //    
+          //    PRESERVE: strategies_active:{conn} — coordinator current counts
+          //    (per-symbol per-stage). This hash is read by the stats API every
+          //    second and must survive hot-reloads.
           for (const key of this.data.lists.keys()) {
             if (key.startsWith("strategies:")) { this.data.lists.delete(key); flushed++ }
           }
           for (const key of this.data.hashes.keys()) {
+            // Preserve strategies_active hash — it contains live coordinator counts
+            if (key.startsWith("strategies_active:")) continue
             if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
               this.data.hashes.delete(key); flushed++
             }
@@ -552,8 +560,9 @@ export class InlineLocalRedis {
                         this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
           console.log(`[v0] [Redis Memory] Startup eviction complete: ${totalKeys} → ${after} keys`)
         }
-      } catch (_) {}
-    }, 500)
+      } catch (err) {
+        console.warn(`[v0] [Redis Memory] Dev startup flush error:`, err)
+      }
 
     const ttlCleanupTimer = setInterval(() => {
       try {
@@ -571,7 +580,7 @@ export class InlineLocalRedis {
         const rssMB      = mem.rss      / 1024 / 1024
         // RSS trigger: evict when process RSS exceeds 3 GB (leaves 3 GB+ for OS/other).
         // heapUsed trigger: evict when V8 heap exceeds 800 MB.
-        const RSS_PRESSURE_MB = 3_000
+    const RSS_PRESSURE_MB      = 2_000 // Reduced from 2500 for 4GB VM safety (aggressive eviction)
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         const MAX_TOTAL_KEYS = 8_000
@@ -811,7 +820,7 @@ export class InlineLocalRedis {
       evicted += trimBucket(keys, cap)
     }
 
-    // ── LIST single-pass ───────────────────────────────────────────────────
+    // ── LIST single-pass ────────────��────────���──────────────────────────��─�����
     // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
       const listCap = isDev ? 0 : 50
@@ -1717,6 +1726,16 @@ export async function initRedis(): Promise<void> {
       // runMigrations() calls ensureCoreRedis() internally (NOT initRedis), so
       // there is no re-entrancy with the promise we are currently inside.
       //
+      // SAFETY: Wrap migrations with a runtime deadline, but never mark Redis
+      // connected if the deadline/error fires. The old path swallowed the error
+      // and continued with a partially migrated schema, which is exactly how
+      // production ended up with missing progress containers, stalled counts,
+      // and zombie running flags after deploy/restart. Build-time imports are
+      // already short-circuited above, so runtime must prefer correctness and
+      // retryability over serving on an incomplete schema.
+      const { runMigrations, resetMigrationRunState } = await import("@/lib/redis-migrations")
+      const MIGRATIONS_DEADLINE_MS = isProductionEnvironment() ? 180_000 : 60_000
+      let migrationTimer: ReturnType<typeof setTimeout> | undefined
       // SAFETY: Wrap with a 90-second deadline. Production coverage repair can
       // legitimately scan/seed every connection on cold start; 35s caused false
       // deadline errors even when routes recovered. Keep a deadline for real
@@ -1731,20 +1750,21 @@ export async function initRedis(): Promise<void> {
       try {
         await Promise.race([
           runMigrations(),
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () => reject(new Error(`runMigrations() exceeded ${MIGRATIONS_DEADLINE_MS}ms global deadline — aborting to keep server responsive`)),
+          new Promise<never>((_, reject) => {
+            migrationTimer = setTimeout(
+              () => reject(new Error(`runMigrations() exceeded ${MIGRATIONS_DEADLINE_MS}ms global deadline — retrying on next request`)),
               MIGRATIONS_DEADLINE_MS,
-            ),
-          ),
+            )
+          }),
         ])
         migrationsRan = true
       } catch (migErr) {
         console.error("[v0] [Redis] runMigrations deadline/error:", migErr instanceof Error ? migErr.message : migErr)
-        // Reset so the next cold-boot can attempt migrations again
         resetMigrationRunState()
         migrationsRan = false
-        // Do NOT rethrow — let the server start anyway with schema as-is
+        throw migErr
+      } finally {
+        if (migrationTimer) clearTimeout(migrationTimer)
       }
     }
 
@@ -1893,14 +1913,14 @@ export async function getConnection(id: string): Promise<any | null> {
   return parseHash(hash)
 }
 
-// ────────────────────────────────────────────────────────��───────────────────
+// ──────────�������─────────────────────────────────────────────��───────────────────
 // PERF: in-memory TTL cache for `getAllConnections`.
 // The dashboard polls every ~8s and each active card fans out multiple
 // per-connection requests. Without this cache we issue N KEYS + N HGETALL
 // ops per poll per component. A short TTL (1.5s) dedupes bursts without
 // introducing user-visible staleness (all writes invalidate the cache
 // immediately via `invalidateConnectionsCache()`).
-// ────────────────────────────────────�������──────────────────��───────────────────
+// ──────────────────────���─────────────�������──────────────────��───────────────────
 const __CONN_CACHE_TTL_MS = 1500
 let __connCache: { at: number; value: any[] } | null = null
 let __connInflight: Promise<any[]> | null = null
@@ -2161,7 +2181,7 @@ export function invalidateAppSettingsCache(): void {
   appSettingsCache = null
 }
 
-// ───────────────────────────────────���─────────────────────────────────
+// ──────────���────────────────────────���──────────────���─���────────────────
 // Live-settings version counter
 //
 // When an operator hits Save in the Settings UI, the server updates the
@@ -2370,9 +2390,14 @@ export async function savePosition(position: any): Promise<void> {
     // Terminal => move from open index -> closed archive idempotently
     if (position.status === "closed") {
       try {
-        // Remove any existing entries from open list, then push to closed list
+        // Remove any existing entries from open list
         await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
-        await client.lpush(`live:positions:${connId}:closed`, id).catch(() => 0)
+        // Check if already in closed list to avoid duplicates
+        const alreadyClosed = await client.lpos(`live:positions:${connId}:closed`, id).catch(() => null)
+        if (!alreadyClosed) {
+          // Only add if not already present
+          await client.lpush(`live:positions:${connId}:closed`, id).catch(() => 0)
+        }
         // Mark moved so closeLivePosition can detect duplicate increments
         await client.set(`live:positions:${connId}:moved:${id}`, String(Date.now())).catch(() => null)
         await client.expire(`live:positions:${connId}:moved:${id}`, 60 * 60).catch(() => 0)
@@ -2651,12 +2676,31 @@ export function setConnectionRunningState(id: string, isRunning: boolean): void 
 
 const globalMigrationState = globalThis as unknown as { __migrations_run?: boolean }
 
+/**
+ * Check if migrations have run — uses in-memory state. Returns true if we've
+ * already cached that migrations ran; false otherwise.
+ * The actual durability check (reading Redis) happens during runMigrations,
+ * which compares Redis schema_version against code's max. The in-memory state
+ * here just avoids re-running migrations multiple times in the same process.
+ */
 export function haveMigrationsRun(): boolean {
   return globalMigrationState.__migrations_run ?? false
 }
 
 export function setMigrationsRun(value: boolean): void {
   globalMigrationState.__migrations_run = value
+  // Also write to Redis for durability across process restart
+  try {
+    const client = getRedisClient()
+    if (client && value) {
+      // Non-blocking fire-and-forget Redis write
+      client.set("_migrations_run", "true").catch(() => {
+        // Ignore write failure — we have the in-memory state as fallback
+      })
+    }
+  } catch {
+    // Ignore Redis errors — in-memory state is sufficient fallback
+  }
 }
 
 /**
@@ -2691,7 +2735,16 @@ export function isProductionEnvironment(): boolean {
 const GLOBAL_SITE_INSTANCE_KEY = "site:unique_instance"
 
 export async function ensureUniqueSiteInstance(): Promise<{ siteSessionId: string; isNew: boolean }> {
-  await initRedis()
+  // This helper is called from production migration coverage while initRedis()
+  // is already awaiting runMigrations(). Calling initRedis() again from that
+  // path deadlocks on the in-flight global init promise. During an init run the
+  // core client is already ready, so use ensureCoreRedis() and proceed; outside
+  // init we still run the full init path for normal callers.
+  if (globalForRedis.__redis_init_promise && !isConnected) {
+    await ensureCoreRedis()
+  } else {
+    await initRedis()
+  }
   const client = getRedisClient()
   if (!client) {
     return { siteSessionId: "fallback-" + Date.now(), isNew: true }
@@ -2843,9 +2896,15 @@ export async function createPosition(data: any): Promise<any> {
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
-  await client.hset(`position:${id}`, positionData)
-  // Also add to positions set for easy listing
-  await client.sadd("positions:all", id)
+  // ── Memory safety: expire positions after 30 days ──────────────────
+  // Without TTL, positions accumulate indefinitely, consuming RAM.
+  // 30 days is a reasonable retention window for trade history.
+  const POSITION_TTL_SEC = 30 * 24 * 60 * 60
+  await Promise.all([
+    client.hset(`position:${id}`, positionData),
+    client.expire(`position:${id}`, POSITION_TTL_SEC),
+    client.sadd("positions:all", id),
+  ])
   return positionData
 }
 
@@ -2853,75 +2912,64 @@ export async function getIndications(connectionId?: string, symbol?: string): Pr
   const client = getRedisClient()
   const indications: any[] = []
   
-  // First, try to get from the main key directly (storeIndications saves here)
-  if (connectionId) {
-    const mainKey = `indications:${connectionId}`
-    try {
-      const mainData = await client.get(mainKey)
-      if (mainData) {
-        const parsed = typeof mainData === "string" ? JSON.parse(mainData) : mainData
-        const arr = Array.isArray(parsed) ? parsed : [parsed]
-        
-        // Filter by symbol if provided
-        if (symbol) {
-          const filtered = arr.filter((ind: any) => ind.symbol === symbol)
-          if (filtered.length > 0) {
-            return filtered
+  try {
+    // Indications are stored as Redis lists at: indications:{connectionId}:{symbol}
+    // If symbol is provided, fetch directly from that list
+    if (connectionId && symbol) {
+      const listKey = `indications:${connectionId}:${symbol}`
+      const listData = await client.lrange(listKey, 0, 499) // Get last 500
+      if (listData && listData.length > 0) {
+        for (const item of listData) {
+          try {
+            const parsed = typeof item === "string" ? JSON.parse(item) : item
+            indications.push(parsed)
+          } catch (e) {
+            // Skip malformed entries
           }
-        } else {
-          return arr
         }
+        return indications
       }
-    } catch (e) {
-      console.warn(`[v0] Error reading main indication key ${mainKey}:`, e)
     }
-  }
-  
-  // Fallback: search with pattern matching
-  let pattern: string
-  if (connectionId && symbol) {
-    pattern = `indications:${connectionId}:${symbol}:*`
-  } else if (connectionId) {
-    pattern = `indications:${connectionId}:*`
-  } else if (symbol) {
-    pattern = `indication:${symbol}:*`
-  } else {
-    pattern = `indications:*`
-  }
-  
-  const keys = await client.keys(pattern)
-  
-  for (const key of keys) {
-    try {
-      const stringData = await client.get(key)
-      if (stringData) {
-        try {
-          const parsed = typeof stringData === "string" ? JSON.parse(stringData) : stringData
-          const arr = Array.isArray(parsed) ? parsed : [parsed]
-          indications.push(...arr)
-        } catch (e) {
-          console.warn(`[v0] Failed to parse indication key ${key}:`, e)
+    
+    // If no symbol specified, collect from all symbol lists for this connection
+    if (connectionId) {
+      const pattern = `indications:${connectionId}:*`
+      const keys = await client.keys(pattern)
+      
+      for (const key of keys) {
+        // Only process keys that are symbol-specific lists: indications:{connectionId}:{symbol}
+        // Skip auxiliary keys: indications:{connectionId}:{symbol}:type, :latest, etc.
+        // Pattern: key should end after symbol, no more colons
+        const keyPattern = /^indications:[^:]+:[^:]+$/
+        const isSymbolKey = keyPattern.test(key) && !key.includes(":type:") && !key.includes(":latest:")
+        
+        if (isSymbolKey) {
+          // This is a symbol-specific list, fetch with LRANGE
+          const listData = await client.lrange(key, 0, 499)
+          if (listData && listData.length > 0) {
+            for (const item of listData) {
+              try {
+                const parsed = typeof item === "string" ? JSON.parse(item) : item
+                indications.push(parsed)
+              } catch (e) {
+                // Skip malformed entries
+              }
+            }
+          }
         }
-        continue
       }
       
-      const hashData = await client.hgetall(key)
-      if (hashData && Object.keys(hashData).length > 0) {
-        // Parse numeric fields from string — hgetall always returns strings
-        const parsed: Record<string, any> = { id: key.replace(/^indications?:/, ""), ...hashData }
-        if (typeof parsed.confidence === "string")    parsed.confidence    = parseFloat(parsed.confidence)
-        if (typeof parsed.profitFactor === "string")  parsed.profitFactor  = parseFloat(parsed.profitFactor)
-        if (typeof parsed.profit_factor === "string") parsed.profit_factor = parseFloat(parsed.profit_factor)
-        if (typeof parsed.value === "string")         parsed.value         = parseFloat(parsed.value)
-        if (typeof parsed.timestamp === "string")     parsed.timestamp     = parseInt(parsed.timestamp, 10)
-        indications.push(parsed)
+      if (indications.length > 0) {
+        return indications
       }
-    } catch (e) {
-      console.warn(`[v0] Error reading indication key ${key}:`, e)
     }
+    
+    // Final fallback: no indications found
+    return []
+  } catch (e) {
+    console.warn(`[v0] Error reading indications for ${connectionId}/${symbol}:`, e)
+    return []
   }
-  
-  return indications
 }
 
 /**

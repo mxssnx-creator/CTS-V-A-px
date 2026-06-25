@@ -666,7 +666,7 @@ export class IndicationSetsProcessor {
 
             const existing = await client.get(setKey)
             let entries = existing ? JSON.parse(existing) : []
-            // ── Newest-at-last (per spec) ────────────────────────────
+            // ── Newest-at-last (per spec) ──���─────────────────────────
             // The compaction policy drops oldest by `slice(-floor)`,
             // which requires chronological order. Use `push`, never
             // `unshift`. Switching from the prior unshift+slice(0, n)
@@ -1051,25 +1051,45 @@ export class IndicationSetsProcessor {
 
   private getPriceHistory(marketData: any, count: number): number[] | null {
     const prices = marketData.prices || []
-    return prices.slice(0, count).map((p: any) => Number.parseFloat(p))
+    if (!Array.isArray(prices) || prices.length === 0) return null
+    
+    // Convert to numbers and filter out NaN/invalid values
+    const validPrices = prices
+      .slice(0, count)
+      .map((p: any) => {
+        const num = typeof p === "number" ? p : Number.parseFloat(String(p))
+        return Number.isFinite(num) ? num : null
+      })
+      .filter((p: number | null): p is number => p !== null)
+    
+    return validPrices.length > 0 ? validPrices : null
   }
 
   private getDirection(prices: number[]): number {
+    if (prices.length === 0) return 0
     const avg = prices.reduce((a, b) => a + b, 0) / prices.length
+    if (!Number.isFinite(avg)) return 0
     return prices.reduce((a, b) => a + (b > avg ? 1 : -1), 0) / prices.length
   }
 
   private calculateVolatility(prices: number[]): number {
+    if (prices.length < 2) return 0
     const avg = prices.reduce((a, b) => a + b, 0) / prices.length
+    if (!Number.isFinite(avg) || avg === 0) return 0
     const variance = prices.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / prices.length
-    return Math.sqrt(variance) / avg
+    const vol = Math.sqrt(variance) / avg
+    return Number.isFinite(vol) ? vol : 0
   }
 
   private detectConsecutiveSteps(prices: number[], range: number): number {
+    if (prices.length < range * 2) return 0
     let steps = 0
     for (let i = range; i < prices.length - range; i += range) {
-      const dir1 = this.getDirection(prices.slice(i - range, i))
-      const dir2 = this.getDirection(prices.slice(i, i + range))
+      const slice1 = prices.slice(i - range, i)
+      const slice2 = prices.slice(i, i + range)
+      if (slice1.length === 0 || slice2.length === 0) continue
+      const dir1 = this.getDirection(slice1)
+      const dir2 = this.getDirection(slice2)
       if ((dir1 > 0 && dir2 < 0) || (dir1 < 0 && dir2 > 0)) {
         steps++
       }
