@@ -596,9 +596,49 @@ export async function PATCH(
       scalarChanged("is_testnet", (connection as Record<string, unknown>).is_testnet, (updated as Record<string, unknown>).is_testnet) ||
       scalarChanged("is_preset_trade", (connection as Record<string, unknown>).is_preset_trade, (updated as Record<string, unknown>).is_preset_trade) ||
       scalarChanged("connection_method", (connection as Record<string, unknown>).connection_method, (updated as Record<string, unknown>).connection_method)
+    let progressionRestartHandled = false
     if (symbolsModeChanged) {
       try {
-        await ProgressionStateManager.recoordinateForActualOne(id)
+        const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
+        if (recoordination.changed) {
+          progressionRestartHandled = true
+
+          // The progression epoch/lock changed, so this is no longer a safe
+          // in-place hot reload for a running manager. Publish a restart-class
+          // settings event and explicitly restart an active manager so it binds
+          // to the newly-created progression instead of continuing to write
+          // underneath an archived epoch.
+          try {
+            const { notifySettingsChanged } = await import("@/lib/settings-coordinator")
+            await notifySettingsChanged(
+              id,
+              ["progression_epoch", "connection_settings"],
+              { ...connection, connection_settings: current },
+              { ...connection, connection_settings: merged, updated_at: updated.updated_at },
+            )
+          } catch (notifyErr) {
+            console.warn(
+              `[v0] [Settings PATCH] restart-class notify failed for ${id}:`,
+              notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
+            )
+          }
+
+          try {
+            const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+            const coordinator = getGlobalTradeEngineCoordinator()
+            if (coordinator.isEngineRunning(id)) {
+              console.log(
+                `[v0] [Settings PATCH] Restarting ${id} after progression recoordination (${recoordination.reason || "changed"})`,
+              )
+              await coordinator.restartEngine(id)
+            }
+          } catch (restartErr) {
+            console.warn(
+              `[v0] [Settings PATCH] engine restart after progression recoordination failed for ${id}:`,
+              restartErr instanceof Error ? restartErr.message : String(restartErr),
+            )
+          }
+        }
       } catch (recoordErr) {
         console.warn(
           `[v0] [Settings PATCH] recoordinateForActualOne failed for ${id} (non-fatal):`,
@@ -612,15 +652,17 @@ export async function PATCH(
     // would report zero changes — pass an explicit override listing the
     // settings keys the caller touched, so the recoordinator knows
     // something inside `connection_settings` actually changed.
-    await recoordinateAfterSettingsChange(
-      id,
-      { ...connection, connection_settings: current },
-      { ...connection, connection_settings: merged, updated_at: updated.updated_at },
-      {
-        logTag: "PATCH /settings",
-        changedFieldsOverride: Object.keys(settings).length > 0 ? ["connection_settings"] : [],
-      },
-    )
+    if (!progressionRestartHandled) {
+      await recoordinateAfterSettingsChange(
+        id,
+        { ...connection, connection_settings: current },
+        { ...connection, connection_settings: merged, updated_at: updated.updated_at },
+        {
+          logTag: "PATCH /settings",
+          changedFieldsOverride: Object.keys(settings).length > 0 ? ["connection_settings"] : [],
+        },
+      )
+    }
 
     await SystemLogger.logConnection(`Patched settings`, id, "info")
 
