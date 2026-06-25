@@ -179,6 +179,14 @@ export async function recoordinateAfterSettingsChange(
   try {
     const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
     const coordinator = getGlobalTradeEngineCoordinator()
+    
+    // Guard against null coordinator (can happen if engine is being reset)
+    if (!coordinator) {
+      console.warn(
+        `[v0] [${opts.logTag}] Global coordinator is null/undefined for ${id} — skipping recoordination`
+      )
+      return
+    }
 
     // ── Invalidate symbol cache if symbols changed ──────────────────────
     // When force_symbols or active_symbols are updated, the engine's cached
@@ -201,7 +209,16 @@ export async function recoordinateAfterSettingsChange(
     }
 
     // Step 2 — in-process fast-path (no-op when engine isn't running here).
-    await coordinator.applyPendingChangesNow(id)
+    // Isolated try-catch to prevent coordinator crash from affecting other operations
+    try {
+      await coordinator.applyPendingChangesNow(id)
+    } catch (applyErr) {
+      console.warn(
+        `[v0] [${opts.logTag}] applyPendingChangesNow failed for ${id}:`,
+        applyErr instanceof Error ? applyErr.message : String(applyErr),
+      )
+      // Continue to recoordination — the change can still be applied
+    }
 
     // Step 3 — recoordinate. Decide "should this connection be running
     // right now" using the SAME predicate the boot-time reconciliation
