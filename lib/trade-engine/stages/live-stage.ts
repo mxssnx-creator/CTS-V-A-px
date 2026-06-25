@@ -42,6 +42,85 @@ import {
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
 
+const DEFAULT_MIN_NOTIONAL_RISK_TOLERANCE_PCT = 25
+const MIN_NOTIONAL_RISK_REASON = "min_notional_exceeds_strategy_risk"
+
+function parseMinNotionalRiskTolerance(settings: Record<string, unknown> | null | undefined): number {
+  const raw = settings?.min_notional_risk_tolerance_pct
+    ?? settings?.minNotionalRiskTolerancePct
+    ?? settings?.min_notional_tolerance_pct
+    ?? settings?.minNotionalTolerancePct
+    ?? DEFAULT_MIN_NOTIONAL_RISK_TOLERANCE_PCT
+  const pct = Number(raw)
+  if (!Number.isFinite(pct) || pct < 0) return DEFAULT_MIN_NOTIONAL_RISK_TOLERANCE_PCT / 100
+  return pct / 100
+}
+
+function buildMinNotionalRiskDetail(args: {
+  volumeResult: any
+  currentPrice: number
+  computedVolume: number
+  tolerance: number
+}): { shouldSuppress: boolean; detail: Record<string, unknown> } {
+  const { volumeResult, currentPrice, computedVolume, tolerance } = args
+  const calculatedVolume = Number(volumeResult?.calculatedVolume)
+  const explicitIntended = Number(volumeResult?.intendedNotionalUsd)
+  const accountBalance = Number(volumeResult?.accountBalance)
+  const positionCost = Number(volumeResult?.positionCost)
+  const positionsAverage = Number(volumeResult?.positionsAverage)
+  const liveEngineFactor = Number(volumeResult?.liveEngineFactor)
+  const sizeMultiplier = Number(volumeResult?.sizeMultiplier)
+  const recomputedIntended =
+    Number.isFinite(accountBalance) && accountBalance > 0 &&
+    Number.isFinite(positionCost) && positionCost > 0 &&
+    Number.isFinite(positionsAverage) && positionsAverage > 0
+      ? (
+          accountBalance *
+          positionCost *
+          (Number.isFinite(liveEngineFactor) && liveEngineFactor > 0 ? liveEngineFactor : 1) *
+          (Number.isFinite(sizeMultiplier) && sizeMultiplier > 0 ? sizeMultiplier : 1)
+        ) / positionsAverage
+      : 0
+  const calculatedIntended =
+    Number.isFinite(calculatedVolume) && calculatedVolume > 0 && currentPrice > 0
+      ? calculatedVolume * currentPrice
+      : 0
+  const intendedNotional = explicitIntended > 0
+    ? explicitIntended
+    : recomputedIntended > 0
+      ? recomputedIntended
+      : calculatedIntended
+  const intendedNotionalSource = explicitIntended > 0
+    ? "volume_result"
+    : recomputedIntended > 0
+      ? "volume_result_inputs"
+      : calculatedIntended > 0
+        ? "calculated_volume"
+        : "unavailable"
+  const exchangeMinimum = Number(volumeResult?.exchangeMinNotionalUsd) > 0
+    ? Number(volumeResult.exchangeMinNotionalUsd)
+    : (currentPrice > 0 ? computedVolume * currentPrice : 0)
+  const detail = {
+    reason: MIN_NOTIONAL_RISK_REASON,
+    intendedNotionalUsd: intendedNotional,
+    intendedNotionalSource,
+    exchangeMinNotionalUsd: exchangeMinimum,
+    computedVolume,
+    currentPrice,
+    tolerancePct: tolerance * 100,
+    calculatedVolume: volumeResult?.calculatedVolume,
+    accountBalance: volumeResult?.accountBalance,
+    positionCost: volumeResult?.positionCost,
+    positionsAverage: volumeResult?.positionsAverage,
+    liveEngineFactor: volumeResult?.liveEngineFactor,
+    sizeMultiplier: volumeResult?.sizeMultiplier,
+  }
+  return {
+    shouldSuppress: intendedNotional > 0 && exchangeMinimum > intendedNotional * (1 + tolerance),
+    detail,
+  }
+}
+
 // ── Exchange call timeouts ────────────────────────────────────────────────
 // Target: syncWithExchange completes in <1 s on the hot path.
 // These timeouts bound per-call worst case so the pool never hangs.
@@ -2335,6 +2414,42 @@ export async function executeLivePosition(
       )
     }
 
+    const minNotionalTolerance = parseMinNotionalRiskTolerance(connSettings as Record<string, unknown>)
+    const minNotionalRisk = buildMinNotionalRiskDetail({
+      volumeResult,
+      currentPrice,
+      computedVolume,
+      tolerance: minNotionalTolerance,
+    })
+
+    if (minNotionalRisk.shouldSuppress) {
+      livePosition.status = "rejected"
+      livePosition.statusReason = MIN_NOTIONAL_RISK_REASON
+      livePosition.quantity = computedVolume
+      livePosition.remainingQuantity = computedVolume
+      livePosition.volumeUsd = computedVolume * currentPrice
+      pushStep(
+        livePosition,
+        "volume_risk_check",
+        false,
+        JSON.stringify(minNotionalRisk.detail),
+      )
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_blocked_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        `Live order suppressed: ${MIN_NOTIONAL_RISK_REASON} for ${realPosition.symbol}`,
+        { symbol: realPosition.symbol, direction: realPosition.direction, ...minNotionalRisk.detail },
+      ).catch(() => {})
+      console.warn(
+        `${LOG_PREFIX} [RISK_SUPPRESSED] ${realPosition.symbol} ${realPosition.direction} ${JSON.stringify(minNotionalRisk.detail)}`
+      )
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      return livePosition
+    }
+
     // High-visibility diagnostic for the most common reason real orders never appear on the exchange
     if (computedVolume <= 0) {
       console.error(
@@ -2474,6 +2589,7 @@ export async function executeLivePosition(
     console.log(
       `${LOG_PREFIX} [REAL_ORDER_ATTEMPT] conn=${connectionId} sym=${realPosition.symbol} dir=${realPosition.direction} ` +
       `computedVol=${computedVolume} price=${currentPrice} lev=${livePosition.leverage} ` +
+      `intendedNotional=${minNotionalRisk.detail.intendedNotionalUsd} exchangeMinNotional=${minNotionalRisk.detail.exchangeMinNotionalUsd} ` +
       `setKey=${livePosition.setKey} trace=${orderTrace.traceId}`
     )
 
@@ -2490,6 +2606,8 @@ export async function executeLivePosition(
           {
             quantity: computedVolume,
             price: currentPrice,
+            intendedNotionalUsd: Number(minNotionalRisk.detail.intendedNotionalUsd),
+            exchangeMinNotionalUsd: Number(minNotionalRisk.detail.exchangeMinNotionalUsd),
             leverage: livePosition.leverage,
             marginType: livePosition.marginType ?? "unknown",
             orderType: "market",
@@ -2542,6 +2660,8 @@ export async function executeLivePosition(
               {
                 quantity: computedVolume,
                 price: currentPrice,
+                intendedNotionalUsd: Number(minNotionalRisk.detail.intendedNotionalUsd),
+                exchangeMinNotionalUsd: Number(minNotionalRisk.detail.exchangeMinNotionalUsd),
                 leverage: reducedLev,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
@@ -2607,6 +2727,38 @@ export async function executeLivePosition(
             ? Math.abs(minQtyForSymbol - computedVolume) / computedVolume
             : 1
           if (minQtyForSymbol > 0 && quantityDiffPct > 0.001) {
+            const lev1MinNotional = minQtyForSymbol * currentPrice
+            const lev1Risk = buildMinNotionalRiskDetail({
+              volumeResult: {
+                ...volumeResult,
+                exchangeMinNotionalUsd: lev1MinNotional,
+              },
+              currentPrice,
+              computedVolume: minQtyForSymbol,
+              tolerance: minNotionalTolerance,
+            })
+            if (lev1Risk.shouldSuppress) {
+              livePosition.status = "rejected"
+              livePosition.statusReason = MIN_NOTIONAL_RISK_REASON
+              livePosition.quantity = minQtyForSymbol
+              livePosition.remainingQuantity = minQtyForSymbol
+              livePosition.volumeUsd = lev1MinNotional
+              pushStep(livePosition, "entry", false, JSON.stringify(lev1Risk.detail))
+              await savePosition(livePosition)
+              await incrementMetric(connectionId, "live_orders_blocked_count")
+              await logProgressionEvent(
+                connectionId,
+                "live_trading",
+                "warning",
+                `Live order suppressed: ${MIN_NOTIONAL_RISK_REASON} for ${realPosition.symbol}`,
+                { symbol: realPosition.symbol, direction: realPosition.direction, ...lev1Risk.detail },
+              ).catch(() => {})
+              console.warn(
+                `${LOG_PREFIX} [RISK_SUPPRESSED] ${realPosition.symbol} ${realPosition.direction} ${JSON.stringify(lev1Risk.detail)}`
+              )
+              await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+              return livePosition
+            }
             console.warn(
               `${LOG_PREFIX} 101204 at ${reducedLev}x still fails on ${realPosition.symbol} — ` +
               `trying lev=1 with min notional qty=${minQtyForSymbol.toFixed(8)}`,
@@ -2622,6 +2774,8 @@ export async function executeLivePosition(
               {
                 quantity: minQtyForSymbol,
                 price: currentPrice,
+                intendedNotionalUsd: Number(minNotionalRisk.detail.intendedNotionalUsd),
+                exchangeMinNotionalUsd: Number(minNotionalRisk.detail.exchangeMinNotionalUsd),
                 leverage: 1,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
