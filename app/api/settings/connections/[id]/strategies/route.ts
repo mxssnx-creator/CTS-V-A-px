@@ -33,6 +33,7 @@ const DEFAULTS: Record<StratRow["strategy_type"], Omit<StratRow, "strategy_type"
   real: { is_enabled: true, min_profit_factor: 1.2, max_drawdown_time: 180, max_positions: 100 },
 }
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

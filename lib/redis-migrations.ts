@@ -1673,7 +1673,7 @@ const migrations: Migration[] = [
     // `app_settings`. Existing hashes have no coordination fields, so the first
     // cycle after upgrade would fall back to global which may also be absent.
     // Seed spec defaults idempotently (never clobbers operator-set values):
-    //   variants:  trailing=true, block=true, dca=false, pause=true
+    //   variants:  trailing=true, block=true, dca=false (pause is an axis, not a variant)
     //   axes:      all disabled by default, maxWindow seeded to spec defaults
     //   block knobs: blockVolumeRatio=1.0, blockMaxStack=3
     //
@@ -1688,7 +1688,6 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false",  // off by spec default
-        variantPauseEnabled:    "true",
         // Axis toggles — disabled by default (operator must opt-in)
         axisPrevEnabled:   "false",
         axisPrevMaxWindow: "12",
@@ -1876,6 +1875,37 @@ const migrations: Migration[] = [
       const CONN_ID = "bingx-x01"
       const symJson = JSON.stringify(SYMBOLS_15)
       const symCount = String(SYMBOLS_15.length)
+      const existingConn = (await client.hgetall(`connection:${CONN_ID}`).catch(() => null)) as Record<string, string> | null
+      const existingSyms = (() => {
+        const raw = existingConn?.force_symbols || existingConn?.active_symbols
+        if (!raw) return []
+        try {
+          const parsed = JSON.parse(raw)
+          return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string" && s.length > 0) : []
+        } catch {
+          return raw.split(",").map((s) => s.trim()).filter(Boolean)
+        }
+      })()
+      if (existingConn?.symbol_order === "manual" && existingSyms.length > 0) {
+        const operatorJson = JSON.stringify(existingSyms)
+        const operatorCount = String(existingSyms.length)
+        await Promise.all([
+          client.hset(`settings:trade_engine_state:${CONN_ID}`, {
+            active_symbols: operatorJson,
+            force_symbols: operatorJson,
+            symbols: operatorJson,
+            symbol_count: operatorCount,
+            config_set_symbols_total: operatorCount,
+          }),
+          client.hset(`settings:connection:${CONN_ID}`, {
+            active_symbols: operatorJson,
+            force_symbols: operatorJson,
+            symbol_count: operatorCount,
+          }),
+        ]).catch(() => {})
+        console.log(`[v0] Migration 033: preserved operator manual symbols (${existingSyms.length}) for ${CONN_ID}`)
+        return
+      }
       // Write `force_symbols` — the highest-priority field in getSymbols().
       // Unlike `active_symbols` / `symbols`, `force_symbols` is NEVER written
       // by the engine startup path, so it cannot be silently overwritten when
@@ -1929,7 +1959,7 @@ const migrations: Migration[] = [
           symbols_hash:      SYMBOLS_15.sort().join("|"),
           is_live_trade:     "1",
           is_preset_trade:   "0",
-          live_volume_factor: "1",
+          live_volume_factor: "0.1",
           connection_method: "library",
           updated_at:        new Date().toISOString(),
         }),
@@ -1951,7 +1981,7 @@ const migrations: Migration[] = [
   //       that StrategyCoordinator.loadProfitFactors() reads (NOT the
   //       pf_base_min snake_case names used by the old settings UI)
   //   • variantTrailingEnabled / variantBlockEnabled / variantDcaEnabled /
-  //     variantPauseEnabled → written to connection_settings:bingx-x01
+  //     pause axis settings → written to connection_settings:bingx-x01
   //     using the camelCase keys that loadCoordinationSettings() reads
   //   • minStep=5, mainEvalPosCount=15, realEvalPosCount=10 →
   //     connection_settings:bingx-x01
@@ -2019,7 +2049,6 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false",
-        variantPauseEnabled:    "true",
         // Block knobs
         blockVolumeRatio:     "1.0",
         blockMaxStack:        "3",
@@ -2057,6 +2086,37 @@ const migrations: Migration[] = [
       const CONN_ID = "bingx-x01"
       const symJson = JSON.stringify(SYMBOLS_20)
       const symCount = String(SYMBOLS_20.length)
+      const existingConn = (await client.hgetall(`connection:${CONN_ID}`).catch(() => null)) as Record<string, string> | null
+      const existingSyms = (() => {
+        const raw = existingConn?.force_symbols || existingConn?.active_symbols
+        if (!raw) return []
+        try {
+          const parsed = JSON.parse(raw)
+          return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string" && s.length > 0) : []
+        } catch {
+          return raw.split(",").map((s) => s.trim()).filter(Boolean)
+        }
+      })()
+      if (existingConn?.symbol_order === "manual" && existingSyms.length > 0) {
+        const operatorJson = JSON.stringify(existingSyms)
+        const operatorCount = String(existingSyms.length)
+        await Promise.all([
+          client.hset(`settings:trade_engine_state:${CONN_ID}`, {
+            active_symbols: operatorJson,
+            force_symbols: operatorJson,
+            symbols: operatorJson,
+            symbol_count: operatorCount,
+            config_set_symbols_total: operatorCount,
+          }),
+          client.hset(`settings:connection:${CONN_ID}`, {
+            active_symbols: operatorJson,
+            force_symbols: operatorJson,
+            symbol_count: operatorCount,
+          }),
+        ]).catch(() => {})
+        console.log(`[v0] Migration 035: preserved operator manual symbols (${existingSyms.length}) for ${CONN_ID}`)
+        return
+      }
 
       await Promise.all([
         client.hset(`connection:${CONN_ID}`, {
@@ -2100,7 +2160,7 @@ const migrations: Migration[] = [
           symbols_hash:      SYMBOLS_20.slice().sort().join("|"),
           is_live_trade:     "0",
           is_preset_trade:   "0",
-          live_volume_factor: "1",
+          live_volume_factor: "0.1",
           connection_method: "library",
           updated_at:        new Date().toISOString(),
         }),
@@ -2224,7 +2284,8 @@ const migrations: Migration[] = [
       const existingActive = parseSyms((stateHash as any)?.active_symbols)
       const rawConnSyms    = parseSyms((connHash as any)?.force_symbols || (connHash as any)?.active_symbols)
 
-      let syms = existingForce.length ? existingForce
+      let syms = (connHash as any)?.symbol_order === "manual" && rawConnSyms.length ? rawConnSyms
+               : existingForce.length ? existingForce
                : existingActive.length ? existingActive
                : rawConnSyms.length ? rawConnSyms
                : [...BASE_TEST_SYMBOLS]          // fresh DB — seed canonical list
@@ -2282,7 +2343,13 @@ const migrations: Migration[] = [
         .concat(parseSyms((connHash as any)?.force_symbols || (connHash as any)?.active_symbols))
 
       // Use first non-empty list found; fall back to canonical 20-symbol list.
+      // If the operator has already saved a manual list to connection:{id},
+      // that raw connection list wins even if an older migration/admin list is
+      // still present in settings:trade_engine_state. This preserves settings
+      // saves that race with dev route recompilation migrations.
       const found = [
+        (connHash as any)?.symbol_order === "manual" ? parseSyms((connHash as any)?.force_symbols) : [],
+        (connHash as any)?.symbol_order === "manual" ? parseSyms((connHash as any)?.active_symbols) : [],
         parseSyms((stateHash as any)?.force_symbols),
         parseSyms((stateHash as any)?.active_symbols),
         parseSyms((connHash as any)?.force_symbols),
@@ -2363,15 +2430,22 @@ const migrations: Migration[] = [
       if (!connExisting["active_symbols"] || connExisting["active_symbols"] === "[]") connSymWrites["active_symbols"] = symJson
       if (!connExisting["symbol_count"]   || connExisting["symbol_count"]   === "0")  connSymWrites["symbol_count"]   = symCount
 
+      const positiveNumberOrDefault = (value: string | undefined, fallback: string): string => {
+        const n = Number(value)
+        return Number.isFinite(n) && n > 0 ? String(value) : fallback
+      }
+      const liveVolumeDefault = positiveNumberOrDefault(connExisting["live_volume_factor"], "2.2")
+      const presetVolumeDefault = positiveNumberOrDefault(connExisting["preset_volume_factor"], "1.0")
+
       await Promise.all([
         Object.keys(engSymWrites).length  > 0 ? client.hset(`settings:trade_engine_state:${CONN_ID}`, engSymWrites).catch(() => {}) : Promise.resolve(),
         Object.keys(connSymWrites).length > 0 ? client.hset(`settings:connection:${CONN_ID}`, connSymWrites).catch(() => {})        : Promise.resolve(),
-        // Always write non-symbol fields to connection hash (volume, order, timestamp)
+        // Always refresh timestamps/order, but preserve any valid operator volume factor.
         client.hset(`connection:${CONN_ID}`, {
           ...(Object.keys(connSymWrites).length > 0 ? connSymWrites : {}),
-          live_volume_factor:   "2.2",
-          preset_volume_factor: "1.0",
-          symbol_order:         "volatility",
+          live_volume_factor:   liveVolumeDefault,
+          preset_volume_factor: presetVolumeDefault,
+          symbol_order:         connExisting["symbol_order"] || "volatility",
           updated_at:           now,
         }).catch(() => {}),
       ])
@@ -2390,9 +2464,10 @@ const migrations: Migration[] = [
       // ── 3. connection_settings:bingx-x01 — coordinator + volume overlay ──
       // StrategyCoordinator.loadProfitFactors() + loadCoordinationSettings()
       // both read exclusively from connection_settings:{id} (hgetall).
-      await client.hset(`connection_settings:${CONN_ID}`, {
-        live_volume_factor:     "2.2",
-        preset_volume_factor:   "1.0",
+      const settingsExisting = (await client.hgetall(`connection_settings:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
+      const connectionSettingsDefaults: Record<string,string> = {
+        live_volume_factor:     liveVolumeDefault,
+        preset_volume_factor:   presetVolumeDefault,
         baseProfitFactor:       "1.0",
         mainProfitFactor:       "1.2",
         realProfitFactor:       "1.2",
@@ -2400,26 +2475,47 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false",
-        variantPauseEnabled:    "true",
         blockVolumeRatio:       "1.0",
         blockMaxStack:          "3",
         mainEvalPosCount:       "3",
         realEvalPosCount:       "3",
         minStep:                "5",
-        updated_at:             now,
-      }).catch(() => {})
+      }
+      const connectionSettingsWrites: Record<string,string> = { updated_at: now }
+      for (const [key, value] of Object.entries(connectionSettingsDefaults)) {
+        if (!settingsExisting[key]) connectionSettingsWrites[key] = value
+      }
+      await client.hset(`connection_settings:${CONN_ID}`, connectionSettingsWrites).catch(() => {})
 
-      // ── 4. Progression snapshot so status API reflects 20 symbols ─────────
+      const parseSyms = (raw: string | null | undefined): string[] => {
+        if (!raw) return []
+        try {
+          const parsed = JSON.parse(raw)
+          return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string" && s.length > 0) : []
+        } catch {
+          return raw.split(",").map((s: string) => s.trim()).filter(Boolean)
+        }
+      }
+      const progressSyms =
+        parseSyms(engExisting.force_symbols).length > 0 ? parseSyms(engExisting.force_symbols)
+        : parseSyms(engExisting.active_symbols).length > 0 ? parseSyms(engExisting.active_symbols)
+        : parseSyms(connExisting.force_symbols).length > 0 ? parseSyms(connExisting.force_symbols)
+        : parseSyms(connExisting.active_symbols).length > 0 ? parseSyms(connExisting.active_symbols)
+        : SYMS
+      const progressSymCount = String(progressSyms.length)
+      const progressSymHash = progressSyms.slice().sort().join("|")
+
+      // ── 4. Progression snapshot so status API reflects actual symbols ─────
       await client.hset(`progression:${CONN_ID}`, {
-        symbol_count:                 symCount,
-        active_symbols_hash:          SYMS.slice().sort().join("|"),
+        symbol_count:                 progressSymCount,
+        active_symbols_hash:          progressSymHash,
         started_for_settings_version: now,
         progress_settings_snapshot:   JSON.stringify({
-          symbol_count:       Number(symCount),
-          symbols_hash:       SYMS.slice().sort().join("|"),
+          symbol_count:       Number(progressSymCount),
+          symbols_hash:       progressSymHash,
           is_live_trade:      "1",
           is_preset_trade:    "0",
-          live_volume_factor: "2.2",
+          live_volume_factor: liveVolumeDefault,
           connection_method:  "library",
           updated_at:         now,
         }),
@@ -2436,7 +2532,7 @@ const migrations: Migration[] = [
 
       console.log(
         `[v0] Migration 040: canonical bingx-x01 state applied — ` +
-        `${SYMS.length} symbols (POLUSDT), pf=1.0/1.2/1.2, live_volume_factor=2.2`
+        `${progressSyms.length} symbols (operator-preserving), pf=1.0/1.2/1.2, live_volume_factor=${liveVolumeDefault}`
       )
     },
     down: async (client: any) => {
@@ -2445,17 +2541,17 @@ const migrations: Migration[] = [
   },
 
   // ── Migration 041 ──────────────────────────────────────────────────────────
-  // Fix stale live_volume_factor < 1.0 on connection:bingx-x01 and clear the
-  // prehistoric_loaded:bingx-x01 cache gate that prevents re-runs when the DB
+  // Validate malformed live_volume_factor values on connection:bingx-x01 and
+  // clear the prehistoric_loaded cache gate that prevents re-runs when the DB
   // is wiped but the marker survives.
   //
-  // Problem 1 — liveVolumeFactor: 0.1 in stats:
-  //   Some earlier write path stored live_volume_factor: "0.1" on
+  // Problem 1 — invalid liveVolumeFactor in stats:
+  //   Some earlier write paths stored boolean/non-numeric values on
   //   connection:bingx-x01. VolumeCalculator.resolveLiveEngine reads this hash
-  //   first (highest priority), so 0.1 beats the correct 2.2 from app_settings
-  //   and connection_settings. Any value below 1.0 is a misconfiguration —
-  //   live_volume_factor is a scaling multiplier and sub-1 shrinks positions.
-  //   Correct unconditionally to 2.2.
+  //   first (highest priority), so invalid values beat app_settings and
+  //   connection_settings. Preserve any positive operator value (including low
+  //   stress-test factors like 0.1) and only restore defaults for missing,
+  //   non-numeric, or non-positive factors.
   //
   // Problem 2 — prehistoric re-run gate:
   //   `prehistoric_loaded:{conn}` (plain string "1") is the 24-hour cache key
@@ -2473,18 +2569,21 @@ const migrations: Migration[] = [
       const CONN_ID = "bingx-x01"
       const now = new Date().toISOString()
 
-      // 1. Correct stale volume factor unconditionally.
-      //    Some write paths stored a boolean "true" (live_volume_factor=true) instead
-      //    of a number string. parseFloat("true")=NaN, clampFactor("true")=null, so any
-      //    non-numeric value silently falls back to 1.0 in the volume route and the
-      //    QuickstartOptionsBar shows the wrong factor. Always overwrite with the
-      //    correct 2.2 default so every fresh DB starts with a sane live factor.
-      await client.hset(`connection:${CONN_ID}`, {
-        live_volume_factor:   "2.2",
-        preset_volume_factor: "1.0",
-        updated_at:           now,
-      }).catch(() => {})
-      console.log(`[v0] Migration 041: set live_volume_factor=2.2 on connection:${CONN_ID}`)
+      // 1. Validate stale volume factors without clobbering operator stress-test values.
+      //    A positive numeric value (for example 0.1 during low-volume dev tests)
+      //    is intentional and must survive migrations. Only invalid/missing values
+      //    are replaced with safe defaults.
+      const existingConnection = (await client.hgetall(`connection:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
+      const liveFactor = Number(existingConnection.live_volume_factor)
+      const presetFactor = Number(existingConnection.preset_volume_factor)
+      const factorPatch: Record<string,string> = { updated_at: now }
+      if (!Number.isFinite(liveFactor) || liveFactor <= 0) factorPatch.live_volume_factor = "2.2"
+      if (!Number.isFinite(presetFactor) || presetFactor <= 0) factorPatch.preset_volume_factor = "1.0"
+      await client.hset(`connection:${CONN_ID}`, factorPatch).catch(() => {})
+      console.log(
+        `[v0] Migration 041: validated volume factors on connection:${CONN_ID} ` +
+        `(live=${factorPatch.live_volume_factor || existingConnection.live_volume_factor || "unchanged"})`,
+      )
 
       // 2. Clear prehistoric_loaded cache gate — forces fresh prehistoric on
       //    next engine boot. This is idempotent: engine re-stamps it after a
@@ -2501,6 +2600,242 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "40")
+    },
+  },
+
+  // ── Migration 042 ──────────────────────────────────────────────────────────
+  // Reconcile operator volume settings across raw + settings hashes without
+  // clobbering low-but-valid stress-test factors, and clear stale prehistoric
+  // gates once more for installations that already ran the old 041.
+  {
+    version: 42,
+    name: "042-preserve-operator-volume-and-refresh-prehistoric-gates",
+    description: "Preserve positive operator volume factors and force fresh prehistoric gates after migration 041",
+    up: async (client: any) => {
+      await client.set("_schema_version", "42")
+      const CONN_ID = "bingx-x01"
+      const now = new Date().toISOString()
+      const rawConn = (await client.hgetall(`connection:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
+      const settingsConn = (await client.hgetall(`connection_settings:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
+      const prefixedConn = (await client.hgetall(`settings:connection:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
+
+      const choosePositive = (...values: Array<string | undefined>): string | undefined => {
+        for (const value of values) {
+          const n = Number(value)
+          if (Number.isFinite(n) && n > 0) return String(value)
+        }
+        return undefined
+      }
+
+      const liveVolume = choosePositive(
+        settingsConn.volume_factor_live,
+        settingsConn.live_volume_factor,
+        prefixedConn.volume_factor_live,
+        prefixedConn.live_volume_factor,
+        rawConn.live_volume_factor,
+      ) || "2.2"
+      const presetVolume = choosePositive(
+        settingsConn.volume_factor_preset,
+        settingsConn.preset_volume_factor,
+        prefixedConn.volume_factor_preset,
+        prefixedConn.preset_volume_factor,
+        rawConn.preset_volume_factor,
+      ) || "1.0"
+
+      await Promise.all([
+        client.hset(`connection:${CONN_ID}`, {
+          live_volume_factor: liveVolume,
+          preset_volume_factor: presetVolume,
+          updated_at: now,
+        }).catch(() => {}),
+        client.hset(`settings:connection:${CONN_ID}`, {
+          live_volume_factor: liveVolume,
+          preset_volume_factor: presetVolume,
+          updated_at: now,
+        }).catch(() => {}),
+        client.hset(`connection_settings:${CONN_ID}`, {
+          live_volume_factor: liveVolume,
+          preset_volume_factor: presetVolume,
+          updated_at: now,
+        }).catch(() => {}),
+        client.del(`prehistoric_loaded:${CONN_ID}`).catch(() => {}),
+        client.del(`prehistoric_loaded:${CONN_ID}:verified`).catch(() => {}),
+        client.del(`prehistoric:progress:${CONN_ID}`).catch(() => {}),
+      ])
+
+      console.log(
+        `[v0] Migration 042: reconciled ${CONN_ID} volume factors ` +
+        `(live=${liveVolume}, preset=${presetVolume}) and refreshed prehistoric gates`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "41")
+    },
+  },
+
+  // ── Migration 043 ──────────────────────────────────────────────────────────
+  // Production progression repair: align all configured symbol lists across the
+  // raw connection hash and the setSettings-prefixed hashes, and repair visible
+  // prehistoric denominators without manufacturing completion. This is safe to
+  // run on already-migrated installs because it only mirrors existing operator
+  // symbol choices and never marks processing done.
+  {
+    version: 43,
+    name: "043-align-symbol-state-and-prehistoric-denominators",
+    description: "Mirror operator symbol lists into engine read paths and repair prehistoric progress denominators",
+    up: async (client: any) => {
+      await client.set("_schema_version", "43")
+      const now = new Date().toISOString()
+      const parseSymbols = (raw: unknown): string[] => {
+        if (Array.isArray(raw)) return raw.map(String).map((x) => x.trim()).filter(Boolean)
+        const value = String(raw ?? "").trim()
+        if (!value || value === "[]") return []
+        if (value.startsWith("[")) {
+          try {
+            const parsed = JSON.parse(value)
+            if (Array.isArray(parsed)) return parsed.map(String).map((x) => x.trim()).filter(Boolean)
+          } catch { /* fall through */ }
+        }
+        return value.split(/[,|\n]/).map((x) => x.trim()).filter(Boolean)
+      }
+
+      const connectionIds = new Set<string>([
+        ...((await client.smembers("connections").catch(() => [])) || []),
+        ...((await client.smembers("connections:main:enabled").catch(() => [])) || []),
+      ].map(String).filter(Boolean))
+
+      let repaired = 0
+      for (const connId of connectionIds) {
+        const rawConn = (await client.hgetall(`connection:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
+        const prefConn = (await client.hgetall(`settings:connection:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
+        const engineState = (await client.hgetall(`settings:trade_engine_state:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
+        const symbols = [
+          parseSymbols(rawConn.force_symbols),
+          parseSymbols(rawConn.active_symbols),
+          parseSymbols(prefConn.force_symbols),
+          parseSymbols(prefConn.active_symbols),
+          parseSymbols(engineState.force_symbols),
+          parseSymbols(engineState.active_symbols),
+          parseSymbols(engineState.symbols),
+        ].find((candidate) => candidate.length > 0) || []
+
+        if (symbols.length === 0) continue
+
+        const symbolsJson = JSON.stringify(symbols)
+        await Promise.all([
+          client.hset(`connection:${connId}`, {
+            active_symbols: symbolsJson,
+            force_symbols: symbolsJson,
+            symbol_count: String(symbols.length),
+            updated_at: now,
+          }).catch(() => {}),
+          client.hset(`settings:connection:${connId}`, {
+            active_symbols: symbolsJson,
+            force_symbols: symbolsJson,
+            symbol_count: String(symbols.length),
+            updated_at: now,
+          }).catch(() => {}),
+          client.hset(`settings:trade_engine_state:${connId}`, {
+            symbols: symbolsJson,
+            active_symbols: symbolsJson,
+            force_symbols: symbolsJson,
+            symbol_count: String(symbols.length),
+            config_set_symbols_total: String(symbols.length),
+            updated_at: now,
+          }).catch(() => {}),
+        ])
+
+        const engineProgression = (await client.hgetall(`settings:engine_progression:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
+        if (engineProgression.phase === "prehistoric_data") {
+          await client.hset(`settings:engine_progression:${connId}`, {
+            sub_item: engineProgression.sub_item || "symbols",
+            sub_total: String(Math.max(Number(engineProgression.sub_total || 0), symbols.length)),
+            updated_at: now,
+          }).catch(() => {})
+        }
+        repaired++
+      }
+
+      console.log(`[v0] Migration 043: aligned symbol state and prehistoric denominators for ${repaired} connection(s)`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "42")
+    },
+  },
+  {
+    version: 44,
+    name: "044-initialize-production-progression-tracking",
+    description: "Ensure progression counters and stats are initialized for production mode",
+    up: async (client: any) => {
+      await client.set("_schema_version", "44")
+      const now = new Date().toISOString()
+      
+      // Initialize progression tracking structures for all known connections
+      const connectionIds = new Set<string>([
+        ...((await client.smembers("connections").catch(() => [])) || []),
+        ...((await client.smembers("connections:main:enabled").catch(() => [])) || []),
+        "bingx-x01", // Ensure primary connection is always set up
+      ].map(String).filter(Boolean))
+
+      let initialized = 0
+      for (const connId of connectionIds) {
+        try {
+          // Initialize progression tracking hash
+          const progressionKey = `progression:${connId}`
+          const existingProg = await client.hgetall(progressionKey).catch(() => ({}))
+          
+          // Only initialize if not already set
+          if (!existingProg || Object.keys(existingProg || {}).length === 0) {
+            await client.hset(progressionKey, {
+              prehistoric_passed: "0",
+              prehistoric_failed: "0",
+              prehistoric_placed: "0",
+              prehistoric_filled: "0",
+              prehistoric_canceled: "0",
+              prehistoric_rejected: "0",
+              prehistoric_errored: "0",
+              real_evaluated: "0",
+              real_passed: "0",
+              real_placed: "0",
+              real_filled: "0",
+              live_evaluated: "0",
+              live_passed: "0",
+              live_placed: "0",
+              live_filled: "0",
+              candlesLoaded: "0",
+              indicatorsComputed: "0",
+              configSetsCreated: "0",
+              initialized_at: now,
+              updated_at: now,
+            })
+            
+            // Set TTL to never expire (production uses indefinite progression)
+            await client.persist(progressionKey).catch(() => {})
+          }
+
+          // Initialize strategies_active hash if not present
+          const strategiesKey = `strategies_active:${connId}`
+          const existingStrat = await client.hgetall(strategiesKey).catch(() => ({}))
+          
+          if (!existingStrat || Object.keys(existingStrat || {}).length === 0) {
+            // Initialize empty for now; coordinator will populate on first cycle
+            await client.hset(strategiesKey, {
+              "_initialized": now,
+            })
+            // Set TTL to 10 minutes; coordinator refreshes every cycle
+            await client.expire(strategiesKey, 600).catch(() => {})
+          }
+
+          initialized++
+        } catch (err: any) {
+          console.warn(`[v0] Migration 044: failed to initialize ${connId}: ${err?.message}`)
+        }
+      }
+
+      console.log(`[v0] Migration 044: initialized progression tracking for ${initialized} connection(s)`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "43")
     },
   },
 ]
@@ -2589,7 +2924,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     const { apiKey, apiSecret } = getBaseConnectionCredentials(cfg.credentialId)
     const hasRealCredentials = apiKey.length > 10 && apiSecret.length > 10
 
-    // ── OPERATOR-STATE PRESERVATION CONTRACT ──────────────────────────
+    // ── OPERATOR-STATE PRESERVATION CONTRACT ��─────────────────────────
     // Bug being fixed (operator report): "after removing main connections,
     // it's getting re-added by some procedure".
     //
@@ -2827,7 +3162,7 @@ const ensureBootstrapDiag = new Set<string>()
  * It guarantees:
  *  - All migration-022 style indexes and progression containers exist
  *  - Progression counters, strategy sets, live-position indexes are repaired
- *  - trade_engine:global is bootstrapped to "running" (unless operator stopped)
+ *  - trade_engine:global is never force-started; operator start/stop intent is preserved
  *  - Zero-count metadata keys are initialized for every enabled connection
  *  - No "No Progress / No counts" after cold start / redeploy
  * 
@@ -2911,6 +3246,29 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
 
   console.log("[v0] [Migrations] PRODUCTION MODE — INTENSIVE COMPLETE COVERAGE (making Prod identical to long-running Dev)")
 
+  // Ensure the entire Site/Project has ONE unique instance (independent of
+  // connections) without calling redis-db.ensureUniqueSiteInstance(). That helper
+  // normally calls initRedis(); invoking it from inside runMigrations() re-enters
+  // the migration promise and deadlocks production cold start. We already have a
+  // ready core Redis client here, so write the small site-instance hash directly.
+  try {
+    const siteKey = "site:unique_instance"
+    const existingSite = await client.hgetall(siteKey).catch(() => null)
+    if (existingSite?.site_session_id) {
+      await client.hset(siteKey, { last_activity: new Date().toISOString() }).catch(() => {})
+    } else {
+      const now = new Date().toISOString()
+      const siteSessionId = "site_" + Date.now() + "_" + Math.random().toString(36).slice(2, 12)
+      await client.hset(siteKey, {
+        site_session_id: siteSessionId,
+        created_at: now,
+        last_activity: now,
+        version: "1",
+      }).catch(() => {})
+      await client.hset("trade_engine:global", {
+        site_session_id: siteSessionId,
+        site_instance_created: now,
+      }).catch(() => {})
   // Ensure the entire Site/Project has ONE unique instance (independent of connections).
   // IMPORTANT: do not call redis-db.ensureUniqueSiteInstance() from inside
   // migrations; that helper calls initRedis(), and initRedis is currently
@@ -3104,15 +3462,20 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
 export async function runMigrations(): Promise<{ success: boolean; message: string; version: number }> {
   // If a run is already in-flight (or completed), return the same promise so
   // concurrent callers coalesce onto a single execution and never re-enter
-  // runMigrationsInternal(). The promise is intentionally kept after resolution —
-  // clearing it in `finally` caused a race where a second caller that had just
-  // started awaiting would see null and immediately start a second migration run.
+  // runMigrationsInternal(). Successful promises are cached for the process,
+  // but rejected promises MUST be cleared; otherwise one transient production
+  // Redis/deadline failure poisons the process forever and every later request
+  // receives the same stale rejection without retrying migrations.
   const existing = getMigrationRunPromise()
   if (existing) {
     return existing
   }
 
-  const promise = runMigrationsInternal()
+  const promise = runMigrationsInternal().catch((error) => {
+    setMigrationRunPromise(null)
+    setMigrationsRun(false)
+    throw error
+  })
   setMigrationRunPromise(promise)
   return promise
 }
