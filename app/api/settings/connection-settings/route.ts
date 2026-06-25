@@ -10,6 +10,7 @@ import {
  * GET /api/settings/connection-settings?connectionId=xxx
  * Get settings for a specific connection
  */
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const connectionId = request.nextUrl.searchParams.get("connectionId")

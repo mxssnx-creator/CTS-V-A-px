@@ -3,6 +3,7 @@ import { getConnection, initRedis, updateConnection } from "@/lib/redis-db"
 import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 
 // POST - Toggle dashboard active status
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

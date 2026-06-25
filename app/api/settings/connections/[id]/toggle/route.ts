@@ -8,6 +8,7 @@ import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 // Main/Preset engines are controlled independently via their toggle endpoints:
 // - /api/settings/connections/[id]/live-trade (controls Main Engine)
 // - /api/settings/connections/[id]/preset-type (controls Preset Engine)
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

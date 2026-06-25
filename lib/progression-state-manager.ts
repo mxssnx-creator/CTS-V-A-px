@@ -223,7 +223,7 @@ return {
           lastCycleTime: data.last_cycle_time ? new Date(data.last_cycle_time) : undefined,
           lastUpdate: new Date(data.last_update || new Date()),
           prehistoricCyclesCompleted: parseInt(data.prehistoric_cycles_completed || "0", 10),
-          prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? JSON.parse(data.prehistoric_symbols_processed) : [],
+          prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? (() => { try { return JSON.parse(data.prehistoric_symbols_processed) } catch { return [] } })() : [],
           prehistoricPhaseActive: data.prehistoric_phase_active === "true",
           prehistoricCandlesProcessed: parseInt(data.prehistoric_candles_processed || "0", 10),
           prehistoricSymbolsProcessedCount: parseInt(data.prehistoric_symbols_processed_count || "0", 10),
@@ -244,7 +244,7 @@ return {
           indicationsCount: parseInt(data.indications_count || "0", 10),
           strategiesCount: parseInt(data.strategies_count || "0", 10),
           // Uniqueness / solidity snapshot fields (captured at progression start)
-          progressSettingsSnapshot: data.progress_settings_snapshot ? JSON.parse(data.progress_settings_snapshot) : {},
+          progressSettingsSnapshot: data.progress_settings_snapshot ? (() => { try { return JSON.parse(data.progress_settings_snapshot) } catch { return {} } })() : {},
           symbolCount: data.symbol_count ? parseInt(data.symbol_count, 10) : 0,
           activeSymbolsHash: data.active_symbols_hash || "",
           startedForSettingsVersion: data.started_for_settings_version || "",
@@ -797,7 +797,7 @@ return {
         started_at: String(now),
         last_update: new Date(now).toISOString(),
         // State
-        engine_started: "true",
+        engine_started: "false",
         // Prehistoric phase explicitly closed so a new engine start never
         // inherits a stuck prehistoric_phase_active="true" from a prior
         // crashed session, which would block the realtime phase from starting.
@@ -927,7 +927,7 @@ return {
       }
 
       const liveSymbolCount = currentSymbols.length
-      const liveSymbolsHash = currentSymbols.sort().join("|")
+      const liveSymbolsHash = currentSymbols.slice().sort().join("|")
 
       // ── Settings fingerprint ────────────────────────────────────────────
       // Fields that fundamentally change what the progression computes.
@@ -1005,9 +1005,25 @@ return {
         await Promise.all([
           client.del(`prehistoric:${connectionId}:done`).catch(() => {}),
           client.del(`prehistoric:${connectionId}:firstpass:done`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}:verified`).catch(() => {}),
+          client.del(`prehistoric:progress:${connectionId}`).catch(() => {}),
           client.del(`prehistoric:${connectionId}`).catch(() => {}),
           client.del(`prehistoric:${connectionId}:symbols`).catch(() => {}),
+          client.del(`progression:${connectionId}:prehistoric_symbols_set`).catch(() => {}),
         ])
+
+        try {
+          // Do not run a broad KEYS scan on every settings save; that can
+          // block the in-memory Redis emulator and make progress/stat polling
+          // look stalled under large datasets. The live symbol list is exactly
+          // the namespace that must be invalidated for the next prehistoric
+          // run, so delete those bounded per-symbol interval gates directly.
+          const intervalKeys = currentSymbols.map((symbol) => `prehistoric:${connectionId}:${symbol}:processed_intervals`)
+          if (intervalKeys.length > 0) {
+            await client.del(...intervalKeys).catch(() => {})
+          }
+        } catch { /* non-critical */ }
 
         // Immediately solidify the new progression with the *actual* live data
         await client.hset(key, {
@@ -1018,6 +1034,16 @@ return {
           prehistoric_phase_active: "false",
         }).catch(() => {})
         return { changed: true, reason, newEpoch }
+
+        await setSettings(`engine_progression:${connectionId}`, {
+          phase: "prehistoric_data",
+          progress: 0,
+          detail: `Settings changed — queued fresh prehistoric run for ${liveSymbolCount} symbols`,
+          sub_current: 0,
+          sub_total: liveSymbolCount,
+          connection_id: connectionId,
+          updated_at: new Date().toISOString(),
+        }).catch(() => {})
       }
 
       return { changed: false, reason: "already current" }
@@ -1073,6 +1099,22 @@ return {
       // dead — treating the progression as live would incorrectly attach
       // a new engine start to a zombie session (wrong epoch, wrong counters).
       const STALENESS_MS = 30 * 60 * 1000
+
+      if (existing && Object.keys(existing).length > 0 && existing.engine_started !== "true") {
+        const sessionNumber = parseInt(existing.session_number || "1", 10)
+        const epoch = Number(existing.epoch) || now
+        await client.hset(key, {
+          last_update: nowIso,
+          last_visited: nowIso,
+          engine_started: "true",
+        }).catch(() => {})
+        await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})
+        console.log(
+          `[v0] [Progression] Activated coordinated progression for ${connectionId} ` +
+          `(session=${sessionNumber}, epoch=${epoch})`,
+        )
+        return { sessionNumber, epoch, wasNew: false }
+      }
 
       if (existing && Object.keys(existing).length > 0 && existing.engine_started === "true") {
         // Check that the session is actually fresh — not a zombie from a prior

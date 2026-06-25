@@ -15,6 +15,7 @@ const MAX_BATCH_TESTS_PER_HOUR = 10
 const MAX_CONCURRENT_TESTS = 5
 const MIN_INTERVAL_BETWEEN_TESTS_MS = 5000
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   const startTime = Date.now()
 
