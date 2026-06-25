@@ -348,6 +348,7 @@ interface LivePosition {
   //   when trailing becomes inactive so the static stopLoss % takes over again.
   trailingActive?: boolean
   trailingStopPrice?: number
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "pending_fill" | "placed_unconfirmed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
   status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending" | "pending_fill"
   status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending" | "blocked"
   statusReason?: string
@@ -760,6 +761,7 @@ async function findOpenLivePositionByDir(connId: string, symbol: string, side: s
   const norm = String(symbol || "").toUpperCase().replace(/[-_]/g, "")
   for (const p of positions) {
     const psym = String(p.symbol || "").toUpperCase().replace(/[-_]/g, "")
+    if (psym === norm && p.direction === side && (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed")) {
     if (psym === norm && p.direction === side && (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill")) {
       return p
     }
@@ -4093,6 +4095,9 @@ export async function executeLivePosition(
       })
       livePosition.status = livePosition.remainingQuantity <= 0.000001 ? "filled" : "partially_filled"
       livePosition.statusReason = fill.status === "filled_via_position"
+        ? `confirmed_position_fallback: exchange position size=${fill.filledQty} avg=${fill.filledPrice || currentPrice}`
+        : `confirmed_fill: order fill status=${fill.status} qty=${fill.filledQty}`
+      pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice} via=${fill.status} reason=${livePosition.statusReason}`)
         ? "position_confirmed_after_order_poll_timeout"
         : "fill_confirmed"
       pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice} via=${fill.status}`)
@@ -4126,6 +4131,18 @@ export async function executeLivePosition(
       // PROD FIX: Increased from 1s to 2s to ensure position registry consistency
       await new Promise((r) => setTimeout(r, 2000))
     } else {
+      // D) Protection-deferred guard: if neither order polling nor direct
+      // exchange-position reads confirm a position size, do NOT synthesize a
+      // fill from computedVolume. Persist an unconfirmed status and let
+      // reconcile arm SL/TP immediately once the venue position appears.
+      const deferredStatus: LivePosition["status"] = livePosition.orderId ? "pending_fill" : "placed_unconfirmed"
+      livePosition.executedQuantity = 0
+      livePosition.remainingQuantity = computedVolume
+      livePosition.averageExecutionPrice = 0
+      livePosition.status = deferredStatus
+      livePosition.statusReason =
+        `protection_deferred: fill unconfirmed after pollStatus=${fill.status}; direct position lookup found no size`
+      pushStep(livePosition, "poll_fill", false, livePosition.statusReason)
       // D) Final guard: fill unconfirmed but order was accepted. Read the
       // exchange position one more time immediately before assigning
       // executedQuantity. Only a confirmed venue size may become the local
@@ -4181,6 +4198,10 @@ export async function executeLivePosition(
         connectionId,
         "live_trading",
         "warning",
+        `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP deferred until exchange position appears`,
+        { orderId: livePosition.orderId, status: fill.status, requestedQty: computedVolume, savedStatus: deferredStatus }
+      )
+      await savePosition(livePosition)
         livePosition.executedQuantity > 0
           ? `Entry position confirmed for ${realPosition.symbol} after order poll timeout`
           : `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP deferred until reconcile confirms size`,
@@ -4203,6 +4224,10 @@ export async function executeLivePosition(
       await logLiveOrderFinal(orderTrace, {
         status: livePosition.executedQuantity > 0 ? "filled" : "placed",
         livePositionId: livePosition.id,
+        executedQuantity: 0,
+        averagePrice: 0,
+        reason: livePosition.statusReason,
+        extra: { orderId: livePosition.orderId, attempts: placeAttempt, requestedQty: computedVolume },
         executedQuantity: livePosition.executedQuantity,
         averagePrice: livePosition.averageExecutionPrice || currentPrice,
         reason: livePosition.statusReason,
@@ -5592,6 +5617,7 @@ export async function reconcileLivePositions(
     // Load live-positions index (single Redis round-trip, filtered in-memory)
     const allOpen = await getLivePositions(connectionId)
     const openPositions = allOpen.filter(
+      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed",
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill",
     )
     if (openPositions.length === 0 && !reconcileMode) {
@@ -5748,6 +5774,8 @@ export async function reconcileLivePositions(
 
           // ── Entry-order fill detection (reconcile path) ───────────────
           let justFilled = false
+          if (pos.status === "placed" || pos.status === "pending_fill" || pos.status === "placed_unconfirmed") {
+            const exSize  = Math.abs(parseFloat(String(exPos.size ?? exPos.positionAmt ?? exPos.quantity ?? "0"))) || 0
           if (pos.status === "placed" || pos.status === "pending_fill") {
             const exSize  = Math.abs(parseFloat(String(exPos.size ?? exPos.positionAmt ?? exPos.quantity ?? "0")) || 0)
             const exEntry = parseFloat(String(exPos.entryPrice ?? exPos.avgPrice ?? exPos.markPrice ?? "0")) || 0
@@ -5758,6 +5786,8 @@ export async function reconcileLivePositions(
                 pos.averageExecutionPrice = exEntry || pos.entryPrice
               }
               pos.status = "open"
+              pos.statusReason = `confirmed_position_fallback: reconcile saw exchange position size=${exSize} avg=${pos.averageExecutionPrice}`
+              pushStep(pos, "reconcile_fill_detected", true, pos.statusReason)
               pos.statusReason = "position_confirmed_after_order_poll_timeout"
               pos.updatedAt = Date.now()
               justFilled = true
@@ -5777,6 +5807,8 @@ export async function reconcileLivePositions(
                     pos.averageExecutionPrice = parseFloat(String(order.filledPrice ?? order.avgPrice ?? "0")) || pos.averageExecutionPrice || pos.entryPrice
                   }
                   pos.status = "open"
+                  pos.statusReason = `confirmed_fill: reconcile order status=${statusLower} qty=${pos.executedQuantity}`
+                  pushStep(pos, "reconcile_fill_detected", true, pos.statusReason)
                   pos.statusReason = pos.statusReason || "fill_confirmed"
                   pos.updatedAt = Date.now()
                   if (!justFilled) {
@@ -5799,6 +5831,7 @@ export async function reconcileLivePositions(
             }
           }
 
+          if (pos.status === "placed" || pos.status === "pending_fill" || pos.status === "placed_unconfirmed") {
           if (pos.status === "placed" || pos.status === "pending_fill") {
             await savePosition(pos)
             delta.updated++
@@ -5878,6 +5911,27 @@ export async function reconcileLivePositions(
           await savePosition(pos)
           delta.updated++
         } else {
+          if (pos.status === "placed" || pos.status === "pending_fill" || pos.status === "placed_unconfirmed") {
+            let terminalEntryStatus = ""
+            if (pos.orderId && typeof exchangeConnector.getOrder === "function") {
+              try {
+                const order = await exchangeConnector.getOrder(pos.symbol, pos.orderId)
+                terminalEntryStatus = String(order?.status ?? "").toLowerCase()
+              } catch { /* transient getOrder failure — keep waiting for position visibility */ }
+            }
+            if (terminalEntryStatus === "cancelled" || terminalEntryStatus === "canceled" || terminalEntryStatus === "rejected") {
+              pos.status = "rejected"
+              pos.statusReason = `entry_order_${terminalEntryStatus}`
+              pos.closeReason = pos.statusReason
+              pos.closedAt = Date.now()
+            } else {
+              pos.statusReason = pos.statusReason || "protection_deferred: awaiting exchange position size"
+            }
+            pos.updatedAt = Date.now()
+            await savePosition(pos)
+            delta.updated++
+            return delta
+          }
           // Position closed externally — compute PnL, move to archive.
           let exitPrice: number = Number(pos.exchangeData?.markPrice) || pos.averageExecutionPrice || 0
           if (exitPrice <= 0) {
@@ -6244,6 +6298,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // just to bucket by status. Load once, then filter in memory.
     const allOpen = await getLivePositions(connectionId)
     const openPositions = allOpen.filter(
+      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed",
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill",
     )
 
@@ -6332,6 +6387,9 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       acc[s] = (acc[s] || 0) + 1
       return acc
     }, {})
+    const placedCount = (statusBreakdown.placed || 0) + (statusBreakdown.pending_fill || 0) + (statusBreakdown.placed_unconfirmed || 0)
+    const simCount = statusBreakdown.simulated || 0
+    const totalLive = openPositions.filter((p) => p.status !== "placed" && p.status !== "pending_fill" && p.status !== "placed_unconfirmed").length
     const placedCount = (statusBreakdown.placed || 0) + (statusBreakdown.pending_fill || 0)
     const simCount = statusBreakdown.simulated || 0
     const totalLive = openPositions.filter((p) => p.status !== "placed" && p.status !== "pending_fill").length
@@ -6782,6 +6840,27 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           return // closeLivePosition persisted terminal state — skip per-position setex
         }
 
+        let justFilled = false
+        if (
+          exchangePos &&
+          (position.status === "placed" || position.status === "pending_fill" || position.status === "placed_unconfirmed")
+        ) {
+          const exSize = Math.abs(parseFloat(String(exchangePos.size ?? (exchangePos as any).positionAmt ?? exchangePos.quantity ?? "0"))) || 0
+          const exEntry = parseFloat(String(exchangePos.entryPrice ?? (exchangePos as any).avgPrice ?? exchangePos.markPrice ?? "0")) || 0
+          if (exSize > 0) {
+            position.executedQuantity = exSize
+            position.remainingQuantity = Math.max(0, (position.quantity || exSize) - exSize)
+            position.averageExecutionPrice = exEntry || position.entryPrice
+            position.status = "open"
+            position.statusReason = `confirmed_position_fallback: sync saw exchange position size=${exSize} avg=${position.averageExecutionPrice}`
+            position.updatedAt = Date.now()
+            justFilled = true
+            incrementMetric(connectionId, "live_orders_filled_count").catch(() => {})
+            incrementOrdersBySymbol(connectionId, position.symbol, position.direction || position.side || "long", "filled").catch(() => {})
+            pushStep(position, "sync_fill_detected", true, position.statusReason)
+          }
+        }
+
         // ── Delayed-fill SL/TP arming ────���────────────────────���───────
         // If the entry order was still pending when `executeLivePosition`
         // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
@@ -6791,6 +6870,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // an open exchange position with zero stop-loss / take-profit
         // protection. This was a real bug the user reported as
         // "TP/SL control orders are not working".
+        if ((position.status === "placed" || position.status === "pending_fill" || position.status === "placed_unconfirmed") && position.orderId) {
         let justFilled = false
         if ((position.status === "placed" || position.status === "pending_fill") && position.orderId) {
           try {
@@ -6808,6 +6888,8 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               position.remainingQuantity = Math.max(0, position.quantity! - position.executedQuantity)
               position.averageExecutionPrice = order.filledPrice || position.entryPrice
               position.status = "open"
+              position.statusReason = `confirmed_fill: sync order status=${order.status} qty=${position.executedQuantity}`
+              pushStep(position, "sync_fill_detected", true, position.statusReason)
               position.statusReason = position.statusReason || "fill_confirmed"
               position.updatedAt = Date.now()
               justFilled = true
@@ -6867,6 +6949,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // Promise.allSettled batch after the for loop so that N stuck
         // positions don't serialize for EXCHANGE_TIMEOUT_CANCEL_ORDER_MS × N
         // and block protection-order updates for all healthy positions.
+        if ((position.status === "placed" || position.status === "pending_fill" || position.status === "placed_unconfirmed") && (position.executedQuantity ?? 0) === 0) {
         if ((position.status === "placed" || position.status === "pending_fill") && (position.executedQuantity ?? 0) === 0) {
           const STUCK_PLACED_MAX_MS = 5 * 60_000 // 5 minutes
           const placedAgeMs = Date.now() - (position.createdAt || position.updatedAt || Date.now())

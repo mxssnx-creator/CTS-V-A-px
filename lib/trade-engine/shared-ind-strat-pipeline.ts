@@ -237,6 +237,7 @@ async function executeReadyStrategiesAsLiveOrders(
         }
 
         const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
+        if (livePos?.status === "filled" || livePos?.status === "placed" || livePos?.status === "pending_fill" || livePos?.status === "placed_unconfirmed") {
         if (livePos?.status === "filled" || livePos?.status === "placed" || livePos?.status === "pending_fill") {
           createdCount++
           // ── CRITICAL FIX: Log full RealPosition context to progression ──
