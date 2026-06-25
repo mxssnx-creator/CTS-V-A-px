@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { getAllConnections, getSettings } from "@/lib/redis-db"
 
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     console.log("[v0] Preparing deployment package...")

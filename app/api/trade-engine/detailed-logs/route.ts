@@ -36,6 +36,41 @@ function enforceHierarchy(base: number, main: number, real: number) {
   }
 }
 
+
+async function getRecentLiveOrderAudits(client: ReturnType<typeof getRedisClient>, connectionIds: string[], limit = 75) {
+  const rows: any[] = []
+  for (const connectionId of connectionIds) {
+    try {
+      const traceIds = await client.zrevrange(`live_order_audit:${connectionId}:recent`, 0, limit - 1).catch(() => [])
+      const fallbackKeys = traceIds.length > 0
+        ? []
+        : await client.keys(`live_order_audit:${connectionId}:*`).catch(() => [])
+
+      if (traceIds.length > 0) {
+        for (const traceId of traceIds) {
+          const raw = await client.get(`live_order_audit:${connectionId}:${traceId}`).catch(() => null)
+          if (!raw) continue
+          try { rows.push(typeof raw === "string" ? JSON.parse(raw) : raw) } catch { /* ignore malformed audit */ }
+        }
+      } else {
+        for (const key of fallbackKeys) {
+          if (key.endsWith(":recent")) continue
+          const raw = await client.get(key).catch(() => null)
+          if (!raw) continue
+          try { rows.push(typeof raw === "string" ? JSON.parse(raw) : raw) } catch { /* ignore malformed audit */ }
+        }
+      }
+    } catch {
+      // best-effort diagnostics only
+    }
+  }
+
+  return rows
+    .filter((row) => row && row.traceId && row.connectionId)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0).getTime() - new Date(a.updatedAt || a.createdAt || 0).getTime())
+    .slice(0, limit)
+}
+
 async function countArrayEntries(client: ReturnType<typeof getRedisClient>, key: string): Promise<number> {
   try {
     const raw = await client.get(key)
@@ -214,6 +249,18 @@ export async function GET(request: Request) {
     }))
 
     const client = getRedisClient()
+    const auditRows = await getRecentLiveOrderAudits(client, activeConnections.map((c: any) => c.id))
+    const auditLogs = auditRows.map((audit: any) => ({
+      id: `audit-${audit.connectionId}-${audit.traceId}`,
+      timestamp: audit.updatedAt || audit.createdAt || new Date().toISOString(),
+      type: "live",
+      symbol: audit.symbol,
+      phase: "live_order_audit",
+      message: `Live order audit ${audit.symbol} ${audit.direction} ${audit.entryOrderStatus || "pending"} protection=${audit.protectionState}`,
+      connectionId: audit.connectionId,
+      details: audit,
+    }))
+
     const perConnection = await Promise.all(
       activeConnections.map(async (conn: any, index: number) => {
         const state = (await getSettings(`trade_engine_state:${conn.id}`)) || {}
@@ -545,7 +592,10 @@ export async function GET(request: Request) {
 
     return NextResponse.json({
       success: true,
-      logs,
+      logs: [...auditLogs, ...logs]
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+        .slice(0, 375),
+      liveOrderAudits: auditRows,
       summary,
       timestamp: new Date().toISOString(),
       activeConnections: activeConnections.map((c: any) => ({

@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { initRedis, getAllConnections, getConnection } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
