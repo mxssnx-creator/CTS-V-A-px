@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid"
 import type { IndicationConfig, PseudoPosition } from "./types"
 import { db } from "@/lib/database"
+import { calculateSignedResultR } from "@/lib/profit-factor"
 
 export interface IndicationResult {
   id: string
@@ -152,14 +153,13 @@ export class IndicationEngine {
 
     // Stop-loss grid: operator-spec extension to 3.0 with step 0.25.
     // Coarser-but-wider sweep (12 values vs the legacy 0.2..2.2/0.1 = 21):
-    // covers the previously-uncovered 2.25..3.0 SL band where wide-stop
-    // / illiquid-pair / news-volatility setups end up sitting, while
-    // still giving the strategy fan-out enough granularity inside the
-    // tight band. The 250-position cap below remains in force.
-    for (let tpFactor = 2; tpFactor <= 22; tpFactor++) {
-      for (let slRatio = 0.25; slRatio <= 3.0 + 1e-9; slRatio += 0.25) {
+    // Updated to new unified ranges: SL 0.2 to 2.2 with 0.1 step (21 values)
+    // TP factors 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22 (11 values)
+    for (let tpFactor = 2; tpFactor <= 22; tpFactor += 2) {
+      for (let slRatio = 0.2; slRatio <= 2.2 + 1e-9; slRatio += 0.1) {
+        const slRatioFixed = Number(slRatio.toFixed(1))
         positions.push(
-          this.createPseudoPosition(symbol, entryPrice, tpFactor, slRatio, false, positionCost, config.type),
+          this.createPseudoPosition(symbol, entryPrice, tpFactor, slRatioFixed, false, positionCost, config.type),
         )
 
         const trailStarts = [0.3, 0.6, 1.0]
@@ -172,7 +172,7 @@ export class IndicationEngine {
                 symbol,
                 entryPrice,
                 tpFactor,
-                slRatio,
+                slRatioFixed,
                 true,
                 positionCost,
                 config.type,
@@ -216,6 +216,8 @@ export class IndicationEngine {
       entry_price: entryPrice,
       current_price: entryPrice,
       profit_factor: 0,
+      signedResultR: 0,
+      costNormalizedReturn: 0,
       position_cost: positionCost,
       status: "open",
       created_at: new Date().toISOString(),
@@ -226,13 +228,23 @@ export class IndicationEngine {
   // Update pseudo positions with current market data
   updatePseudoPositions(positions: PseudoPosition[], currentPrice: number): PseudoPosition[] {
     return positions.map((position) => {
-      const priceDiff = currentPrice - position.entry_price
-      const profitFactor = priceDiff / (position.entry_price * position.position_cost)
+      const direction = position.direction === "short" ? "short" : "long"
+      const signedPricePercent =
+        direction === "long"
+          ? ((currentPrice - position.entry_price) / position.entry_price) * 100
+          : ((position.entry_price - currentPrice) / position.entry_price) * 100
+      const positionCostPct = Number.isFinite(position.position_cost) && position.position_cost > 0 ? position.position_cost : 0.1
+      const signedResultR = signedPricePercent / positionCostPct
+      const direction = position.direction || "long"
+      const signedResultR = calculateSignedResultR(position.entry_price, currentPrice, direction, position.position_cost)
 
       return {
         ...position,
         current_price: currentPrice,
-        profit_factor: profitFactor,
+        signedResultR,
+        costNormalizedReturn: signedResultR,
+        profit_factor: Math.max(0, signedResultR),
+        signed_result_r: signedResultR,
         updated_at: new Date().toISOString(),
       }
     })
@@ -240,15 +252,15 @@ export class IndicationEngine {
 
   // Get indication statistics
   getIndicationStats(positions: PseudoPosition[]) {
-    const profitable = positions.filter((p) => p.profit_factor > 0).length
+    const profitable = positions.filter((p) => (p.signedResultR ?? p.costNormalizedReturn ?? p.profit_factor) > 0).length
     const total = positions.length
-    const avgProfitFactor = positions.reduce((sum, p) => sum + p.profit_factor, 0) / total
+    const avgSignedResultR = positions.reduce((sum, p) => sum + (p.signedResultR ?? p.costNormalizedReturn ?? p.profit_factor), 0) / total
 
     return {
       total_positions: total,
       profitable_positions: profitable,
       profit_ratio: profitable / total,
-      avg_profit_factor: avgProfitFactor,
+      avg_signed_result_r: avgSignedResultR,
       last_8_avg: this.calculateLastNAverage(positions, 8),
       last_20_avg: this.calculateLastNAverage(positions, 20),
       last_50_avg: this.calculateLastNAverage(positions, 50),
@@ -257,6 +269,6 @@ export class IndicationEngine {
 
   private calculateLastNAverage(positions: PseudoPosition[], n: number): number {
     const recent = positions.slice(-n)
-    return recent.reduce((sum, p) => sum + p.profit_factor, 0) / recent.length
+    return recent.reduce((sum, p) => sum + (p.signedResultR ?? p.costNormalizedReturn ?? p.profit_factor), 0) / recent.length
   }
 }

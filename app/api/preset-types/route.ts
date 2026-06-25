@@ -3,6 +3,7 @@ import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { nanoid } from "nanoid"
 
 // GET /api/preset-types - Get all preset types from Redis
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     console.log("[v0] GET /api/preset-types - Fetching preset types...")

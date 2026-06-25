@@ -4,6 +4,7 @@ import { getDashboardWorkflowSnapshot } from "@/lib/dashboard-workflow"
 import { buildLogisticsQueuePayload } from "@/lib/logistics-workflow"
 import { getActiveIndications, getActiveStrategies, getAllPositions } from "@/lib/db-helpers"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     // Scope metrics to a specific exchange connection when the sidebar page

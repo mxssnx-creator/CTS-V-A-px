@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server"
 import { execute } from "@/lib/db"
 
+export const dynamic = "force-dynamic"
 export async function POST() {
   try {
     console.log("[v0] [FixTestnetAPI] Starting testnet to mainnet conversion...")
