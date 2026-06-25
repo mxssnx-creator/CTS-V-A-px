@@ -44,7 +44,6 @@ interface StrategyTracking {
       trailing: number
       block: number
       dca: number
-      pause: number
     }
   }
   real: {
@@ -70,7 +69,6 @@ interface StrategyTracking {
       trailing: number
       block: number
       dca: number
-      pause: number
     }
     /**
      * Operator's 4-perspective Real stats:
@@ -437,7 +435,7 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             <div className="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground">
               Variants per Base Set (cloned & adjusted)
             </div>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               <VariantBox label="Default" value={data.main.variants.default} />
               <VariantBox label="Trailing" value={data.main.variants.trailing} />
               <VariantBox
@@ -450,7 +448,6 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
                 value={data.main.variants.dca}
                 hint="Clones Base positions"
               />
-              <VariantBox label="Pause" value={data.main.variants.pause} />
             </div>
           </div>
         </CardContent>
@@ -607,7 +604,7 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             <div className="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground">
               Variants Accumulated at Real
             </div>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               <VariantBox
                 label="Default"
                 value={data.real.variantsAccumulated.default}
@@ -623,10 +620,6 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
               <VariantBox
                 label="DCA"
                 value={data.real.variantsAccumulated.dca}
-              />
-              <VariantBox
-                label="Pause"
-                value={data.real.variantsAccumulated.pause}
               />
             </div>
           </div>

@@ -6,6 +6,7 @@ function toBoolean(value: unknown): boolean {
   return value === true || value === "1" || value === "true"
 }
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   console.log("[v0] /api/init: System initialization starting...")
 

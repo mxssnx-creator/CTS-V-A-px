@@ -3,6 +3,7 @@ import { loadConnections } from "@/lib/file-storage"
 import { SystemLogger } from "@/lib/system-logger"
 import { query } from "@/lib/db"
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     console.log("[v0] Fetching detailed trading statistics")

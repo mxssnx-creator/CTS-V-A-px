@@ -25,7 +25,7 @@ type DetailedLog = {
   details?: Record<string, unknown>
 }
 
-const FILTERS = ["all", "error", "live", "strategy", "engine", "indication", "position"] as const
+const FILTERS = ["all", "error", "live", "audit", "strategy", "engine", "indication", "position"] as const
 
 export function DetailedLogsButton() {
   const [open, setOpen] = useState(false)
