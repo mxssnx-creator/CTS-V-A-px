@@ -1,19 +1,18 @@
 "use client"
 
-import { useState, useMemo } from "react"
+import { useState, useMemo, useCallback } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Input } from "@/components/ui/input"
 import {
   History,
-  ArrowUpDown,
   ArrowUp,
   ArrowDown,
   TrendingUp,
   TrendingDown,
   Filter,
+  RotateCw,
 } from "lucide-react"
 
 export interface TradeHistoryRow {
@@ -36,31 +35,65 @@ export interface TradeHistoryRow {
 interface TradeHistoryTableProps {
   trades: TradeHistoryRow[]
   limit?: number
+  onRefresh?: () => void
 }
 
 type SortField = "closedAt" | "realizedPnl" | "pnlPct" | "symbol" | "holdMinutes" | "volumeUsd" | "entryPrice" | "exitPrice" | "direction"
 type SortDir = "asc" | "desc"
 
-export function TradeHistoryTable({ trades, limit = 100 }: TradeHistoryTableProps) {
+export function TradeHistoryTable({ trades, limit = 15, onRefresh }: TradeHistoryTableProps) {
   const [sortField, setSortField] = useState<SortField>("closedAt")
   const [sortDir, setSortDir] = useState<SortDir>("desc")
   const [search, setSearch] = useState("")
   const [directionFilter, setDirectionFilter] = useState<"all" | "long" | "short">("all")
+  const [isRefreshing, setIsRefreshing] = useState(false)
 
   const handleSort = (field: SortField) => {
     if (sortField === field) setSortDir((d) => (d === "asc" ? "desc" : "asc"))
     else { setSortField(field); setSortDir("desc") }
   }
 
+  const handleRefresh = useCallback(async () => {
+    setIsRefreshing(true)
+    try {
+      if (onRefresh) await onRefresh()
+    } finally {
+      setIsRefreshing(false)
+    }
+  }, [onRefresh])
+
   const SortIcon = ({ field }: { field: SortField }) => {
-    if (sortField !== field) return <ArrowUpDown className="h-3.5 w-3.5 ml-1 opacity-40" />
+    if (sortField !== field) return <ArrowUp className="h-3 w-3 ml-1 opacity-30" />
     return sortDir === "asc"
-      ? <ArrowUp className="h-3.5 w-3.5 ml-1 text-foreground" />
-      : <ArrowDown className="h-3.5 w-3.5 ml-1 text-foreground" />
+      ? <ArrowUp className="h-3 w-3 ml-1" />
+      : <ArrowDown className="h-3 w-3 ml-1" />
   }
 
+  // Dedupe trades by id. The server's tradeHistory payload can carry the same
+  // closed position twice (e.g. an "adopted" exchange position that is also
+  // tracked in Redis), which produced duplicate React keys at render → React
+  // duplicates/omits children inconsistently between server and client
+  // (hydration error #418). Keep the most-recently-closed copy per id and let
+  // entries with an empty id fall back to a positional key so none are dropped.
+  const dedupedTrades = useMemo(() => {
+    const out: TradeHistoryRow[] = []
+    const seen = new Map<string, number>()
+    for (const t of trades) {
+      const id = t.id || ""
+      if (!id) { out.push(t); continue }
+      const idx = seen.get(id)
+      if (idx === undefined) {
+        seen.set(id, out.length)
+        out.push(t)
+      } else if ((t.closedAt || 0) >= (out[idx].closedAt || 0)) {
+        out[idx] = t
+      }
+    }
+    return out
+  }, [trades])
+
   const filtered = useMemo(() => {
-    let list = [...trades]
+    let list = [...dedupedTrades]
     if (directionFilter !== "all") list = list.filter((t) => t.direction === directionFilter)
     if (search.trim()) {
       const q = search.trim().toUpperCase()
@@ -82,138 +115,120 @@ export function TradeHistoryTable({ trades, limit = 100 }: TradeHistoryTableProp
       return sortDir === "asc" ? (va > vb ? 1 : -1) : (va < vb ? 1 : -1)
     })
     return list.slice(0, limit)
-  }, [trades, sortField, sortDir, search, directionFilter, limit])
+  }, [dedupedTrades, sortField, sortDir, search, directionFilter, limit])
 
-  const wins   = trades.filter((t) => t.realizedPnl > 0).length
-  const losses = trades.filter((t) => t.realizedPnl < 0).length
-  const totalPnl = trades.reduce((s, t) => s + t.realizedPnl, 0)
+  const wins   = dedupedTrades.filter((t) => t.realizedPnl > 0).length
+  const losses = dedupedTrades.filter((t) => t.realizedPnl < 0).length
+  const totalPnl = dedupedTrades.reduce((s, t) => s + t.realizedPnl, 0)
 
   const fmtTime = (ts: number) =>
     ts > 0 ? new Date(ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"
 
   return (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <History className="h-4.5 w-4.5" />
-          Trade History
-          <Badge variant="outline" className="ml-1 text-xs">{trades.length} total</Badge>
-          <span className="ml-auto flex items-center gap-2 text-xs text-muted-foreground font-normal">
-            <span className="text-green-600 font-medium">{wins}W</span>
-            <span className="text-red-600 font-medium">{losses}L</span>
-            <span className={totalPnl >= 0 ? "text-green-600" : "text-red-600"}>
-              {totalPnl >= 0 ? "+" : ""}{totalPnl.toFixed(2)}
-            </span>
-          </span>
-        </CardTitle>
-        {/* Filter bar */}
-        <div className="flex items-center gap-2 mt-2">
-          <div className="relative flex-1">
+    <Card className="h-full flex flex-col">
+      <CardHeader className="pb-3 border-b">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <History className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-sm font-semibold">Trade History</CardTitle>
+            <Badge variant="outline" className="text-[10px] font-normal h-5">{trades.length}</Badge>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1 text-[11px]">
+              <span className="text-green-600 font-medium">{wins}W</span>
+              <span className="text-red-600 font-medium">{losses}L</span>
+              <span className={totalPnl >= 0 ? "text-green-600 font-medium" : "text-red-600 font-medium"}>
+                {totalPnl >= 0 ? "+" : ""}{totalPnl.toFixed(2)}
+              </span>
+            </div>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 w-7 p-0 ml-1"
+              onClick={handleRefresh}
+              disabled={isRefreshing}
+            >
+              <RotateCw className={`h-3.5 w-3.5 ${isRefreshing ? "animate-spin" : ""}`} />
+            </Button>
+          </div>
+        </div>
+        
+        {/* Filter controls */}
+        <div className="flex items-center gap-2 mt-3">
+          <div className="relative flex-1 max-w-xs">
             <Input
-              placeholder="Filter by symbol or trade ID…"
+              placeholder="Symbol or ID…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="h-8 text-sm pl-8"
+              className="h-7 text-xs pl-7"
             />
-            <Filter className="absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" />
+            <Filter className="absolute left-2 top-1.5 h-3 w-3 text-muted-foreground" />
           </div>
           <div className="flex gap-1">
             {(["all", "long", "short"] as const).map((d) => (
-              <Button key={d} size="sm" variant={directionFilter === d ? "default" : "outline"} className="h-8 text-xs capitalize"
-                onClick={() => setDirectionFilter(d)}>{d}</Button>
+              <Button
+                key={d}
+                size="sm"
+                variant={directionFilter === d ? "default" : "outline"}
+                className="h-7 text-[10px] font-medium"
+                onClick={() => setDirectionFilter(d)}
+              >
+                {d === "all" ? "All" : d.toUpperCase()}
+              </Button>
             ))}
           </div>
         </div>
       </CardHeader>
-      <CardContent className="pt-0">
-        <div className="rounded-md border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="text-xs">
-                  <Button variant="ghost" className="h-auto p-0 font-semibold text-xs" onClick={() => handleSort("closedAt")}>
-                    Closed <SortIcon field="closedAt" />
-                  </Button>
-                </TableHead>
-                <TableHead className="text-xs">Symbol</TableHead>
-                <TableHead className="text-xs">Direction</TableHead>
-                <TableHead className="text-xs text-right">
-                  <Button variant="ghost" className="h-auto p-0 font-semibold text-xs ml-auto" onClick={() => handleSort("entryPrice")}>
-                    Entry <SortIcon field="entryPrice" />
-                  </Button>
-                </TableHead>
-                <TableHead className="text-xs text-right">Exit</TableHead>
-                <TableHead className="text-xs">
-                  <Button variant="ghost" className="h-auto p-0 font-semibold text-xs" onClick={() => handleSort("realizedPnl")}>
-                    P&L <SortIcon field="realizedPnl" />
-                  </Button>
-                </TableHead>
-                <TableHead className="text-xs">
-                  <Button variant="ghost" className="h-auto p-0 font-semibold text-xs" onClick={() => handleSort("pnlPct")}>
-                    P&L % <SortIcon field="pnlPct" />
-                  </Button>
-                </TableHead>
-                <TableHead className="text-xs">
-                  <Button variant="ghost" className="h-auto p-0 font-semibold text-xs" onClick={() => handleSort("holdMinutes")}>
-                    Hold <SortIcon field="holdMinutes" />
-                  </Button>
-                </TableHead>
-                <TableHead className="text-xs text-right">
-                  <Button variant="ghost" className="h-auto p-0 font-semibold text-xs ml-auto" onClick={() => handleSort("volumeUsd")}>
-                    Volume <SortIcon field="volumeUsd" />
-                  </Button>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {filtered.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={9} className="text-center text-muted-foreground py-10">
-                    <History className="h-8 w-8 mx-auto mb-2 opacity-30" />
-                    No closed trades yet
-                  </TableCell>
-                </TableRow>
-              ) : (
-                filtered.map((trade) => {
-                  const isWin = trade.realizedPnl >= 0
-                  return (
-                    <TableRow key={trade.id} className="hover:bg-muted/30">
-                      <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{fmtTime(trade.closedAt)}</TableCell>
-                      <TableCell className="font-medium text-sm">{trade.symbol}</TableCell>
-                      <TableCell>
-                        <Badge variant={trade.direction === "long" ? "default" : "secondary"} className="text-[10px] h-5">
-                          {trade.direction === "long" ? (
-                            <><TrendingUp className="h-3 w-3 mr-0.5" />LONG</>
-                          ) : (
-                            <><TrendingDown className="h-3 w-3 mr-0.5" />SHORT</>
-                          )}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="text-right text-sm">${trade.entryPrice.toFixed(4)}</TableCell>
-                      <TableCell className="text-right text-sm">${trade.exitPrice.toFixed(4)}</TableCell>
-                      <TableCell>
-                        <span className={`text-sm font-semibold ${isWin ? "text-green-600" : "text-red-600"}`}>
-                          {trade.pnlLabel}
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        <span className={`text-sm font-medium ${isWin ? "text-green-600" : "text-red-600"}`}>
-                          {trade.pnlPctLabel}
-                        </span>
-                      </TableCell>
-                      <TableCell className="text-sm text-muted-foreground">{trade.holdLabel}</TableCell>
-                      <TableCell className="text-right text-sm">${trade.volumeUsd.toFixed(2)}</TableCell>
-                    </TableRow>
-                  )
-                })
-              )}
-            </TableBody>
-          </Table>
-        </div>
-        {filtered.length >= limit && (
-          <p className="text-xs text-muted-foreground mt-2 text-center">
-            Showing {filtered.length} of {trades.length} closed trades (limit {limit})
-          </p>
+
+      <CardContent className="flex-1 overflow-hidden p-0">
+        {filtered.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-40 text-muted-foreground">
+            <History className="h-6 w-6 mb-2 opacity-30" />
+            <p className="text-xs">No trades yet</p>
+          </div>
+        ) : (
+          <div className="h-full overflow-y-auto">
+            <div className="space-y-1 p-3">
+              {/* Compact header row */}
+              <div className="grid gap-2 px-2 py-1.5 text-[10px] font-medium text-muted-foreground border-b sticky top-0 bg-background z-10"
+                style={{gridTemplateColumns: "1fr 0.7fr 0.6fr 0.8fr 0.8fr 0.7fr"}}>
+                <div className="cursor-pointer hover:text-foreground" onClick={() => handleSort("closedAt")}>
+                  Closed <SortIcon field="closedAt" />
+                </div>
+                <div className="cursor-pointer hover:text-foreground" onClick={() => handleSort("symbol")}>Sym</div>
+                <div className="cursor-pointer hover:text-foreground" onClick={() => handleSort("direction")}>Dir</div>
+                <div className="text-right cursor-pointer hover:text-foreground" onClick={() => handleSort("entryPrice")}>Entry</div>
+                <div className="text-right cursor-pointer hover:text-foreground" onClick={() => handleSort("exitPrice")}>Exit</div>
+                <div className="text-right cursor-pointer hover:text-foreground" onClick={() => handleSort("realizedPnl")}>P&L</div>
+              </div>
+
+              {/* Data rows */}
+              {filtered.map((trade, i) => {
+                const isWin = trade.realizedPnl >= 0
+                return (
+                  <div
+                    key={trade.id ? `${trade.id}#${i}` : `trade-${i}`}
+                    className="grid gap-2 px-2 py-1.5 text-[10px] hover:bg-muted/40 rounded transition-colors items-center"
+                    style={{gridTemplateColumns: "1fr 0.7fr 0.6fr 0.8fr 0.8fr 0.7fr"}}
+                  >
+                    <div className="text-muted-foreground whitespace-nowrap">{fmtTime(trade.closedAt)}</div>
+                    <div className="font-medium truncate">{trade.symbol}</div>
+                    <div>
+                      <Badge variant={trade.direction === "long" ? "default" : "secondary"} className="text-[9px] h-4 px-1.5">
+                        {trade.direction === "long" ? <TrendingUp className="h-2.5 w-2.5 mr-0.5" /> : <TrendingDown className="h-2.5 w-2.5 mr-0.5" />}
+                        {trade.direction === "long" ? "L" : "S"}
+                      </Badge>
+                    </div>
+                    <div className="text-right font-mono text-muted-foreground">${trade.entryPrice.toFixed(3)}</div>
+                    <div className="text-right font-mono text-muted-foreground">${trade.exitPrice.toFixed(3)}</div>
+                    <div className={`text-right font-medium ${isWin ? "text-green-600" : "text-red-600"}`}>
+                      {isWin ? "+" : ""}{trade.pnlLabel.substring(1)}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
         )}
       </CardContent>
     </Card>

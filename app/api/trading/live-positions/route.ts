@@ -61,6 +61,26 @@ export async function GET(request: Request) {
       ? all.filter(p => p.status === statusFilter)
       : all
 
+    // Ensure all positions have calculated/current PnL values
+    for (const pos of filtered) {
+      if (!pos.unrealizedPnL && pos.status === "open" && pos.exchangeData?.markPrice && pos.averageExecutionPrice && pos.executedQuantity) {
+        const markPrice = pos.exchangeData.markPrice
+        const entryPrice = pos.averageExecutionPrice || pos.entryPrice || 0
+        const qty = pos.executedQuantity || 0
+        if (entryPrice > 0 && markPrice > 0 && qty > 0) {
+          const pnl = qty * (pos.direction === "long" ? markPrice - entryPrice : entryPrice - markPrice)
+          pos.unrealizedPnL = Math.round(pnl * 100) / 100
+          
+          const lev = Math.max(1, pos.leverage || 1)
+          const notional = entryPrice * qty
+          const margin = notional > 0 ? notional / lev : 0
+          if (margin > 0) {
+            pos.unrealizedRoi = Math.round((pos.unrealizedPnL / margin) * 100 * 100) / 100
+          }
+        }
+      }
+    }
+
     const stats = await calculateLivePositionStats(connectionId).catch(() => ({
       totalFilled: 0,
       totalOpen: 0,
@@ -78,6 +98,8 @@ export async function GET(request: Request) {
         open:      all.filter(p => p.status === "open").length,
         pending:   all.filter(p => p.status === "pending").length,
         placed:    all.filter(p => p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed").length,
+        pending_fill: all.filter(p => p.status === "pending_fill").length,
+        placed:    all.filter(p => p.status === "placed").length,
         filled:    all.filter(p => p.status === "filled").length,
         simulated: all.filter(p => p.status === "simulated").length,
         closed:    all.filter(p => p.status === "closed").length,

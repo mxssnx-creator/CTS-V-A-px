@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { query } from "@/lib/db"
 import { getActiveIndications, getActiveStrategies, getAllPositions } from "@/lib/db-helpers"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     // When the Structure page has a connection selected, derive module health

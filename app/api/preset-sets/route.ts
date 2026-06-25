@@ -3,6 +3,7 @@ import { sql } from "@/lib/db"
 import { nanoid } from "nanoid"
 
 // GET /api/preset-sets - Get all configuration sets
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const sets = await sql`

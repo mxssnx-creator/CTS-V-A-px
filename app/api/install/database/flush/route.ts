@@ -4,6 +4,7 @@ import { runMigrations, resetMigrationRunState } from "@/lib/redis-migrations"
 import { SystemLogger } from "@/lib/system-logger"
 import { stopAllProgressionsBeforeReset } from "@/lib/db-reset-helper"
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 /**

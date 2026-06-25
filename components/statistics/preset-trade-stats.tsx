@@ -7,6 +7,7 @@ import type { AnalyticsFilter } from "@/lib/analytics"
 import type { TradingPosition } from "@/lib/trading"
 import { TrendingUp, TrendingDown, Activity, Target, Clock, DollarSign } from "lucide-react"
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts"
+import { formatSampledMetric, grossProfitFactorTitle } from "@/lib/metric-formatting"
 
 interface PresetTradeStatsProps {
   filter: AnalyticsFilter
@@ -73,7 +74,7 @@ export function PresetTradeStats({ filter, positions }: PresetTradeStatsProps) {
       const totalProfit = winningTrades.reduce((sum, p) => sum + (p.profit_loss || 0), 0)
       const totalLoss = Math.abs(losingTrades.reduce((sum, p) => sum + (p.profit_loss || 0), 0))
 
-      const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? 999 : 0
+      const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? Number.POSITIVE_INFINITY : 0
 
       // Calculate max drawdown
       let cumulativePnl = 0
@@ -146,12 +147,12 @@ export function PresetTradeStats({ filter, positions }: PresetTradeStatsProps) {
     }).format(amount)
   }
 
+  const totalTrades = presetStats.reduce((sum, s) => sum + s.total_trades, 0)
   const totalStats = {
-    total_trades: presetStats.reduce((sum, s) => sum + s.total_trades, 0),
+    total_trades: totalTrades,
     total_pnl: presetStats.reduce((sum, s) => sum + s.total_pnl, 0),
     avg_win_rate: presetStats.length > 0 ? presetStats.reduce((sum, s) => sum + s.win_rate, 0) / presetStats.length : 0,
-    avg_profit_factor:
-      presetStats.length > 0 ? presetStats.reduce((sum, s) => sum + s.profit_factor, 0) / presetStats.length : 0,
+    avg_profit_factor: totalTrades > 0 ? presetStats.reduce((sum, s) => sum + s.profit_factor, 0) / presetStats.length : 0,
   }
 
   return (
@@ -189,8 +190,8 @@ export function PresetTradeStats({ filter, positions }: PresetTradeStatsProps) {
             <div className="flex items-center gap-2">
               <TrendingUp className="h-5 w-5 text-orange-500" />
               <div>
-                <div className="text-2xl font-bold">{totalStats.avg_profit_factor.toFixed(2)}</div>
-                <div className="text-sm text-muted-foreground">Avg Profit Factor</div>
+                <div className="text-2xl font-bold">{formatSampledMetric(totalStats.avg_profit_factor, totalStats.total_trades)}</div>
+                <div className="text-sm text-muted-foreground">Avg PF</div>
               </div>
             </div>
           </div>
@@ -208,7 +209,7 @@ export function PresetTradeStats({ filter, positions }: PresetTradeStatsProps) {
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis dataKey="preset_name" angle={-45} textAnchor="end" height={100} />
                 <YAxis />
-                <Tooltip formatter={(value: number) => [value.toFixed(2), "Profit Factor"]} />
+                <Tooltip formatter={(value: number) => [formatSampledMetric(value, 1), "PF"]} />
                 <Bar dataKey="profit_factor" fill="#3b82f6" />
               </BarChart>
             </ResponsiveContainer>
@@ -245,8 +246,8 @@ export function PresetTradeStats({ filter, positions }: PresetTradeStatsProps) {
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
                       <h3 className="font-semibold text-lg">{stat.preset_name}</h3>
-                      <Badge variant={stat.profit_factor >= 1 ? "default" : "destructive"}>
-                        PF: {stat.profit_factor.toFixed(2)}
+                      <Badge variant={stat.profit_factor >= 1 ? "default" : "destructive"} title={grossProfitFactorTitle(stat.profit_factor, stat.total_trades)}>
+                        PF: {formatSampledMetric(stat.profit_factor, stat.total_trades)}
                       </Badge>
                     </div>
 

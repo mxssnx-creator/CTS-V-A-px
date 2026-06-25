@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { ArrowUpDown, ArrowUp, ArrowDown, BarChart3 } from "lucide-react"
 import type { StrategyAnalytics } from "@/lib/analytics"
+import { formatSampledMetric, grossProfitFactorTitle } from "@/lib/metric-formatting"
 
 interface StrategyPerformanceTableProps {
   strategies: StrategyAnalytics[]
@@ -93,7 +94,7 @@ export function StrategyPerformanceTable({ strategies, onStrategyClick }: Strate
                     onClick={() => handleSort("profit_factor")}
                     className="h-auto p-0 font-semibold"
                   >
-                    Profit Factor
+                    PF
                     <SortIcon field="profit_factor" />
                   </Button>
                 </TableHead>
@@ -199,6 +200,7 @@ export function StrategyPerformanceTable({ strategies, onStrategyClick }: Strate
                   </TableCell>
                   <TableCell>
                     <span
+                      title={grossProfitFactorTitle(strategy.profit_factor, strategy.total_trades)}
                       className={`font-semibold ${
                         strategy.profit_factor >= 1.2
                           ? "text-green-600"
@@ -207,11 +209,12 @@ export function StrategyPerformanceTable({ strategies, onStrategyClick }: Strate
                             : "text-red-600"
                       }`}
                     >
-                      {strategy.profit_factor.toFixed(2)}
+                      {formatSampledMetric(strategy.profit_factor, strategy.total_trades)}
                     </span>
                   </TableCell>
                   <TableCell>
                     <span
+                      title={grossProfitFactorTitle(strategy.profit_factor_last_50, Math.min(strategy.total_trades, 50))}
                       className={`font-semibold ${
                         strategy.profit_factor_last_50 >= 1.2
                           ? "text-green-600"
@@ -220,7 +223,7 @@ export function StrategyPerformanceTable({ strategies, onStrategyClick }: Strate
                             : "text-red-600"
                       }`}
                     >
-                      {strategy.profit_factor_last_50.toFixed(2)}
+                      {formatSampledMetric(strategy.profit_factor_last_50, Math.min(strategy.total_trades, 50))}
                     </span>
                   </TableCell>
                   <TableCell>{strategy.trades_per_day.toFixed(1)}</TableCell>
