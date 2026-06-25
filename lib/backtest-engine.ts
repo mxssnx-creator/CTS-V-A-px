@@ -5,6 +5,7 @@
 
 import { getSettings, setSettings } from "@/lib/redis-db"
 import { sql } from "@/lib/db"
+import { calculateSignedResultR } from "@/lib/profit-factor"
 
 interface BacktestTrade {
   symbol: string
@@ -15,6 +16,7 @@ interface BacktestTrade {
   exit_time: Date
   profit_loss: number
   profit_factor: number
+  signed_result_r: number
   strategy_config: any
 }
 
@@ -353,9 +355,9 @@ export class BacktestEngine {
       exitTime = currentTime
     }
 
-    // Calculate P&L
+    // Calculate P&L and signed, cost-normalized return (R).
     const profitLoss = side === "long" ? exitPrice - entryPrice : entryPrice - exitPrice
-    const profitFactor = profitLoss / (entryPrice * 0.001) // Relative to 0.1% position cost
+    const signedResultR = calculateSignedResultR(entryPrice, exitPrice, side)
 
     return {
       symbol,
@@ -365,7 +367,8 @@ export class BacktestEngine {
       entry_time: entryTime,
       exit_time: exitTime,
       profit_loss: profitLoss,
-      profit_factor: profitFactor,
+      profit_factor: Math.max(0, signedResultR),
+      signed_result_r: signedResultR,
       strategy_config: strategy,
     }
   }
