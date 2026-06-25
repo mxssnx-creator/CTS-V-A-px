@@ -508,6 +508,14 @@ function deriveProtectionFromProfitFactor(
   }
 }
 
+function hasVariantSizingEntry(entry: StrategySetEntry | undefined): entry is StrategySetEntry {
+  return !!entry &&
+    Number.isFinite(entry.sizeMultiplier) &&
+    Number.isFinite(entry.leverage) &&
+    typeof entry.positionState === "string" &&
+    entry.positionState.length > 0
+}
+
 const AXIS_KEY_TABLE: ReadonlyMap<string, string> = (() => {
   const m = new Map<string, string>()
   for (const prev of AXIS_PREV) {
@@ -3979,9 +3987,10 @@ export class StrategyCoordinator {
                 //   2. coordIndex.base.byKey.get(parentKey).entries  ← O(1)
                 //   3. realSets.find() linear scan  ← only when no coordIndex
                 const parentKey = set.parentSetKey || set.setKey.split("#")[0]
+                const setRepresentativeEntry = set.entries.find(hasVariantSizingEntry)
                 const effectiveEntries: StrategySetEntry[] =
-                  set.entries.length > 0
-                    ? set.entries
+                  setRepresentativeEntry
+                    ? [setRepresentativeEntry]
                     : coordIndex
                       ? (coordIndex.base.byKey.get(parentKey)?.entries ?? [])
                       : (realSets.find((s) => s.setKey === parentKey)?.entries ?? [])
@@ -4212,9 +4221,10 @@ export class StrategyCoordinator {
                 // Priority: set.entries (non-empty profile-variant sets) →
                 //   coordIndex.base.byKey O(1) lookup → O(N) realSets.find() fallback.
                 const _pseudoParentKey = set.parentSetKey || set.setKey.split("#")[0]
+                const setRepresentativeEntry = set.entries.find(hasVariantSizingEntry)
                 const effectiveEntries =
-                  set.entries.length > 0
-                    ? set.entries
+                  setRepresentativeEntry
+                    ? [setRepresentativeEntry]
                     : coordIndex
                       ? (coordIndex.base.byKey.get(_pseudoParentKey)?.entries ?? [])
                       : (realSets.find((s) => s.setKey === _pseudoParentKey)?.entries ?? [])
@@ -4917,6 +4927,8 @@ export class StrategyCoordinator {
     // O(1), zero-copy.  The Real-stage tuner for-loop over s.entries becomes
     // a no-op; coordRec.tunedAvgPF is written from s.avgProfitFactor here.
     let sumPF = 0, sumDDT = 0, sumCnf = 0, count = 0
+    let selectedCfg: (typeof profile.configs)[number] | null = null
+    let selectedScore = Number.NEGATIVE_INFINITY
     const baseDDTFallback = baseSet.avgDrawdownTime || 0
 
     outer: for (const baseEntry of baseSet.entries) {
@@ -4929,6 +4941,10 @@ export class StrategyCoordinator {
         sumPF  += pf
         sumDDT += ddt
         sumCnf += Math.min(0.99, baseEntry.confidence)
+        if (pf > selectedScore) {
+          selectedScore = pf
+          selectedCfg = cfg
+        }
         count++
       }
     }
@@ -4938,6 +4954,13 @@ export class StrategyCoordinator {
     const avgPF  = sumPF  / count
     const avgDDT = sumDDT / count
     const avgCnf = sumCnf / count
+    const representativeCfg = selectedCfg ?? profile.configs[0] ?? {
+      size: 1,
+      leverage: 1,
+      state: "new",
+      pfBias: 1,
+      ddtBias: 0,
+    }
 
     const axisWindows = ctx
       ? {
@@ -4959,10 +4982,18 @@ export class StrategyCoordinator {
       avgConfidence:   avgCnf,
       avgDrawdownTime: avgDDT,
       entryCount:      count,
-      // EMPTY entries[] — Base entries resolved at dispatch via
-      // coordIndex.base.byKey.get(parentSetKey).  Eliminates the primary
-      // V8 heap driver (~80 000 object allocations per second).
-      entries:         [],
+      // Slim representative entry — keep exactly the variant config values
+      // live dispatch needs for sizing/leverage/state, while avoiding the old
+      // full baseEntry × profile.configs materialisation.
+      entries:         [{
+        id:             `${baseSet.setKey}#${profile.name}:representative`,
+        sizeMultiplier: representativeCfg.size,
+        leverage:       representativeCfg.leverage,
+        positionState:  representativeCfg.state,
+        profitFactor:   avgPF,
+        drawdownTime:   avgDDT,
+        confidence:     avgCnf,
+      }],
       ...(baseSet.prevPos && { prevPos: baseSet.prevPos }),
     }
   }
