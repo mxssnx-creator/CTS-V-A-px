@@ -1,7 +1,7 @@
 /**
  * Indication State Manager
  * Manages step-based indication calculations for Main System Trade mode
- * Implements: direction (3-30), move (3-30), active (0.5-2.5%), optimal (advanced) types
+ * Implements: direction (2-30), move (2-30), active (0.5-2.5%), optimal (advanced) types
  * With validation timeout (15s) and position cooldown (20s)
  */
 
@@ -208,8 +208,8 @@ export class IndicationStateManager {
 
     // Mirror-aware scalar read — falls back from the individual
     // `settings:indicationRangeMin` hash (historical) to
-    // `app_settings.indicationRangeMin` (UI-saved) to the 3 default.
-    const minRange = await getAppSetting<number>("indicationRangeMin", 3)
+    // `app_settings.indicationRangeMin` (UI-saved) to the 2 default.
+    const minRange = await getAppSetting<number>("indicationRangeMin", 2)
     const maxRange = 30
 
     this.cachedRanges = { minRange, maxRange, timestamp: now }
@@ -272,7 +272,7 @@ export class IndicationStateManager {
   }
 
   /**
-   * Direction Type: Opposite direction change detection (range 3-30)
+   * Direction Type: Opposite direction change detection (range 2-30)
    * OPTIMIZED: Use time-window limits based on indication type
    */
   private async processDirectionIndications(
@@ -317,7 +317,7 @@ export class IndicationStateManager {
   }
 
   /**
-   * Move Type: Price movement without opposite requirement (range 3-30)
+   * Move Type: Price movement without opposite requirement (range 2-30)
    * OPTIMIZED: Use time-window limits based on indication type
    */
   private async processMoveIndications(

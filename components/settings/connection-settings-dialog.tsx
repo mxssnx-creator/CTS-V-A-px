@@ -457,10 +457,17 @@ export function ConnectionSettingsDialog({
             })(),
             minStep: (() => {
               const flat = Number((settings as Record<string, unknown>).minStep)
-              if (Number.isFinite(flat) && flat >= 3) return Math.min(30, Math.max(3, Math.round(flat)))
+              if (Number.isFinite(flat) && flat >= 2) return Math.min(30, Math.max(2, Math.round(flat)))
               const nested = Number((coord as Record<string, unknown>).minStep)
-              if (Number.isFinite(nested) && nested >= 3) return Math.min(30, Math.max(3, Math.round(nested)))
+              if (Number.isFinite(nested) && nested >= 2) return Math.min(30, Math.max(2, Math.round(nested)))
               return DEFAULT_COORDINATION_SETTINGS.minStep ?? 5
+            })(),
+            trailingMinStep: (() => {
+              const flat = Number((settings as Record<string, unknown>).trailingMinStep)
+              if (Number.isFinite(flat) && flat >= 2) return Math.min(30, Math.max(2, Math.round(flat)))
+              const nested = Number((coord as Record<string, unknown>).trailingMinStep)
+              if (Number.isFinite(nested) && nested >= 2) return Math.min(30, Math.max(2, Math.round(nested)))
+              return DEFAULT_COORDINATION_SETTINGS.trailingMinStep ?? 6
             })(),
           }))
         }
@@ -484,6 +491,7 @@ export function ConnectionSettingsDialog({
     } finally {
       setLoading(false)
     }
+  // Reload settings whenever the active connection or exchange changes.
   // connectionId and exchange are stable — both come from props and don't change
   // within a single dialog open. Excluding them from the dep array intentionally
   // to avoid re-triggering on every render cycle.
@@ -532,6 +540,7 @@ export function ConnectionSettingsDialog({
         realEvalPosCount: coordination.realEvalPosCount,
         prevPosWindow:    coordination.prevPosWindow,
         minStep:          coordination.minStep ?? 5,
+        trailingMinStep:  coordination.trailingMinStep ?? 6,
         // Control orders (SL/TP placement toggle) — operator spec: on by default
         control_orders:   true,
         // Flat variant toggles for backwards compat with old hash readers
@@ -708,6 +717,7 @@ export function ConnectionSettingsDialog({
     setPresetConfirm(null)
     loadAllSettings()
     fetchPresets()
+    // Opening the dialog resets the transient preset state and refreshes data.
     // Stable stable refs — intentionally omit from dep array to avoid
     // retriggering on every render. `open` is the only signal we need.
 
@@ -914,17 +924,33 @@ export function ConnectionSettingsDialog({
                   <SectionHeading icon={Sparkles} title="Minimal Base Pseudo Positions Range Step" subtitle="Minimum step size for Base pseudo-position windows (3–30, default 5). Higher values create fewer, smoother position ranges." />
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
-                      <Label className="text-xs">Min Step (3–30)</Label>
+                      <Label className="text-xs">Base Min Step (2–30)</Label>
                       <span className="text-xs font-mono tabular-nums font-semibold">{coordination.minStep ?? 5}</span>
                     </div>
                     <Slider
-                      min={3} max={30} step={1}
+                      min={2} max={30} step={1}
                       value={[coordination.minStep ?? 5]}
                       onValueChange={([v]) => setCoordination(p => ({ ...p, minStep: v }))}
                       className="py-2"
                     />
                     <div className="flex justify-between text-[10px] text-muted-foreground">
-                      <span>3 — fast noise</span><span className="text-muted-foreground/60">default 5</span><span>30 — smooth</span>
+                      <span>2 — fastest</span><span className="text-muted-foreground/60">default 5</span><span>30 — smooth</span>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs">Trailing Min Step (2–30)</Label>
+                      <span className="text-xs font-mono tabular-nums font-semibold">{coordination.trailingMinStep ?? 6}</span>
+                    </div>
+                    <Slider
+                      min={2} max={30} step={1}
+                      value={[coordination.trailingMinStep ?? 6]}
+                      onValueChange={([v]) => setCoordination(p => ({ ...p, trailingMinStep: v }))}
+                      className="py-2"
+                    />
+                    <div className="flex justify-between text-[10px] text-muted-foreground">
+                      <span>2 — include fast trailing</span><span className="text-muted-foreground/60">default 6</span><span>30 — only slow trailing</span>
                     </div>
                   </div>
 

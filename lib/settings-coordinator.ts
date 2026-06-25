@@ -100,9 +100,8 @@ export async function notifySettingsChanged(
     }
   }
 
-  // If hot-reload, update engine state to signal reload needed.
-  // Also reset per-stage strategy counters so the dashboard doesn't show
-  // a statistically-incoherent blend of old-setting and new-setting data.
+  // If hot-reload, update engine state to signal reload needed without
+  // clearing progression counters or stopping the global coordinator.
   if (changeType === "reload") {
     const engineState = await getSettings(`trade_engine_state:${connectionId}`)
     if (engineState && (engineState.status === "running" || engineState.status === "ready")) {
@@ -112,35 +111,14 @@ export async function notifySettingsChanged(
         reload_fields: changedFields,
         reload_requested_at: new Date().toISOString(),
       })
-      // Reset per-stage counters so stats are recomputed from scratch
-      // under the new settings — avoids blending pre-change and
-      // post-change data in the dashboard.
-      //
-      // CRITICAL: setSettings() stores under a `settings:` prefix, so it writes
-      // to `settings:progression:{id}` — NOT the canonical `progression:{id}`
-      // hash that the dashboard reads via `getProgressionState / hgetall`.
-      // Use the raw Redis client + hset on the bare key instead.
+      // Keep progression/stat counters intact on hot reload. Operators expect
+      // settings-dialog saves to update the next cycle in-place; resetting the
+      // canonical progression hash here made dashboard stats disappear and looked
+      // like the global coordinator had stopped. Stamp only an audit timestamp.
       try {
         const client = getRedisClient()
         if (client) {
-          // Only reset the per-stage SET and EVALUATED counters. These are the
-          // fields that blend pre-change and post-change strategy data. Do NOT
-          // reset cycle_count or total_trades — the progression timeline is still
-          // valid; only the per-stage strategy output needs to restart clean.
-          const progKey = `progression:${connectionId}`
-          await client.hset(progKey, {
-            strategies_base_total: "0",
-            strategies_main_total: "0",
-            strategies_real_total: "0",
-            strategies_base_evaluated: "0",
-            strategies_main_evaluated: "0",
-            strategies_real_evaluated: "0",
-            indications_direction_count: "0",
-            indications_move_count: "0",
-            indications_active_count: "0",
-            indications_active_advanced_count: "0",
-            indications_optimal_count: "0",
-            indications_auto_count: "0",
+          await client.hset(`progression:${connectionId}`, {
             settings_changed_at: new Date().toISOString(),
           })
         }

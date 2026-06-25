@@ -54,7 +54,7 @@ export async function GET(
         if ([
           "symbol_count", "symbolCount", "leveragePercentage",
           "prevPosMinCount", "prevPosWindow", "mainEvalPosCount",
-          "realEvalPosCount", "minStep",
+          "realEvalPosCount", "minStep", "trailingMinStep",
           // Axis max-window values
           "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
           // Block strategy tuning
@@ -71,7 +71,7 @@ export async function GET(
           "useSystemCloseOnly", "use_system_close_only",
           // Coordination variant toggles
           "variantTrailingEnabled", "variantBlockEnabled",
-          "variantDcaEnabled", "variantPauseEnabled",
+          "variantDcaEnabled",
           // Axis enable flags
           "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
         ].includes(k)) {
@@ -87,7 +87,14 @@ export async function GET(
     }
 
     // Merge: hash fields override JSON blob fields (hash is more recent).
-    const settings = { ...jsonSettings, ...hashSettings }
+    // Include defaults for newer coordination knobs so existing production
+    // connections expose stable values before the first save after upgrade.
+    const settings = {
+      minStep: 5,
+      trailingMinStep: 6,
+      ...jsonSettings,
+      ...hashSettings,
+    }
 
     return NextResponse.json({
       connection,
@@ -239,6 +246,7 @@ export async function PATCH(
         "mainEvalPosCount",
         "realEvalPosCount",
         "minStep",
+        "trailingMinStep",
       ] as const
       for (const k of knobKeys) {
         const v = (merged as Record<string, unknown>)[k]
@@ -304,12 +312,12 @@ export async function PATCH(
           | Record<string, unknown>
           | undefined
         if (coord && typeof coord === "object") {
-          // Variant toggles:  variants.{trailing,block,dca,pause}
+          // Variant toggles:  variants.{trailing,block,dca}
           //   → flat key variantTrailingEnabled, variantBlockEnabled, …
           const variantsObj = coord.variants as Record<string, unknown> | undefined
           if (variantsObj && typeof variantsObj === "object") {
             for (const [vk, vv] of Object.entries(variantsObj)) {
-              if (typeof vv === "boolean") {
+              if (typeof vv === "boolean" && ["trailing", "block", "dca"].includes(vk)) {
                 const cap = vk.charAt(0).toUpperCase() + vk.slice(1)
                 flatKnobs[`variant${cap}Enabled`] = vv ? "true" : "false"
               }
@@ -470,6 +478,27 @@ export async function PATCH(
     // and the `trade_engine_state:{id}` hash, then the live engine's symbol
     // cache is invalidated so the next tick (≤ TTL) picks it up without a
     // restart.
+    const normalizeSymbolList = (raw: unknown): string[] => {
+      if (Array.isArray(raw)) return raw.map(String).map((s) => s.trim()).filter(Boolean)
+      if (typeof raw !== "string") return []
+      const s = raw.trim()
+      if (!s) return []
+      if (s.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(s)
+          return Array.isArray(parsed) ? parsed.map(String).map((x) => x.trim()).filter(Boolean) : []
+        } catch {
+          // fall through to delimiter parsing
+        }
+      }
+      return s.split(/[,|]/).map((x) => x.trim()).filter(Boolean)
+    }
+    const stableSymbolKey = (symbols: string[]) => symbols.map((s) => s.trim()).filter(Boolean).sort().join("|")
+    const beforeForcedSymbols = normalizeSymbolList((connection as Record<string, unknown>).force_symbols)
+    const beforeActiveSymbols = normalizeSymbolList((connection as Record<string, unknown>).active_symbols)
+    const beforeActiveSymbolKey = stableSymbolKey(beforeForcedSymbols.length > 0 ? beforeForcedSymbols : beforeActiveSymbols)
+    let resolvedSymbolsForSettings: string[] | null = null
+
     const touchedSymbols =
       Array.isArray((settings as Record<string, unknown>).symbols) ||
       typeof (settings as Record<string, unknown>).symbol_order === "string" ||
@@ -516,6 +545,7 @@ export async function PATCH(
         }
 
         if (resolved.length > 0) {
+          resolvedSymbolsForSettings = resolved
           // 1. Persist as the connection's ACTIVE symbol source (what the engine reads).
           const resolvedSymbolsJson = JSON.stringify(resolved)
           effectiveConnection = (await updateConnection(id, {
@@ -622,14 +652,31 @@ export async function PATCH(
     // SAFE to recoordinate when: symbols list changed, symbol count changed,
     // live/testnet mode flipped, or connection_method changed. NOT on PF/DDT/axis
     // changes, coordination, volume_factor, position_mode, margin_mode alone.
-    const symbolsModeKeys = [
-      "symbols", "symbol_order", "symbol_count",
-      "is_live_trade", "is_testnet", "is_preset_trade",
-      "connection_method",
-    ]
-    const symbolsModeChanged = symbolsModeKeys.some((k) =>
-      Object.prototype.hasOwnProperty.call(settings, k)
-    )
+    const beforeSettings = current as Record<string, unknown>
+    const afterSettings = merged as Record<string, unknown>
+    const scalarChanged = (key: string, beforeFallback?: unknown, afterFallback?: unknown) => {
+      if (!Object.prototype.hasOwnProperty.call(settings, key)) return false
+      const beforeValue = beforeSettings[key] ?? beforeFallback ?? ""
+      const afterValue = afterSettings[key] ?? afterFallback ?? ""
+      return JSON.stringify(beforeValue) !== JSON.stringify(afterValue)
+    }
+    const symbolListChanged =
+      resolvedSymbolsForSettings !== null &&
+      stableSymbolKey(resolvedSymbolsForSettings) !== beforeActiveSymbolKey
+    const manualSymbolsChanged =
+      Array.isArray((settings as Record<string, unknown>).symbols) &&
+      stableSymbolKey(normalizeSymbolList(beforeSettings.symbols).length > 0
+        ? normalizeSymbolList(beforeSettings.symbols)
+        : (beforeForcedSymbols.length > 0 ? beforeForcedSymbols : beforeActiveSymbols)) !== stableSymbolKey(normalizeSymbolList(afterSettings.symbols))
+    const symbolsModeChanged =
+      symbolListChanged ||
+      manualSymbolsChanged ||
+      scalarChanged("symbol_order", (connection as Record<string, unknown>).symbol_order) ||
+      scalarChanged("symbol_count", (connection as Record<string, unknown>).symbol_count) ||
+      scalarChanged("is_live_trade", (connection as Record<string, unknown>).is_live_trade, (updated as Record<string, unknown>).is_live_trade) ||
+      scalarChanged("is_testnet", (connection as Record<string, unknown>).is_testnet, (updated as Record<string, unknown>).is_testnet) ||
+      scalarChanged("is_preset_trade", (connection as Record<string, unknown>).is_preset_trade, (updated as Record<string, unknown>).is_preset_trade) ||
+      scalarChanged("connection_method", (connection as Record<string, unknown>).connection_method, (updated as Record<string, unknown>).connection_method)
     if (symbolsModeChanged) {
       try {
         await ProgressionStateManager.recoordinateForActualOne(id)
