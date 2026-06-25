@@ -3010,6 +3010,7 @@ export class StrategyCoordinator {
   private async createPseudoPositionsFromRealSets(
     symbol: string,
     realSets: StrategySet[],
+    cachedMarketPrice = 0,
   ): Promise<void> {
     // DEV-MODE BYPASS: pseudo_position hashes are only used by the dashboard
     // "Positions" tile. Writing up to 3000 hashes per symbol per cycle (3 writes
@@ -3046,14 +3047,40 @@ export class StrategyCoordinator {
       const writeBatches: Promise<any>[] = []
       let createdCount = 0
 
+      const hasCachedMarketPrice = cachedMarketPrice > 0 && !isNaN(cachedMarketPrice)
+
       for (let i = 0; i < setMeta.length; i++) {
-        if (existing[i]) continue
         const { set, setKey, existingKey } = setMeta[i]
         try {
           const avgPF       = set.avgProfitFactor || 1
-          const entryPrice  = Math.max(1, avgPF * 100)   // unitless proxy
+          // Prefer the same market-price snapshot used by live exchange dispatch
+          // so dashboard pseudo positions and live orders align on entry basis.
+          // Standalone/test callers can still omit it and use the legacy PF proxy.
+          const entryPrice  = hasCachedMarketPrice
+            ? cachedMarketPrice
+            : Math.max(1, avgPF * 100)   // unitless proxy fallback
           const quantity    = set.entryCount || 1
           const positionCost = entryPrice * quantity
+
+          // Existing mappings are intentionally idempotent, but when a valid
+          // cached market price is available we still refresh the stored entry
+          // basis. That makes this alignment take effect for pseudo positions
+          // created by earlier cycles that used the old PF proxy.
+          const existingMapping = existing[i] as { posId?: unknown } | null
+          if (existingMapping) {
+            const existingPosId = typeof existingMapping.posId === "string" ? existingMapping.posId : null
+            if (hasCachedMarketPrice && existingPosId) {
+              writeBatches.push(
+                setSettings(`pseudo_position:${this.connectionId}:${existingPosId}`, {
+                  entry_price: entryPrice,
+                  position_cost: positionCost,
+                }).catch((err) => {
+                  console.warn(`[StrategyFlow] Failed to refresh pseudo position price for set ${setKey}:`, err)
+                })
+              )
+            }
+            continue
+          }
 
           const pseudoPos = {
             id: `pseudo-${this.connectionId}-${setKey}-${nowMs}`,
@@ -4643,6 +4670,32 @@ export class StrategyCoordinator {
       })
     }
 
+    // Pre-fetch the current market price ONCE so both the live exchange dispatch
+    // and the pseudo-position creation below share the same price without
+    // duplicate Redis reads. The live-stage will still validate / re-fetch if
+    // we hand it 0, but providing a good seed eliminates the most common cause
+    // of "no market price" failures when market_data is just milliseconds stale.
+    let _cachedMarketPrice = 0
+    try {
+      const _priceClient = getRedisClient()
+      const _mdhash = await _priceClient.hgetall(`market_data:${symbol}`)
+      _cachedMarketPrice = parseFloat(String(_mdhash?.close ?? _mdhash?.price ?? _mdhash?.last ?? "0"))
+      if (!_cachedMarketPrice || isNaN(_cachedMarketPrice)) {
+        // Spec §7: prefer the canonical :1s envelope, fall back to :1m.
+        const _mdraw =
+          (await _priceClient.get(`market_data:${symbol}:1s`)) ??
+          (await _priceClient.get(`market_data:${symbol}:1m`))
+        if (_mdraw) {
+          const _mdobj = typeof _mdraw === "string" ? JSON.parse(_mdraw) : _mdraw
+          const _candles = _mdobj?.candles
+          if (Array.isArray(_candles) && _candles.length > 0) {
+            _cachedMarketPrice = parseFloat(String(_candles[_candles.length - 1]?.close ?? "0")) || 0
+          } else {
+            _cachedMarketPrice = parseFloat(String(_mdobj?.close ?? _mdobj?.price ?? _mdobj?.last ?? "0")) || 0
+          }
+        }
+      }
+    } catch { /* best-effort; live-stage falls back internally */ }
     // Select the active Live dispatch model once and use it for both counters and
     // exchange dispatch. `qualifying` is the candidate pool; `dispatchSets` is the
     // selected active set list after applying the per-direction / per-variant Live
@@ -4677,6 +4730,9 @@ export class StrategyCoordinator {
     // Create pseudo positions from the LIVE-qualifying subset only.
     // Previously received all `realSets` (up to 3000/symbol), causing N×3 Redis
     // writes for sets that never reach live dispatch. `qualifying` is the capped
+    // Live subset (typically ≤500/symbol) — the only sets that semantically need
+    // pseudo-position records (they represent active dispatch candidates).
+    await this.createPseudoPositionsFromRealSets(symbol, qualifying, _cachedMarketPrice)
     // Live candidate subset (typically ≤500/symbol) — dispatch selection is
     // tracked separately below so the UI can compare candidates vs selected sets.
     await this.createPseudoPositionsFromRealSets(symbol, qualifying)
@@ -5004,33 +5060,6 @@ export class StrategyCoordinator {
     } catch (err: any) {
       console.error(`[v0] [Coordinator] Error in createLiveSets for ${symbol}:`, err?.message)
     }
-
-    // Pre-fetch the current market price ONCE so both the live exchange dispatch
-    // and the pseudo-position creation below share the same price without
-    // duplicate Redis reads. The live-stage will still validate / re-fetch if
-    // we hand it 0, but providing a good seed eliminates the most common cause
-    // of "no market price" failures when market_data is just milliseconds stale.
-    let _cachedMarketPrice = 0
-    try {
-      const _priceClient = getRedisClient()
-      const _mdhash = await _priceClient.hgetall(`market_data:${symbol}`)
-      _cachedMarketPrice = parseFloat(String(_mdhash?.close ?? _mdhash?.price ?? _mdhash?.last ?? "0"))
-      if (!_cachedMarketPrice || isNaN(_cachedMarketPrice)) {
-        // Spec §7: prefer the canonical :1s envelope, fall back to :1m.
-        const _mdraw =
-          (await _priceClient.get(`market_data:${symbol}:1s`)) ??
-          (await _priceClient.get(`market_data:${symbol}:1m`))
-        if (_mdraw) {
-          const _mdobj = typeof _mdraw === "string" ? JSON.parse(_mdraw) : _mdraw
-          const _candles = _mdobj?.candles
-          if (Array.isArray(_candles) && _candles.length > 0) {
-            _cachedMarketPrice = parseFloat(String(_candles[_candles.length - 1]?.close ?? "0")) || 0
-          } else {
-            _cachedMarketPrice = parseFloat(String(_mdobj?.close ?? _mdobj?.price ?? _mdobj?.last ?? "0")) || 0
-          }
-        }
-      }
-    } catch { /* best-effort; live-stage falls back internally */ }
 
     // Attempt real exchange trading for qualifying LIVE sets when the connection has live trading enabled.
     // This is guarded by is_live_trade flag on the connection — if disabled, only pseudo positions are created.
