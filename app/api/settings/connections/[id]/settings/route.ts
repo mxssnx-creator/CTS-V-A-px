@@ -70,7 +70,7 @@ export async function GET(
           "useSystemCloseOnly", "use_system_close_only",
           // Coordination variant toggles
           "variantTrailingEnabled", "variantBlockEnabled",
-          "variantDcaEnabled", "variantPauseEnabled",
+          "variantDcaEnabled",
           // Axis enable flags
           "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
         ].includes(k)) {
@@ -311,12 +311,12 @@ export async function PATCH(
           | Record<string, unknown>
           | undefined
         if (coord && typeof coord === "object") {
-          // Variant toggles:  variants.{trailing,block,dca,pause}
+          // Variant toggles:  variants.{trailing,block,dca}
           //   → flat key variantTrailingEnabled, variantBlockEnabled, …
           const variantsObj = coord.variants as Record<string, unknown> | undefined
           if (variantsObj && typeof variantsObj === "object") {
             for (const [vk, vv] of Object.entries(variantsObj)) {
-              if (typeof vv === "boolean") {
+              if (typeof vv === "boolean" && ["trailing", "block", "dca"].includes(vk)) {
                 const cap = vk.charAt(0).toUpperCase() + vk.slice(1)
                 flatKnobs[`variant${cap}Enabled`] = vv ? "true" : "false"
               }
