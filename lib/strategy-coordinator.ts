@@ -5741,6 +5741,7 @@ export class StrategyCoordinator {
                 if (liveResult.status === "open" || liveResult.status === "filled" || liveResult.status === "partially_filled") {
                   filled++
                   placed++
+                } else if (liveResult.status === "placed" || liveResult.status === "pending_fill") {
                   if (isBlockDispatch) { blockExecutionStats.filled++; blockExecutionStats.placed++ }
                 } else if (liveResult.status === "placed") {
                   placed++

@@ -97,6 +97,7 @@ export async function GET(request: Request) {
         total:     all.length,
         open:      all.filter(p => p.status === "open").length,
         pending:   all.filter(p => p.status === "pending").length,
+        pending_fill: all.filter(p => p.status === "pending_fill").length,
         placed:    all.filter(p => p.status === "placed").length,
         filled:    all.filter(p => p.status === "filled").length,
         simulated: all.filter(p => p.status === "simulated").length,
