@@ -674,7 +674,11 @@ export class IndicationStateManager {
       // 1.5 to 3.0 so wide-stop / news-volatility setups get covered,
       // and quantises to 0.25 steps so the per-direction Set count stays
       // tractable (11 TP × 12 SL × 4 trailing = 528 Sets per symbol).
-      const slRatios = [0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00]
+      // Updated to new unified ranges: SL 0.2 to 2.2 with 0.1 step (21 values)
+      const slRatios: number[] = []
+      for (let sl = 0.2; sl <= 2.2 + 1e-9; sl += 0.1) {
+        slRatios.push(Number(sl.toFixed(1)))
+      }
       const trailingOptions = [
         { enabled: false, start: null, stop: null },
         { enabled: true, start: 0.3, stop: 0.1 },
@@ -1093,13 +1097,17 @@ export class IndicationStateManager {
     // Stop-loss grid: operator-spec — 0.25..3.0 step 0.25 (12 values).
     // Same grid as the optimal/advanced and non-optimal generators so
     // every (TP, SL) coordinate exists symmetrically across keyspaces.
-    const slRatios = [0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00]
-    const trailingOptions = [
-      { enabled: false },
-      { enabled: true, start: 0.3, stop: 0.1 },
-      { enabled: true, start: 0.6, stop: 0.2 },
-      { enabled: true, start: 1.0, stop: 0.3 },
-    ]
+      // Updated to new unified ranges: SL 0.2 to 2.2 with 0.1 step (21 values)
+      const slRatios: number[] = []
+      for (let sl = 0.2; sl <= 2.2 + 1e-9; sl += 0.1) {
+        slRatios.push(Number(sl.toFixed(1)))
+      }
+      const trailingOptions = [
+        { enabled: false, start: null, stop: null },
+        { enabled: true, start: 0.3, stop: 0.1 },
+        { enabled: true, start: 0.6, stop: 0.2 },
+        { enabled: true, start: 1.0, stop: 0.3 },
+      ]
 
     const positions: any[] = []
 
