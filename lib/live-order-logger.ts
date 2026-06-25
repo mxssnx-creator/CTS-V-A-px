@@ -57,6 +57,8 @@ export interface LiveOrderRequestContext {
   /** What we asked the exchange for. */
   quantity: number
   price: number
+  intendedNotionalUsd?: number
+  exchangeMinNotionalUsd?: number
   leverage: number
   marginType: "cross" | "isolated" | "unknown"
   /** Type passed to the connector (almost always "market"). */
