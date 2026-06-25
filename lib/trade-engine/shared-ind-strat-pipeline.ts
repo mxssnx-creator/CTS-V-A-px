@@ -56,6 +56,7 @@ export interface PipelineCycleResult {
   mode: PipelineMode
   asOfMs?: number
   indicationCount: number
+  indicationTypeCounts: Record<string, number>
   pseudoUpdates: number
   strategiesEvaluated: number
   liveReady: number
@@ -106,6 +107,7 @@ export async function runIndStratCycle(
     mode,
     asOfMs: deps.asOfMs,
     indicationCount: 0,
+    indicationTypeCounts: {},
     pseudoUpdates: 0,
     strategiesEvaluated: 0,
     liveReady: 0,
@@ -126,6 +128,19 @@ export async function runIndStratCycle(
         return [] as any[]
       })
     result.indicationCount = Array.isArray(indications) ? indications.length : 0
+    if (Array.isArray(indications)) {
+      for (const indication of indications) {
+        const rawType =
+          typeof indication?.type === "string" ? indication.type
+            : typeof indication?.indication_type === "string" ? indication.indication_type
+              : typeof indication?.indicationType === "string" ? indication.indicationType
+                : ""
+        const type = rawType.trim()
+        if (type.length > 0) {
+          result.indicationTypeCounts[type] = (result.indicationTypeCounts[type] ?? 0) + 1
+        }
+      }
+    }
 
     // ── Phase 1b: Sets-fill (replay only) ─────────────────────────────
     // The shared `indication_set:*` keyspace is the bridge between the
