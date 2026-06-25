@@ -40,6 +40,11 @@ export interface StrategyEvaluation {
   totalCreated: number      // number of Sets created/evaluated
   passedEvaluation: number  // number of Sets that passed the filter
   failedEvaluation: number  // number of Sets that failed
+  // LIVE-only dispatch counters. `passedEvaluation` remains the candidate gate count;
+  // these distinguish candidates selected for exchange dispatch from candidates suppressed
+  // by per-direction/per-variant dispatch throttling.
+  dispatchSelected?: number
+  dispatchSuppressed?: number
   avgProfitFactor: number
   avgDrawdownTime: number
 }
@@ -3669,7 +3674,40 @@ export class StrategyCoordinator {
       }
     } catch (e) { /* non-fatal */ }
 
-
+    // LIVE has two distinct sets after the PF/DDT candidate gate:
+    //   1. qualifying: candidates that passed the Live PF/DDT gate and are
+    //      tracked as Live-progressing candidates.
+    //   2. dispatchSets: candidates selected for the exchange-dispatch attempt
+    //      after per-direction/per-variant suppression.
+    // Keep the distinction explicit so downstream readers do not infer that
+    // returned `sets.length` is the candidate count.
+    const dispatchSets: StrategySet[] = []
+    {
+      let sawNewLong  = false
+      let sawNewShort = false
+      let sawBlockLong  = false
+      let sawBlockShort = false
+      let sawDcaLong    = false
+      let sawDcaShort   = false
+      for (const s of qualifying) {
+        const isBlock = s.variant === "block"
+        const isDca   = s.variant === "dca"
+        const isNew   = !isBlock && !isDca // default / trailing / pause
+        if (s.direction === "long") {
+          if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
+          if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
+          if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
+        } else {
+          if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
+          if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
+          if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
+        }
+        if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
+      }
+    }
+    const dispatchSelected = dispatchSets.length
+    const selectedSets = new Set<StrategySet>(dispatchSets)
+    const dispatchSuppressed = qualifying.filter((s) => !selectedSets.has(s))
 
     // Persist LIVE sets — slim format (coord keys only). Skip in dev:
     // setSettings writes to InlineLocalRedis (on-heap Map) on every cycle for
@@ -3814,13 +3852,14 @@ export class StrategyCoordinator {
           evaluated:         String(realSets.length),
           passed_sets:       String(qualifying.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
-          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
-          //   Live's `qualifying` Sets ARE the executed orders. They
-          //   are by definition "running" — exchange has accepted the
-          //   order or is holding the position. `sets_progressing` is
-          //   the real-stage input pool being ranked & capped this
-          //   cycle (i.e. candidates currently progressing toward live
-          //   execution).
+          dispatch_selected: String(dispatchSelected),
+          dispatch_suppressed: String(dispatchSuppressed.length),
+          // ── ACTIVELY-RUNNING metrics (operator spec) ─────────────────
+          //   Keep the legacy candidate-based running/open fields stable for
+          //   existing stats readers; the dispatch-specific fields above
+          //   expose the stricter exchange-dispatch subset.
+          //   `sets_progressing` remains the real-stage input pool being
+          //   ranked and capped toward live candidate selection.
           sets_running_now:         String(qualifying.length),
           sets_with_open_positions: String(qualifying.length),
           sets_progressing:         String(realSets.length),
@@ -3834,6 +3873,8 @@ export class StrategyCoordinator {
           [`s:${symbol}:running`]:    String(qualifying.length),
           [`s:${symbol}:progressing`]: String(realSets.length),
           [`s:${symbol}:passed`]:     String(qualifying.length),
+          [`s:${symbol}:dispatch_selected`]: String(dispatchSelected),
+          [`s:${symbol}:dispatch_suppressed`]: String(dispatchSuppressed.length),
           [`s:${symbol}:evaluated`]:  String(realSets.length),
           [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(liveAvgDDT)),
@@ -3934,31 +3975,6 @@ export class StrategyCoordinator {
             // Without this rule, block/dca sets targeting e.g. long were
             // always dropped because `sawLong=true` was already set by the
             // default set, meaning block strategy NEVER dispatched.
-            const dispatchSets: StrategySet[] = []
-            {
-              let sawNewLong  = false
-              let sawNewShort = false
-              let sawBlockLong  = false
-              let sawBlockShort = false
-              let sawDcaLong    = false
-              let sawDcaShort   = false
-              for (const s of qualifying) {
-                const isBlock = s.variant === "block"
-                const isDca   = s.variant === "dca"
-                const isNew   = !isBlock && !isDca // default / trailing / pause
-                if (s.direction === "long") {
-                  if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
-                  if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
-                  if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
-                } else {
-                  if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
-                  if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
-                  if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
-                }
-                if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
-              }
-            }
-
             let placed = 0
             let filled = 0
             let rejected = 0
@@ -4292,10 +4308,12 @@ export class StrategyCoordinator {
         totalCreated: realSets.length,
         passedEvaluation: qualifying.length,
         failedEvaluation: realSets.length - qualifying.length,
+        dispatchSelected,
+        dispatchSuppressed: dispatchSuppressed.length,
         avgProfitFactor: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgProfitFactor, 0) / qualifying.length : 0,
         avgDrawdownTime: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgDrawdownTime, 0) / qualifying.length : 0,
       },
-      sets: qualifying,
+      sets: dispatchSets,
     }
   }
 
@@ -5024,9 +5042,11 @@ export class StrategyCoordinator {
       stages: results.map((r) => ({
         type: r.type,
         sets: r.passedEvaluation,
+        ...(r.type === "live" ? { dispatchSelected: r.dispatchSelected ?? 0, dispatchSuppressed: r.dispatchSuppressed ?? 0 } : {}),
         avgPF: r.avgProfitFactor.toFixed(2),
       })),
       totalLiveSets: results.find((r) => r.type === "live")?.passedEvaluation || 0,
+      totalLiveDispatchSelected: results.find((r) => r.type === "live")?.dispatchSelected || 0,
     }
 
     try {
