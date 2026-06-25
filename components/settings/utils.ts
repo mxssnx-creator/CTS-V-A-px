@@ -34,7 +34,8 @@ export const initialSettings: Settings = {
   positionCost: 0.1, // Fixed default to 0.1 (representing 0.1%)
   useMaximalLeverage: true,
   min_volume_enforcement: true, // Added missing min_volume_enforcement property
-  minStep: 5, // 3-30 step 1 — minimum pseudo-position step-window size
+  minStep: 5, // 2-30 step 1 — minimum pseudo-position step-window size
+  trailingMinStep: 6, // 2-30 step 1 — minimum Base step allowed to fan out into trailing Sets
 
   // Base Strategy
   baseValueRangeMin: 0.5,
@@ -165,7 +166,7 @@ export const initialSettings: Settings = {
 
   // Indication
   indication_time_interval: 1,
-  indication_range_min: 3,
+  indication_range_min: 2,
   indication_range_max: 30,
   indication_min_profit_factor: 0.7,
 
@@ -182,7 +183,7 @@ export const initialSettings: Settings = {
   directionEnabled: true, // Changed to enabled by default
   directionInterval: 100,
   directionTimeout: 3,
-  directionRangeFrom: 3,
+  directionRangeFrom: 2,
   directionRangeTo: 30,
   moveEnabled: true, // Changed to enabled by default
   moveInterval: 100,
@@ -338,7 +339,7 @@ export const initialSettings: Settings = {
   directionRatioFactorTo: 2.0,
   directionRatioFactorStep: 0.1,
 
-  moveRangeFrom: 3,
+  moveRangeFrom: 2,
   moveRangeTo: 30,
   moveRangeStep: 1,
   moveDrawdownValues: "10,20,30,40,50",
@@ -351,7 +352,7 @@ export const initialSettings: Settings = {
   moveRatioFactorTo: 2.0,
   moveRatioFactorStep: 0.1,
 
-  activeRangeFrom: 3,
+  activeRangeFrom: 2,
   activeRangeTo: 30,
   activeRangeStep: 1,
   activeDrawdownValues: "10,20,30,40,50",

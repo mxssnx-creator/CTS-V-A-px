@@ -33,6 +33,7 @@ export interface Settings {
    * Range 3–30 step 1, default 5.
    */
   minStep: number
+  trailingMinStep: number
 
   // Base Strategy
   baseValueRangeMin: number

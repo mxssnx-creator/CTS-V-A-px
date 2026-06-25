@@ -9,7 +9,7 @@ import { initRedis, getRedisClient } from "@/lib/redis-db"
 export interface IndicationConfig {
   id: string
   connectionId: string
-  steps: number // 3-30
+  steps: number // 2-30
   drawdown_ratio: number // 0.01-0.5
   active_ratio: number // 0.5-0.9
   last_part_ratio: number // 0.1-0.5

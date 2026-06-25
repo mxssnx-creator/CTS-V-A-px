@@ -157,7 +157,7 @@ export class IndicationCalculator {
 
 ┌─ DIRECTION INDICATIONS ─────────────────────────────────────────┐
 │ BASE PARAMETERS:                                                 │
-│ • Range: 3 to 30 (step 1) = 28 variations                       │
+│ • Range: 2 to 30 (step 1) = 28 variations                       │
 │ • Drawdown Ratio: 0.1 to 0.5 (step 0.1) = 5 variations          │
 │   Values: 0.1 (10%), 0.2 (20%), 0.3 (30%), 0.4 (40%), 0.5 (50%) │
 │                                                                  │
@@ -176,7 +176,7 @@ export class IndicationCalculator {
 
 ┌─ MOVE INDICATIONS ──────────────────────────────────────────────┐
 │ BASE PARAMETERS:                                                 │
-│ • Range: 3 to 30 (step 1) = 28 variations                       │
+│ • Range: 2 to 30 (step 1) = 28 variations                       │
 │ • Drawdown Ratio: 0.1 to 0.5 (step 0.1) = 5 variations          │
 │   Values: 0.1 (10%), 0.2 (20%), 0.3 (30%), 0.4 (40%), 0.5 (50%) │
 │                                                                  │

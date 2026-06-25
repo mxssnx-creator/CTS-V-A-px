@@ -83,7 +83,6 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
     if (apiTypes.length > 0 && !apiTypes.includes(formData.api_type)) {
       setFormData(prev => ({ ...prev, api_type: apiTypes[0] }))
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formData.exchange])
 
   useEffect(() => {

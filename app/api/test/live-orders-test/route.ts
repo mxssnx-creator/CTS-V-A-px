@@ -111,6 +111,15 @@ function extractPositionMetrics(position: any): {
   return { quantity: size, entryPrice, side }
 }
 
+function protectionTestQuantity(positionSymbol: string, positionQuantity: number, fraction = 0.1, cap?: number): number {
+  const venueMin = getVenueMinQty(positionSymbol)
+  const requested = Math.max(positionQuantity * fraction, 0)
+  const capped = cap && cap > 0 ? Math.min(requested, cap) : requested
+  if (capped >= venueMin) return capped
+  if (positionQuantity >= venueMin) return venueMin
+  return positionQuantity
+}
+
 interface TestResult {
   testName: string
   success: boolean
@@ -557,7 +566,7 @@ async function testStopLossOrder(
     // accepting that the test may close more than 10% of the position
     // when 10% itself rounds below the venue minimum — that's strictly
     // better than the test failing on a healthy connector.
-    const quantity = Math.max(metrics.quantity * 0.1, getVenueMinQty(position.symbol))
+    const quantity = protectionTestQuantity(position.symbol, metrics.quantity)
 
     const slSymbol = toCanonicalSymbol(position.symbol)
     if (slSymbol !== position.symbol) {
@@ -893,8 +902,7 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
     // venue's per-base-asset minimum (e.g. 0.0001 BTC on BingX) so the
     // request never trips code=110422 "minimum size per order". The
     // floor wins over the cap when the venue minimum is larger.
-    const venueMin = getVenueMinQty(position.symbol)
-    const quantity = Math.max(Math.min(metrics.quantity * 0.1, 0.001), venueMin)
+    const quantity = protectionTestQuantity(position.symbol, metrics.quantity, 0.1, 0.001)
     // Use the extracted side rather than `position.side` so connectors
     // that report direction via `positionSide` / sign-of-size still work.
     const closeSide = isShortLc ? "buy" : "sell"

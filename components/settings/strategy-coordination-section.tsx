@@ -118,16 +118,25 @@ export interface CoordinationSettings {
    * 10–15) keeps only longer, smoother windows that typically yield higher
    * signal quality at the cost of slower response.
    *
-   * Range 3..30 step 1, default 5.
+   * Range 2..30 step 1, default 5.
    * Backed by `connection_settings:{conn}.minStep`.
    */
   minStep: number
+
+  /**
+   * Minimum Base step-window size that is allowed to fan out into
+   * independent trailing Sets. Default 6 keeps very noisy 2–5 step Base
+   * windows on the non-trailing path while still allowing normal Base Sets
+   * to be evaluated. Backed by connection_settings:{conn}.trailingMinStep.
+   */
+  trailingMinStep: number
 }
 
 /**
  * Operator-spec defaults.
  * - trailing: on, block: on, dca: off (per directive)
- * - minStep: 5 (default; range 3-30)
+ * - minStep: 5 (default; range 2-30)
+ * - trailingMinStep: 6 (default; range 2-30)
  * - PF defaults set in DEFAULT_STRATEGY_PROFILE (base=1.0, main/real=1.2)
  */
 export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
@@ -150,6 +159,7 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   mainEvalPosCount: 15,
   realEvalPosCount: 10,
   minStep:           5,
+  trailingMinStep:   6,
 }
 
 interface StrategyCoordinationSectionProps {

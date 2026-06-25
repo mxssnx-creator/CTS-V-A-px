@@ -486,6 +486,28 @@ const AXIS_DIRS     = ["long", "short"]    as const
 const AXIS_OUTCOMES = ["pos", "neg"] as const
 type AxisOutcome = (typeof AXIS_OUTCOMES)[number]
 type AxisDir = (typeof AXIS_DIRS)[number]
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
+}
+
+function deriveProtectionFromProfitFactor(
+  profitFactor: number,
+  positionCostPct: number,
+  sizeMultiplier = 1,
+): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
+  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
+  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  // Tie SL to the actual position-cost budget, then apply variant scaling.
+  // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
+  const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
+  const takeProfitPct = clampNumber(stopLossPct * Math.max(1, pf), 0.2, 22)
+  return {
+    takeProfitPct,
+    stopLossPct,
+    effectiveProfitFactor: takeProfitPct / stopLossPct,
+  }
+}
+
 const AXIS_KEY_TABLE: ReadonlyMap<string, string> = (() => {
   const m = new Map<string, string>()
   for (const prev of AXIS_PREV) {
@@ -1292,13 +1314,20 @@ export class StrategyCoordinator {
    * createBaseSets calls in `executeStrategyFlowBatch` share one read.
    */
   private async getEnabledTrailingVariants(): Promise<
-    Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string }>
+    Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string; minStep: number }>
   > {
     if ((this as any)._trailingVariantsCache) return (this as any)._trailingVariantsCache
     try {
       // Lazy import to avoid circular deps in legacy callers
-      const { getAppSettings } = await import("@/lib/redis-db")
+      const { getAppSettings, getRedisClient } = await import("@/lib/redis-db")
       const settings = (await getAppSettings()) || {}
+      let trailingMinStep = 6
+      try {
+        const client = getRedisClient()
+        const cs = (await client.hgetall(`connection_settings:${this.connectionId}`).catch(() => null)) as Record<string, string> | null
+        const rawMin = Number(cs?.trailingMinStep ?? cs?.trailing_min_step ?? (settings as any).trailingMinStep ?? 6)
+        if (Number.isFinite(rawMin)) trailingMinStep = Math.min(30, Math.max(2, Math.round(rawMin)))
+      } catch { /* default stays */ }
       const enabledMaster = settings.strategyBaseTrailingEnabled !== false
       if (!enabledMaster) {
         ;(this as any)._trailingVariantsCache = []
@@ -1319,7 +1348,7 @@ export class StrategyCoordinator {
         tokens = raw.split(/[\s,]+/).filter(Boolean)
       }
 
-      const profiles: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string }> = []
+      const profiles: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string; minStep: number }> = []
       for (const token of tokens) {
         if (typeof token !== "string") continue
         const [sStr, kStr] = token.split(":")
@@ -1329,7 +1358,7 @@ export class StrategyCoordinator {
         if (start <= 0 || stop <= 0) continue
         // tag is the canonical compact identifier used in setKey suffix
         const tag = `t${Math.round(start * 100)}-${Math.round(stop * 100)}`
-        profiles.push({ startRatio: start, stopRatio: stop, stepRatio: stop / 2, tag })
+        profiles.push({ startRatio: start, stopRatio: stop, stepRatio: stop / 2, tag, minStep: trailingMinStep })
       }
       ;(this as any)._trailingVariantsCache = profiles
       return profiles
@@ -1443,7 +1472,7 @@ export class StrategyCoordinator {
     // sentinel "untrailed" pass so the body of the loop is shared between
     // both paths.
     const trailingVariants = await this.getEnabledTrailingVariants()
-    const variantPasses: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string } | null> =
+    const variantPasses: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string; minStep: number } | null> =
       trailingVariants.length > 0 ? trailingVariants : [null]
 
     for (const variant of variantPasses) {
@@ -1459,6 +1488,22 @@ export class StrategyCoordinator {
         for (const ind of group.indications) {
           if (entryIdx >= maxEntries) break
           // Always parse as numbers — indication fields may arrive as strings from Redis hgetall
+          if (variant) {
+            // Only explicit step-window metadata participates in the
+            // trailing-min-step gate. Do NOT fall back to unrelated fields
+            // such as `range` or `consecutiveSteps`: those are volatility /
+            // pattern measurements, not Base position-window sizes, and using
+            // them here incorrectly filtered valid trailing Sets out of live
+            // production. Legacy indications without step metadata remain
+            // eligible so old saved runs do not lose trailing coverage.
+            const explicitStep =
+              ind.metadata?.stepWindow ??
+              ind.metadata?.step ??
+              ind.metadata?.windowSize ??
+              ind.metadata?.period
+            const rawStep = explicitStep == null ? Number.POSITIVE_INFINITY : Number(explicitStep)
+            if (Number.isFinite(rawStep) && rawStep < variant.minStep) continue
+          }
           const rawConf = parseFloat(String(ind.confidence ?? 0.5))
           const conf = Number.isFinite(rawConf) ? rawConf : 0.5
           const rawPF = parseFloat(String(ind.profitFactor ?? ind.profit_factor ?? 0))
@@ -3555,7 +3600,28 @@ export class StrategyCoordinator {
     }
 
     const metrics = this.METRICS.live
-    const maxLive = this.config.maxLiveSets || 500
+    let maxLive = this.config.maxLiveSets || 500
+    let livePositionCostPct = 0.1
+    try {
+      const { getConnection } = await import("@/lib/redis-db")
+      const [conn, connSettings] = await Promise.all([
+        getConnection(this.connectionId).catch(() => null),
+        getRedisClient().hgetall(`connection_settings:${this.connectionId}`).catch(() => ({})),
+      ])
+      const exchange = String((conn as any)?.exchange || "").toLowerCase()
+      // BingX commonly enforces a 200-open-order ceiling. Each live position
+      // can carry two reduce-only control orders (SL + TP), so cap dispatch to
+      // 90 positions per cycle (≤180 controls) and leave room for manual orders,
+      // in-flight cancels, and venue-side lag.
+      if (exchange === "bingx") maxLive = Math.min(maxLive, 90)
+      const rawCost = Number((connSettings as any)?.exchangePositionCost ?? (connSettings as any)?.positionCost ?? "")
+      if (Number.isFinite(rawCost) && rawCost > 0) livePositionCostPct = rawCost
+    } catch (err) {
+      console.warn(
+        `[v0] [StrategyFlow] ${this.connectionId}:${symbol} live dispatch settings read failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
 
     // P0-2: Live filter axes are PF-min + DDT-max ONLY (then rank by
     // avgProfitFactor and take top N). Confidence is advisory metadata.
@@ -3936,10 +4002,18 @@ export class StrategyCoordinator {
                 // Real-stage tuner's per-variant performance bias.
                 const effectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
 
-                // Derive SL/TP % from the set's profit factor. The pipeline
-                // converts these to concrete prices after the entry fills.
-                const tp = Math.max(0.5, (effectivePF - 1) * 100)
-                const sl = Math.min(5, (100 / Math.max(1, effectivePF)) * 0.5)
+                // Derive SL/TP % from PF and the actual position-cost budget.
+                // The live-stage converts these percentages to concrete prices
+                // after fill. Keeping TP/SL ratio-aligned ensures PF comparisons
+                // are meaningful and variant volume multipliers are reflected in
+                // the risk band used for the live exchange order.
+                const protection = deriveProtectionFromProfitFactor(
+                  effectivePF,
+                  livePositionCostPct,
+                  effectiveSizeMult,
+                )
+                const tp = protection.takeProfitPct
+                const sl = protection.stopLossPct
 
                 const liveResult = await executeLivePosition(
                   this.connectionId,
@@ -3966,7 +4040,7 @@ export class StrategyCoordinator {
                     ratios: {
                       // Use effectivePF (coord-record tuned) so risk ratios reflect
                       // the Real-stage performance bias rather than raw Base entry PF.
-                      profitabilityRatio: effectivePF,
+                      profitabilityRatio: protection.effectiveProfitFactor,
                       accountRiskRatio: sl / 100,
                       successRateRatio: bestEntry.confidence,
                       consistencyRatio: set.avgConfidence,
