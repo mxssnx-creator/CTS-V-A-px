@@ -6,6 +6,7 @@ import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
  * GET /api/trade-engine/structured-logs
  * Retrieve detailed structured engine processing logs
  */
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     await initRedis()

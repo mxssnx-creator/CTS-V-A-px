@@ -6,6 +6,7 @@ import { SystemLogger } from "@/lib/system-logger"
  * Comprehensive Monitoring Endpoint
  * Consolidates all system monitoring data into a single response
  */
+export const dynamic = "force-dynamic"
 export async function GET() {
   const startTime = Date.now()
 
