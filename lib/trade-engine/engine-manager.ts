@@ -15,7 +15,7 @@ const _ENGINE_BUILD_VERSION = "11.0.0"
 // This allows stale closures from old code to continue without ReferenceError
 // The variable is defined but not used - new code doesn't reference it
 declare global {
-  // eslint-disable-next-line no-var
+
   var totalStrategiesEvaluated: number
 }
 if (typeof globalThis.totalStrategiesEvaluated === "undefined") {
@@ -593,6 +593,10 @@ export class TradeEngineManager {
         console.warn("[v0] [Engine] ensureJustUniqueProgression failed, falling back to archive:", ensureErr)
         this.epoch = this.lockHandle?.epoch ?? Date.now()
         await ProgressionStateManager.archiveAndStartNewProgression(this.connectionId, this.epoch).catch(() => {})
+        await getRedisClient().hset(`progression:${this.connectionId}`, {
+          engine_started: "true",
+          last_update: new Date().toISOString(),
+        }).catch(() => {})
       }
 
       // Initialize engine state
@@ -625,7 +629,7 @@ export class TradeEngineManager {
       try {
         const redisClient = getRedisClient()
         const symbolCount = symbols.length
-        const symbolsHash = symbols.sort().join("|") // simple deterministic hash
+        const symbolsHash = symbols.slice().sort().join("|") // simple deterministic hash; do not reorder runtime processing
         // Snapshot a minimal but useful slice of current connection settings
         const connData = (await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({}))) as Record<string, string>
         const settingsSnapshot = {
@@ -634,6 +638,7 @@ export class TradeEngineManager {
           is_live_trade: connData.is_live_trade || "0",
           is_preset_trade: connData.is_preset_trade || "0",
           live_volume_factor: connData.live_volume_factor ?? String(MIN_VOLUME_FACTOR),
+          live_volume_factor: connData.live_volume_factor || "0.1",
           connection_method: connData.connection_method || "library",
           updated_at: new Date().toISOString(),
         }
@@ -938,7 +943,7 @@ export class TradeEngineManager {
       // Picks up operator edits to connection settings and applies
       // them WITHOUT requiring a manual restart. See `applyPendingSettingsChange`.
       this.startSettingsWatcher()
-      
+
       // Phase 6: Boot complete. The engine is now "ready":
       //   - Cache-hit path: live_trading @ 100% (set above).
       //   - Cache-miss path: phase stays at `prehistoric_data` with live
@@ -960,7 +965,7 @@ export class TradeEngineManager {
         realtimeInterval: config.realtimeInterval,
         prehistoricCached: cacheHit,
       })
-      
+
       // Also update engine state to indicate all phases are running
       await setSettings(`trade_engine_state:${this.connectionId}`, {
         all_phases_started: true,
@@ -970,7 +975,7 @@ export class TradeEngineManager {
         live_trading_started: true,
         updated_at: new Date().toISOString(),
       })
-      
+
       await logProgressionEvent(this.connectionId, "engine_started", "info", "Trade engine fully started", {
         symbols: symbols.length,
         phases: 6,
@@ -1003,7 +1008,7 @@ export class TradeEngineManager {
       if (this.prehistoricTimer) { clearTimeout(this.prehistoricTimer); this.prehistoricTimer = undefined }
       if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = undefined }
       if (this.heartbeatTimer)   { clearInterval(this.heartbeatTimer);   this.heartbeatTimer = undefined }
-      
+
       await this.updateProgressionPhase("error", 0, errorMsg)
       await this.updateEngineState("error", errorMsg)
       await this.setRunningFlag(false)
@@ -1436,7 +1441,7 @@ export class TradeEngineManager {
         indicationConfigs: configInitResult.indications,
         strategyConfigs: configInitResult.strategies,
       })
-      
+
       // Process prehistoric data: only missing ranges, step by timeframe interval
       const processingResult = await configProcessor.processPrehistoricData(
         symbols,
@@ -1573,7 +1578,7 @@ export class TradeEngineManager {
       await logProgressionEvent(this.connectionId, "prehistoric_error", "error", "Prehistoric processing failed", {
         error: error instanceof Error ? error.message : String(error),
       })
-      
+
       try {
         await setSettings(`trade_engine_state:${this.connectionId}`, {
           prehistoric_data_loaded: false,
@@ -1581,7 +1586,7 @@ export class TradeEngineManager {
           updated_at: new Date().toISOString(),
         })
       } catch { /* ignore */ }
-      
+
       console.log("[v0] [Prehistoric] Proceeding with realtime processing despite prehistoric failure")
     }
   }
@@ -1721,7 +1726,7 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
-      
+
       // Check pause state before executing cycle (cached, 1 s TTL)
       try {
         if (await isGloballyPausedCached()) {
@@ -1732,7 +1737,7 @@ export class TradeEngineManager {
       } catch (err) {
         // Ignore Redis errors - continue with cycle
       }
-      
+
       const startTime = Date.now()
       // Local abort flag — when true, the finally block will NOT schedule the next cycle.
       let aborted = false
@@ -1841,15 +1846,10 @@ export class TradeEngineManager {
         // writes its own error counters to Redis inline (see below).
         // This guarantees correct counts even when withCycleDeadline
         // fires before all tasks settle — no silent data loss.
-        // Phase 4 live order execution reference — loaded once at module
-        // level (see lazy-init helpers at top of file). Previously this
-        // was `require("./stages/live-stage")` which pulled the entire
-        // 5500-line module into every pipelineDeps object on every cycle.
         const pipelineDeps = {
           indication: this.indicationProcessor,
           strategy: this.strategyProcessor,
           realtime: this.realtimeProcessor,
-          liveStage: __liveStage || (__liveStage = await import("./stages/live-stage")),
         }
         const pipelineResults = await withCycleDeadline(
           mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>
@@ -1879,6 +1879,7 @@ export class TradeEngineManager {
                 symbol,
                 mode: "realtime" as const,
                 indicationCount: 0,
+                indicationTypeCounts: {},
                 pseudoUpdates: 0,
                 strategiesEvaluated: 0,
                 liveReady: 0,
@@ -1916,29 +1917,17 @@ export class TradeEngineManager {
           pipelinePseudoUpdates += r.pseudoUpdates
         }
 
-        // Build per-type counts from pipeline result metadata.
-        // pipelineResults carry indicationCount (total per symbol) but not the
-        // individual indication objects (processIndication returns them inside
-        // the processor and the count is bubbled up via PipelineCycleResult).
-        // The canonical type breakdown comes from the active indication configs;
-        // we approximate it here as: symbols that produced > 0 indications
-        // contributed one "realtime" type indication per symbol (the inline
-        // PF-based fallback). When the full indication pipeline is wired in,
-        // the per-type field will reflect real type keys from the processor.
+        // Build per-type counts from the actual indications emitted by
+        // processIndication. PipelineCycleResult carries an already-reduced
+        // map so this loop preserves canonical live families (direction, move,
+        // active, optimal, auto, and any future processor-emitted types) without
+        // synthesizing pseudo-types such as pf_inline/strategy_eval/live_ready.
         const indicationTypeCounts: Record<string, number> = {}
         for (const r of pipelineResults) {
-          if (r.indicationCount > 0) {
-            // Tag indications from this cycle. The processor uses "pf_inline"
-            // as the type when falling back to the inline PF-based indication;
-            // real types (sma_cross, rsi, macd, etc.) will appear here once the
-            // indication pipeline emits them with a `type` field.
-            indicationTypeCounts["pf_inline"] = (indicationTypeCounts["pf_inline"] || 0) + r.indicationCount
-          }
-          if (r.strategiesEvaluated > 0) {
-            indicationTypeCounts["strategy_eval"] = (indicationTypeCounts["strategy_eval"] || 0) + r.strategiesEvaluated
-          }
-          if (r.liveReady > 0) {
-            indicationTypeCounts["live_ready"] = (indicationTypeCounts["live_ready"] || 0) + r.liveReady
+          for (const [type, count] of Object.entries(r.indicationTypeCounts ?? {})) {
+            if (count > 0) {
+              indicationTypeCounts[type] = (indicationTypeCounts[type] ?? 0) + count
+            }
           }
         }
         void pipelineStrategiesEvaluated; void pipelineLiveReady; void pipelinePseudoUpdates
@@ -1946,6 +1935,12 @@ export class TradeEngineManager {
         const totalIndications = indicationResults.reduce((sum: number, arr: any[]) => sum + (arr?.length || 0), 0)
         // producedIndications = totalIndications > 0
         producedIndications = totalIndications > 0
+        const missingTypeBreakdown = totalIndications > 0 && Object.keys(indicationTypeCounts).length === 0
+        if (missingTypeBreakdown) {
+          console.warn(
+            `[v0] [IndicationProcessor] WARNING: produced ${totalIndications} indications but no indication types were reported`,
+          )
+        }
 
         // Increment cycle count BEFORE writing to Redis so the stored value is accurate
         cycleCount++
@@ -2039,15 +2034,11 @@ export class TradeEngineManager {
           if (cycleCount % 500 === 1) {
             writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
           }
-          // GATE ON REAL PRODUCTION: `indicationTypeCounts` is intentionally
-          // left empty here (per-type counters are written authoritatively by
-          // trackIndicationStats inside the processor). The cumulative
-          // `indications_count` and the "live" cycle counter must therefore be
-          // gated on the REAL produced total — `totalIndications` — not on the
-          // always-empty indicationTypeCounts map. The previous guard
-          // (`Object.keys(indicationTypeCounts).length > 0`) was always false,
-          // so indications_count / indication_live_cycle_count never advanced
-          // and the dashboard's total-indications tile was stuck at 0.
+          // GATE ON REAL PRODUCTION: total indication telemetry remains based
+          // on the produced total, while per-type counters are now written from
+          // the real processor-emitted type map. If a cycle produces signals but
+          // no type map, the warning above surfaces the mismatch without losing
+          // the cumulative total.
           if (totalIndications > 0) {
             writes.push(client.hincrby(redisKey, "indication_live_cycle_count", 1))
             for (const [type, count] of Object.entries(indicationTypeCounts)) {
@@ -2206,6 +2197,7 @@ export class TradeEngineManager {
     return
     // The original loop body below is unreachable — preserved only as
     // a reference for the legacy behaviour. Safe to delete in a follow-up.
+
     let cycleCount = 0
     let totalDuration = 0
     let errorCount = 0
@@ -2259,7 +2251,7 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
-      
+
       // Check pause state before executing cycle (cached, 1 s TTL)
       try {
         if (await isGloballyPausedCached()) {
@@ -2270,7 +2262,7 @@ export class TradeEngineManager {
       } catch (err) {
         // Ignore Redis errors - continue with cycle
       }
-      
+
       const startTime = Date.now()
       let producedStrategies = false
 
@@ -2329,7 +2321,7 @@ export class TradeEngineManager {
         const evaluatedThisCycle = strategyResults.reduce((sum: number, result: any) => sum + (result?.strategiesEvaluated || 0), 0)
         const liveReadyThisCycle = strategyResults.reduce((sum: number, result: any) => sum + (result?.liveReady || 0), 0)
         producedStrategies = evaluatedThisCycle > 0
-        
+
         // Defensive: handle stale closures from HMR
         try {
           totalStrategiesEvaluated += evaluatedThisCycle
@@ -2726,6 +2718,7 @@ export class TradeEngineManager {
     }
     return
     // ── Legacy body preserved as unreachable reference ───────────────────
+
     let cycleCount_legacy = 0
     void cycleCount_legacy
     let cycleCount2 = 0
@@ -3394,7 +3387,7 @@ export class TradeEngineManager {
     if (cycleCount < 20) {
       return "healthy"
     }
-    
+
     // Very relaxed thresholds - only unhealthy if totally failing
     if (successRate < 30 || lastCycleDuration > threshold * 10) {
       return "unhealthy"
@@ -3465,7 +3458,7 @@ export class TradeEngineManager {
           }
           if (Array.isArray(forceSymbols) && forceSymbols.length > 0) {
             console.log(`[v0] [getSymbols] ${this.connectionId}: using force_symbols (${forceSymbols.length} symbols from migration/admin override)`)
-            return forceSymbols
+            return forceSymbols.map(String).filter(Boolean)
           }
 
           // ── Secondary: self-written symbols from previous engine start ─────
@@ -3477,16 +3470,19 @@ export class TradeEngineManager {
           if (typeof connSymbols === "string") {
             try { connSymbols = JSON.parse(connSymbols) } catch { /* ignore */ }
           }
-          if (Array.isArray(connSymbols) && connSymbols.length > 0) return connSymbols
+          if (Array.isArray(connSymbols) && connSymbols.length > 0) return connSymbols.map(String).filter(Boolean)
         }
 
         if (connSettings && typeof connSettings === "object") {
-          const symbolsField = (connSettings as any).active_symbols || (connSettings as any).symbols
+          const symbolsField =
+            (connSettings as any).force_symbols ||
+            (connSettings as any).active_symbols ||
+            (connSettings as any).symbols
           let symbols = symbolsField
           if (typeof symbols === "string") {
             try { symbols = JSON.parse(symbols) } catch { /* ignore */ }
           }
-          if (Array.isArray(symbols) && symbols.length > 0) return symbols
+          if (Array.isArray(symbols) && symbols.length > 0) return symbols.map(String).filter(Boolean)
         }
 
         // Global main-symbols fallback — the UI stores these as fields on
@@ -3499,7 +3495,7 @@ export class TradeEngineManager {
         const useMainSymbols = appSettings?.useMainSymbols === true || appSettings?.useMainSymbols === "true" || appSettings?.useMainSymbols === "1"
         if (useMainSymbols === true) {
           const mainSymbols = appSettings?.mainSymbols
-          if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols
+          if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols.map(String).filter(Boolean)
         }
 
         return ["DRIFTUSDT"]
@@ -3540,7 +3536,7 @@ export class TradeEngineManager {
         updated_at: new Date().toISOString(),
         last_indication_run: new Date().toISOString(),
       })
-      
+
       console.log(`[v0] [Engine State] Updated ${stateKey}: status=${status}`)
     } catch (error) {
       console.error("[v0] Failed to update engine state:", error)
@@ -3552,8 +3548,8 @@ export class TradeEngineManager {
    * Phases: idle -> initializing -> prehistoric_data -> indications -> strategies -> realtime -> live_trading
    */
   async updateProgressionPhase(
-    phase: string, 
-    progress: number, 
+    phase: string,
+    progress: number,
     detail: string,
     subProgress?: { current: number; total: number; item?: string }
   ): Promise<void> {
@@ -3569,14 +3565,14 @@ export class TradeEngineManager {
         connection_id: this.connectionId,
         updated_at: new Date().toISOString(),
       }
-      
+
       await setSettings(key, progressionData)
-      
+
       // Log progression update with full details
-      const msg = subProgress && subProgress.total > 0 
+      const msg = subProgress && subProgress.total > 0
         ? `${detail} (${subProgress.current}/${subProgress.total}${subProgress.item ? ` - ${subProgress.item}` : ""})`
         : detail
-      
+
       console.log(`[v0] [Progression] ${this.connectionId}: ${phase} @ ${progress}% - ${msg}`)
     } catch (error) {
       console.error("[v0] Failed to update progression phase:", error)
@@ -3667,12 +3663,11 @@ export class TradeEngineManager {
    */
   /**
    * Tolerance for transient extend failures BEFORE we declare ownership
-   * lost and self-stop. With LOCK_EXTEND_INTERVAL_MS = 15s and the
-   * lock TTL = 90s we can comfortably tolerate up to 5 consecutive
-   * miss-extends (75s) before the lock would naturally expire. 3 was
-   * too tight ��� a Redis blip of ~46s would cascade-self-stop ALL
-   * engines, requiring full auto-start-sweep restart (~75s total
-   * downtime). 5 extends the survival window to 75s before self-stop.
+   * lost and self-stop. With LOCK_EXTEND_INTERVAL_MS = 30s and the
+   * lock TTL = 300s we can tolerate 5 consecutive miss-extends (~150s)
+   * without healthy engines self-stopping during slow exchange calls or
+   * dev-route recompiles. Shorter windows caused live tests to lose
+   * ownership while market/order requests were still in flight.
    */
   private extendFailuresInARow = 0
   private static readonly EXTEND_FAILURES_TOLERATED = 5

@@ -42,6 +42,7 @@ function clampFactor(raw: unknown): number | null {
   return Math.max(FACTOR_MIN, Math.min(FACTOR_MAX, n))
 }
 
+export const dynamic = "force-dynamic"
 export async function GET(_request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   try {
@@ -55,6 +56,10 @@ export async function GET(_request: NextRequest, { params }: { params: Promise<{
     // slider hydrates at exactly the value the engine will apply.
     const liveFactor = clampFactor(conn.live_volume_factor) ?? MIN_VOLUME_FACTOR
     const presetFactor = clampFactor(conn.preset_volume_factor) ?? MIN_VOLUME_FACTOR
+    // Default unset connections to the canonical minimum so the
+    // slider hydrates at exactly the value the engine will apply.
+    const liveFactor = clampFactor(conn.live_volume_factor) ?? FACTOR_MIN
+    const presetFactor = clampFactor(conn.preset_volume_factor) ?? FACTOR_MIN
     return NextResponse.json({
       connectionId: id,
       live_volume_factor: liveFactor,
@@ -128,6 +133,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       connectionId: id,
       live_volume_factor: live ?? clampFactor(conn.live_volume_factor) ?? MIN_VOLUME_FACTOR,
       preset_volume_factor: preset ?? clampFactor(conn.preset_volume_factor) ?? MIN_VOLUME_FACTOR,
+      live_volume_factor: live ?? clampFactor(conn.live_volume_factor) ?? FACTOR_MIN,
+      preset_volume_factor: preset ?? clampFactor(conn.preset_volume_factor) ?? FACTOR_MIN,
     })
   } catch (error) {
     console.error("[v0] Failed to update volume factors:", error)

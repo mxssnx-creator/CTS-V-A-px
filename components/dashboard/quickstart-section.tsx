@@ -953,6 +953,7 @@ export function QuickstartSection() {
         } catch { /* ignore corrupted sessionStorage data */ }
       }
     } catch { /* localStorage may be unavailable */ }
+
   }, [])
 
   // Persist QuickStart UI session flags so page reloads restore the live
