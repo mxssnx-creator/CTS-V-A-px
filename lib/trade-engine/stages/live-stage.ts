@@ -2467,6 +2467,18 @@ export async function executeLivePosition(
         livePosition.statusReason,
         { symbol: realPosition.symbol, direction: realPosition.direction },
       ).catch(() => {})
+      await releaseLock(
+        connectionId,
+        realPosition.symbol,
+        realPosition.direction + _lockDirSuffix,
+      ).catch(() => {})
+      pushStep(
+        livePosition,
+        "lock_release",
+        true,
+        `Released ${realPosition.symbol} ${realPosition.direction}${_lockDirSuffix} lock after blocked live order`,
+      )
+      await savePosition(livePosition)
       return livePosition
     }
 
