@@ -1111,13 +1111,9 @@ export async function GET(
     //
     // We surface these alongside the stage-level detail so the dashboard can
     // show "Avg PF / Avg DDT per variant" over the lifetime of the run.
-    // ���─ PAUSE VARIANT ────────────────────────────────────────────────
-    // The Real stage and StrategyCoordinator both write a 5th variant
-    // bucket — `pause` — for entries placed under the global pause-axis
-    // ratio config. The previous `variantKeys` list dropped this row so
-    // the dashboard quietly missed the count. Adding it here surfaces
-    // those entries in `strategyVariants.pause` of the response.
-    const variantKeys = ["default", "trailing", "block", "dca", "pause"] as const
+    // Pause is not a strategy variant; it is exposed below as a
+    // position-count axis (`axisAccumulation.pause`).
+    const variantKeys = ["default", "trailing", "block", "dca"] as const
     const variantDetail: Record<string, Record<string, number>> = {}
     await Promise.all(
       variantKeys.map(async (variant) => {

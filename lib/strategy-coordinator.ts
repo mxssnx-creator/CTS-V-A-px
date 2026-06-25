@@ -92,7 +92,7 @@ export interface StrategySet {
   
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
-  variant?: "default" | "trailing" | "block" | "dca" | "pause"
+  variant?: "default" | "trailing" | "block" | "dca"
   /**
    * ── Position-count axis windows that this Set satisfies ────────────
    *
@@ -296,7 +296,7 @@ export interface SetCoordRecord {
   /** Points at the originating Base Set in BaseRegistry. */
   parentKey: string
   /** Variant profile this record represents. */
-  variant: "default" | "trailing" | "block" | "dca" | "pause"
+  variant: "default" | "trailing" | "block" | "dca"
   /** Axis tuple — null for profile-variant (non-axis) records. */
   axisWindows: StrategySet["axisWindows"] | null
   /**
@@ -569,7 +569,7 @@ export class StrategyCoordinator {
    * Per-cycle cached coordination settings (axes + variants toggles).
    * The coordinator loads this from connection settings on each flow and
    * respects the operator's toggles for position-count axes and categorical
-   * variants (trailing, block, dca, pause). Cached for `_coordinationTtlMs`
+   * variants (trailing, block, dca). Cached for `_coordinationTtlMs`
    * (5s) to avoid spamming Redis on every symbol's evaluation.
    */
   private _coordinationSettings: {
@@ -583,7 +583,6 @@ export class StrategyCoordinator {
       trailing: boolean
       block:    boolean
       dca:      boolean
-      pause:    boolean
     }
     /**
      * Block-strategy live-position × volume-ratio coordination knobs.
@@ -639,7 +638,6 @@ export class StrategyCoordinator {
       trailing: true,
       block:    true, // ← ENABLED by default (per spec)
       dca:      true,
-      pause:    true,
     },
     blockVolumeRatio: 1.0,
     blockMaxStack:    3,
@@ -1121,13 +1119,12 @@ export class StrategyCoordinator {
       this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  false)
       this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  0)
 
-      // Variant toggles. Defaults: trailing=true, block=true, dca=false, pause=true
+      // Variant toggles. Defaults: trailing=true, block=true, dca=false
       // (spec: DCA off by default). The bool() helper only falls back to the
       // default when the key is genuinely absent — an explicit "false" is honoured.
       this._coordinationSettings.variants.trailing = bool(s.variantTrailingEnabled, true)
       this._coordinationSettings.variants.block    = bool(s.variantBlockEnabled,    true)
       this._coordinationSettings.variants.dca      = bool(s.variantDcaEnabled,      false)
-      this._coordinationSettings.variants.pause    = bool(s.variantPauseEnabled,    true)
 
       // ── Block-strategy tuning (previously never read from settings) ─────
       // blockVolumeRatio and blockMaxStack control the Block variant's live
@@ -2226,7 +2223,6 @@ export class StrategyCoordinator {
       trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
-      pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
     }
     // Aggregate scalars — computed in the same pass as variantAgg to avoid
     // 4 extra reduce/filter sweeps that each allocate a result value.
@@ -3361,7 +3357,6 @@ export class StrategyCoordinator {
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
-        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       }
       // Slim-path Real Sets carry entries:[] — use set-level scalar aggregates
       // (entryCount, avgProfitFactor, avgDrawdownTime) instead of iterating
@@ -3378,7 +3373,7 @@ export class StrategyCoordinator {
         agg.sumPF          += set.avgProfitFactor * ec
         agg.sumDDT         += (set.avgDrawdownTime || 0) * ec
       }
-      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
+      for (const variant of ["default", "trailing", "block", "dca"] as const) {
         const agg = realVariantAgg[variant]
         // Guard on setsContaining (not entries) so sets with entryCount=0 still
         // contribute their count metadata to the variant hash.
@@ -3477,7 +3472,7 @@ export class StrategyCoordinator {
       // so the stats API can read them without recomputing.
       try {
         const recompute: Promise<any>[] = []
-        for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
+        for (const variant of ["default", "trailing", "block", "dca"] as const) {
           if (realVariantAgg[variant].setsContaining === 0) continue
           const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
           recompute.push(
@@ -3671,6 +3666,109 @@ export class StrategyCoordinator {
 
 
 
+    // ── Live dispatch preselection ──────────────────────────────────────
+    // `qualifying` is the Live candidate pool after PF/DDT/rank/cap. Only
+    // `dispatchSets` are active/running targets for pseudo/live execution:
+    // one per direction for each independent bucket (new, trailing, block,
+    // dca). Pause is intentionally absent here; pause is an axis window
+    // (`axisWindows.pause`), not a strategy variant.
+    const dispatchSets: StrategySet[] = []
+    const dispatchSelected: Array<{
+      setKey: string
+      direction: StrategySet["direction"]
+      variant: StrategySet["variant"] | "default"
+      bucket: "new" | "trailing" | "block" | "dca"
+      isTrailing: boolean
+    }> = []
+    const dispatchSuppressed: Array<{
+      setKey: string
+      direction: StrategySet["direction"]
+      variant: StrategySet["variant"] | "default"
+      bucket: "new" | "trailing" | "block" | "dca"
+      isTrailing: boolean
+      reason: "duplicate_new_direction" | "duplicate_trailing_direction" | "duplicate_block_direction" | "duplicate_dca_direction"
+      detail?: string
+    }> = []
+    {
+      let sawNewLong  = false
+      let sawNewShort = false
+      let sawTrailingLong  = false
+      let sawTrailingShort = false
+      let sawBlockLong  = false
+      let sawBlockShort = false
+      let sawDcaLong    = false
+      let sawDcaShort   = false
+
+      const selectDispatchSet = (s: StrategySet, bucket: "new" | "trailing" | "block" | "dca", isTrailing: boolean) => {
+        dispatchSets.push(s)
+        dispatchSelected.push({
+          setKey: s.setKey,
+          direction: s.direction,
+          variant: s.variant ?? "default",
+          bucket,
+          isTrailing,
+        })
+      }
+      const suppressDispatchSet = (
+        s: StrategySet,
+        bucket: "new" | "trailing" | "block" | "dca",
+        isTrailing: boolean,
+        reason: "duplicate_new_direction" | "duplicate_trailing_direction" | "duplicate_block_direction" | "duplicate_dca_direction",
+        detail?: string,
+      ) => {
+        dispatchSuppressed.push({
+          setKey: s.setKey,
+          direction: s.direction,
+          variant: s.variant ?? "default",
+          bucket,
+          isTrailing,
+          reason,
+          ...(detail ? { detail } : {}),
+        })
+      }
+
+      for (const s of qualifying) {
+        const isBlock = s.variant === "block"
+        const isDca = s.variant === "dca"
+        const isTrailing = s.variant === "trailing" || !!s.trailingProfile
+        const isNew = s.variant === "default" || !s.variant
+        if (s.direction === "long") {
+          if (isTrailing) {
+            if (!sawTrailingLong) { selectDispatchSet(s, "trailing", true); sawTrailingLong = true }
+            else suppressDispatchSet(s, "trailing", true, "duplicate_trailing_direction")
+          } else if (isNew) {
+            if (!sawNewLong) { selectDispatchSet(s, "new", false); sawNewLong = true }
+            else suppressDispatchSet(s, "new", false, "duplicate_new_direction")
+          } else if (isBlock) {
+            if (!sawBlockLong) { selectDispatchSet(s, "block", false); sawBlockLong = true }
+            else suppressDispatchSet(s, "block", false, "duplicate_block_direction")
+          } else if (isDca) {
+            if (!sawDcaLong) { selectDispatchSet(s, "dca", false); sawDcaLong = true }
+            else suppressDispatchSet(s, "dca", false, "duplicate_dca_direction")
+          }
+        } else {
+          if (isTrailing) {
+            if (!sawTrailingShort) { selectDispatchSet(s, "trailing", true); sawTrailingShort = true }
+            else suppressDispatchSet(s, "trailing", true, "duplicate_trailing_direction")
+          } else if (isNew) {
+            if (!sawNewShort) { selectDispatchSet(s, "new", false); sawNewShort = true }
+            else suppressDispatchSet(s, "new", false, "duplicate_new_direction")
+          } else if (isBlock) {
+            if (!sawBlockShort) { selectDispatchSet(s, "block", false); sawBlockShort = true }
+            else suppressDispatchSet(s, "block", false, "duplicate_block_direction")
+          } else if (isDca) {
+            if (!sawDcaShort) { selectDispatchSet(s, "dca", false); sawDcaShort = true }
+            else suppressDispatchSet(s, "dca", false, "duplicate_dca_direction")
+          }
+        }
+      }
+    }
+    const dispatchSelectedJson = JSON.stringify(dispatchSelected)
+    const dispatchSuppressedJson = JSON.stringify(dispatchSuppressed)
+    const dispatchAvgPF = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + st.avgProfitFactor, 0) / dispatchSets.length : 0
+    const dispatchAvgDDT = dispatchSets.length > 0 ? dispatchSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / dispatchSets.length : 0
+    const dispatchEntries = dispatchSets.reduce((s, st) => s + (st.entryCount || 0), 0)
+
     // Persist LIVE sets — slim format (coord keys only). Skip in dev:
     // setSettings writes to InlineLocalRedis (on-heap Map) on every cycle for
     // every symbol; 20 symbols × every 0.3s = 67 writes/s with no reclaim.
@@ -3679,20 +3777,19 @@ export class StrategyCoordinator {
     if (process.env.NODE_ENV !== "development") {
       const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
       await setSettings(liveKey, {
-        setKeys:    qualifying.map((s) => s.setKey),
-        count:      qualifying.length,
+        setKeys:    dispatchSets.map((s) => s.setKey),
+        count:      dispatchSets.length,
         created:    new Date(),
         executable: true,
         _slim:      true,
       })
     }
 
-    // Create pseudo positions from the LIVE-qualifying subset only.
-    // Previously received all `realSets` (up to 3000/symbol), causing N×3 Redis
-    // writes for sets that never reach live dispatch. `qualifying` is the capped
-    // Live subset (typically ≤500/symbol) — the only sets that semantically need
-    // pseudo-position records (they represent active dispatch candidates).
-    await this.createPseudoPositionsFromRealSets(symbol, qualifying)
+    // Create pseudo positions only for dispatch-selected LIVE Sets.
+    // `qualifying` is the candidate pool; `dispatchSets` is the active/running
+    // subset after duplicate-direction suppression. This keeps Live active logs
+    // and pseudo positions aligned with what can actually dispatch.
+    await this.createPseudoPositionsFromRealSets(symbol, dispatchSets)
 
     // Write live set count into progression hash — use hset so count reflects current cycle snapshot.
     // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
@@ -3705,8 +3802,8 @@ export class StrategyCoordinator {
       const liveDetailKey = `strategy_detail:${this.connectionId}:live`
       const liveCountKey = `strategies:${this.connectionId}:live:count`
 
-      const liveAvgPF  = qualifying.length > 0 ? qualifying.reduce((s, st) => s + st.avgProfitFactor, 0) / qualifying.length : 0
-      const liveAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
+      const liveAvgPF  = dispatchAvgPF
+      const liveAvgDDT = dispatchAvgDDT
       const passRatioLive = realSets.length > 0 ? qualifying.length / realSets.length : 0
 
       // ── P1-1: Live-stage per-variant aggregation ──────────────────────
@@ -3722,9 +3819,8 @@ export class StrategyCoordinator {
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
-        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
       }
-      for (const set of qualifying) {
+      for (const set of dispatchSets) {
         // Slim-path sets carry entries: [] — use entryCount + set-level avgPF/DDT
         // so Live variant aggregates are accurate (mirrors Main stage accounting).
         const variant = (set.variant as keyof typeof liveVariantAgg) ?? "default"
@@ -3738,7 +3834,7 @@ export class StrategyCoordinator {
 
       // ── bumpValidPositions — Live-promoted Set counter ─────────────────
       // The `valid_positions:{conn}` hash tracks Sets reaching Live stage.
-      // Skip in dev: qualifying.length × multi() pipeline writes fire every 0.3s
+      // Skip in dev: dispatchSets.length × multi() pipeline writes fire every 0.3s
       // per symbol (up to 400 sets × 20 symbols = 8000 writes/cycle), driving
       // heap pressure faster than GC can reclaim. The "Valid positions" dashboard
       // tile is observability-only; the engine does not read from valid_positions.
@@ -3746,7 +3842,7 @@ export class StrategyCoordinator {
         try {
           const { bumpValidPositions } = await import("@/lib/pos-history")
           const vpPipeline = getRedisClient().multi()
-          for (const set of qualifying) {
+          for (const set of dispatchSets) {
             bumpValidPositions({
               connectionId: this.connectionId,
               symbol,
@@ -3764,7 +3860,7 @@ export class StrategyCoordinator {
       }
 
       const liveVariantWrites: Promise<any>[] = []
-      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
+      for (const variant of ["default", "trailing", "block", "dca"] as const) {
         const agg = liveVariantAgg[variant]
         // Guard on setsContaining — a variant bucket with sets but entryCount=0
         // still contributes count metadata. Avoids writing empty buckets.
@@ -3799,7 +3895,7 @@ export class StrategyCoordinator {
         // Without {symbol}:live fields the `stratCounts.live` bucket in the
         // stats route always returned 0, making the Live column empty.
         client.hset(`strategies_active:${this.connectionId}`, {
-          [`${symbol}:live`]:           String(qualifying.length),
+          [`${symbol}:live`]:           String(dispatchSets.length),
           // live:evaluated = Real Sets that entered Live selection (= candidates)
           [`${symbol}:live:evaluated`]: String(realSets.length),
         }),
@@ -3808,32 +3904,38 @@ export class StrategyCoordinator {
         client.hset(liveDetailKey, {
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
           // for backwards compat; /stats prefers per-symbol sums below.
-          created_sets:      String(qualifying.length),
+          created_sets:      String(dispatchSets.length),
           avg_profit_factor: String(liveAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(liveAvgDDT)),
           evaluated:         String(realSets.length),
           passed_sets:       String(qualifying.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
+          dispatch_candidates: String(qualifying.length),
+          dispatch_selected_count: String(dispatchSets.length),
+          dispatch_suppressed_count: String(dispatchSuppressed.length),
+          dispatch_selected: dispatchSelectedJson,
+          dispatch_suppressed: dispatchSuppressedJson,
           // ── ACTIVELY-RUNNING metrics (operator spec) ──────────������──
-          //   Live's `qualifying` Sets ARE the executed orders. They
-          //   are by definition "running" — exchange has accepted the
-          //   order or is holding the position. `sets_progressing` is
-          //   the real-stage input pool being ranked & capped this
-          //   cycle (i.e. candidates currently progressing toward live
-          //   execution).
-          sets_running_now:         String(qualifying.length),
-          sets_with_open_positions: String(qualifying.length),
+          //   `dispatchSets` are the selected active/running targets.
+          //   `qualifying` remains the candidate pool that passed Live PF/DDT
+          //   and was considered by the duplicate-direction selection.
+          //   `sets_progressing` is the real-stage input pool being ranked &
+          //   capped this cycle.
+          sets_running_now:         String(dispatchSets.length),
+          sets_with_open_positions: String(dispatchSets.length),
           sets_progressing:         String(realSets.length),
           updated_at:        String(Date.now()),
           // Per-symbol fields — see createBaseSets for rationale.
           // Live doesn't compute avg_pos_per_set / avg_pos_eval_real;
           // those keys are intentionally omitted from the per-symbol
           // bundle so /stats's weighted-mean calculator skips them.
-          [`s:${symbol}:created`]:    String(qualifying.length),
-          [`s:${symbol}:entries`]:    String(qualifying.reduce((s, st) => s + (st.entryCount || 0), 0)),
-          [`s:${symbol}:running`]:    String(qualifying.length),
+          [`s:${symbol}:created`]:    String(dispatchSets.length),
+          [`s:${symbol}:entries`]:    String(dispatchEntries),
+          [`s:${symbol}:running`]:    String(dispatchSets.length),
           [`s:${symbol}:progressing`]: String(realSets.length),
           [`s:${symbol}:passed`]:     String(qualifying.length),
+          [`s:${symbol}:dispatch_selected`]: String(dispatchSets.length),
+          [`s:${symbol}:dispatch_suppressed`]: String(dispatchSuppressed.length),
           [`s:${symbol}:evaluated`]:  String(realSets.length),
           [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(liveAvgDDT)),
@@ -3841,7 +3943,7 @@ export class StrategyCoordinator {
         }),
         client.expire(liveDetailKey, 86400),
         // `set` with EX in a single command avoids the separate expire round-trip.
-        client.set(liveCountKey, String(qualifying.length), { EX: 86400 } as any),
+        client.set(liveCountKey, String(dispatchSets.length), { EX: 86400 } as any),
         ...liveVariantWrites,
       ])
     } catch { /* non-critical */ }
@@ -3912,8 +4014,8 @@ export class StrategyCoordinator {
             // findOpenLivePositionByDir + savePosition + incrementMetric +
             // logProgressionEvent) before being deferred.
             //
-            // Fix: pre-select at most 1 Set per direction (the highest-PF one,
-            // already guaranteed by .sort() above) before calling the pipeline.
+            // Fix: use the preselected dispatchSets computed above: at most 1
+            // Set per direction per independent bucket (highest-PF first).
             // Only call executeLivePosition for sets that have a real chance of
             // acquiring the lock or merging — not for the 49 duplicates that
             // will always be deferred on the same cycle.
@@ -3921,7 +4023,7 @@ export class StrategyCoordinator {
             // The qualifying array is already sorted by avgProfitFactor desc.
             //
             // Preselection rules:
-            //   • "new" variants (default, trailing, pause): at most 1 per
+            //   • "new" variants (default/no variant): at most 1 per
             //     direction — first (highest-PF) wins.
             //   • "block" variant: allowed through even when the direction
             //     already has a "new" set selected. Block places an ADD-ON
@@ -3934,29 +4036,11 @@ export class StrategyCoordinator {
             // Without this rule, block/dca sets targeting e.g. long were
             // always dropped because `sawLong=true` was already set by the
             // default set, meaning block strategy NEVER dispatched.
-            const dispatchSets: StrategySet[] = []
-            {
-              let sawNewLong  = false
-              let sawNewShort = false
-              let sawBlockLong  = false
-              let sawBlockShort = false
-              let sawDcaLong    = false
-              let sawDcaShort   = false
-              for (const s of qualifying) {
-                const isBlock = s.variant === "block"
-                const isDca   = s.variant === "dca"
-                const isNew   = !isBlock && !isDca // default / trailing / pause
-                if (s.direction === "long") {
-                  if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
-                  if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
-                  if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
-                } else {
-                  if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
-                  if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
-                  if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
-                }
-                if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
-              }
+            if (dispatchSelected.length > 0 || dispatchSuppressed.length > 0) {
+              console.log(
+                `[v0] [StrategyFlow] ${symbol} LIVE dispatch selection`,
+                JSON.stringify({ dispatchSelected, dispatchSuppressed })
+              )
             }
 
             let placed = 0
@@ -4063,6 +4147,7 @@ export class StrategyCoordinator {
                     parentSetKey: set.parentSetKey,
                     setVariant:   set.variant,
                     axisWindows:  set.axisWindows,
+                    trailingProfile: set.trailingProfile,
                     // Forward the variant size multiplier so VolumeCalculator
                     // can apply Block (1.5–2.0×) or DCA (0.5×) notional scaling
                     // before placing the exchange order. `effectiveSizeMult` has
@@ -4292,10 +4377,10 @@ export class StrategyCoordinator {
         totalCreated: realSets.length,
         passedEvaluation: qualifying.length,
         failedEvaluation: realSets.length - qualifying.length,
-        avgProfitFactor: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgProfitFactor, 0) / qualifying.length : 0,
-        avgDrawdownTime: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgDrawdownTime, 0) / qualifying.length : 0,
+        avgProfitFactor: dispatchAvgPF,
+        avgDrawdownTime: dispatchAvgDDT,
       },
-      sets: qualifying,
+      sets: dispatchSets,
     }
   }
 
@@ -4758,7 +4843,7 @@ export class StrategyCoordinator {
   }
 
   private variantProfiles(): Array<{
-    name: "default" | "trailing" | "block" | "dca" | "pause"
+    name: "default" | "trailing" | "block" | "dca"
     gate: (ctx: PositionContext) => boolean
     configs: Array<{ size: number; leverage: number; state: string; pfBias: number; ddtBias: number }>
   }> {
@@ -4806,33 +4891,7 @@ export class StrategyCoordinator {
           { size: 0.5, leverage: 1, state: "reduce", pfBias: 0.98, ddtBias: 20 },
           { size: 0.5, leverage: 1, state: "close",  pfBias: 0.95, ddtBias: 30 },
         ],
-      },
-      {
-        // ── Pause variant — 1..8 last-position validation windows (step 1) ─���
-        // Spec: *"add Pause 1-8 Pos step 1 to Main additional Sets creation
-        // after Pos prev,Last,cont .. add the 1-8 Last for counting Pause of
-        // validating."* Each sub-config encodes one validation lookback N
-        // (the last N closed positions) — when at least one of them was a
-        // loser the Pause Set throttles back the next entry. The 8 sub-
-        // configs ramp size DOWN and DDT-bias UP as the pause window
-        // widens, so a deeper-history pause produces a more conservative
-        // entry config than a shallow-history one. Gate fires whenever
-        // there is ≥1 closed position to validate against; the closed-only
-        // lookback enforced by `getPositionContext` (P2-1) means floating
-        // mark-to-market PnL never leaks into this trigger.
-        name: "pause",
-        gate: (c) => c.lastPosCount >= 1,
-        configs: [
-          { size: 0.90, leverage: 1, state: "new", pfBias: 1.00, ddtBias: 5  }, // last 1
-          { size: 0.85, leverage: 1, state: "new", pfBias: 1.00, ddtBias: 10 }, // last 2
-          { size: 0.80, leverage: 1, state: "new", pfBias: 1.01, ddtBias: 15 }, // last 3
-          { size: 0.75, leverage: 1, state: "new", pfBias: 1.02, ddtBias: 20 }, // last 4
-          { size: 0.70, leverage: 1, state: "new", pfBias: 1.03, ddtBias: 25 }, // last 5
-          { size: 0.65, leverage: 1, state: "new", pfBias: 1.04, ddtBias: 30 }, // last 6
-          { size: 0.60, leverage: 1, state: "new", pfBias: 1.05, ddtBias: 35 }, // last 7
-          { size: 0.55, leverage: 1, state: "new", pfBias: 1.06, ddtBias: 40 }, // last 8
-        ],
-      },
+      }
     ]
   }
 
@@ -4867,7 +4926,7 @@ export class StrategyCoordinator {
    */
   private variantFingerprint(
     baseSet: StrategySet,
-    variant: "default" | "trailing" | "block" | "dca" | "pause",
+    variant: "default" | "trailing" | "block" | "dca",
     ctx: PositionContext,
   ): string {
     const bPF = Math.round(baseSet.avgProfitFactor * 10) / 10
@@ -4964,6 +5023,7 @@ export class StrategyCoordinator {
       // V8 heap driver (~80 000 object allocations per second).
       entries:         [],
       ...(baseSet.prevPos && { prevPos: baseSet.prevPos }),
+      ...(baseSet.trailingProfile && { trailingProfile: baseSet.trailingProfile }),
     }
   }
 

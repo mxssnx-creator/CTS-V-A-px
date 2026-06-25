@@ -131,7 +131,8 @@ interface LivePosition {
   // dca=0.5, others=1.0). Stored so accumulation can match original sizing.
   sizeMultiplier?: number
   parentSetKey?: string
-  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
+  setVariant?: "default" | "trailing" | "block" | "dca"
+  trailingProfile?: { startRatio: number; stopRatio: number; stepRatio: number }
   accumulatedSetKeys?: string[]
   
   progression?: { step: string; timestamp: number; success: boolean; details: string }[]
@@ -1884,6 +1885,7 @@ export async function executeLivePosition(
     setVariant:     realPosition.setVariant,
     axisWindows:    realPosition.axisWindows,
     sizeMultiplier: realPosition.sizeMultiplier,
+    trailingProfile: realPosition.trailingProfile,
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
   }
 
@@ -1988,7 +1990,7 @@ export async function executeLivePosition(
       // occupied — don't open a second default", not "all orders blocked").
       //
       // We use a variant-scoped lock key for block sets:
-      //   default/trailing/pause/dca: live:lock:{conn}:{sym}:{dir}
+      //   default/trailing/dca: live:lock:{conn}:{sym}:{dir}
       //   block:                      live:lock:{conn}:{sym}:{dir}:block
       //
       // This allows at most 1 default + 1 block position per direction per
