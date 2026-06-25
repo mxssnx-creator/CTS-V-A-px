@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { getAllConnections, initRedis } from "@/lib/redis-db"
 import { ensureDefaultExchangesExist } from "@/lib/default-exchanges-seeder"
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 /**

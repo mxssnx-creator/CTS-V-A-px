@@ -3,6 +3,7 @@ import { query, execute } from "@/lib/db"
 import { nanoid } from "nanoid"
 import { SystemLogger } from "@/lib/system-logger"
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 export async function GET(request: NextRequest) {

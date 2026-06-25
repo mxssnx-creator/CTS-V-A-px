@@ -4,6 +4,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import { getTradeEngineStatus } from "@/lib/trade-engine"
 
 // GET real-time status for all active connections
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     console.log("[v0] Fetching real connection statuses from Redis")
