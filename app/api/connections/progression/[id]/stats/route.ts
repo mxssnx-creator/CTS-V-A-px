@@ -2344,16 +2344,17 @@ export async function GET(
         live: stratDetail.live,
       },
 
-      // Per-variant strategy breakdown (Default / Trailing / Block / DCA).
+      // Per-variant strategy breakdown (Default / Trailing / Block / DCA / Pause).
       // Written by StrategyCoordinator.createMainSets based on each entry's
       // positionState + leverage + size profile. The `overall` row is a
       // weighted aggregate so the UI can show one canonical PF/DDT alongside
-      // the four variant rows. These counts are cumulative since run start.
+      // all five variant rows. These counts are cumulative since run start.
       strategyVariants: {
         default:  variantDetail.default,
         trailing: variantDetail.trailing,
         block:    variantDetail.block,
         dca:      variantDetail.dca,
+        pause:    variantDetail.pause,
         overall:  variantOverall,
       },
 
