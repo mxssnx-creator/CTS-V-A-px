@@ -5,6 +5,7 @@ import { StrategyEvaluator } from "@/lib/strategy-evaluator"
 import { MetricsAggregator } from "@/lib/metrics-aggregator"
 import { getEngineLogger } from "@/lib/engine-logger"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
