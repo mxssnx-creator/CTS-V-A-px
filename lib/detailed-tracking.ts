@@ -104,7 +104,7 @@ export interface StrategyStageTracking {
     maxDrawdownTime: number           // gate threshold (e.g. 1440 min)
     // Variant breakdown — Main CLONES Base's positions and strategically
     // adjusts them into new relative Sets (does NOT open new positions).
-    // Indexed by variant name ("default" | "trailing" | "block" | "dca" | "pause")
+    // Indexed by variant name ("default" | "trailing" | "block" | "dca")
     variants: Record<string, number>
   }
   real: {
@@ -147,7 +147,7 @@ export interface StrategyStageTracking {
       pause: Record<string, number>
     }
     // Per-variant cumulative counts at Real (post-filter)
-    // Indexed by variant name ("default" | "trailing" | "block" | "dca" | "pause")
+    // Indexed by variant name ("default" | "trailing" | "block" | "dca")
     variantsAccumulated: Record<string, number>
     /**
      * ── Averaged running counts (operator spec) ──────────────────────
@@ -171,7 +171,11 @@ export interface StrategyStageTracking {
     setsRunningNow: number           // ★ alias of setsActive (running orders)
     setsWithOpenPositions: number    // alias of setsActive (real exchange orders)
     setsProgressing: number          // Sets being evaluated for live execution
-    setsTotal: number                 // best 500 ranked
+    setsTotal: number                 // cumulative selected/created Live sets
+    setsCandidatesTotal: number       // cumulative Live candidates before active model selection
+    dispatchCandidates: number        // latest cycle candidates before selection
+    dispatchSelectedCount: number     // latest cycle selected active Live sets
+    dispatchSuppressedCount: number   // latest cycle candidates not selected for dispatch
     avgProfitFactor: number
     cap: number                       // maxLiveSets, default 500
   }
@@ -363,9 +367,9 @@ export async function getStrategyTracking(
   // source + key names + defaults the engine gate uses in
   // `strategy-coordinator.loadAppPFThresholds` (`mainProfitFactor` /
   // `realProfitFactor`, connection hash overlaid on global app settings,
-  // clamp [0,5], defaults main 1.0 / real 1.0). The old display read
-  // `settings.minProfitFactorMain` / `minProfitFactorReal` (defaults
-  // 1.2 / 1.4) which are NEVER written anywhere — so the dashboard PF
+  // clamp [0,5], defaults main 1.2 / real 1.2). The old display read
+  // `settings.minProfitFactorMain` / `minProfitFactorReal` (legacy keys)
+  // which are NEVER written anywhere — so the dashboard PF
   // ceiling permanently diverged from the gate the engine enforced.
   const resolvePF = (key: string, fallback: number): number => {
     // connection hash wins, else global app setting, else default.
@@ -376,8 +380,8 @@ export async function getStrategyTracking(
     if (!Number.isFinite(n) || n < 0) return fallback
     return Math.max(0, Math.min(5, n))
   }
-  const mainPFThreshold = resolvePF("mainProfitFactor", 1.0)
-  const realPFThreshold = resolvePF("realProfitFactor", 1.0)
+  const mainPFThreshold = resolvePF("mainProfitFactor", 1.2)
+  const realPFThreshold = resolvePF("realProfitFactor", 1.2)
 
   // Variant breakdowns
   const mainVariants = await readVariantBreakdown(client, connectionId, "main")
@@ -469,10 +473,18 @@ export async function getStrategyTracking(
       if (count === 0) {
         // No samples in-window: fall back to the latest live snapshot so the
         // tiles show the current values rather than zero on a fresh boot.
+        // For posPerSet, use the avg_pos_per_set from the tracking data.
+        // For posOpen, calculate it as a percentage: (sets with open / total sets) * 100
+        const realSetsWithOpen = Number(real.sets_with_open_positions || "0")
+        const realSetsTotal = Number(real.sets_total || "0")
+        const posOpenPercent = realSetsTotal > 0 
+          ? Math.round((realSetsWithOpen / realSetsTotal) * 10000) / 100
+          : 0
+        
         return {
           activeSets: realCombined,
           posPerSet: Number(real.avg_pos_per_set || "0"),
-          posOpen: Number(real.entries_total || "0"),
+          posOpen: posOpenPercent,
           samples: 0,
         }
       }
@@ -570,6 +582,10 @@ export async function getStrategyTracking(
       setsWithOpenPositions: Number(liveDetail.sets_running_now || liveDetail.sets_with_open_positions || liveActive),
       setsProgressing: Number(liveDetail.sets_progressing || "0"),
       setsTotal: Number(prog.strategies_live_total || "0"),
+      setsCandidatesTotal: Number(prog.strategies_live_candidates_total || "0"),
+      dispatchCandidates: Number(liveDetail.dispatch_candidates || "0"),
+      dispatchSelectedCount: Number(liveDetail.dispatch_selected_count || liveDetail.sets_running_now || liveActive),
+      dispatchSuppressedCount: Number(liveDetail.dispatch_suppressed_count || "0"),
       avgProfitFactor: Number(prog.live_avg_profit_factor || "0"),
       cap: Number(settings.maxLiveSets || "500"),
     },
@@ -595,7 +611,7 @@ async function readVariantBreakdown(
   connectionId: string,
   stage: "main" | "real",
 ): Promise<Record<string, number>> {
-  const variants = ["default", "trailing", "block", "dca", "pause"]
+  const variants = ["default", "trailing", "block", "dca"]
   const result: Record<string, number> = {}
   await Promise.all(
     variants.map(async (v) => {

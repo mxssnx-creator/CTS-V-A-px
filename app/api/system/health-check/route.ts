@@ -5,6 +5,7 @@ import { getAllConnections, getSettings } from '@/lib/redis-db';
  * Comprehensive system health check endpoint
  * Verifies all critical system components and workflows
  */
+export const dynamic = "force-dynamic"
 export async function GET() {
   console.log('[v0] System health check initiated');
   

@@ -31,7 +31,7 @@ interface VolumeCalculationParams {
   // and count-driven per spec — it MUST NOT receive any volume-factor
   // multiplier. Only Live Positions (real exchange orders) get the
   // engine-specific scalar applied. So Strategy callers leave
-  // `tradeMode` undefined and the factor defaults to 1.0 (identity).
+  // `tradeMode` undefined keeps the pseudo-position path at 1.0 (identity).
   //
   //   - `"main"`   → multiply by `mainVolumeFactor`   (a.k.a. live_volume_factor)
   //   - `"preset"` → multiply by `presetVolumeFactor` (a.k.a. preset_volume_factor)
@@ -39,8 +39,8 @@ interface VolumeCalculationParams {
   tradeMode?: "main" | "preset"
 
   // Volume scaling factors applied at the LIVE-EXECUTION layer only.
-  // Both default to 1.0 (no scaling) when missing or invalid. Bounded
-  // to [0.1, 10] inside `calculatePositionVolume` so a misconfigured
+  // Live-engine factors default to the canonical minimum 0.1 when missing
+  // or invalid. Bounded to [0.1, 10] inside `calculatePositionVolume` so a misconfigured
   // setting can never blow out a live order to 100× the intended size.
   mainVolumeFactor?: number
   presetVolumeFactor?: number
@@ -61,6 +61,17 @@ interface VolumeCalculationResult {
   volumeAdjusted: boolean
   adjustmentReason?: string
   riskAmount?: number
+  /** Pure strategy notional before exchange/universal minimum floors. */
+  intendedNotionalUsd?: number
+  /** Exchange/universal minimum notional implied by the effective quantity floor. */
+  exchangeMinNotionalUsd?: number
+  /** Raw sizing inputs echoed for live-stage risk validation and diagnostics. */
+  accountBalance?: number
+  positionCost?: number
+  positionsAverage?: number
+  liveEngineFactor?: number
+  sizeMultiplier?: number
+  exchangeMinVolume?: number
 }
 
 export class VolumeCalculator {
@@ -187,7 +198,7 @@ export class VolumeCalculator {
     // Only applied when the CALLER explicitly identifies as a Live trade
     // engine via `tradeMode`. The Strategy stack (Base/Main/Real pseudo
     // positions) never sets `tradeMode`, so it always sees a 1.0
-    // multiplier here — pseudo positions stay strictly ratio-based per
+    // identity multiplier here — pseudo positions stay strictly ratio-based per
     // spec ("at Strategies, pseudo pos use ratios for volume calcs").
     //
     // Bounds: [0.1, 10]. A misconfigured 0 or negative collapses the
@@ -198,7 +209,7 @@ export class VolumeCalculator {
     // POST bypasses the UI.
     const clampFactor = (raw: number | undefined): number => {
       const n = Number(raw)
-      if (!Number.isFinite(n) || n <= 0) return 1
+      if (!Number.isFinite(n) || n <= 0) return 0.1
       return Math.max(0.1, Math.min(10, n))
     }
     const liveEngineFactor =
@@ -303,6 +314,14 @@ export class VolumeCalculator {
         leverage,
         volumeAdjusted: adjusted || liveEngineFactor !== 1 || variantMult !== 1,
         adjustmentReason: composedReason,
+        intendedNotionalUsd: positionSizeUsd,
+        exchangeMinNotionalUsd: effectiveMin * currentPrice,
+        accountBalance,
+        positionCost,
+        positionsAverage: posAvg,
+        liveEngineFactor,
+        sizeMultiplier: variantMult,
+        exchangeMinVolume: effectiveMin,
       }
     }
 
@@ -329,6 +348,14 @@ export class VolumeCalculator {
       volumeAdjusted: adjusted,
       adjustmentReason: reason,
       riskAmount: adjustedRisk,
+      intendedNotionalUsd: rawVolume * currentPrice,
+      exchangeMinNotionalUsd: effectiveMin * currentPrice,
+      accountBalance,
+      positionCost,
+      positionsAverage,
+      liveEngineFactor,
+      sizeMultiplier: 1,
+      exchangeMinVolume: effectiveMin,
     }
   }
 
@@ -342,7 +369,7 @@ export class VolumeCalculator {
    *
    *   per-connection override (saved by VolumeConfigurationPanel)
    *   > global setting (Settings → Overall → Volume Configuration)
-   *   > 1.0 (identity, no scaling)
+   *   > 0.1 (canonical minimum when unset)
    *
    * Trade-mode resolution from connection flags:
    *   - `is_preset_trade === true` AND `is_live_trade !== true` → "preset"
@@ -381,7 +408,7 @@ export class VolumeCalculator {
     //   3. Global app_settings hash written by migration 034 → `volume_factor_live`
     //   4. Legacy UI-named variant                          → `mainTradeVolumeFactor`
     //   5. Snake-case UI variant                            → `main_trade_volume_factor`
-    //   6. Identity (1.0) — no scaling
+    //   6. Canonical minimum (0.1) when unset
     //
     // Key-name history:
     //   Migration 034 writes `volume_factor_live` to app_settings.
@@ -394,21 +421,21 @@ export class VolumeCalculator {
         ?? app["volume_factor_live"]
         ?? app["mainTradeVolumeFactor"]
         ?? app["main_trade_volume_factor"],
-      1,
+      0.1,
     )
 
     // Priority stack for the preset volume factor:
     //   1. Per-connection `preset_volume_factor`
     //   2. Global `volume_factor_preset` (migration 034)
     //   3. Legacy UI variants
-    //   4. Identity (1.0)
+    //   4. Canonical minimum (0.1) when unset
     const presetVolumeFactor = num(
       conn["preset_volume_factor"]
         ?? app["preset_volume_factor"]
         ?? app["volume_factor_preset"]
         ?? app["presetTradeVolumeFactor"]
         ?? app["preset_trade_volume_factor"],
-      1,
+      0.1,
     )
 
     return { tradeMode, mainVolumeFactor, presetVolumeFactor }
@@ -501,9 +528,11 @@ export class VolumeCalculator {
         settings.exchange_position_cost ??
         "0.02"
       const positionCostPercent = parseFloat(String(positionCostRaw))
-      const positionCost = (Number.isFinite(positionCostPercent) && positionCostPercent > 0)
-        ? positionCostPercent / 100
-        : 0.02 / 100  // 0.02% absolute fallback
+      const clampedPositionCostPercent =
+        Number.isFinite(positionCostPercent) && positionCostPercent > 0
+          ? Math.max(0.02, Math.min(1.0, positionCostPercent))
+          : 0.02
+      const positionCost = clampedPositionCostPercent / 100  // 0.02% absolute fallback
 
       // ── Positions-average resolution ─────────────────────────────────
       // Same priority stack: connection_settings overlay → app_settings → default 2.
@@ -581,8 +610,8 @@ export class VolumeCalculator {
       // Live-stage callers pass tradeMode: "main" | "preset" explicitly.
       // Strategy callers omit it → liveEngineFactor stays 1.0.
       let resolvedMode: "main" | "preset" | undefined = options.tradeMode
-      let mainVolumeFactor = 1
-      let presetVolumeFactor = 1
+      let mainVolumeFactor = 0.1
+      let presetVolumeFactor = 0.1
       if (resolvedMode === "main" || resolvedMode === "preset") {
         // Pass BOTH the connection record (has live_volume_factor written
         // by the volume endpoint) AND the merged settings object (has
@@ -641,6 +670,13 @@ export class VolumeCalculator {
         volume_usd: calculation.volumeUsd,
         volume_adjusted: calculation.volumeAdjusted,
         adjustment_reason: calculation.adjustmentReason || null,
+        intended_notional_usd: calculation.intendedNotionalUsd,
+        exchange_min_notional_usd: calculation.exchangeMinNotionalUsd,
+        account_balance: calculation.accountBalance,
+        position_cost: calculation.positionCost,
+        positions_average: calculation.positionsAverage,
+        live_engine_factor: calculation.liveEngineFactor,
+        size_multiplier: calculation.sizeMultiplier,
         created_at: new Date().toISOString(),
       }))
 
