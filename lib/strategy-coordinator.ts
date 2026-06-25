@@ -40,6 +40,11 @@ export interface StrategyEvaluation {
   totalCreated: number      // number of Sets created/evaluated
   passedEvaluation: number  // number of Sets that passed the filter
   failedEvaluation: number  // number of Sets that failed
+  // LIVE-only dispatch counters. `passedEvaluation` remains the candidate gate count;
+  // these distinguish candidates selected for exchange dispatch from candidates suppressed
+  // by per-direction/per-variant dispatch throttling.
+  dispatchSelected?: number
+  dispatchSuppressed?: number
   avgProfitFactor: number
   avgDrawdownTime: number
 }
@@ -4466,6 +4471,17 @@ export class StrategyCoordinator {
     }
 
 
+    // LIVE has two distinct sets after the PF/DDT candidate gate:
+    //   1. qualifying: candidates that passed the Live PF/DDT gate and are
+    //      tracked as Live-progressing candidates.
+    //   2. dispatchSets: candidates selected for the exchange-dispatch attempt
+    //      after per-direction/per-variant suppression.
+    // Keep the distinction explicit so downstream readers do not infer that
+    // returned `sets.length` is the candidate count.
+    const dispatchSets: StrategySet[] = []
+    {
+      let sawNewLong  = false
+      let sawNewShort = false
     const {
       dispatchSets,
       dispatchSelected,
@@ -4518,6 +4534,25 @@ export class StrategyCoordinator {
       let sawBlockShort = false
       let sawDcaLong    = false
       let sawDcaShort   = false
+      for (const s of qualifying) {
+        const isBlock = s.variant === "block"
+        const isDca   = s.variant === "dca"
+        const isNew   = !isBlock && !isDca // default / trailing / pause
+        if (s.direction === "long") {
+          if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
+          if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
+          if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
+        } else {
+          if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
+          if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
+          if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
+        }
+        if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
+      }
+    }
+    const dispatchSelected = dispatchSets.length
+    const selectedSets = new Set<StrategySet>(dispatchSets)
+    const dispatchSuppressed = qualifying.filter((s) => !selectedSets.has(s))
 
       const selectDispatchSet = (s: StrategySet, bucket: "new" | "trailing" | "block" | "dca", isTrailing: boolean) => {
         dispatchSets.push(s)
@@ -4860,6 +4895,16 @@ export class StrategyCoordinator {
           output_sets:       String(qualifying.length),
           previous_stage_output_sets: String(realSets.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
+          dispatch_selected: String(dispatchSelected),
+          dispatch_suppressed: String(dispatchSuppressed.length),
+          // ── ACTIVELY-RUNNING metrics (operator spec) ─────────────────
+          //   Keep the legacy candidate-based running/open fields stable for
+          //   existing stats readers; the dispatch-specific fields above
+          //   expose the stricter exchange-dispatch subset.
+          //   `sets_progressing` remains the real-stage input pool being
+          //   ranked and capped toward live candidate selection.
+          sets_running_now:         String(qualifying.length),
+          sets_with_open_positions: String(qualifying.length),
           live_candidates:   String(qualifying.length),
           dispatch_candidates: String(qualifying.length),
           dispatchSelected: String(dispatchSelected),
@@ -4934,6 +4979,9 @@ export class StrategyCoordinator {
           [`s:${symbol}:entries`]:    String(qualifying.reduce((s, st) => s + (st.entryCount || 0), 0)),
           [`s:${symbol}:running`]:    String(qualifying.length),
           [`s:${symbol}:progressing`]: String(realSets.length),
+          [`s:${symbol}:passed`]:     String(qualifying.length),
+          [`s:${symbol}:dispatch_selected`]: String(dispatchSelected),
+          [`s:${symbol}:dispatch_suppressed`]: String(dispatchSuppressed.length),
           [`s:${symbol}:passed`]:     String(dispatchSets.length),
           [`s:${symbol}:evaluated`]:  String(realSets.length),
           [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
@@ -5789,6 +5837,8 @@ export class StrategyCoordinator {
         totalCreated: realSets.length,
         passedEvaluation: qualifying.length,
         failedEvaluation: realSets.length - qualifying.length,
+        dispatchSelected,
+        dispatchSuppressed: dispatchSuppressed.length,
         avgProfitFactor: dispatchAvgPF,
         avgDrawdownTime: dispatchAvgDDT,
         failedEvaluation: realCount - qualifying.length,
@@ -6813,9 +6863,11 @@ export class StrategyCoordinator {
       stages: results.map((r) => ({
         type: r.type,
         sets: r.passedEvaluation,
+        ...(r.type === "live" ? { dispatchSelected: r.dispatchSelected ?? 0, dispatchSuppressed: r.dispatchSuppressed ?? 0 } : {}),
         avgPF: r.avgProfitFactor.toFixed(2),
       })),
       totalLiveSets: results.find((r) => r.type === "live")?.passedEvaluation || 0,
+      totalLiveDispatchSelected: results.find((r) => r.type === "live")?.dispatchSelected || 0,
     }
 
     try {
