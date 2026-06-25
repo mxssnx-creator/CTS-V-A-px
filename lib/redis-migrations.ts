@@ -2864,6 +2864,29 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
         }
       }
 
+      // Canonical prehistoric/progression containers for BOTH dev and prod.
+      // Seed only pending/zero fields when absent — never stamp completion gates.
+      // This makes fresh installs and flushed DBs render a complete progress shape
+      // before the engine starts, while preserving the rule that only the real
+      // prehistoric pipeline can write :done / :firstpass:done / is_complete=1.
+      const prehistoricKey = `prehistoric:${connId}`
+      const preExists = await client.exists(prehistoricKey).catch(() => 0)
+      if (!preExists) {
+        await client.hset(prehistoricKey, {
+          is_complete: "0",
+          symbols_processed: "0",
+          symbols_total: "0",
+          candles_loaded: "0",
+          indicators_calculated: "0",
+          data_source: "pending",
+          repaired_by: "ensureCompleteProductionCoverage",
+          updated_at: new Date().toISOString(),
+        }).catch(() => {})
+      }
+      await client.hset(`progression:${connId}`, {
+        migration_coverage_checked_at: new Date().toISOString(),
+      }).catch(() => {})
+
       // DO NOT stamp prehistoric:done / firstpass:done here.
       // These gates are written by the engine itself after a genuine prehistoric
       // run completes. Stamping them unconditionally on every coverage-repair call
@@ -2888,10 +2911,25 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
 
   console.log("[v0] [Migrations] PRODUCTION MODE — INTENSIVE COMPLETE COVERAGE (making Prod identical to long-running Dev)")
 
-  // Ensure the entire Site/Project has ONE unique instance (independent of connections)
+  // Ensure the entire Site/Project has ONE unique instance (independent of connections).
+  // IMPORTANT: do not call redis-db.ensureUniqueSiteInstance() from inside
+  // migrations; that helper calls initRedis(), and initRedis is currently
+  // awaiting runMigrations(), causing a startup deadlock. Use the already-open
+  // core Redis client passed to this repair function.
   try {
-    const { ensureUniqueSiteInstance } = await import("@/lib/redis-db")
-    await ensureUniqueSiteInstance()
+    const siteKey = "site:unique_instance"
+    const existing = await client.hgetall(siteKey).catch(() => null)
+    if (!existing || !existing.site_session_id) {
+      await client.hset(siteKey, {
+        site_session_id: `site_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+        created_at: new Date().toISOString(),
+        last_activity: new Date().toISOString(),
+        page_instance_count: "0",
+        initialized_by: "migration_coverage",
+      })
+    } else {
+      await client.hset(siteKey, { last_activity: new Date().toISOString() })
+    }
   } catch {}
 
   try {
@@ -3023,6 +3061,18 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
           }).catch(() => {})
         }
       }
+      if (!(await client.exists(`prehistoric:${connId}`).catch(() => 0))) {
+        await client.hset(`prehistoric:${connId}`, {
+          is_complete: "0",
+          symbols_processed: "0",
+          symbols_total: "0",
+          candles_loaded: "0",
+          indicators_calculated: "0",
+          data_source: "pending",
+          repaired_by: "ensureCompleteProductionCoverage",
+          updated_at: new Date().toISOString(),
+        }).catch(() => {})
+      }
     }
 
     // Ensure uniqueness/solidity snapshot fields exist on progression hashes (for the new per-progress isolation)
@@ -3042,7 +3092,7 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
     // (No fake position seeding — positions are created exclusively by the
     // live-trade engine when real orders fill on the exchange.)
 
-    console.log(`[v0] [Migrations] [PROD-COVERAGE] Complete coverage repair finished for ${connSet.size} connections (including FULL prehistoric structures + logistics + per-progress uniqueness + sample live positions)`)
+    console.log(`[v0] [Migrations] [PROD-COVERAGE] Complete coverage repair finished for ${connSet.size} connections (prehistoric containers + logistics + per-progress uniqueness; no fake completion/live positions)`)
   } catch (err) {
     console.warn("[v0] [Migrations] [PROD-COVERAGE] Repair pass had non-fatal error (continuing):", err)
   }

@@ -82,7 +82,7 @@ export const DEFAULT_ADVANCED_CONFIG: AdvancedEngineConfig = {
   },
 
   indicationParameters: {
-    steps: { min: 3, max: 30, default: 15, step: 1 },
+    steps: { min: 2, max: 30, default: 15, step: 1 },
     drawdownRatio: { min: 0.1, max: 0.5, default: 0.3, step: 0.1 },
     marketActivity: { min: 0.01, max: 0.1, default: 0.05, step: 0.01 },
     rangeRatio: { min: 0.1, max: 0.4, default: 0.25, step: 0.1 },
