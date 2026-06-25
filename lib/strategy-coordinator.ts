@@ -3725,9 +3725,14 @@ export class StrategyCoordinator {
       // much of Real is Default vs Adjust{Block, DCA} vs Trailing?"
       // without re-scanning every set on read.
       type RealVariantAgg = {
-        sumPF: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
+        sumPFByEntries: number; sumPFBySets: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
       }
       const realVariantAgg: Record<string, RealVariantAgg> = {
+        default:  { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        trailing: { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        block:    { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        dca:      { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        pause:    { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
@@ -3745,7 +3750,8 @@ export class StrategyCoordinator {
         agg.setsContaining += 1
         agg.passedSets     += 1
         agg.entries        += ec
-        agg.sumPF          += set.avgProfitFactor * ec
+        agg.sumPFByEntries += set.avgProfitFactor * ec
+        agg.sumPFBySets    += set.avgProfitFactor
         agg.sumDDT         += (set.avgDrawdownTime || 0) * ec
       }
       for (const variant of ["default", "trailing", "block", "dca"] as const) {
@@ -3762,6 +3768,10 @@ export class StrategyCoordinator {
           client.hincrby(vKey, "entries_count",  agg.entries),
           client.hincrby(vKey, "created_sets",   agg.setsContaining),
           client.hincrby(vKey, "passed_sets",    agg.passedSets),
+          client.hincrby(vKey, "sum_pf_x1000",         Math.round(agg.sumPFByEntries * 1000)),
+          client.hincrby(vKey, "sum_pf_sets_x1000",    Math.round(agg.sumPFBySets * 1000)),
+          client.hincrby(vKey, "sum_ddt_x10",          Math.round(agg.sumDDT * 10)),
+          client.hset(vKey, { updated_at: new Date().toISOString() }),
           client.hincrby(vKey, "sum_pf_x1000",   Math.round(agg.sumPF * 1000)),
           client.hincrby(vKey, "sum_ddt_x10",    Math.round(agg.sumDDT * 10)),
           client.hset(vKey, { generation: statsGeneration, engine_generation: statsGeneration, updated_at: new Date().toISOString() }),
@@ -3863,9 +3873,12 @@ export class StrategyCoordinator {
               const h = ((await client.hgetall(vKey).catch(() => null)) || {}) as Record<string, string>
               const entriesCount = Number(h.entries_count  || "0")
               const createdSets  = Number(h.created_sets   || "0")
-              const sumPfX1000   = Number(h.sum_pf_x1000   || "0")
-              const sumDdtX10    = Number(h.sum_ddt_x10    || "0")
-              const avgPF  = entriesCount > 0 ? (sumPfX1000  / 1000) / entriesCount : 0
+              const sumPfX1000     = Number(h.sum_pf_x1000      || "0")
+              const sumPfSetsX1000 = Number(h.sum_pf_sets_x1000 || "0")
+              const sumDdtX10      = Number(h.sum_ddt_x10       || "0")
+              const avgPF  = entriesCount > 0
+                ? (sumPfX1000 / 1000) / entriesCount
+                : createdSets > 0 ? (sumPfSetsX1000 / 1000) / createdSets : 0
               const avgDDT = entriesCount > 0 ? (sumDdtX10   / 10)   / entriesCount : 0
               const avgPosPerSet = createdSets > 0 ? entriesCount / createdSets : 0
               const passRate = createdSets > 0 ? (Number(h.passed_sets || "0") / createdSets) : 0
@@ -4216,9 +4229,14 @@ export class StrategyCoordinator {
       // contributing Sets to the live mirror. Kept as a single Promise.all
       // so we still land in one network hop.
       type LiveVariantAgg = {
-        sumPF: number; sumDDT: number; entries: number; setsContaining: number
+        sumPFByEntries: number; sumPFBySets: number; sumDDT: number; entries: number; setsContaining: number
       }
       const liveVariantAgg: Record<string, LiveVariantAgg> = {
+        default:  { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        trailing: { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        block:    { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        dca:      { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        pause:    { sumPFByEntries: 0, sumPFBySets: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
@@ -4231,9 +4249,10 @@ export class StrategyCoordinator {
         const lv = liveVariantAgg[variant] ?? liveVariantAgg["default"]
         const ec = set.entryCount || set.entries.length
         lv.setsContaining += 1
-        lv.entries += ec
-        lv.sumPF   += set.avgProfitFactor * ec
-        lv.sumDDT  += (set.avgDrawdownTime || 0) * ec
+        lv.entries        += ec
+        lv.sumPFByEntries += set.avgProfitFactor * ec
+        lv.sumPFBySets    += set.avgProfitFactor
+        lv.sumDDT         += (set.avgDrawdownTime || 0) * ec
       }
 
       // ── bumpValidPositions — Live-promoted Set counter ─────────────────
@@ -4270,9 +4289,10 @@ export class StrategyCoordinator {
         // still contributes count metadata. Avoids writing empty buckets.
         if (agg.setsContaining === 0) continue
         const vKey   = `strategy_variant_live:${this.connectionId}:${variant}`
-        const ec     = agg.entries || 1   // guard division — falls back to 1 if entryCount unset
-        const avgPF  = agg.sumPF  / ec
-        const avgDDT = agg.sumDDT / ec
+        const avgPF  = agg.entries > 0
+          ? agg.sumPFByEntries / agg.entries
+          : agg.sumPFBySets / agg.setsContaining
+        const avgDDT = agg.entries > 0 ? agg.sumDDT / agg.entries : 0
         liveVariantWrites.push(
           client.hset(vKey, {
             generation:        statsGeneration,
