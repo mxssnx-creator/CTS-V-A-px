@@ -94,6 +94,15 @@ interface LivePosition {
   volumeUsd?: number
   positionCostPct?: number
   leverage: number
+  /**
+   * Internal coordination leverage emitted by the strategy/variant layer before
+   * live execution applies the venue-max exchange policy.
+   */
+  coordinationLeverage?: number
+  /** Diagnostic-only leverage returned by VolumeCalculator; not applied to venue. */
+  volumeCalculatedLeverage?: number
+  /** Final leverage sent to the exchange for the primary live order path. */
+  exchangeLeverageApplied?: number
   marginType: "cross" | "isolated"
   unrealized_pnl?: number
   unrealized_pnl_percent?: number
@@ -2506,12 +2515,14 @@ export async function executeLivePosition(
       const { getConnection: _getConnLev } = await import("@/lib/redis-db")
       const connRecord = await _getConnLev(connectionId).catch(() => null)
       const venueMax = getMaxLeverageForExchange(connRecord?.exchange)
+      livePosition.coordinationLeverage = previous
       livePosition.leverage = venueMax
+      livePosition.exchangeLeverageApplied = venueMax
       pushStep(
         livePosition,
         "leverage_override",
         true,
-        `coordination=${previous}x → venue_max=${venueMax}x (operator policy)`,
+        `coordinationLeverage=${previous}x exchangeLeverageApplied=${venueMax}x (operator policy)`,
       )
     }
 
@@ -2654,6 +2665,9 @@ export async function executeLivePosition(
     livePosition.quantity = computedVolume
     livePosition.remainingQuantity = computedVolume
     livePosition.volumeUsd = computedVolume * currentPrice
+    livePosition.volumeCalculatedLeverage = Number.isFinite(Number(volumeResult?.leverage))
+      ? Number(volumeResult?.leverage)
+      : undefined
     const positionCostRawForAudit = (connSettings as any).exchangePositionCost ?? (connSettings as any).positionCost ?? (connSettings as any).exchange_position_cost
     const parsedPositionCostPct = parseFloat(String(positionCostRawForAudit ?? "0"))
     livePosition.positionCostPct = Number.isFinite(parsedPositionCostPct) && parsedPositionCostPct > 0 ? parsedPositionCostPct : 0
@@ -2672,11 +2686,27 @@ export async function executeLivePosition(
       livePosition,
       "volume_calc",
       true,
-      `qty=${computedVolume.toFixed(6)} usd=${livePosition.volumeUsd.toFixed(2)} lev=${livePosition.leverage}x${clampNote}${volumeNote}`
+      `qty=${computedVolume.toFixed(6)} usd=${livePosition.volumeUsd.toFixed(2)} ` +
+      `coordinationLeverage=${livePosition.coordinationLeverage ?? "unknown"}x ` +
+      `volumeCalculatedLeverage=${livePosition.volumeCalculatedLeverage ?? "n/a"}x ` +
+      `exchangeLeverageApplied=${livePosition.exchangeLeverageApplied ?? livePosition.leverage}x${clampNote}${volumeNote}`
     )
     if (volumeResult) {
       await VolumeCalculator.logVolumeCalculation(connectionId, realPosition.symbol, volumeResult).catch(() => {})
     }
+    await logProgressionEvent(
+      connectionId,
+      "live_trading",
+      "info",
+      `Live order leverage diagnostics for ${realPosition.symbol}`,
+      {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+        coordinationLeverage: livePosition.coordinationLeverage,
+        volumeCalculatedLeverage: livePosition.volumeCalculatedLeverage,
+        exchangeLeverageApplied: livePosition.exchangeLeverageApplied ?? livePosition.leverage,
+      },
+    ).catch(() => {})
 
     // ── Step 4: Configure leverage + margin type on exchange ───────────────
     // T2.3 perf: parallelize the two pre-flight venue calls. They are
@@ -2693,10 +2723,10 @@ export async function executeLivePosition(
     const setLeveragePromise: Promise<{ ok: boolean; note: string }> =
       typeof exchangeConnector.setLeverage === "function"
         ? exchangeConnector
-            .setLeverage(realPosition.symbol, livePosition.leverage)
+            .setLeverage(realPosition.symbol, livePosition.exchangeLeverageApplied ?? livePosition.leverage)
             .then((lev: any) => ({
               ok: !!lev?.success,
-              note: lev?.error || `leverage=${livePosition.leverage}`,
+              note: lev?.error || `exchangeLeverageApplied=${livePosition.exchangeLeverageApplied ?? livePosition.leverage}`,
             }))
             .catch((err: unknown) => ({ ok: false, note: String(err) }))
         : Promise.resolve({
