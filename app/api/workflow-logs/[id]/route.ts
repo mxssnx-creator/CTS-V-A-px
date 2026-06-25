@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { WorkflowLogger } from "@/lib/workflow-logger"
 import { initRedis } from "@/lib/redis-db"
 
+export const dynamic = "force-dynamic"
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     await initRedis()

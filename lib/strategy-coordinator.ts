@@ -393,6 +393,109 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
+/**
+ * Build a SetCoordRecord that mirrors a slim/axis StrategySet's scalars.
+ * Used by createMainSets right after a variant/axis projection is computed
+ * so the projection object itself can be discarded — all downstream stages
+ * (Real, Live) read the record, never a retained StrategySet array.
+ */
+function coordRecordFromSet(set: StrategySet): SetCoordRecord {
+  const parentKey = set.parentSetKey || set.setKey.split("#")[0]
+  const dir = (set.axisWindows?.direction as "long" | "short" | undefined) ?? set.direction
+  return {
+    coordKey:           set.setKey,
+    parentKey,
+    variant:            (set.variant ?? "default") as SetCoordRecord["variant"],
+    axisWindows:        set.axisWindows ?? null,
+    status:             "valid_main",
+    overrideDirection:  set.axisWindows?.direction as "long" | "short" | undefined,
+    overrideEntryCount: set.parentSetKey && set.entryCount !== undefined ? set.entryCount : undefined,
+    avgProfitFactor:    set.avgProfitFactor,
+    avgDrawdownTime:    set.avgDrawdownTime,
+    avgConfidence:      set.avgConfidence,
+    entryCount:         set.entryCount,
+    indicationType:     set.indicationType,
+    direction:          dir,
+    prevPos:            set.prevPos,
+    trailingProfile:    set.trailingProfile,
+  }
+}
+
+/**
+ * Lazily materialise the full StrategySet VIEW for a coord record — built at
+ * most once per cycle and cached on `rec._setView`. Quality `entries[]` are
+ * SHARED BY REFERENCE from the immutable Base Set (never copied), so this is a
+ * single small object allocation, not a clone of the entry array. The Real
+ * tuner deltas (tunedAvgPF / overrideEntryCount / overrideDirection) are folded
+ * into the view so live dispatch and pseudo-position creation see post-tuned
+ * values without re-deriving them.
+ *
+ * This is the ONLY place a StrategySet is constructed after the Base stage —
+ * and only for records that actually reach live dispatch, satisfying the
+ * "no clones after base; resolve from base + coord vars on demand" contract.
+ */
+function hydrateSetView(idx: CoordIndex, rec: SetCoordRecord): StrategySet {
+  if (rec._setView) return rec._setView
+  const base = idx.base.byKey.get(rec.parentKey)
+/** Materialize a lightweight StrategySet view from a coord record only when a downstream consumer needs it. */
+function coordRecordToSetView(idx: CoordIndex, rec: SetCoordRecord): StrategySet | null {
+  if (rec._setView) return rec._setView
+  const base = idx.base.byKey.get(rec.parentKey)
+  if (!base) return null
+  const view: StrategySet = {
+    setKey:          rec.coordKey,
+    parentSetKey:    rec.parentKey,
+    variant:         rec.variant,
+    indicationType:  rec.indicationType,
+    direction:       rec.overrideDirection ?? rec.direction,
+    avgProfitFactor: rec.tunedAvgPF ?? rec.avgProfitFactor,
+    avgConfidence:   rec.avgConfidence,
+    avgDrawdownTime: rec.avgDrawdownTime,
+    entryCount:      rec.overrideEntryCount ?? rec.entryCount,
+    // Share Base entries by reference — never copied. Empty when the Base Set
+    // is unavailable (standalone/diagnostic paths build a synthetic Base).
+    entries:         base?.entries ?? [],
+    axisWindows:     rec.axisWindows ?? undefined,
+    trailingProfile: rec.trailingProfile,
+    prevPos:         rec.prevPos,
+    status:          rec.status === "pending" || rec.status === "valid_base" ? undefined : rec.status,
+    direction:       rec.direction,
+    avgProfitFactor: rec.tunedAvgPF ?? rec.avgProfitFactor,
+    avgConfidence:   rec.avgConfidence,
+    avgDrawdownTime: rec.avgDrawdownTime,
+    entryCount:      rec.entryCount,
+    entries:         [],
+    status:          rec.status === "invalid" ? "invalid" : rec.status === "valid_real" ? "valid_real" : "valid_main",
+    rejectionReason: rec.rejectionReason,
+    ...(rec.axisWindows ? { axisWindows: rec.axisWindows } : {}),
+    ...(rec.prevPos ? { prevPos: rec.prevPos } : {}),
+    ...(rec.trailingProfile ? { trailingProfile: rec.trailingProfile } : {}),
+  }
+  rec._setView = view
+  return view
+}
+
+/**
+ * Standalone/diagnostic fallback: build a transient CoordIndex from already-
+ * resolved StrategySets (e.g. read from Redis when the in-memory pipeline index
+ * was not threaded). Each set becomes both a Base entry (so hydrateSetView can
+ * resolve entries) and a coord record, giving the stage one uniform code path
+ * whether it was called from the live pipeline or in isolation.
+ */
+function coordIndexFromSets(sets: StrategySet[]): CoordIndex {
+  const base: BaseRegistry = { byKey: new Map(), orderedKeys: [] }
+  for (const s of sets) {
+    const parentKey = s.parentSetKey || s.setKey.split("#")[0]
+    if (!base.byKey.has(parentKey)) {
+      base.byKey.set(parentKey, s)
+      base.orderedKeys.push(parentKey)
+    }
+  }
+  const idx = makeCoordIndex(base)
+  for (const s of sets) registerCoordRecord(idx, coordRecordFromSet(s))
+  return idx
+}
+
 // ─����������������������������������������� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
@@ -1320,20 +1423,24 @@ export class StrategyCoordinator {
       // variant Sets (Default / Trailing / Block / DCA) gated by posCtx.
       // CoordIndex receives a SetCoordRecord per built set (O(1) per set).
       const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx, coordIndex, isPrehistoric)
+      // Main registers one SetCoordRecord per projection into `coordIndex`
+      // and returns NO parallel StrategySet array — Real/Live consume the
+      // records directly (Base-Anchored Coordination).
+      const { result: mainResult } = await this.createMainSets(symbol, baseSets, posCtx, coordIndex)
       results.push(mainResult)
 
-      // STAGE 3: REAL — promote Sets with avgPF >= 1.4 (base-promoted AND
-      // additional related variants flow uniformly through this filter).
+      // STAGE 3: REAL — promote records with avgPF >= threshold (base-promoted
+      // AND additional related variants flow uniformly through this filter).
       // CoordIndex.validRealKeys is populated here; Real tuner writes sizeDelta
       // / tunedAvgPF onto each record for O(1) access at Live dispatch.
-      const { result: realResult, sets: realSets } = await this.evaluateRealSets(symbol, mainSets, coordIndex)
+      const { result: realResult } = await this.evaluateRealSets(symbol, undefined, coordIndex)
       results.push(realResult)
 
-      // STAGE 4: LIVE — best 500 Sets for execution (skip in prehistoric mode).
+      // STAGE 4: LIVE — best 500 records for execution (skip in prehistoric mode).
       // Axis-entry hydration uses coordIndex.base.byKey.get(parentKey) — O(1)
-      // instead of the prior O(N) realSets.find() scan.
+      // — and a full set view is materialised only for dispatched records.
       if (!isPrehistoric) {
-        const { result: liveResult } = await this.createLiveSets(symbol, realSets, coordIndex)
+        const { result: liveResult } = await this.createLiveSets(symbol, undefined, coordIndex)
         results.push(liveResult)
       }
 
@@ -1869,6 +1976,7 @@ export class StrategyCoordinator {
     coordIndex?: CoordIndex,
     skipAxisFanout: boolean = false,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
+  ): Promise<{ result: StrategyEvaluation; coordIndex: CoordIndex }> {
     // Prefer in-memory input (hot-path pipelined from createBaseSets). Fall
     // back to Redis only when called standalone (tests / diagnostics).
     let baseSets: StrategySet[]
@@ -1883,7 +1991,22 @@ export class StrategyCoordinator {
     const metricsMain = this.METRICS.main
     const maxEntries = this.config.maxEntriesPerSet || 250
     const ctx = posCtx ?? this.neutralPositionContext()
-    const mainSets: StrategySet[] = []
+
+    // ── Base-Anchored output: coord records, NOT a parallel StrategySet array ──
+    // Every variant/axis projection is registered as a SetCoordRecord that points
+    // back at its immutable Base Set. The projection objects produced by
+    // buildVariantSet / expandAxisSets are consumed to populate the record and
+    // then discarded — they are never retained or threaded to Real/Live. When
+    // called standalone (no pipeline index) we build a local one anchored on the
+    // resolved Base Sets so the rest of the function has a uniform record source.
+    const idx: CoordIndex = coordIndex ?? (() => {
+      const base: BaseRegistry = { byKey: new Map(), orderedKeys: [] }
+      for (const b of baseSets) {
+        if (!base.byKey.has(b.setKey)) { base.byKey.set(b.setKey, b); base.orderedKeys.push(b.setKey) }
+      }
+      return makeCoordIndex(base)
+    })()
+    const mainRecords = idx.records
 
     // ── Cold-start bootstrap for live quickstarts (Main stage) ────────
     // Fresh quickstarts after enabling live trade often have Base sets with
@@ -2115,43 +2238,25 @@ export class StrategyCoordinator {
     // ── Await all async builds to complete ────���──────────────────────────
     const results = await Promise.all(buildTasks)
     
-    // ── Process results and populate mainSets ──���─────────────────────────
+    // ── Process results → register coord records (no retained set array) ──
     for (const result of results) {
       const { baseSet, profile, built, cachedSet } = result
       const set = cachedSet || built
       if (!set) continue
 
-      mainSets.push(set)
+      // Keep ONLY the freshly-built `default` set transiently so the axis
+      // fan-out below can project from it; it is discarded after expansion.
       if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, set)
       if (cachedSet) reused++
 
       // ── Register SetCoordRecord for this variant (O(1) per set) ──────
-      // CoordIndex is the per-cycle performance index; registering here
-      // avoids a second full scan of mainSets downstream. Stores only
-      // scalars — quality fields are resolved from BaseRegistry on demand.
-      if (coordIndex) {
-        const rec: SetCoordRecord = {
-          coordKey:           set.setKey,
-          parentKey:          set.parentSetKey || baseSet.setKey,
-          variant:            (set.variant ?? profile.name) as SetCoordRecord["variant"],
-          axisWindows:        set.axisWindows ?? null,
-          status:             "valid_main",
-          overrideDirection:  set.axisWindows?.direction as "long" | "short" | undefined,
-          overrideEntryCount: set.entryCount !== baseSet.entryCount ? set.entryCount : undefined,
-          // ── Scalar value carrier (Base-Anchored) ──────────────────────
-          // Mirror the slim set scalars so Real/Live validate + switch states
-          // by iterating coord records directly, never a parallel set array.
-          avgProfitFactor:    set.avgProfitFactor,
-          avgDrawdownTime:    set.avgDrawdownTime,
-          avgConfidence:      set.avgConfidence,
-          entryCount:         set.entryCount,
-          indicationType:     set.indicationType,
-          direction:          (set.axisWindows?.direction as "long" | "short" | undefined) ?? set.direction,
-          prevPos:            set.prevPos,
-          trailingProfile:    set.trailingProfile,
-        }
-        registerCoordRecord(coordIndex, rec)
-      }
+      // Stores only scalars — quality entries[] are resolved from the Base
+      // Set on demand. The slim `set` object itself is now discarded; Real
+      // and Live operate exclusively on these records.
+      const rec = coordRecordFromSet(set)
+      // overrideEntryCount only when the projection diverges from its Base.
+      rec.overrideEntryCount = set.entryCount !== baseSet.entryCount ? set.entryCount : undefined
+      registerCoordRecord(idx, rec)
     }
 
     // ── Log min-pos skip count (diagnostic) ──────────────────���────
@@ -2221,38 +2326,45 @@ export class StrategyCoordinator {
         if (axisCapHit) break
         const expanded = this.expandAxisSets(defaultSet, minPF, liveCont, liveContByDir)
         for (const axisSet of expanded) {
-          mainSets.push(axisSet)
           axisSetsAdded++
 
           // ── Register axis SetCoordRecord ─────────────────────────────
           // Axis sets carry a synthetic entry but their quality data lives
           // on the parent Base Set. Recording the parentKey here enables
           // createLiveSets to do a O(1) base lookup instead of O(N) find().
-          if (coordIndex) {
-            const axisRec: SetCoordRecord = {
-              coordKey:           axisSet.setKey,
-              parentKey:          axisSet.parentSetKey || axisSet.setKey.split("#")[0],
-              variant:            "default",
-              axisWindows:        axisSet.axisWindows ?? null,
-              status:             "valid_main",
-              overrideDirection:  axisSet.axisWindows?.direction as "long" | "short" | undefined,
-              overrideEntryCount: axisSet.entryCount,
-              // ── Scalar value carrier (axis projection of parent default) ──
-              avgProfitFactor:    axisSet.avgProfitFactor,
-              avgDrawdownTime:    axisSet.avgDrawdownTime,
-              avgConfidence:      axisSet.avgConfidence,
-              entryCount:         axisSet.entryCount,
-              indicationType:     axisSet.indicationType,
-              direction:          (axisSet.axisWindows?.direction as "long" | "short" | undefined) ?? axisSet.direction,
-              prevPos:            axisSet.prevPos,
-              trailingProfile:    axisSet.trailingProfile,
-            }
-            registerCoordRecord(coordIndex, axisRec)
-          }
+          // The axis StrategySet (LRU-cached value object) is read for its
+          // scalars and not retained in any per-cycle array.
+          const axisRec = coordRecordFromSet(axisSet)
+          axisRec.overrideEntryCount = axisSet.entryCount
+          registerCoordRecord(idx, axisRec)
 
           if (axisSetsAdded >= MAIN_AXIS_SETS_CEILING) {
             axisCapHit = true
             break
+        if (coordIndex) {
+          // Hot path: axis projections are coord vars anchored to Base Sets.
+          // Do not materialise StrategySet clones; Real/Live resolve the Base
+          // data only for the final qualifying records.
+          const expandedRecords = this.expandAxisCoordRecords(defaultSet, minPF, liveCont, liveContByDir)
+          for (const axisRec of expandedRecords) {
+            registerCoordRecord(coordIndex, axisRec)
+            axisSetsAdded++
+            if (axisSetsAdded >= MAIN_AXIS_SETS_CEILING) {
+              axisCapHit = true
+              break
+            }
+          }
+        } else {
+          // Standalone diagnostics/tests without CoordIndex keep the legacy
+          // materialised view so existing tooling can still inspect axis Sets.
+          const expanded = this.expandAxisSets(defaultSet, minPF, liveCont, liveContByDir)
+          for (const axisSet of expanded) {
+            mainSets.push(axisSet)
+            axisSetsAdded++
+            if (axisSetsAdded >= MAIN_AXIS_SETS_CEILING) {
+              axisCapHit = true
+              break
+            }
           }
         }
       }
@@ -2315,14 +2427,18 @@ export class StrategyCoordinator {
     let axisLong              = 0
     let axisShort             = 0
     const uniqueBaseSetsProduced = new Set<string>()
-    for (const set of mainSets) {
+    for (const rec of mainRecords) {
+      // Variant tag — coord records always carry an authoritative .variant field.
+      const sv = (rec.variant as keyof typeof variantAgg) ?? "default"
+    const mainMetricItems: Array<StrategySet | SetCoordRecord> = coordIndex?.records ?? mainSets
+    for (const set of mainMetricItems) {
       // Variant tag — sets always carry an authoritative .variant field;
       // the per-entry classifier fallback is never needed in the slim path.
       const sv = (set.variant as keyof typeof variantAgg) ?? "default"
       const agg = variantAgg[sv] ?? variantAgg.default
-      const ec = set.entryCount || 0
-      const pf = set.avgProfitFactor || 0
-      const ddt = set.avgDrawdownTime || 0
+      const ec = (rec.overrideEntryCount ?? rec.entryCount) || 0
+      const pf = rec.avgProfitFactor || 0
+      const ddt = rec.avgDrawdownTime || 0
       agg.setsContaining += 1
       agg.passedSets     += 1
       // Use entryCount as the "entries" dimension — each Set represents
@@ -2335,9 +2451,10 @@ export class StrategyCoordinator {
       mainEntriesTotal += ec
       mainSumPF        += pf
       mainSumDDT       += ddt
-      uniqueBaseSetsProduced.add(set.parentSetKey ?? set.setKey)
+      uniqueBaseSetsProduced.add(rec.parentKey)
+      uniqueBaseSetsProduced.add("parentKey" in set ? set.parentKey : (set.parentSetKey ?? set.setKey))
 
-      const axDir = set.axisWindows?.direction
+      const axDir = rec.axisWindows?.direction
       if (axDir) {
         axisSetsCount++
         if (axDir === "long") axisLong++; else axisShort++
@@ -2345,7 +2462,8 @@ export class StrategyCoordinator {
         mainProfileEntries += ec
       }
     }
-    const n = mainSets.length
+    const n = mainRecords.length
+    const n = mainMetricItems.length
     const mainAvgPF         = n > 0 ? mainSumPF  / n : 0
     const mainAvgDDT        = n > 0 ? mainSumDDT / n : 0
     const mainAvgPosPerSet  = n > 0 ? mainEntriesTotal / n : 0
@@ -2359,8 +2477,10 @@ export class StrategyCoordinator {
     if (process.env.NODE_ENV !== "development") {
       const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
       await setSettings(mainKey, {
-        setKeys: mainSets.map((s) => s.setKey),
-        count:   mainSets.length,
+        setKeys: mainRecords.map((r) => r.coordKey),
+        count:   mainRecords.length,
+        setKeys: (coordIndex?.records ?? mainSets).map((s) => "coordKey" in s ? s.coordKey : s.setKey),
+        count:   n,
         created: new Date(),
         _slim:   true,
       })
@@ -2414,36 +2534,53 @@ export class StrategyCoordinator {
       // Computed inline here to avoid another .filter() pass.
       let mainRunningNow = 0
       let mainProgressing = 0
-      for (const s of mainSets) {
+      for (const rec of mainRecords) {
+        if (((rec.overrideEntryCount ?? rec.entryCount) || 0) > 0) mainProgressing++
+        if (activeKeys.has(rec.parentKey)) mainRunningNow++
+      for (const s of mainMetricItems) {
         if ((s.entryCount || 0) > 0) mainProgressing++
-        const parent = s.parentSetKey || s.setKey.split("#")[0]
+        const parent = "parentKey" in s ? s.parentKey : (s.parentSetKey || s.setKey.split("#")[0])
         if (activeKeys.has(parent)) mainRunningNow++
       }
+      const mainCount = mainRecords.length
 
       const writes: Promise<any>[] = [
-        client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
+        client.hset(redisKey, "strategies_main_current", String(mainCount)),
         client.hset(mainDetailKey, {
-          created_sets:      String(mainSets.length),
+          created_sets:      String(mainCount),
+        client.hset(redisKey, "strategies_main_current", String(n)),
+        client.hset(mainDetailKey, {
+          created_sets:      String(n),
           avg_profit_factor: String(mainAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(mainAvgDDT)),
           avg_pos_per_set:   String(mainAvgPosPerSet.toFixed(2)),
           entries_total:     String(mainEntriesTotal),
           entries_count:     String(mainEntriesTotal),
           axis_sets:         String(axisSetsAdded),
-          evaluated:         String(mainSets.length),
-          passed_sets:       String(mainSets.length),
+          evaluated:         String(mainCount),
+          passed_sets:       String(mainCount),
           pass_rate:         String(passRatioMain.toFixed(4)),
-          count_pos_eval:    String(mainSets.length),
+          count_pos_eval:    String(mainCount),
+          evaluated:         String(n),
+          passed_sets:       String(n),
+          pass_rate:         String(passRatioMain.toFixed(4)),
+          count_pos_eval:    String(n),
           sets_running_now:         String(mainRunningNow),
           sets_with_open_positions: String(mainRunningNow),
           sets_progressing:         String(mainProgressing),
           updated_at:        String(Date.now()),
-          [`s:${symbol}:created`]:    String(mainSets.length),
+          [`s:${symbol}:created`]:    String(mainCount),
           [`s:${symbol}:entries`]:    String(mainEntriesTotal),
           [`s:${symbol}:running`]:    String(mainRunningNow),
           [`s:${symbol}:progressing`]: String(mainProgressing),
-          [`s:${symbol}:passed`]:     String(mainSets.length),
-          [`s:${symbol}:evaluated`]:  String(mainSets.length),
+          [`s:${symbol}:passed`]:     String(mainCount),
+          [`s:${symbol}:evaluated`]:  String(mainCount),
+          [`s:${symbol}:created`]:    String(n),
+          [`s:${symbol}:entries`]:    String(mainEntriesTotal),
+          [`s:${symbol}:running`]:    String(mainRunningNow),
+          [`s:${symbol}:progressing`]: String(mainProgressing),
+          [`s:${symbol}:passed`]:     String(n),
+          [`s:${symbol}:evaluated`]:  String(n),
           [`s:${symbol}:apf`]:        String(mainAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(mainAvgDDT)),
           [`s:${symbol}:apps`]:       String(mainAvgPosPerSet.toFixed(2)),
@@ -2455,14 +2592,17 @@ export class StrategyCoordinator {
           pass_rate:   String(passRatioMain.toFixed(4)),
           [`s:${symbol}:passed`]: String(baseSets.length),
         }).catch(() => {}),
-        client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length)),
-        client.set(`strategies:${this.connectionId}:main:evaluated`, String(mainSets.length)),
+        client.set(`strategies:${this.connectionId}:main:count`, String(mainCount)),
+        client.set(`strategies:${this.connectionId}:main:evaluated`, String(mainCount)),
+        client.set(`strategies:${this.connectionId}:main:count`, String(n)),
+        client.set(`strategies:${this.connectionId}:main:evaluated`, String(n)),
         client.set(`strategies:${this.connectionId}:base:passed`, String(baseSets.length)),
         client.expire(`strategies:${this.connectionId}:main:count`, 86400),
         client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:base:passed`, 86400),
       ]
-      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", mainSets.length))
+      if (mainCount > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", mainCount))
+      if (n > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", n))
       if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", baseSets.length))
 
       // ── ACTIVE-NOW snapshot for Main stage (per symbol, like Base/Real) ───
@@ -2471,14 +2611,16 @@ export class StrategyCoordinator {
       // bucket was always 0, making the Main column on the dashboard empty.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
-          [`${symbol}:main`]:           String(mainSets.length),
+          [`${symbol}:main`]:           String(mainCount),
+          [`${symbol}:main`]:           String(n),
           // main:evaluated = Base Sets that entered Main filter (= candidates)
           [`${symbol}:main:evaluated`]: String(baseSets.length),
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
 
-      const relatedCreated = mainSets.length - reused
+      const relatedCreated = mainCount - reused
+      const relatedCreated = n - reused
       const activeVariantNames = activeVariants.map((p) => p.name)
       writes.push(
         client.hincrby(redisKey, "strategies_main_related_created", relatedCreated),
@@ -2517,16 +2659,17 @@ export class StrategyCoordinator {
         symbol,
         timestamp: new Date(),
         totalCreated: baseSets.length,
-        passedEvaluation: mainSets.length,
+        passedEvaluation: mainRecords.length,
+        passedEvaluation: n,
         // failedEvaluation = Base Sets that were explicitly rejected (status=invalid),
         // not baseSets.length - uniqueBaseSetsProduced.size (which undercounts when
         // all Base Set parents appear via axis fan-out but some were still rejected
         // at PF/DDT gate). Counting status=invalid directly is authoritative.
         failedEvaluation: baseSets.filter((s) => s.status === "invalid").length,
-        avgProfitFactor: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgProfitFactor, 0) / mainSets.length : 0,
-        avgDrawdownTime: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / mainSets.length : 0,
+        avgProfitFactor: mainAvgPF,
+        avgDrawdownTime: mainAvgDDT,
       },
-      sets: mainSets,
+      coordIndex: idx,
     }
   }
 
@@ -2640,14 +2783,17 @@ export class StrategyCoordinator {
     symbol: string,
     inputSets?: StrategySet[],
     coordIndex?: CoordIndex,
-  ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
-    let mainSets: StrategySet[]
-    if (inputSets) {
-      mainSets = inputSets
+  ): Promise<{ result: StrategyEvaluation; coordIndex: CoordIndex }> {
+    // ── Base-Anchored input: coord records from the pipeline index ──────────
+    // Normal pipeline path threads `coordIndex` (populated by createMainSets).
+    // The standalone path (tests / diagnostics) resolves Main sets from Redis
+    // and synthesises a transient index so the rest of the function has ONE
+    // uniform record source — it never operates on a parallel StrategySet array.
+    let idx: CoordIndex
+    if (coordIndex) {
+      idx = coordIndex
     } else {
-      // Standalone path (tests / diagnostics) — read from Redis.
-      // Handles both slim key-list format (_slim: true, setKeys: string[])
-      // and legacy full-blob format (sets: StrategySet[]).
+      let mainSets: StrategySet[]
       const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
       const stored = (await getSettings(mainKey)) as any
       if (stored?._slim && Array.isArray(stored.setKeys)) {
@@ -2660,9 +2806,14 @@ export class StrategyCoordinator {
         const keySet  = new Set<string>(stored.setKeys as string[])
         mainSets      = baseArr.filter((s) => keySet.has(s.setKey))
       } else {
-        mainSets = Array.isArray(stored?.sets) ? stored.sets : []
+        mainSets = Array.isArray(inputSets) ? inputSets : (Array.isArray(stored?.sets) ? stored.sets : [])
       }
+      idx = coordIndexFromSets(mainSets)
     }
+
+    // Candidate records = everything Main promoted to valid_main (one record per
+    // variant/axis projection). Real marks each in-place to valid_real / invalid.
+    const mainRecords = idx.records
 
     const metricsReal = this.METRICS.real
 
@@ -2678,7 +2829,7 @@ export class StrategyCoordinator {
      // pass the gate and be evaluated on PF/DDT merit. This allows fresh
      // connections to start generating positions on cycle 1.
       let realMinPos = this._coordinationSettings.realEvalPosCount
-      const beforePosGate = mainSets.length
+      const beforePosGate = mainRecords.length
 
       // ── Production + Live Trade relaxation for fresh quickstarts ─────
       // After quickstart (N symbols, minimal/no history), Main sets often have
@@ -2756,49 +2907,64 @@ export class StrategyCoordinator {
     // Active-Set continuous validity: a Set that currently backs an OPEN live
     // position MUST stay valid_real regardless of PF/DDT wobble this cycle
     // (without this, a transient dip orphans the live position from its owner).
-    const realQualifying: StrategySet[] = []
+    const realQualifying: SetCoordRecord[] = []
     let skippedRealLowPos = 0
-    for (const s of mainSets) {
+    for (const rec of mainRecords) {
+      const posCount = Math.max(rec.entryCount ?? 0, rec.prevPos?.count ?? 0)
+      const isAxisSet = !!(rec.axisWindows?.direction)
+      // Axis records always carry a synthetic representative entry on their
+      // Base Set, so they are exempt from the low-pos rejection.
+
+      // ── 1. Position-count gate ───────────────────────────────────────────
+      if (posCount < realMinPos && !isAxisSet) {
+        const hasActiveReal = realActiveKeysForVP.has(rec.coordKey) || rec._hasLivePositions === true
+    const realQualifying: Array<StrategySet | SetCoordRecord> = []
+    const realCandidateItems: Array<StrategySet | SetCoordRecord> = coordIndex?.records ?? mainSets
+    let skippedRealLowPos = 0
+    for (const s of realCandidateItems) {
       const posCount = Math.max(s.entryCount ?? 0, s.prevPos?.count ?? 0)
       const isAxisSet = !!(s.axisWindows?.direction)
       // Axis Sets always have a synthetic entry (entries.length === 1) so
       // hasEntries is always true for them — skip the check for non-axis.
-      const hasEntries = isAxisSet || (s.entries?.length ?? 0) > 0
+      const hasEntries = isAxisSet || (!("coordKey" in s) && (s.entries?.length ?? 0) > 0)
 
       // ── 1. Position-count gate ──────────────────────�����─────────────────────
       if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
-        const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
+        const sKey = "coordKey" in s ? s.coordKey : s.setKey
+        const hasActiveReal = realActiveKeysForVP.has(sKey) || (s as any)._hasLivePositions === true
         if (!hasActiveReal) {
-          s.status = "invalid"
-          s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
+          rec.status = "invalid"
+          rec.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
           skippedRealLowPos++
           continue
         }
         // Active live position — keep valid despite low pos-count.
-        s.status = "valid_real"
-        realQualifying.push(s)
+        rec.status = "valid_real"
+        realQualifying.push(rec)
         continue
       }
 
       // ── 2. Active-Set continuous validity exemption ───────────────────────
-      const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
+      const hasActiveReal = realActiveKeysForVP.has(rec.coordKey) || rec._hasLivePositions === true
+      const sKey = "coordKey" in s ? s.coordKey : s.setKey
+      const hasActiveReal = realActiveKeysForVP.has(sKey) || (s as any)._hasLivePositions === true
       if (hasActiveReal) {
-        s.status = "valid_real"
-        realQualifying.push(s)
+        rec.status = "valid_real"
+        realQualifying.push(rec)
         continue
       }
 
       // ── 3. PF/DDT gate ────────────────────────────────────────────────────
-      const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
-                     s.avgDrawdownTime  <= metrics.maxDrawdownTime
+      const passes = rec.avgProfitFactor >= metrics.minProfitFactor &&
+                     rec.avgDrawdownTime  <= metrics.maxDrawdownTime
       if (passes) {
-        s.status = "valid_real"
-        realQualifying.push(s)
+        rec.status = "valid_real"
+        realQualifying.push(rec)
       } else {
-        s.status = "invalid"
-        s.rejectionReason = s.avgProfitFactor < metrics.minProfitFactor
-          ? `real_low_pf: ${s.avgProfitFactor.toFixed(2)} < ${metrics.minProfitFactor}`
-          : `real_high_ddt: ${s.avgDrawdownTime} > ${metrics.maxDrawdownTime}`
+        rec.status = "invalid"
+        rec.rejectionReason = rec.avgProfitFactor < metrics.minProfitFactor
+          ? `real_low_pf: ${rec.avgProfitFactor.toFixed(2)} < ${metrics.minProfitFactor}`
+          : `real_high_ddt: ${rec.avgDrawdownTime} > ${metrics.maxDrawdownTime}`
       }
     }
     if (skippedRealLowPos > 0) {
@@ -2849,10 +3015,14 @@ export class StrategyCoordinator {
     // the Live exchange layer can reconcile via partial-open / partial-
     // close orders when the dominant direction or magnitude changes
     // between cycles.
-    type HedgeBucket = { long: StrategySet[]; short: StrategySet[] }
+    type HedgeBucket = { long: SetCoordRecord[]; short: SetCoordRecord[] }
     const hedgeBuckets = new Map<string, HedgeBucket>()
-    const passthrough: StrategySet[] = []
-    const axisPassthrough: StrategySet[] = []
+    const passthrough: SetCoordRecord[] = []
+    const axisPassthrough: SetCoordRecord[] = []
+    type HedgeBucket = { long: Array<StrategySet | SetCoordRecord>; short: Array<StrategySet | SetCoordRecord> }
+    const hedgeBuckets = new Map<string, HedgeBucket>()
+    const passthrough: Array<StrategySet | SetCoordRecord> = []
+    const axisPassthrough: Array<StrategySet | SetCoordRecord> = []
     let axisSetsCounted = 0
     for (const s of realSorted) {
       const dir = s.axisWindows?.direction
@@ -2860,25 +3030,23 @@ export class StrategyCoordinator {
         passthrough.push(s)
         continue 
       }
-      // Axis Sets bypass hedge netting — each axis tuple is a valid config
+      // Axis records bypass hedge netting — each axis tuple is a valid config
       axisPassthrough.push(s)
       axisSetsCounted++
     }
-    const netted: StrategySet[] = []
+    const netted: SetCoordRecord[] = []
+    const netted: Array<StrategySet | SetCoordRecord> = []
     const netTargetWrites: Record<string, string> = {}
     let netCancelled = 0
     for (const s of passthrough) {
       const aw = s.axisWindows
-      // ── CRITICAL FIX: Profile-variant Sets always go to hedging ��─
-      // Sets in `passthrough` are profile-variant (default/trailing/block/DCA)
-      // and MUST participate in hedge netting. Previously, sets without
-      // axisWindows were auto-added to netted, bypassing the netting logic.
-      // This caused Real stage to include more sets than should qualify.
-      // Now: ALL profile-variant sets go through the bucketing/netting phase,
-      // regardless of whether they have axisWindows. Only Axis Sets bypass
-      // netting (handled separately via axisPassthrough).
+      // ── CRITICAL FIX: Profile-variant records always go to hedging ──
+      // Records in `passthrough` are profile-variant (default/trailing/block/DCA)
+      // and MUST participate in hedge netting. Only Axis records bypass netting
+      // (handled separately via axisPassthrough).
       const outcome = aw?.outcome ?? "pos"
-      const parentKey = s.parentSetKey ?? s.setKey.split("#")[0]
+      const parentKey = s.parentKey
+      const parentKey = "parentKey" in s ? s.parentKey : (s.parentSetKey ?? s.setKey.split("#")[0])
       const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|p${aw?.prev ?? 0}|l${aw?.last ?? 0}|c${aw?.cont ?? 0}|o${outcome}`
       let b = hedgeBuckets.get(bucketKey)
       if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
@@ -2924,11 +3092,12 @@ export class StrategyCoordinator {
     // there are no axis sets either, keep the top-PF set per direction so the live
     // pipeline can start building position history. Future cycles will develop
     // asymmetric signals and netting will work as intended.
-    let effectiveNetted = netted
+    let effectiveNetted: Array<StrategySet | SetCoordRecord> = netted
     if (netted.length === 0 && axisPassthrough.length === 0 && realSorted.length > 0) {
       const topLong  = realSorted.find((s) => (s.direction ?? "long") === "long")
       const topShort = realSorted.find((s) => s.direction === "short")
-      effectiveNetted = [topLong, topShort].filter(Boolean) as StrategySet[]
+      effectiveNetted = [topLong, topShort].filter(Boolean) as SetCoordRecord[]
+      effectiveNetted = [topLong, topShort].filter(Boolean) as Array<StrategySet | SetCoordRecord>
       if (effectiveNetted.length > 0) {
         console.log(
           `[v0] [StrategyCoordinator] ${this.connectionId}:${symbol} hedge-bootstrap: ` +
@@ -2997,7 +3166,10 @@ export class StrategyCoordinator {
     // during a 5-symbol live run). The operator can LOWER the cap via
     // maxRealSets but can never exceed the ceiling.
     const realSetsCap = Math.min(this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING, REAL_SETS_SAFETY_CEILING)
-    const realSets = realPostHedge.slice(0, realSetsCap)
+    const realRecordsOrSets = realPostHedge.slice(0, realSetsCap)
+    const realSets: StrategySet[] = coordIndex
+      ? realRecordsOrSets.map((r) => "coordKey" in r ? coordRecordToSetView(coordIndex, r) : r).filter((s): s is StrategySet => !!s)
+      : realRecordsOrSets as StrategySet[]
     if (realPostHedge.length > realSetsCap) {
       console.warn(
         `[v0] [RealStage] ${this.connectionId}: ${realPostHedge.length} Real Sets exceeds ` +
@@ -3007,17 +3179,13 @@ export class StrategyCoordinator {
     }
 
     // ── Populate CoordIndex.validRealKeys — O(N) single pass ───────────────
-    // Stamp every surviving real set's coord record as `valid_real` and
-    // populate the fast Set<string> for O(1) membership checks downstream.
-    // Sets that were dropped by the cap or hedge-net are left at `valid_main`.
-    if (coordIndex) {
-      for (const s of realSets) {
-        coordIndex.validRealKeys.add(s.setKey)
-        const coordRec = coordIndex.byCoordKey.get(s.setKey)
-        if (coordRec && coordRec.status !== "valid_real") {
-          coordRec.status = "valid_real"
-        }
-      }
+    // Stamp every surviving real record as `valid_real` and populate the fast
+    // Set<string> for O(1) membership checks downstream. Records dropped by the
+    // cap or hedge-net keep their prior status (valid_main/valid_real). Records
+    // ARE the coord records, so we set status directly — no second lookup.
+    for (const rec of realSets) {
+      idx.validRealKeys.add(rec.coordKey)
+      rec.status = "valid_real"
     }
 
     // ── Real-stage tuner — per-variant adjustments from Base prev-pos ──
@@ -3048,7 +3216,7 @@ export class StrategyCoordinator {
       // the data can't change within the same async function call.
       const accPipeline = getRedisClient().multi()
       for (const s of realSets) {
-        const parentKey = s.parentSetKey || s.setKey.split("#")[0]
+        const parentKey = s.parentKey
         bumpRealPosAccumulation(this.connectionId, parentKey, 1, accPipeline)
 
         // ── Hedge pos-count accumulation per base Set (operator spec) ─
@@ -3063,7 +3231,8 @@ export class StrategyCoordinator {
         // entryCount is used (not 1) so axis Sets with larger windows
         // contribute proportionally to the hedge totals.
         const hedgeDir = (s.axisWindows?.direction ?? s.direction ?? "long") as "long" | "short"
-        const hedgeEC  = s.entryCount > 0 ? s.entryCount : 1
+        const recEC    = (s.overrideEntryCount ?? s.entryCount) ?? 0
+        const hedgeEC  = recEC > 0 ? recEC : 1
         bumpHedgePosAccumulation({
           connectionId: this.connectionId,
           parentSetKey: parentKey,
@@ -3083,12 +3252,12 @@ export class StrategyCoordinator {
         // of Pis to be added, counted onto the new sets". Pipelined
         // alongside the existing accumulation writes for zero added
         // round-trips.
-        if (s.axisWindows?.axisKey && s.entryCount > 0) {
+        if (s.axisWindows?.axisKey && recEC > 0) {
           bumpAxisPosAccumulation(
             this.connectionId,
             parentKey,
             s.axisWindows.axisKey,
-            s.entryCount,
+            recEC,
             accPipeline,
           )
         }
@@ -3133,15 +3302,13 @@ export class StrategyCoordinator {
           // (avoids re-summing the now-unmodified entries array each cycle).
           const tunedAvgPF = Math.max(0.5, (s.avgProfitFactor ?? 1) * combined)
 
-          if (coordIndex) {
-            const coordRec = coordIndex.byCoordKey.get(s.setKey)
-            if (coordRec) {
-              coordRec.sizeDelta     = sizeDelta !== 0 ? sizeDelta : undefined
-              coordRec.leverageDelta = leverageDelta
-              coordRec.tunedAvgPF    = tunedAvgPF
-              coordRec.status        = "valid_real"
-            }
-          }
+          // `s` IS the coord record — write tuner deltas directly. Live
+          // dispatch reads sizeDelta / tunedAvgPF off the record (and folds
+          // them into the hydrated set view) for O(1) access.
+          s.sizeDelta     = sizeDelta !== 0 ? sizeDelta : undefined
+          s.leverageDelta = leverageDelta
+          s.tunedAvgPF    = tunedAvgPF
+          s.status        = "valid_real"
         }
 
         // ── Valid Positions counter ──
@@ -3204,18 +3371,19 @@ export class StrategyCoordinator {
       (this._realSetWriteCounter = ((this._realSetWriteCounter ?? 0) + 1)) % 50 === 1
     if (shouldWriteRealSets) {
       await setSettings(realKey, {
-        setKeys: realSets.map((s) => s.setKey),
+        setKeys: realSets.map((s) => s.coordKey),
         count:   realSets.length,
         created: new Date(),
         _slim:   true,
       })
     }
 
-    // Count of Main Sets that actually entered PF/DDT evaluation (excludes pos-count
-    // pre-gated sets). Used for correct passRatioReal and evaluated counters.
+    // Count of Main records that actually entered PF/DDT evaluation (excludes pos-count
+    // pre-gated records). Used for correct passRatioReal and evaluated counters.
     // After the merged pos-gate + PF/DDT pass, `realQualifying` is the survivor list;
     // `skippedRealLowPos` is the count of pos-gated rejects. PF-eligible = total - pos-gated.
-    const mainPFEligible = mainSets.length - skippedRealLowPos
+    const mainPFEligible = mainRecords.length - skippedRealLowPos
+    const mainPFEligible = realCandidateItems.length - skippedRealLowPos
 
     // Write Real counts to progression hash — CUMULATIVE via hincrby so the dashboard
     // doesn't oscillate with per-cycle snapshots (see matching fix in createBaseSets/createMainSets).
@@ -3228,10 +3396,10 @@ export class StrategyCoordinator {
       // allocated an intermediate result and iterated the full array independently.
       let _sumPF = 0, _sumDDT = 0, _sumConf = 0, _sumEC = 0
       for (const st of realSets) {
-        _sumPF   += st.avgProfitFactor
+        _sumPF   += st.tunedAvgPF ?? st.avgProfitFactor
         _sumDDT  += st.avgDrawdownTime  || 0
         _sumConf += st.avgConfidence    || 0
-        _sumEC   += st.entryCount       || 0
+        _sumEC   += (st.overrideEntryCount ?? st.entryCount) || 0
       }
       const n = realSets.length
       const realAvgPF        = n > 0 ? _sumPF   / n : 0
@@ -3261,16 +3429,13 @@ export class StrategyCoordinator {
               .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
               .catch(() => [])) as string[],
           )
-      const realRunningNow = realSets.filter((s) => {
-        const base = (s.parentSetKey ?? s.setKey).split("#")[0]
-        return realActiveBaseKeys.has(base)
-      }).length
+      const realRunningNow = realSets.filter((s) => realActiveBaseKeys.has(s.parentKey)).length
+      const realProgressing = realSets.filter((s) => ((s.overrideEntryCount ?? s.entryCount) || 0) > 0).length
 
-      // Open positions = sum of entryCount across the Real Sets that are
+      // Open positions = sum of entryCount across the Real records that are
       // actively running now (each entry is one open position the Set holds).
       const realOpenPositions = realSets.reduce((sum, s) => {
-        const base = (s.parentSetKey ?? s.setKey).split("#")[0]
-        return realActiveBaseKeys.has(base) ? sum + (s.entryCount || 0) : sum
+        return realActiveBaseKeys.has(s.parentKey) ? sum + ((s.overrideEntryCount ?? s.entryCount) || 0) : sum
       }, 0)
       // Positions (entries) per running Set — averaged over running Sets only.
       const realPosPerRunningSet = realRunningNow > 0 ? realOpenPositions / realRunningNow : 0
@@ -3331,9 +3496,7 @@ export class StrategyCoordinator {
           //   active_config_keys.
           sets_running_now:         String(realRunningNow),
           sets_with_open_positions: String(realRunningNow),
-          sets_progressing:         String(
-            realSets.filter((s) => (s.entryCount || 0) > 0).length,
-          ),
+          sets_progressing:         String(realProgressing),
           // ── 4-perspective Real stats ──────────────────────────────
           // These are connection-wide (not per-symbol) so writing them
           // once per (symbol, cycle) is fine — every symbol computes the
@@ -3347,9 +3510,7 @@ export class StrategyCoordinator {
           [`s:${symbol}:created`]:    String(realSets.length),
           [`s:${symbol}:entries`]:    String(realEntriesTotal),
           [`s:${symbol}:running`]:    String(realRunningNow),
-          [`s:${symbol}:progressing`]: String(
-            realSets.filter((s) => (s.entryCount || 0) > 0).length,
-          ),
+          [`s:${symbol}:progressing`]: String(realProgressing),
           [`s:${symbol}:passed`]:     String(realSets.length),
           [`s:${symbol}:evaluated`]:  String(mainPFEligible),
           [`s:${symbol}:apf`]:        String(realAvgPF.toFixed(4)),
@@ -3447,11 +3608,12 @@ export class StrategyCoordinator {
       for (const set of realSets) {
         const sv = (set.variant as keyof typeof realVariantAgg) ?? "default"
         const agg = realVariantAgg[sv] ?? realVariantAgg.default
-        const ec  = set.entryCount || 0
+        const ec  = (set.overrideEntryCount ?? set.entryCount) || 0
+        const pf  = set.tunedAvgPF ?? set.avgProfitFactor
         agg.setsContaining += 1
         agg.passedSets     += 1
         agg.entries        += ec
-        agg.sumPF          += set.avgProfitFactor * ec
+        agg.sumPF          += pf * ec
         agg.sumDDT         += (set.avgDrawdownTime || 0) * ec
       }
       for (const variant of ["default", "trailing", "block", "dca"] as const) {
@@ -3582,7 +3744,7 @@ export class StrategyCoordinator {
 
     // ── Position count metrics for real stage ──────────────────────
     // Track entries passing Real filter so dashboard shows promotion success
-    const realEntriesTotal = realSets.reduce((sum, s) => sum + (s.entryCount ?? 0), 0)
+    const realEntriesTotal = realSets.reduce((sum, s) => sum + ((s.overrideEntryCount ?? s.entryCount) ?? 0), 0)
     try {
       const client = getRedisClient()
       const progKey = `progression:${this.connectionId}`
@@ -3600,10 +3762,10 @@ export class StrategyCoordinator {
         totalCreated: mainPFEligible,
         passedEvaluation: realSets.length,
         failedEvaluation: mainPFEligible - realSets.length,
-        avgProfitFactor: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgProfitFactor, 0) / realSets.length : 0,
+        avgProfitFactor: realSets.length > 0 ? realSets.reduce((s, set) => s + (set.tunedAvgPF ?? set.avgProfitFactor), 0) / realSets.length : 0,
         avgDrawdownTime: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / realSets.length : 0,
       },
-      sets: realSets,
+      coordIndex: idx,
     }
   }
 
@@ -3618,63 +3780,38 @@ export class StrategyCoordinator {
     inputSets?: StrategySet[],
     coordIndex?: CoordIndex,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
-    let realSets: StrategySet[]
-    if (inputSets) {
-      realSets = inputSets
+    // ── Base-Anchored input: valid_real coord records, NOT a set array ──────
+    // Normal pipeline path threads `coordIndex` (Real stamped validRealKeys +
+    // tuner deltas). Standalone path resolves Real keys from Redis → Base and
+    // synthesises a transient index. Either way Live operates on records and
+    // hydrates a FULL StrategySet view ONLY for the capped qualifying subset.
+    let idx: CoordIndex
+    if (coordIndex) {
+      idx = coordIndex
     } else {
+      let resolved: StrategySet[] = []
       const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
       const stored  = await getSettings(realKey) as any
       if (stored && typeof stored === "object") {
         if (stored._slim && Array.isArray(stored.setKeys)) {
-          // ── Slim format: key list only — resolve full Sets from Base ───
-          // Base sets carry entries/quality data and are always written as
-          // full blobs. A single base:sets read is cheaper than deserialising
-          // the old full Real blob, and the result is always fresh-cycle data.
           const baseKey  = `strategies:${this.connectionId}:${symbol}:base:sets`
           const baseSt   = await getSettings(baseKey) as any
           const baseArr: StrategySet[] = Array.isArray(baseSt?.sets) ? baseSt.sets : []
           const keySet   = new Set<string>(stored.setKeys as string[])
-          realSets       = baseArr.filter((s) => keySet.has(s.setKey))
+          resolved       = baseArr.filter((s) => keySet.has(s.setKey))
         } else {
-          // Legacy full-blob format — tolerate during rollout period.
-          realSets = Array.isArray(stored.sets) ? stored.sets : Array.isArray(stored) ? stored : []
+          resolved = Array.isArray(stored.sets) ? stored.sets : Array.isArray(stored) ? stored : []
         }
-      } else {
-        realSets = []
       }
-
-      // DEV/TEST fallback: when no Real sets yet but Main sets exist, allow
-      // a temporary synthetic Real escalation so the live pipeline can be
-      // exercised in test environments. Guard by testnet flag or FORCE_LIVE env.
-      // In dev we short-circuit the getConnection() call (an async Redis read
-      // per cycle per symbol) since NODE_ENV==="development" already covers it.
-      try {
-        const isDevEnv = process.env.NODE_ENV === "development" || process.env.FORCE_LIVE === "1"
-        const conn = isDevEnv ? null : (await (await import("@/lib/redis-db")).getConnection(this.connectionId)) || {}
-        const isTestConn = isDevEnv || conn?.is_testnet === true || conn?.is_testnet === "1"
-        if (realSets.length === 0 && isTestConn) {
-          const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
-          const mainStored = await getSettings(mainKey)
-          const mainSets = mainStored && typeof mainStored === "object" ? (Array.isArray((mainStored as any).sets) ? (mainStored as any).sets : Array.isArray(mainStored) ? mainStored : []) : []
-          if (mainSets && mainSets.length > 0) {
-            // Pick top Main set and convert to a minimal Real set
-            const top = mainSets.sort((a: any, b: any) => (b.avgProfitFactor || 0) - (a.avgProfitFactor || 0))[0]
-            const synthetic: any = {
-              ...top,
-              setKey: top.setKey || `${symbol}:${top.direction || "long"}:synthetic`,
-              parentSetKey: top.setKey || null,
-              avgProfitFactor: Math.max(0.8, top.avgProfitFactor || 0.8),
-              avgDrawdownTime: top.avgDrawdownTime || 0,
-              entries: top.entries && top.entries.length > 0 ? top.entries : [{ profitFactor: Math.max(1.0, (top.avgProfitFactor || 1.0)), leverage: 1, confidence: 0.8, sizeMultiplier: 1 }],
-              entryCount: top.entryCount || (top.entries ? top.entries.length : 1),
-              status: "valid_real",
-            }
-            realSets = [synthetic]
-            console.log(`[v0] [StrategyCoordinator] ${this.connectionId}:${symbol} - injecting synthetic Real set for test mode to allow live dispatch`)
-          }
-        }
-      } catch (e) { /* non-fatal */ }
+      idx = coordIndexFromSets(resolved)
+      // In the standalone path every resolved record is treated as valid_real.
+      for (const rec of idx.records) idx.validRealKeys.add(rec.coordKey)
     }
+
+    // valid_real record population this cycle (what Real promoted). Used as the
+    // Live denominator and the candidate pool for the PF/DDT live filter.
+    const realRecords = idx.records.filter((r) => idx.validRealKeys.has(r.coordKey))
+    const realCount = realRecords.length
 
     const metrics = this.METRICS.live
     let maxLive = this.config.maxLiveSets || 500
@@ -3705,51 +3842,43 @@ export class StrategyCoordinator {
     }
 
     // P0-2: Live filter axes are PF-min + DDT-max ONLY (then rank by
-    // avgProfitFactor and take top N). Confidence is advisory metadata.
-    let qualifying = realSets
-      .filter(
-        (s) =>
-          s.avgProfitFactor >= metrics.minProfitFactor &&
-          s.avgDrawdownTime <= metrics.maxDrawdownTime,
-      )
-      .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
+    // tuned avgProfitFactor and take top N). Confidence is advisory metadata.
+    // Records carry tunedAvgPF (Real tuner) — prefer it for both gate + rank.
+    const recPF = (r: SetCoordRecord) => r.tunedAvgPF ?? r.avgProfitFactor
+    let qualifyingRecs = realRecords
+      .filter((r) => recPF(r) >= metrics.minProfitFactor && r.avgDrawdownTime <= metrics.maxDrawdownTime)
+      .sort((a, b) => recPF(b) - recPF(a))
       .slice(0, maxLive)
 
-    // DEV/TEST fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
-    // Short-circuit getConnection() in dev — NODE_ENV check is free vs async Redis read per cycle.
-    try {
+    // DEV/TEST fallback: if nothing qualifies, promote the single best record
+    // (Real, else any) so live dispatch can still build position history.
+    if (qualifyingRecs.length === 0) {
       const isDevMode = process.env.FORCE_SIMULATED === "1" || process.env.FORCE_LIVE === "1" || process.env.NODE_ENV === "development"
-      const conn = isDevMode ? null : await (await import("@/lib/redis-db")).getConnection(this.connectionId)
-      const isTestOrDev = isDevMode || conn?.is_testnet === true || conn?.is_testnet === "1"
-      if (qualifying.length === 0 && isTestOrDev) {
-        if (realSets.length > 0) {
-          qualifying = [realSets.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)[0]]
-          console.log(`[v0] [StrategyFlow] ${this.connectionId}:${symbol} dev fallback - promoted top REAL set for live dispatch`)
-        } else {
-          // Try to seed from MAIN as a last resort
-          const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
-          const mainStored = await getSettings(mainKey)
-          const mainSets = mainStored && typeof mainStored === "object" ? (Array.isArray((mainStored as any).sets) ? (mainStored as any).sets : Array.isArray(mainStored) ? mainStored : []) : []
-          if (mainSets.length > 0) {
-            const top = mainSets.sort((a: any, b: any) => (b.avgProfitFactor || 0) - (a.avgProfitFactor || 0))[0]
-            const synth: any = {
-              ...top,
-              setKey: top.setKey || `${symbol}:${top.direction || "long"}:dev-seed`,
-              parentSetKey: top.setKey || null,
-              avgProfitFactor: Math.max(0.9, top.avgProfitFactor || 0.9),
-              avgDrawdownTime: top.avgDrawdownTime || 0,
-              entries: top.entries && top.entries.length > 0 ? top.entries : [{ profitFactor: Math.max(1.0, (top.avgProfitFactor || 1.0)), leverage: 1, confidence: 0.85, sizeMultiplier: 1 }],
-              entryCount: top.entryCount || (top.entries ? top.entries.length : 1),
-              status: "valid_real",
-            }
-            qualifying = [synth]
-            console.log(`[v0] [StrategyFlow] ${this.connectionId}:${symbol} dev fallback - injected synthetic qualifying set from MAIN`)
-          }
+      let isTestOrDev = isDevMode
+      if (!isTestOrDev) {
+        try {
+          const conn = await (await import("@/lib/redis-db")).getConnection(this.connectionId)
+          isTestOrDev = conn?.is_testnet === true || conn?.is_testnet === "1"
+        } catch { /* non-fatal */ }
+      }
+      if (isTestOrDev) {
+        const pool = realRecords.length > 0 ? realRecords : idx.records
+        if (pool.length > 0) {
+          const top = pool.reduce((best, r) => (recPF(r) > recPF(best) ? r : best), pool[0])
+          qualifyingRecs = [top]
+          console.log(`[v0] [StrategyFlow] ${this.connectionId}:${symbol} dev fallback - promoted top record for live dispatch`)
         }
       }
-    } catch (e) { /* non-fatal */ }
+    }
 
-
+    // ── Hydrate FULL StrategySet views for the capped live subset ONLY ──────
+    // This is the single materialisation point after Base. Each view shares the
+    // immutable Base Set's entries[] by reference and folds in the Real tuner
+    // deltas (tunedAvgPF / overrideEntryCount / overrideDirection).
+    const qualifying: StrategySet[] = qualifyingRecs.map((r) => hydrateSetView(idx, r))
+    // `realSets` retained as the hydrated valid_real view list for the legacy
+    // count/ratio expressions below (denominator = realCount, not its length).
+    const realSets = qualifying
 
     // ── Live dispatch preselection ──────────────────────────────────────
     // `qualifying` is the Live candidate pool after PF/DDT/rank/cap. Only
@@ -3893,6 +4022,11 @@ export class StrategyCoordinator {
       const liveAvgPF  = dispatchAvgPF
       const liveAvgDDT = dispatchAvgDDT
       const passRatioLive = realSets.length > 0 ? qualifying.length / realSets.length : 0
+      const liveAvgPF  = qualifying.length > 0 ? qualifying.reduce((s, st) => s + st.avgProfitFactor, 0) / qualifying.length : 0
+      const liveAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
+      // Denominator = valid_real population this cycle (realCount), NOT the
+      // hydrated qualifying view length (which equals qualifying.length).
+      const passRatioLive = realCount > 0 ? qualifying.length / realCount : 0
 
       // ── P1-1: Live-stage per-variant aggregation ──────────────────────
       // Same bucket shape as Main/Real. Drives the stats API's breakdown
@@ -3985,7 +4119,7 @@ export class StrategyCoordinator {
         client.hset(`strategies_active:${this.connectionId}`, {
           [`${symbol}:live`]:           String(dispatchSets.length),
           // live:evaluated = Real Sets that entered Live selection (= candidates)
-          [`${symbol}:live:evaluated`]: String(realSets.length),
+          [`${symbol}:live:evaluated`]: String(realCount),
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
         client.expire(redisKey, 7 * 24 * 60 * 60),
@@ -3995,7 +4129,7 @@ export class StrategyCoordinator {
           created_sets:      String(dispatchSets.length),
           avg_profit_factor: String(liveAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(liveAvgDDT)),
-          evaluated:         String(realSets.length),
+          evaluated:         String(realCount),
           passed_sets:       String(qualifying.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
           dispatch_candidates: String(qualifying.length),
@@ -4012,6 +4146,15 @@ export class StrategyCoordinator {
           sets_running_now:         String(dispatchSets.length),
           sets_with_open_positions: String(dispatchSets.length),
           sets_progressing:         String(realSets.length),
+          //   Live's `qualifying` Sets ARE the executed orders. They
+          //   are by definition "running" — exchange has accepted the
+          //   order or is holding the position. `sets_progressing` is
+          //   the real-stage input pool being ranked & capped this
+          //   cycle (i.e. candidates currently progressing toward live
+          //   execution).
+          sets_running_now:         String(qualifying.length),
+          sets_with_open_positions: String(qualifying.length),
+          sets_progressing:         String(realCount),
           updated_at:        String(Date.now()),
           // Per-symbol fields — see createBaseSets for rationale.
           // Live doesn't compute avg_pos_per_set / avg_pos_eval_real;
@@ -4025,6 +4168,12 @@ export class StrategyCoordinator {
           [`s:${symbol}:dispatch_selected`]: String(dispatchSets.length),
           [`s:${symbol}:dispatch_suppressed`]: String(dispatchSuppressed.length),
           [`s:${symbol}:evaluated`]:  String(realSets.length),
+          [`s:${symbol}:created`]:    String(qualifying.length),
+          [`s:${symbol}:entries`]:    String(qualifying.reduce((s, st) => s + (st.entryCount || 0), 0)),
+          [`s:${symbol}:running`]:    String(qualifying.length),
+          [`s:${symbol}:progressing`]: String(realCount),
+          [`s:${symbol}:passed`]:     String(qualifying.length),
+          [`s:${symbol}:evaluated`]:  String(realCount),
           [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(liveAvgDDT)),
           [`s:${symbol}:ts`]:         String(Date.now()),
@@ -4516,11 +4665,14 @@ export class StrategyCoordinator {
         type: "live",
         symbol,
         timestamp: new Date(),
-        totalCreated: realSets.length,
+        totalCreated: realCount,
         passedEvaluation: qualifying.length,
         failedEvaluation: realSets.length - qualifying.length,
         avgProfitFactor: dispatchAvgPF,
         avgDrawdownTime: dispatchAvgDDT,
+        failedEvaluation: realCount - qualifying.length,
+        avgProfitFactor: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgProfitFactor, 0) / qualifying.length : 0,
+        avgDrawdownTime: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgDrawdownTime, 0) / qualifying.length : 0,
       },
       sets: dispatchSets,
     }
@@ -4982,6 +5134,78 @@ export class StrategyCoordinator {
       }
     }
     return axisSets
+  }
+
+  /**
+   * Coord-record-only axis fan-out. This is the hot production path: axis
+   * projections are metadata over immutable Base Sets, so materialising full
+   * StrategySet objects for every prev×last×cont×dir tuple only burns heap.
+   */
+  private expandAxisCoordRecords(
+    baseDefault: StrategySet,
+    minPF: number,
+    liveCont = 0,
+    liveContByDir?: { long: number; short: number },
+  ): SetCoordRecord[] {
+    const records: SetCoordRecord[] = []
+    const baseEC = baseDefault.entryCount || 0
+    const entries = baseDefault.entries || []
+    const parentKey = baseDefault.parentSetKey || baseDefault.setKey.split("#")[0]
+    const inheritedPF   = baseDefault.avgProfitFactor ?? 1
+    const inheritedDDT  = baseDefault.avgDrawdownTime ?? 0
+    const inheritedConf = baseDefault.avgConfidence   ?? 0
+
+    for (const prev of AXIS_PREV) {
+      const prevMeanPF = this.meanPFOfLastN(entries, prev)
+      if (prevMeanPF !== null && prevMeanPF < minPF) continue
+
+      for (const last of AXIS_LAST) {
+        const lastMeanPF = this.meanPFOfLastN(entries, last)
+        const outcomes: Array<"pos" | "neg"> =
+          lastMeanPF === null ? ["pos", "neg"] : [lastMeanPF >= 1.0 ? "pos" : "neg"]
+
+        for (const cont of AXIS_CONT) {
+          for (const dir of AXIS_DIRS) {
+            const dirLiveCont = liveContByDir
+              ? (dir === "short" ? liveContByDir.short : liveContByDir.long)
+              : liveCont
+            const credited = Math.min(cont, Math.max(0, dirLiveCont))
+            const ec = baseEC + credited
+
+            for (const outcome of outcomes) {
+              const axisKey = axisKeyOf(prev, last, cont, outcome, dir)
+              const axisWindows: NonNullable<StrategySet["axisWindows"]> = {
+                prev,
+                last,
+                cont,
+                pause: 0,
+                direction: dir,
+                axisKey,
+                outcome,
+              }
+              records.push({
+                coordKey:           `${parentKey}#axis:${axisKey}`,
+                parentKey,
+                variant:            "default",
+                axisWindows,
+                status:             "valid_main",
+                overrideDirection:  dir,
+                overrideEntryCount: ec,
+                avgProfitFactor:    inheritedPF,
+                avgDrawdownTime:    inheritedDDT,
+                avgConfidence:      inheritedConf,
+                entryCount:         ec,
+                indicationType:     baseDefault.indicationType,
+                direction:          dir,
+                prevPos:            baseDefault.prevPos,
+                trailingProfile:    baseDefault.trailingProfile,
+              })
+            }
+          }
+        }
+      }
+    }
+    return records
   }
 
   private variantProfiles(): Array<{

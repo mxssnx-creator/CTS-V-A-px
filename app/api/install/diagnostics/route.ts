@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { getAllConnections, initRedis, getRedisStats } from "@/lib/redis-db"
 import os from "os"
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 export async function POST(request: NextRequest) {

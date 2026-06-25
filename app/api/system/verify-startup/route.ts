@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { loadConnections } from "@/lib/file-storage"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     console.log("[v0] [VERIFY] Starting comprehensive system verification")
