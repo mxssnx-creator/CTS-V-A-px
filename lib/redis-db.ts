@@ -224,8 +224,13 @@ export class InlineLocalRedis {
     // "ownership loss" crashes. Check the global flag published by the
     // trade-engine coordinator; if ANY engine is active, skip the reload.
     const globalCtx = globalThis as any
-    if (globalCtx.__engine_manager_instance?.isEngineRunning) {
-      console.log(`[v0] [Redis] Snapshot reload skipped: engine running in this process`)
+    const coordinator = globalCtx.__tradeEngineCoordinator
+    const coordinatorHasEngines =
+      coordinator &&
+      typeof coordinator.getActiveEngineCount === "function" &&
+      Number(coordinator.getActiveEngineCount()) > 0
+    if (globalCtx.__engine_manager_instance?.isEngineRunning || coordinatorHasEngines) {
+      console.log(`[v0] [Redis] Snapshot reload skipped: engine/coordinator running in this process`)
       return false
     }
 
@@ -665,6 +670,10 @@ export class InlineLocalRedis {
       if (k.startsWith("live:position:"))    return true  // open/closed live positions
       if (k.startsWith("live:positions:"))   return true  // open/closed index LISTs
       if (k.startsWith("progression:"))      return true  // progression counters
+      if (/^prehistoric:[^:]+$/.test(k))     return true  // prehistoric summary hash for stats
+      if (/^prehistoric:[^:]+:symbols$/.test(k)) return true  // processed-symbol denominator set
+      if (/^prehistoric:[^:]+:done$/.test(k)) return true  // realtime gate marker
+      if (/^prehistoric:[^:]+:firstpass:done$/.test(k)) return true  // first-pass gate
       if (k.startsWith("connection:"))       return true  // exchange credentials
       if (k.startsWith("strategy_count:"))   return true  // strategy count totals
       if (k.startsWith("real_pi_acc:"))      return true  // real PI accumulation
@@ -1542,6 +1551,17 @@ let coreInitialized = false      // core ready: client constructed + snapshot lo
 let connectionsInitialized = false
 let migrationsRan = false
 
+function isNextBuildPhase(): boolean {
+  const lifecycle = process.env.npm_lifecycle_event || ""
+  const argv = process.argv.join(" ")
+  return (
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    lifecycle === "build" ||
+    lifecycle === "vercel-build" ||
+    /\bnext(\.js)?\s+build\b/.test(argv)
+  )
+}
+
 /**
  * Ensure the CORE Redis client is ready: instance constructed, on-disk
  * snapshot loaded, and ping verified. This deliberately does NOT run
@@ -1612,6 +1632,35 @@ export async function ensureCoreRedis(): Promise<void> {
  * this, and every server action / route guards on it via ensureRedisInitialized.
  */
 export async function initRedis(): Promise<void> {
+  // Build/deploy builders import route modules while collecting page data.
+  // Runtime Redis hydration/migrations are not needed for static analysis and
+  // can exceed hosted builder deadlines (kilo.ai). Provide an empty, connected
+  // in-memory client for build-time reads and defer real migrations to runtime.
+  if (isNextBuildPhase()) {
+    if (!redisInstance) redisInstance = new InlineLocalRedis()
+    isConnected = true
+    coreInitialized = true
+    connectionsInitialized = true
+    migrationsRan = true
+    globalForRedis.__redis_snapshot_loaded = true
+    globalForRedis.__redis_fully_connected = true
+    return
+  }
+
+  // Next.js dev can re-evaluate this module for a newly compiled route while
+  // keeping the InlineLocalRedis data on globalThis. In that case the
+  // module-scoped `isConnected` / `migrationsRan` flags reset to false even
+  // though another module instance has already completed core init +
+  // migrations. Honour the global ready marker so route compilation does not
+  // re-run all migrations and overwrite operator-saved state (symbols,
+  // connection mode, progression snapshots) back to migration defaults.
+  if (globalForRedis.__redis_fully_connected) {
+    isConnected = true
+    coreInitialized = true
+    connectionsInitialized = true
+    migrationsRan = true
+    return
+  }
   if (isConnected) return
 
   // DEV ONLY — flush stale live positions on every initRedis() call.
@@ -1967,6 +2016,17 @@ export async function setSettings(key: string, value: any): Promise<void> {
   const client = getClient()
   const data = flattenForHmset(value)
   await client.hset(`settings:${key}`, data)
+}
+
+export async function persistNow(): Promise<boolean> {
+  const client = getClient()
+  if (typeof (client as any).persistNow === "function") {
+    return (client as any).persistNow()
+  }
+  if (typeof (client as any).saveToDisk === "function") {
+    return (client as any).saveToDisk()
+  }
+  return false
 }
 
 export async function getAllSettings(): Promise<Record<string, any>> {
@@ -3309,4 +3369,3 @@ export async function softResetWithCoordinationPreserved(): Promise<{
     buckets,
   }
 }
-

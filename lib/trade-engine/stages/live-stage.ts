@@ -131,7 +131,8 @@ interface LivePosition {
   // dca=0.5, others=1.0). Stored so accumulation can match original sizing.
   sizeMultiplier?: number
   parentSetKey?: string
-  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
+  setVariant?: "default" | "trailing" | "block" | "dca"
+  trailingProfile?: { startRatio: number; stopRatio: number; stepRatio: number }
   accumulatedSetKeys?: string[]
   
   progression?: { step: string; timestamp: number; success: boolean; details: string }[]
@@ -179,6 +180,36 @@ function normalizeStopLossPercent(rawStopLoss: unknown): { value: number; adjust
   }
   return { value: n, adjusted: false }
 }
+
+function resolveMinNotionalRiskTolerance(settings: Record<string, unknown> | null | undefined): number {
+  const raw = settings?.min_notional_risk_tolerance_pct
+    ?? settings?.minNotionalRiskTolerancePct
+    ?? settings?.min_notional_exceeds_strategy_risk_tolerance_pct
+    ?? settings?.minNotionalExceedsStrategyRiskTolerancePct
+    ?? 5
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return 5
+  // Accept either percent values (5 = 5%) or fractional values (0.05 = 5%).
+  return n > 1 ? n / 100 : n
+}
+
+function getPositiveNotional(quantity: unknown, price: number): number {
+  const qty = Number(quantity)
+  return Number.isFinite(qty) && qty > 0 && Number.isFinite(price) && price > 0
+    ? qty * price
+    : 0
+}
+
+function minNotionalExceedsStrategyRisk(
+  intendedNotional: number,
+  fallbackNotional: number,
+  tolerance: number,
+): boolean {
+  return intendedNotional > 0
+    && fallbackNotional > 0
+    && fallbackNotional > intendedNotional * (1 + Math.max(0, tolerance))
+}
+
 async function savePosition(position: LivePosition): Promise<void> {
   const { savePosition: redisSave } = await import("@/lib/redis-db")
   await redisSave(position as any)
@@ -332,6 +363,35 @@ async function accumulateIntoLivePosition(connId: string, existing: LivePosition
       pushStep(existing, "accumulate_skip", false, `could not size accumulation order for ${symbol}`)
       await savePosition(existing)
       return existing
+    }
+
+    const intendedNotionalUsd = getPositiveNotional(volumeResult?.calculatedVolume, price)
+    const fallbackNotionalUsd = getPositiveNotional(addQty, price)
+    const usedMinimumOrFallback = Boolean(volumeResult?.volumeAdjusted) || !volumeResult
+    if (usedMinimumOrFallback) {
+      const { getConnection: _getConnForTol } = await import("@/lib/redis-db")
+      const tolerance = resolveMinNotionalRiskTolerance(await _getConnForTol(connId).catch(() => null))
+      if (minNotionalExceedsStrategyRisk(intendedNotionalUsd, fallbackNotionalUsd, tolerance)) {
+        const detail =
+          `min_notional_exceeds_strategy_risk: intendedNotional=$${intendedNotionalUsd.toFixed(4)} ` +
+          `fallbackNotional=$${fallbackNotionalUsd.toFixed(4)} price=${price} ` +
+          `setKey=${real.setKey || "n/a"} tolerance=${(tolerance * 100).toFixed(2)}%`
+        pushStep(existing, "accumulate_skip", false, detail)
+        await savePosition(existing)
+        await logProgressionEvent(connId, "live_trading", "warning", `Accumulation suppressed — minimum notional exceeds strategy risk for ${symbol}`, {
+          reason: "min_notional_exceeds_strategy_risk",
+          symbol,
+          direction,
+          intendedNotionalUsd,
+          fallbackNotionalUsd,
+          currentPrice: price,
+          setKey: real.setKey || null,
+          tolerancePct: tolerance * 100,
+          adjustmentReason: volumeResult?.adjustmentReason || null,
+        }).catch(() => {})
+        console.warn(`${LOG_PREFIX} ${detail}`)
+        return existing
+      }
     }
 
     // ── Place the real market order for the added size ──────────────────
@@ -1884,6 +1944,7 @@ export async function executeLivePosition(
     setVariant:     realPosition.setVariant,
     axisWindows:    realPosition.axisWindows,
     sizeMultiplier: realPosition.sizeMultiplier,
+    trailingProfile: realPosition.trailingProfile,
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
   }
 
@@ -1988,7 +2049,7 @@ export async function executeLivePosition(
       // occupied — don't open a second default", not "all orders blocked").
       //
       // We use a variant-scoped lock key for block sets:
-      //   default/trailing/pause/dca: live:lock:{conn}:{sym}:{dir}
+      //   default/trailing/dca: live:lock:{conn}:{sym}:{dir}
       //   block:                      live:lock:{conn}:{sym}:{dir}:block
       //
       // This allows at most 1 default + 1 block position per direction per
@@ -2333,6 +2394,50 @@ export async function executeLivePosition(
           synthesizedQty: computedVolume,
         }
       )
+    }
+
+    const intendedNotionalUsd = getPositiveNotional(volumeResult?.calculatedVolume, currentPrice)
+    const fallbackNotionalUsd = getPositiveNotional(computedVolume, currentPrice)
+    const minNotionalRiskTolerance = resolveMinNotionalRiskTolerance(connSettings as Record<string, unknown>)
+    const usedMinimumOrFallback = Boolean(volumeResult?.volumeAdjusted) || volumeNote.length > 0
+
+    if (
+      usedMinimumOrFallback
+      && minNotionalExceedsStrategyRisk(intendedNotionalUsd, fallbackNotionalUsd, minNotionalRiskTolerance)
+    ) {
+      livePosition.status = "rejected"
+      livePosition.statusReason = "min_notional_exceeds_strategy_risk"
+      livePosition.quantity = 0
+      livePosition.remainingQuantity = 0
+      livePosition.volumeUsd = 0
+      livePosition.updatedAt = Date.now()
+      const detail =
+        `min_notional_exceeds_strategy_risk: intendedNotional=$${intendedNotionalUsd.toFixed(4)} ` +
+        `fallbackNotional=$${fallbackNotionalUsd.toFixed(4)} price=${currentPrice} ` +
+        `setKey=${realPosition.setKey || "n/a"} tolerance=${(minNotionalRiskTolerance * 100).toFixed(2)}%`
+      pushStep(livePosition, "volume_calc", false, detail)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_rejected_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        `Live order rejected — minimum notional exceeds strategy risk for ${realPosition.symbol}`,
+        {
+          reason: livePosition.statusReason,
+          symbol: realPosition.symbol,
+          direction: realPosition.direction,
+          intendedNotionalUsd,
+          fallbackNotionalUsd,
+          currentPrice,
+          setKey: realPosition.setKey || null,
+          tolerancePct: minNotionalRiskTolerance * 100,
+          adjustmentReason: volumeResult?.adjustmentReason || null,
+        },
+      )
+      console.warn(`${LOG_PREFIX} ${detail}`)
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+      return livePosition
     }
 
     // High-visibility diagnostic for the most common reason real orders never appear on the exchange

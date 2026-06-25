@@ -55,6 +55,7 @@ async function emitSettingsChanged(keyCount: number, changedKeys: string[]): Pro
   }
 }
 
+export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 const POSITION_COST_MIN_PERCENT = 0.02
