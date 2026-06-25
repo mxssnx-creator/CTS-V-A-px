@@ -1736,15 +1736,37 @@ export class StrategyCoordinator {
         const n = Number(val)
         return Number.isFinite(n) ? n : def
       }
+      const hasSetting = (key: string): boolean =>
+        Object.prototype.hasOwnProperty.call(s, key) && s[key] !== undefined && s[key] !== null && s[key] !== ""
+      const axisDefaults = {
+        axisPrevEnabled: true,
+        axisPrevMaxWindow: 12,
+        axisLastEnabled: true,
+        axisLastMaxWindow: 4,
+        axisContEnabled: true,
+        axisContMaxWindow: 8,
+        axisPauseEnabled: true,
+        axisPauseMaxWindow: 8,
+      } as const
+      const missingAxisDefaults = Object.keys(axisDefaults).filter((key) => !hasSetting(key))
+      if (missingAxisDefaults.length > 0) {
+        console.info(
+          `[v0] [StrategyCoordinator] ${this.connectionId} coordination axis settings absent; using defaults`,
+          {
+            missing: missingAxisDefaults,
+            defaults: axisDefaults,
+          },
+        )
+      }
 
-      this._coordinationSettings.axes.prev.enabled   = bool(s.axisPrevEnabled,   false)
-      this._coordinationSettings.axes.prev.maxWindow  = num(s.axisPrevMaxWindow,   0)
-      this._coordinationSettings.axes.last.enabled   = bool(s.axisLastEnabled,   false)
-      this._coordinationSettings.axes.last.maxWindow  = num(s.axisLastMaxWindow,   0)
-      this._coordinationSettings.axes.cont.enabled   = bool(s.axisContEnabled,   false)
-      this._coordinationSettings.axes.cont.maxWindow  = num(s.axisContMaxWindow,   0)
-      this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  false)
-      this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  0)
+      this._coordinationSettings.axes.prev.enabled   = bool(s.axisPrevEnabled,   axisDefaults.axisPrevEnabled)
+      this._coordinationSettings.axes.prev.maxWindow  = num(s.axisPrevMaxWindow,   axisDefaults.axisPrevMaxWindow)
+      this._coordinationSettings.axes.last.enabled   = bool(s.axisLastEnabled,   axisDefaults.axisLastEnabled)
+      this._coordinationSettings.axes.last.maxWindow  = num(s.axisLastMaxWindow,   axisDefaults.axisLastMaxWindow)
+      this._coordinationSettings.axes.cont.enabled   = bool(s.axisContEnabled,   axisDefaults.axisContEnabled)
+      this._coordinationSettings.axes.cont.maxWindow  = num(s.axisContMaxWindow,   axisDefaults.axisContMaxWindow)
+      this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  axisDefaults.axisPauseEnabled)
+      this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  axisDefaults.axisPauseMaxWindow)
 
       // Variant toggles. Defaults: trailing=true, block=true, dca=false.
       // Pause is an axis/position-count window, not a general strategy type.
