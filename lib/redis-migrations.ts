@@ -2257,6 +2257,7 @@ const migrations: Migration[] = [
     // getSymbols() actually reads.  Migration 039 re-applies the correct write
     // regardless of whether 038 ran.
     version: 39,
+    name: "039-polusdt-settings-hashes",
     // ↑ keep 038/039 as-is for existing DBs that already ran them
     description: "Re-apply POLUSDT force_symbols to settings: prefixed hashes (fixes 038 write-path bug)",
     up: async (client: any) => {
@@ -2331,8 +2332,9 @@ const migrations: Migration[] = [
     version: 40,
     name: "040-canonical-bingx-x01-state",
     up: async (client: any) => {
-      await client.set("_schema_version", "40")
-
+      // NOTE: do NOT stamp _schema_version here. The runner stamps it only after
+      // up() resolves successfully. Stamping at the start meant a mid-migration
+      // crash falsely marked the migration complete, so it never re-ran.
       const CONN_ID = "bingx-x01"
       const now     = new Date().toISOString()
 
@@ -2464,8 +2466,10 @@ const migrations: Migration[] = [
   //   migration always forces a fresh prehistoric run on the next engine boot.
   {
     version: 41,
+    name: "041-fix-volume-and-prehistoric-gate",
+    description: "Correct live_volume_factor to 2.2 and clear prehistoric_loaded gate for fresh prehistoric run",
     up: async (client: any) => {
-      await client.set("_schema_version", "41")
+      // NOTE: do NOT stamp _schema_version here — the runner stamps on success only.
       const CONN_ID = "bingx-x01"
       const now = new Date().toISOString()
 

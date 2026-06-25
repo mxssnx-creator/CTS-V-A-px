@@ -497,11 +497,13 @@ export function sanitizeLiveProfitFactor(profitFactor: unknown, fallback = 1): n
 }
 
 export function deriveProtectionFromProfitFactor(
+function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
   sizeMultiplier = 1,
 ): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
   const pf = sanitizeLiveProfitFactor(profitFactor, 1)
+  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
   const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
   // Tie SL to the actual position-cost budget, then apply variant scaling.
   // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
@@ -4009,6 +4011,7 @@ export class StrategyCoordinator {
                 // Real-stage tuner's per-variant performance bias.
                 const rawEffectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
                 const effectivePF = sanitizeLiveProfitFactor(rawEffectivePF, bestEntry.profitFactor)
+                const effectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
 
                 // Derive SL/TP % from PF and the actual position-cost budget.
                 // The live-stage converts these percentages to concrete prices

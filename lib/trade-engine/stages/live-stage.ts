@@ -1860,6 +1860,7 @@ export async function executeLivePosition(
     marginType: "cross",
     stopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
     takeProfit: Math.max(0, Number(realPosition.takeProfit) || 0),
+    takeProfit: realPosition.takeProfit,
     // Immutable assignment snapshot — preserved across overrides so the
     // progression panel and post-trade stats can always recover what the
     // upstream Set originally specified. Mirrors `stopLoss`/`takeProfit`
