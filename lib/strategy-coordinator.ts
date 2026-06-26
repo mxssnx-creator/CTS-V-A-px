@@ -492,6 +492,112 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
+type ProtectionCostModel = {
+  takerFeeBpsPerSide: number
+  estimatedSpreadBps: number
+  estimatedMarketSlippageBps: number
+  fundingHoldCostBufferBps?: number
+  source?: string
+}
+
+type DerivedProtection = {
+  takeProfitPct: number
+  stopLossPct: number
+  grossPF: number
+  netPF: number
+  costBufferPct: number
+  effectiveTpPct: number
+  effectiveSlPct: number
+}
+
+function conservativeCostFallbackForExchange(exchange: string): ProtectionCostModel {
+  const ex = exchange.toLowerCase()
+  if (ex === "binance" || ex === "binanceusdm") {
+    return { takerFeeBpsPerSide: 5, estimatedSpreadBps: 2, estimatedMarketSlippageBps: 4, fundingHoldCostBufferBps: 2, source: "fallback:binance" }
+  }
+  if (ex === "okx" || ex === "okex") {
+    return { takerFeeBpsPerSide: 5, estimatedSpreadBps: 3, estimatedMarketSlippageBps: 5, fundingHoldCostBufferBps: 2, source: "fallback:okx" }
+  }
+  if (ex === "bybit") {
+    return { takerFeeBpsPerSide: 6, estimatedSpreadBps: 3, estimatedMarketSlippageBps: 5, fundingHoldCostBufferBps: 2, source: "fallback:bybit" }
+  }
+  if (ex === "bingx") {
+    return { takerFeeBpsPerSide: 7, estimatedSpreadBps: 5, estimatedMarketSlippageBps: 8, fundingHoldCostBufferBps: 3, source: "fallback:bingx" }
+  }
+  return { takerFeeBpsPerSide: 8, estimatedSpreadBps: 6, estimatedMarketSlippageBps: 10, fundingHoldCostBufferBps: 4, source: "fallback:generic" }
+}
+
+function pickFiniteBps(settings: Record<string, unknown>, keys: string[], fallback: number): number {
+  for (const key of keys) {
+    const n = Number(settings[key])
+    if (Number.isFinite(n) && n >= 0) return n
+  }
+  return fallback
+}
+
+function resolveProtectionCostModel(exchange: string, settings: Record<string, unknown>): ProtectionCostModel {
+  const fallback = conservativeCostFallbackForExchange(exchange)
+  const hasExplicit = (...keys: string[]) => keys.some((k) => settings[k] !== undefined && settings[k] !== null && settings[k] !== "")
+  return {
+    takerFeeBpsPerSide: pickFiniteBps(settings, ["takerFeeBpsPerSide", "takerFeeBps", "exchangeTakerFeeBps", "taker_fee_bps"], fallback.takerFeeBpsPerSide),
+    estimatedSpreadBps: pickFiniteBps(settings, ["estimatedSpreadBps", "spreadBps", "exchangeSpreadBps", "estimated_spread_bps"], fallback.estimatedSpreadBps),
+    estimatedMarketSlippageBps: pickFiniteBps(settings, ["estimatedMarketSlippageBps", "marketSlippageBps", "slippageBps", "estimated_market_slippage_bps"], fallback.estimatedMarketSlippageBps),
+    fundingHoldCostBufferBps: pickFiniteBps(settings, ["fundingHoldCostBufferBps", "fundingBufferBps", "holdCostBufferBps", "funding_hold_cost_buffer_bps"], fallback.fundingHoldCostBufferBps ?? 0),
+    source: hasExplicit(
+      "takerFeeBpsPerSide", "takerFeeBps", "exchangeTakerFeeBps", "taker_fee_bps",
+      "estimatedSpreadBps", "spreadBps", "exchangeSpreadBps", "estimated_spread_bps",
+      "estimatedMarketSlippageBps", "marketSlippageBps", "slippageBps", "estimated_market_slippage_bps",
+      "fundingHoldCostBufferBps", "fundingBufferBps", "holdCostBufferBps", "funding_hold_cost_buffer_bps",
+    ) ? "settings" : fallback.source,
+  }
+}
+export function sanitizeLiveProfitFactor(profitFactor: unknown, fallback = 1): number {
+  const pf = Number(profitFactor)
+  const fb = Number.isFinite(fallback) && fallback > 0 ? fallback : 1
+  return Number.isFinite(pf) && pf > 0 ? pf : fb
+}
+
+const LIVE_PROTECTION_FEE_BUFFER_PCT = 0.12
+
+type LiveExecutionCostProfile = {
+  exchange: string
+  takerFeePct: number
+  estimatedSpreadPct: number
+  slippagePct: number
+  fundingBufferPct: number
+  costBufferPct: number
+}
+
+type ProfitFactorProtection = {
+  takeProfitPct: number
+  stopLossPct: number
+  effectiveProfitFactor: number
+  grossPF: number
+  costBufferPct: number
+  netEffectivePF: number
+  adjustedTakeProfitPct: number
+}
+
+type LiveDispatchDecision = {
+  setKey: string
+  parentSetKey?: string
+  variant: string
+  symbol: string
+  direction: "long" | "short"
+  grossPF: number
+  costBufferPct: number
+  netEffectivePF: number
+  takeProfitPct: number
+  adjustedTakeProfitPct: number
+  stopLossPct: number
+  effectiveProfitFactor: number
+  liveThresholdPF: number
+  costs: LiveExecutionCostProfile
+  reason?: "net_pf_after_costs_low" | "tp_after_costs_exceeds_max"
+}
+
+const MAX_LIVE_TAKE_PROFIT_PCT = 22
+
 function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
@@ -503,10 +609,84 @@ function deriveProtectionFromProfitFactor(
   // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
   const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
   const takeProfitPct = clampNumber(stopLossPct * Math.max(1, pf), 0.2, 22)
+  costModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic"),
+): DerivedProtection & ProfitFactorProtection {
+  const pf = sanitizeLiveProfitFactor(profitFactor, 1)
+  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
+  const costBufferPct = (
+    (costModel.takerFeeBpsPerSide * 2) +
+    costModel.estimatedSpreadBps +
+    (costModel.estimatedMarketSlippageBps * 2) +
+    (costModel.fundingHoldCostBufferBps ?? 0)
+  ) / 100
+  const grossTakeProfitPct = Math.max(0.2, stopLossPct * Math.max(1, pf))
+  const adjustedTakeProfitPct = grossTakeProfitPct + Math.max(costBufferPct, LIVE_PROTECTION_FEE_BUFFER_PCT)
+  const takeProfitPct = clampNumber(adjustedTakeProfitPct, 0.2, MAX_LIVE_TAKE_PROFIT_PCT)
+  const effectiveTpPct = Math.max(0, takeProfitPct - costBufferPct)
   return {
     takeProfitPct,
     stopLossPct,
     effectiveProfitFactor: takeProfitPct / stopLossPct,
+    grossPF: takeProfitPct / stopLossPct,
+    netPF: effectiveTpPct / stopLossPct,
+    costBufferPct,
+    netEffectivePF: effectiveTpPct / stopLossPct,
+    adjustedTakeProfitPct,
+    effectiveTpPct,
+    effectiveSlPct: stopLossPct,
+  }
+}
+
+function normalizePercentSetting(value: unknown, fallbackPct: number): number {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return fallbackPct
+  // Settings often store tolerances as ratios (0.0006 = 0.06%). Accept both.
+  return n <= 1 ? n * 100 : n
+}
+
+function defaultTakerFeePct(exchange: string): number {
+  switch (exchange) {
+    case "binance": return 0.04
+    case "bybit": return 0.055
+    case "okx": return 0.05
+    case "bingx": return 0.05
+    default: return 0.06
+  }
+}
+
+function resolveLiveExecutionCostProfile(exchange: string, connSettings: Record<string, unknown>): LiveExecutionCostProfile {
+  const takerFeePct = normalizePercentSetting(connSettings.takerFeePct ?? connSettings.takerFee ?? connSettings.exchangeTakerFeePct, defaultTakerFeePct(exchange))
+  const estimatedSpreadPct = normalizePercentSetting(connSettings.estimatedSpreadPct ?? connSettings.spreadPct ?? connSettings.exchangeSpreadPct, 0.02)
+  const slippagePct = normalizePercentSetting(connSettings.slippageTolerance ?? connSettings.slippagePct ?? connSettings.exchangeSlippagePct, 0.06)
+  const fundingBufferPct = normalizePercentSetting(connSettings.fundingBufferPct ?? connSettings.fundingPct ?? connSettings.exchangeFundingBufferPct, 0)
+  return {
+    exchange,
+    takerFeePct,
+    estimatedSpreadPct,
+    slippagePct,
+    fundingBufferPct,
+    costBufferPct: (takerFeePct * 2) + estimatedSpreadPct + (slippagePct * 2) + fundingBufferPct,
+  }
+}
+
+
+function deriveConfiguredStatsFromProfitFactor(
+  profitFactor: number,
+  positionCostPct: number,
+): { takeProfitPct: number; stopLossPct: number; tpR: number; slR: number; rewardRisk: number } {
+  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
+  const posCost = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  // Mirrors the live pseudo-position TP/SL configuration so configured
+  // reward/risk stays separate from realized performance factor.
+  const takeProfitPct = Math.max(0.5, (pf - 1) * 100)
+  const stopLossPct = Math.min(5, 100 / Math.max(1, pf) * 0.5)
+  return {
+    takeProfitPct,
+    stopLossPct,
+    tpR: takeProfitPct / posCost,
+    slR: stopLossPct / posCost,
+    rewardRisk: stopLossPct > 0 ? takeProfitPct / stopLossPct : 0,
   }
 }
 
@@ -3673,6 +3853,8 @@ export class StrategyCoordinator {
         }
       }
     } catch (e) { /* non-fatal */ }
+
+
 
 
 
