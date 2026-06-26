@@ -8,13 +8,16 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
+import { DEFAULT_VOLUME_STEP_RATIO, MAX_VOLUME_STEP_RATIO, MIN_VOLUME_STEP_RATIO } from "@/lib/constants"
 import { Volume2 } from "lucide-react"
 
 interface VolumeConfigurationPanelProps {
   liveVolumeFactor: number
   presetVolumeFactor: number
+  volumeStepRatio: number
   onLiveVolumeChange: (value: number) => void
   onPresetVolumeChange: (value: number) => void
+  onVolumeStepRatioChange: (value: number) => void
   orderType: "market" | "limit"
   onOrderTypeChange: (type: "market" | "limit") => void
   volumeType: "usdt" | "contract"
@@ -28,8 +31,10 @@ const PRESET_MULTIPLIERS = [0.5, 1.0, 1.5, 2.0]
 export function VolumeConfigurationPanel({
   liveVolumeFactor,
   presetVolumeFactor,
+  volumeStepRatio,
   onLiveVolumeChange,
   onPresetVolumeChange,
+  onVolumeStepRatioChange,
   orderType,
   onOrderTypeChange,
   volumeType,
@@ -113,6 +118,27 @@ export function VolumeConfigurationPanel({
             </Button>
           ))}
         </div>
+      </div>
+
+      <div className="space-y-3 rounded-lg bg-slate-50 dark:bg-slate-900/30 p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <Label className="text-sm font-medium">Volume Step Ratio</Label>
+            <p className="text-xs text-muted-foreground">Recalculate volume after balance rises by the selected ratio; drawdowns reset immediately.</p>
+          </div>
+          <Badge variant="secondary" className="text-xs">
+            {(volumeStepRatio || DEFAULT_VOLUME_STEP_RATIO).toFixed(1)}×
+          </Badge>
+        </div>
+        <Slider
+          value={[volumeStepRatio || DEFAULT_VOLUME_STEP_RATIO]}
+          onValueChange={(value) => onVolumeStepRatioChange(value[0])}
+          min={MIN_VOLUME_STEP_RATIO}
+          max={MAX_VOLUME_STEP_RATIO}
+          step={0.2}
+          className="w-full"
+          disabled={slidersDisabled}
+        />
       </div>
 
       <Separator className="my-2" />

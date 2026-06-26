@@ -10,6 +10,7 @@
 
 import { initRedis, getSettings, getAppSettings, setSettings, getRedisClient, getConnection } from "@/lib/redis-db"
 import { getMaxLeverageForExchange } from "@/lib/leverage-policy"
+import { DEFAULT_VOLUME_STEP_RATIO, MAX_VOLUME_STEP_RATIO, MIN_VOLUME_STEP_RATIO } from "@/lib/constants"
 
 interface VolumeCalculationParams {
   baseVolumeFactor?: number
@@ -72,7 +73,11 @@ interface VolumeCalculationResult {
   liveEngineFactor?: number
   sizeMultiplier?: number
   exchangeMinVolume?: number
+  volumeStepRatio?: number
+  volumeBalanceAnchor?: number
+  volumeBalanceEffective?: number
 }
+
 
 export class VolumeCalculator {
   /**
@@ -387,7 +392,7 @@ export class VolumeCalculator {
   static resolveLiveEngine(
     connection: Record<string, unknown> | null | undefined,
     appSettings: Record<string, unknown> | null | undefined,
-  ): { tradeMode: "main" | "preset"; mainVolumeFactor: number; presetVolumeFactor: number } {
+  ): { tradeMode: "main" | "preset"; mainVolumeFactor: number; presetVolumeFactor: number; volumeStepRatio: number } {
     const truthy = (v: unknown) =>
       v === true || v === "true" || v === 1 || v === "1"
     const num = (v: unknown, fallback: number) => {
@@ -438,7 +443,58 @@ export class VolumeCalculator {
       0.1,
     )
 
-    return { tradeMode, mainVolumeFactor, presetVolumeFactor }
+    const rawStep = num(
+      conn["volume_step_ratio"]
+        ?? app["volume_step_ratio"]
+        ?? app["volumeStepRatio"]
+        ?? app["main_volume_step_ratio"]
+        ?? app["mainVolumeStepRatio"],
+      DEFAULT_VOLUME_STEP_RATIO,
+    )
+    const volumeStepRatio = Math.max(MIN_VOLUME_STEP_RATIO, Math.min(MAX_VOLUME_STEP_RATIO, rawStep))
+
+    return { tradeMode, mainVolumeFactor, presetVolumeFactor, volumeStepRatio }
+  }
+
+
+  /**
+   * Keep live-order sizing stable across tiny balance changes. The first
+   * balance seen for each connection/mode becomes the sizing anchor; profit
+   * only increases order size after the balance crosses anchor × (1 + step).
+   * Drawdowns reset the anchor downward immediately so sizing never keeps using
+   * a stale higher balance. Example: anchor 100, step 0.6 → recalc at >= 160.
+   */
+  private static async resolveSteppedSizingBalance(
+    connectionId: string,
+    tradeMode: "main" | "preset" | undefined,
+    accountBalance: number,
+    volumeStepRatio: number,
+  ): Promise<{ sizingBalance: number; anchorBalance: number }> {
+    const safeBalance = Number.isFinite(accountBalance) && accountBalance > 0 ? accountBalance : 0
+    if (safeBalance <= 0) return { sizingBalance: accountBalance, anchorBalance: accountBalance }
+
+    const mode = tradeMode === "preset" ? "preset" : "main"
+    const step = Math.max(MIN_VOLUME_STEP_RATIO, Math.min(MAX_VOLUME_STEP_RATIO, Number(volumeStepRatio) || DEFAULT_VOLUME_STEP_RATIO))
+    const key = `connection_volume_step_anchor:${connectionId}:${mode}`
+
+    try {
+      const existing = await getSettings(key)
+      const rawAnchor = typeof existing === "object" && existing ? (existing as any).anchor_balance : existing
+      const anchor = Number(rawAnchor)
+
+      if (!Number.isFinite(anchor) || anchor <= 0 || safeBalance < anchor || safeBalance >= anchor * (1 + step)) {
+        await setSettings(key, {
+          anchor_balance: safeBalance,
+          step_ratio: step,
+          updated_at: new Date().toISOString(),
+        })
+        return { sizingBalance: safeBalance, anchorBalance: safeBalance }
+      }
+
+      return { sizingBalance: anchor, anchorBalance: anchor }
+    } catch {
+      return { sizingBalance: safeBalance, anchorBalance: safeBalance }
+    }
   }
 
   /**
@@ -568,7 +624,7 @@ export class VolumeCalculator {
         const CONN_FIELDS_TO_OVERLAY = [
           "exchangePositionCost", "exchange_position_cost", "positionCost",
           "positions_average", "positionsAverage",
-          "live_volume_factor", "preset_volume_factor",
+          "live_volume_factor", "preset_volume_factor", "volume_step_ratio",
           "leveragePercentage", "useMaximalLeverage",
         ] as const
         for (const f of CONN_FIELDS_TO_OVERLAY) {
@@ -612,6 +668,7 @@ export class VolumeCalculator {
       let resolvedMode: "main" | "preset" | undefined = options.tradeMode
       let mainVolumeFactor = 0.1
       let presetVolumeFactor = 0.1
+      let volumeStepRatio = DEFAULT_VOLUME_STEP_RATIO
       if (resolvedMode === "main" || resolvedMode === "preset") {
         // Pass BOTH the connection record (has live_volume_factor written
         // by the volume endpoint) AND the merged settings object (has
@@ -621,15 +678,25 @@ export class VolumeCalculator {
         const resolved = VolumeCalculator.resolveLiveEngine(connection, settings)
         mainVolumeFactor = resolved.mainVolumeFactor
         presetVolumeFactor = resolved.presetVolumeFactor
+        volumeStepRatio = resolved.volumeStepRatio
         // We honour the CALLER's explicit mode; resolveLiveEngine's
         // tradeMode result is informational here (used only when the
         // caller did not specify).
       }
 
+      const steppedBalance = resolvedMode
+        ? await VolumeCalculator.resolveSteppedSizingBalance(
+            connectionId,
+            resolvedMode,
+            accountBalance,
+            volumeStepRatio,
+          )
+        : { sizingBalance: accountBalance, anchorBalance: accountBalance }
+
       const result = this.calculatePositionVolume({
         positionCost,
         positionsAverage,
-        accountBalance,
+        accountBalance: steppedBalance.sizingBalance,
         currentPrice,
         leverage: maxLeverage,
         exchangeMinVolume,
@@ -639,6 +706,11 @@ export class VolumeCalculator {
         // Variant multiplier forwarded from the callsite (Block/DCA sizing).
         sizeMultiplier: options.sizeMultiplier,
       })
+
+      result.accountBalance = steppedBalance.sizingBalance
+      result.volumeBalanceEffective = steppedBalance.sizingBalance
+      result.volumeBalanceAnchor = steppedBalance.anchorBalance
+      result.volumeStepRatio = volumeStepRatio
 
       return result
     } catch (error) {
@@ -677,6 +749,9 @@ export class VolumeCalculator {
         positions_average: calculation.positionsAverage,
         live_engine_factor: calculation.liveEngineFactor,
         size_multiplier: calculation.sizeMultiplier,
+        volume_step_ratio: calculation.volumeStepRatio,
+        volume_balance_anchor: calculation.volumeBalanceAnchor,
+        volume_balance_effective: calculation.volumeBalanceEffective,
         created_at: new Date().toISOString(),
       }))
 

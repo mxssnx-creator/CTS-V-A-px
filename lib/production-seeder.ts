@@ -134,6 +134,34 @@ async function seedPredefinedConnections(): Promise<void> {
       return
     }
 
+    // Migration-created / operator-created connection hashes are also an
+    // existing state. Rebuild the list cache instead of reseeding defaults;
+    // otherwise a page-triggered /api/system/initialize can overwrite live
+    // operator connection flags when all_connections is missing/stale.
+    const existingConnectionKeys = ((await client.keys("connection:*").catch(() => [])) || [])
+      .filter((key: string) =>
+        !key.includes(":settings:") &&
+        !key.includes(":stats:") &&
+        !key.includes(":logs:")
+      )
+
+    if (existingConnectionKeys.length > 0) {
+      const existingRows = []
+      for (const key of existingConnectionKeys) {
+        const row = await client.hgetall(key).catch(() => null)
+        if (row && Object.keys(row).length > 0) {
+          const id = row.id || key.replace(/^connection:/, "")
+          existingRows.push({ ...row, id })
+          await client.sadd("connections", id).catch(() => {})
+        }
+      }
+      if (existingRows.length > 0) {
+        await client.set(connectionsKey, JSON.stringify(existingRows))
+        console.log(`[v0] [ProductionSeeder] Rebuilt all_connections from ${existingRows.length} existing connection hashes; skipping reseed`)
+        return
+      }
+    }
+
     // Get predefined connections
     const predefinedConnections = getPredefinedAsExchangeConnections()
 
@@ -154,6 +182,8 @@ async function seedPredefinedConnections(): Promise<void> {
       is_predefined: "false",
       active_symbols: "[]",
       live_volume_factor: "0.1",
+      preset_volume_factor: "1.0",
+      volume_step_ratio: "0.6",
     }))
 
     // Save individual connections to Redis (connection:{id} hashes)

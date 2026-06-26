@@ -1,6 +1,6 @@
 "use client"
 
-import { MIN_VOLUME_FACTOR } from "@/lib/constants"
+import { DEFAULT_VOLUME_STEP_RATIO, MIN_VOLUME_FACTOR } from "@/lib/constants"
 export const dynamic = "force-dynamic"
 import { useState, useEffect } from "react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -45,6 +45,7 @@ const EXCHANGE_MAX_POSITIONS: Record<string, number> = {
 // Define Settings type for better type safety
 interface Settings {
   base_volume_factor: number
+  volume_step_ratio: number
   positions_average: number
   max_leverage: number
   negativeChangePercent: number
@@ -377,6 +378,7 @@ interface Settings {
 const initialSettings: Settings = {
   // Overall / Main
   base_volume_factor: MIN_VOLUME_FACTOR,
+  volume_step_ratio: DEFAULT_VOLUME_STEP_RATIO,
   // Default raised 50 → 300; see components/settings/utils.ts for the
   // rationale. The two defaults must stay in lock-step or first-load
   // will paint stale UI before the live settings hydrate from Redis.
@@ -744,10 +746,6 @@ export default function SettingsPage() {
   const [settings, setSettings] = useState<Settings>({
     ...initialSettings,
     // Ensure defaults are applied if not present in initialSettings
-    positionCost: initialSettings.positionCost ?? 0.02, // 0.02% default (slider value)
-    exchangePositionCost: initialSettings.exchangePositionCost ?? 0.02, // Sync with positionCost
-    baseVolumeFactorLive: initialSettings.baseVolumeFactorLive ?? 1.0,
-    baseVolumeFactorPreset: initialSettings.baseVolumeFactorPreset ?? 1.0,
     positionCost: initialSettings.positionCost ?? 0.1, // 0.1% default (slider value)
     exchangePositionCost: initialSettings.exchangePositionCost ?? 0.1, // Sync with positionCost
     baseVolumeFactorLive: initialSettings.baseVolumeFactorLive ?? MIN_VOLUME_FACTOR,

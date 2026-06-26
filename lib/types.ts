@@ -66,7 +66,6 @@ export interface PseudoPosition {
   costNormalizedReturn?: number
   signed_result_r?: number
   position_cost: number
-  direction?: "long" | "short"
   status: "open" | "closed"
   created_at: string
   updated_at: string

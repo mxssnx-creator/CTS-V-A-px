@@ -1,5 +1,7 @@
 "use client"
 
+import { DEFAULT_VOLUME_STEP_RATIO } from "@/lib/constants"
+
 // Settings Overall Tab - manages main configuration, connections, install, logs
 import { useState } from "react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -210,6 +212,25 @@ export function OverallTab({
                       Live notional multiplier for the Preset Trade Engine
                       (default 1.0x). Overridable per-connection from the
                       dashboard. Range 0.1–10x.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Volume Step Ratio</Label>
+                      <span className="text-sm font-medium">
+                        {(settings.volume_step_ratio ?? DEFAULT_VOLUME_STEP_RATIO).toFixed(1)}× balance
+                      </span>
+                    </div>
+                    <Slider
+                      min={0.2}
+                      max={1.8}
+                      step={0.2}
+                      value={[settings.volume_step_ratio ?? DEFAULT_VOLUME_STEP_RATIO]}
+                      onValueChange={([value]) => handleSettingChange("volume_step_ratio", value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Recalculate order sizing only after balance rises by this ratio. Example: 100 USDT with 0.6 recalculates at 160 USDT; drawdowns reset immediately.
                     </p>
                   </div>
 
