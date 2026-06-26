@@ -1,3 +1,4 @@
+import { DEFAULT_VOLUME_STEP_RATIO } from "@/lib/constants"
 import { NextResponse } from "next/server"
 import { getAllConnections, initRedis, updateConnection, setSettings, getSettings, getRedisClient,
   buildMainConnectionEnableUpdate } from "@/lib/redis-db"
@@ -455,12 +456,13 @@ export async function POST(request: Request) {
        // do not let live-stage place venue orders unless the transport test passed.
        is_live_trade: liveTradeEnabled ? "1" : "0",
        live_trade_requested: liveTradeRequested ? "1" : "0",
-       live_trade_blocked_reason: liveTradeBlockedReason,
+       live_trade_blocked_reason: liveTradeBlockedReason || "",
        active_symbols: JSON.stringify(symbols),
        // Lowest-volume live testing: force the per-connection factor to the
        // VolumeCalculator minimum. The calculator then clamps each pair up to
        // that exchange symbol's legal minimum notional/quantity.
        live_volume_factor: QUICKSTART_LIVE_VOLUME_FACTOR,
+       volume_step_ratio: String(DEFAULT_VOLUME_STEP_RATIO),
        force_symbols: JSON.stringify(symbols),
        // QuickStart uses the minimum live volume factor so live-trade smoke tests
        // place only exchange-minimum orders when credentials are available.
@@ -506,6 +508,7 @@ export async function POST(request: Request) {
       // Volume factor
       volume_factor_live:   QUICKSTART_LIVE_VOLUME_FACTOR,
       live_volume_factor:   QUICKSTART_LIVE_VOLUME_FACTOR,
+      volume_step_ratio:    String(DEFAULT_VOLUME_STEP_RATIO),
       volume_factor_preset: "1.0",
       // Symbol order
       symbol_order: "volatility_1h",
@@ -780,11 +783,12 @@ export async function POST(request: Request) {
             await updateConnection(connectionId, {
               is_live_trade: liveTradeEnabled ? "1" : "0",
               live_trade_requested: liveTradeRequested ? "1" : "0",
-              live_trade_blocked_reason: liveTradeBlockedReason,
+              live_trade_blocked_reason: liveTradeBlockedReason || "",
               active_symbols: JSON.stringify(symbols),
               force_symbols: JSON.stringify(symbols),
               symbol_count: String(symbols.length),
               live_volume_factor: "0.1",
+              volume_step_ratio: String(DEFAULT_VOLUME_STEP_RATIO),
               updated_at: new Date().toISOString(),
             })
 

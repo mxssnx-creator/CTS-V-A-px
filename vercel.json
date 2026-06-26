@@ -1,12 +1,10 @@
 {
-  "_deploymentNotes": "Production coordination (instrumentation.ts → completeStartup → trade-engine-auto-start self-heal for bingx-x01) is fully enabled. Higher memory (4096MB) allocated for reliable cold-start initialization and live engine coordination.",
+  "_deploymentNotes": "Production coordination (instrumentation.ts \u2192 completeStartup \u2192 trade-engine-auto-start self-heal for bingx-x01) is enabled with plan-safe function limits and a single continuity cron.",
   "buildCommand": "bash scripts/vercel-build-setup.sh",
   "installCommand": "npm install --legacy-peer-deps",
   "env": {
-    "NODE_ENV": "production",
     "NODE_PG_FORCE_NATIVE": "false",
     "npm_config_build_from_source": "false",
-    "SKIP_OPTIONAL_DEPS": "true",
     "NEXT_PUBLIC_ANALYTICS_ID": "default"
   },
   "framework": "nextjs",
@@ -29,15 +27,15 @@
     }
   ],
   "functions": {
-    "app/api/**/*.ts": {
-      "memory": 4096,
-      "maxDuration": 300,
-      "runtime": "nodejs20.x"
+    "app/api/**/*": {
+      "memory": 1024,
+      "maxDuration": 60
     }
   },
   "crons": [
     {
       "path": "/api/cron/server-continuity",
+      "schedule": "* * * * *"
       "schedule": "* * * * *"
     },
     {

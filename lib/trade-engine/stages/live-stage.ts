@@ -43,6 +43,14 @@ import { isTruthyFlag } from "@/lib/connection-state-utils"
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
 
+function hasLiveTradeBlock(settings: Record<string, any>): boolean {
+  return String(settings.live_trade_blocked_reason || "").trim().length > 0
+}
+
+async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
+  const connection = (await getConnection(connectionId).catch(() => null)) || {}
+  if (hasLiveTradeBlock(connection as Record<string, any>)) return false
+
 async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
   const connection = (await getConnection(connectionId).catch(() => null)) || {}
   return isTruthyFlag((connection as any).is_live_trade) || isTruthyFlag((connection as any).live_trade_enabled)
@@ -2026,8 +2034,9 @@ export async function executeLivePosition(
     const { isTruthyFlag } = await import("@/lib/connection-state-utils")
     const connSettings = (await _getConn(connectionId)) || {}
     const isLiveTradeEnabled =
-      isTruthyFlag(connSettings.is_live_trade) ||
-      isTruthyFlag(connSettings.live_trade_enabled)
+      !hasLiveTradeBlock(connSettings) &&
+      (isTruthyFlag(connSettings.is_live_trade) ||
+        isTruthyFlag(connSettings.live_trade_enabled))
 
     // isBlockVariant and _lockDirSuffix are hoisted to function scope (before
     // the try block) so the catch handler can also release the correct key.
@@ -2542,8 +2551,9 @@ export async function executeLivePosition(
     const { isTruthyFlag: reCheckTruthy } = await import("@/lib/connection-state-utils")
     const freshSettings = (await reCheckConn(connectionId)) || {}
     const isStillLive =
-      reCheckTruthy(freshSettings.is_live_trade) ||
-      reCheckTruthy(freshSettings.live_trade_enabled)
+      !hasLiveTradeBlock(freshSettings) &&
+      (reCheckTruthy(freshSettings.is_live_trade) ||
+        reCheckTruthy(freshSettings.live_trade_enabled))
 
     if (!isStillLive) {
       livePosition.status = "rejected"

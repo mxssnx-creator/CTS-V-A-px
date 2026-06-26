@@ -15,14 +15,10 @@ const RESTART_REQUIRED_FIELDS = [
   "api_key", "api_secret", "exchange", "is_testnet",
   "api_type", "api_subtype", "is_enabled", "progression_epoch",
   "api_type", "api_subtype", "is_enabled",
-  // Symbol and mode changes invalidate prehistoric gates, loaded interval
-  // markers, live exchange routing, and progression denominators. Treat
-  // them as one serialized restart event so the owning engine process
-  // restarts exactly once from the durable settings-change envelope instead
-  // of mixing a hot reload with a separately queued API-route restart.
-  "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
-  "is_live_trade", "is_preset_trade", "connection_method",
-  "symbol_count",  // ── Symbol list changes require NEW progression ──
+  // Browser/dialog saves must not stop or restart a live engine. Symbol and
+  // mode changes are handled by the hot-reload path, which invalidates symbol
+  // caches, refreshes per-cycle settings, and lets progression recoordination
+  // update Redis state without tearing down live trade.
 ]
 
 // Fields that can be hot-reloaded without restart
@@ -30,6 +26,10 @@ const HOT_RELOAD_FIELDS = [
   "name", "volume_factor", "margin_type", "position_mode",
   "connection_settings", "strategies", "indications",
   "active_indications", "preset_type",
+  "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
+  "is_live_trade", "is_preset_trade", "connection_method",
+  "live_volume_factor", "preset_volume_factor", "volume_factor_live",
+  "volume_factor_preset", "volume_step_ratio",
 ]
 
 export type ChangeType = "restart" | "reload" | "cosmetic"
@@ -41,6 +41,29 @@ export interface SettingsChangeEvent {
   timestamp: string
   previousValues?: Record<string, unknown>
   newValues?: Record<string, unknown>
+}
+
+async function clearEngineRestartFlags(connectionId: string): Promise<void> {
+  try {
+    const client = getRedisClient()
+    if (!client) return
+    await Promise.all([
+      client.hdel(
+        `settings:trade_engine_state:${connectionId}`,
+        "restart_required",
+        "restart_reason",
+        "restart_requested_at",
+      ).catch(() => 0),
+      client.hdel(
+        `trade_engine_state:${connectionId}`,
+        "restart_required",
+        "restart_reason",
+        "restart_requested_at",
+      ).catch(() => 0),
+    ])
+  } catch {
+    /* non-critical: stale restart flags should never block a settings save */
+  }
 }
 
 /**
@@ -114,8 +137,12 @@ export async function notifySettingsChanged(
   if (changeType === "reload") {
     const engineState = await getSettings(`trade_engine_state:${connectionId}`)
     if (engineState && (engineState.status === "running" || engineState.status === "ready")) {
+      await clearEngineRestartFlags(connectionId)
       await setSettings(`trade_engine_state:${connectionId}`, {
         ...engineState,
+        restart_required: undefined,
+        restart_reason: undefined,
+        restart_requested_at: undefined,
         reload_required: true,
         reload_fields: changedFields,
         reload_requested_at: new Date().toISOString(),

@@ -2594,282 +2594,121 @@ const migrations: Migration[] = [
   // clobbering low-but-valid stress-test factors, and clear stale prehistoric
   // gates once more for installations that already ran the old 041.
   {
-    version: 42,
-    name: "042-preserve-operator-volume-and-refresh-prehistoric-gates",
-    description: "Preserve positive operator volume factors and force fresh prehistoric gates after migration 041",
-    up: async (client: any) => {
-      await client.set("_schema_version", "42")
-      const CONN_ID = "bingx-x01"
-      const now = new Date().toISOString()
-      const rawConn = (await client.hgetall(`connection:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
-      const settingsConn = (await client.hgetall(`connection_settings:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
-      const prefixedConn = (await client.hgetall(`settings:connection:${CONN_ID}`).catch(() => null)) as Record<string,string>|null ?? {}
-
-      const choosePositive = (...values: Array<string | undefined>): string | undefined => {
-        for (const value of values) {
-          const n = Number(value)
-          if (Number.isFinite(n) && n > 0) return String(value)
-        }
-        return undefined
-      }
-
-      const liveVolume = choosePositive(
-        settingsConn.volume_factor_live,
-        settingsConn.live_volume_factor,
-        prefixedConn.volume_factor_live,
-        prefixedConn.live_volume_factor,
-        rawConn.live_volume_factor,
-      ) || "2.2"
-      const presetVolume = choosePositive(
-        settingsConn.volume_factor_preset,
-        settingsConn.preset_volume_factor,
-        prefixedConn.volume_factor_preset,
-        prefixedConn.preset_volume_factor,
-        rawConn.preset_volume_factor,
-      ) || "1.0"
-
-      await Promise.all([
-        client.hset(`connection:${CONN_ID}`, {
-          live_volume_factor: liveVolume,
-          preset_volume_factor: presetVolume,
-          updated_at: now,
-        }).catch(() => {}),
-        client.hset(`settings:connection:${CONN_ID}`, {
-          live_volume_factor: liveVolume,
-          preset_volume_factor: presetVolume,
-          updated_at: now,
-        }).catch(() => {}),
-        client.hset(`connection_settings:${CONN_ID}`, {
-          live_volume_factor: liveVolume,
-          preset_volume_factor: presetVolume,
-          updated_at: now,
-        }).catch(() => {}),
-        client.del(`prehistoric_loaded:${CONN_ID}`).catch(() => {}),
-        client.del(`prehistoric_loaded:${CONN_ID}:verified`).catch(() => {}),
-        client.del(`prehistoric:progress:${CONN_ID}`).catch(() => {}),
-      ])
-
-      console.log(
-        `[v0] Migration 042: reconciled ${CONN_ID} volume factors ` +
-        `(live=${liveVolume}, preset=${presetVolume}) and refreshed prehistoric gates`,
-      )
-    },
-    down: async (client: any) => {
-      await client.set("_schema_version", "41")
-    },
-  },
-
-  // ── Migration 043 ──────────────────────────────────────────────────────────
-  // Production progression repair: align all configured symbol lists across the
-  // raw connection hash and the setSettings-prefixed hashes, and repair visible
-  // prehistoric denominators without manufacturing completion. This is safe to
-  // run on already-migrated installs because it only mirrors existing operator
-  // symbol choices and never marks processing done.
-  {
-    version: 43,
-    name: "043-align-symbol-state-and-prehistoric-denominators",
-    description: "Mirror operator symbol lists into engine read paths and repair prehistoric progress denominators",
-    up: async (client: any) => {
-      await client.set("_schema_version", "43")
-      const now = new Date().toISOString()
-      const parseSymbols = (raw: unknown): string[] => {
-        if (Array.isArray(raw)) return raw.map(String).map((x) => x.trim()).filter(Boolean)
-        const value = String(raw ?? "").trim()
-        if (!value || value === "[]") return []
-        if (value.startsWith("[")) {
-          try {
-            const parsed = JSON.parse(value)
-            if (Array.isArray(parsed)) return parsed.map(String).map((x) => x.trim()).filter(Boolean)
-          } catch { /* fall through */ }
-        }
-        return value.split(/[,|\n]/).map((x) => x.trim()).filter(Boolean)
-      }
-
-      const connectionIds = new Set<string>([
-        ...((await client.smembers("connections").catch(() => [])) || []),
-        ...((await client.smembers("connections:main:enabled").catch(() => [])) || []),
-      ].map(String).filter(Boolean))
-
-      let repaired = 0
-      for (const connId of connectionIds) {
-        const rawConn = (await client.hgetall(`connection:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
-        const prefConn = (await client.hgetall(`settings:connection:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
-        const engineState = (await client.hgetall(`settings:trade_engine_state:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
-        const symbols = [
-          parseSymbols(rawConn.force_symbols),
-          parseSymbols(rawConn.active_symbols),
-          parseSymbols(prefConn.force_symbols),
-          parseSymbols(prefConn.active_symbols),
-          parseSymbols(engineState.force_symbols),
-          parseSymbols(engineState.active_symbols),
-          parseSymbols(engineState.symbols),
-        ].find((candidate) => candidate.length > 0) || []
-
-        if (symbols.length === 0) continue
-
-        const symbolsJson = JSON.stringify(symbols)
-        await Promise.all([
-          client.hset(`connection:${connId}`, {
-            active_symbols: symbolsJson,
-            force_symbols: symbolsJson,
-            symbol_count: String(symbols.length),
-            updated_at: now,
-          }).catch(() => {}),
-          client.hset(`settings:connection:${connId}`, {
-            active_symbols: symbolsJson,
-            force_symbols: symbolsJson,
-            symbol_count: String(symbols.length),
-            updated_at: now,
-          }).catch(() => {}),
-          client.hset(`settings:trade_engine_state:${connId}`, {
-            symbols: symbolsJson,
-            active_symbols: symbolsJson,
-            force_symbols: symbolsJson,
-            symbol_count: String(symbols.length),
-            config_set_symbols_total: String(symbols.length),
-            updated_at: now,
-          }).catch(() => {}),
-        ])
-
-        const engineProgression = (await client.hgetall(`settings:engine_progression:${connId}`).catch(() => null)) as Record<string,string> | null ?? {}
-        if (engineProgression.phase === "prehistoric_data") {
-          await client.hset(`settings:engine_progression:${connId}`, {
-            sub_item: engineProgression.sub_item || "symbols",
-            sub_total: String(Math.max(Number(engineProgression.sub_total || 0), symbols.length)),
-            updated_at: now,
-          }).catch(() => {})
-        }
-        repaired++
-      }
-
-      console.log(`[v0] Migration 043: aligned symbol state and prehistoric denominators for ${repaired} connection(s)`)
-    },
-    down: async (client: any) => {
-      await client.set("_schema_version", "42")
-    },
-  },
-  {
-    version: 44,
-    name: "044-initialize-production-progression-tracking",
-    description: "Ensure progression counters and stats are initialized for production mode",
-    up: async (client: any) => {
-      await client.set("_schema_version", "44")
-      const now = new Date().toISOString()
-      
-      // Initialize progression tracking structures for all known connections
-      const connectionIds = new Set<string>([
-        ...((await client.smembers("connections").catch(() => [])) || []),
-        ...((await client.smembers("connections:main:enabled").catch(() => [])) || []),
-        "bingx-x01", // Ensure primary connection is always set up
-      ].map(String).filter(Boolean))
-
-      let initialized = 0
-      for (const connId of connectionIds) {
-        try {
-          // Initialize progression tracking hash
-          const progressionKey = `progression:${connId}`
-          const existingProg = await client.hgetall(progressionKey).catch(() => ({}))
-          
-          // Only initialize if not already set
-          if (!existingProg || Object.keys(existingProg || {}).length === 0) {
-            await client.hset(progressionKey, {
-              prehistoric_passed: "0",
-              prehistoric_failed: "0",
-              prehistoric_placed: "0",
-              prehistoric_filled: "0",
-              prehistoric_canceled: "0",
-              prehistoric_rejected: "0",
-              prehistoric_errored: "0",
-              real_evaluated: "0",
-              real_passed: "0",
-              real_placed: "0",
-              real_filled: "0",
-              live_evaluated: "0",
-              live_passed: "0",
-              live_placed: "0",
-              live_filled: "0",
-              candlesLoaded: "0",
-              indicatorsComputed: "0",
-              configSetsCreated: "0",
-              initialized_at: now,
-              updated_at: now,
-            })
-            
-            // Set TTL to never expire (production uses indefinite progression)
-            await client.persist(progressionKey).catch(() => {})
-          }
-
-          // Initialize strategies_active hash if not present
-          const strategiesKey = `strategies_active:${connId}`
-          const existingStrat = await client.hgetall(strategiesKey).catch(() => ({}))
-          
-          if (!existingStrat || Object.keys(existingStrat || {}).length === 0) {
-            // Initialize empty for now; coordinator will populate on first cycle
-            await client.hset(strategiesKey, {
-              "_initialized": now,
-            })
-            // Set TTL to 10 minutes; coordinator refreshes every cycle
-            await client.expire(strategiesKey, 600).catch(() => {})
-          }
-
-          initialized++
-        } catch (err: any) {
-          console.warn(`[v0] Migration 044: failed to initialize ${connId}: ${err?.message}`)
-        }
-      }
-
-      console.log(`[v0] Migration 044: initialized progression tracking for ${initialized} connection(s)`)
-    },
-    down: async (client: any) => {
-      await client.set("_schema_version", "43")
-    },
-  },
-  {
     version: 45,
-    name: "045-canonical-tp-sl-ratio-settings",
-    description: "Persist canonical TP-percent/SL-ratio range semantics for dev and production",
+    name: "045-rebuild-connection-list-cache",
+    description: "Rebuild all_connections from canonical connection hashes without clobbering operator state",
     up: async (client: any) => {
-      await client.set("_schema_version", "45")
-      const now = new Date().toISOString()
-      const ratioSettings: Record<string, string> = {
-        // takeprofit_factor is an absolute percent; stoploss_ratio is a
-        // multiplier of that TP distance. Example: TP=10, SL ratio=0.5 => SL=5%.
-        tp_sl_ratio_version: "2",
-        takeprofit_min: "2",
-        takeprofit_max: "22",
-        takeprofit_step: "1",
-        stoploss_ratio_min: "0.2",
-        stoploss_ratio_max: "2.2",
-        stoploss_ratio_step: "0.1",
-        updated_at: now,
+      // NOTE: do NOT stamp _schema_version here — the runner stamps on success only.
+      const connectionKeys = ((await client.keys("connection:*").catch(() => [])) || [])
+        .filter((key: string) =>
+          typeof key === "string" &&
+          !key.includes(":settings:") &&
+          !key.includes(":stats:") &&
+          !key.includes(":logs:")
+        )
+
+      const rows: Record<string, unknown>[] = []
+      for (const key of connectionKeys) {
+        const row = (await client.hgetall(key).catch(() => null)) as Record<string, unknown> | null
+        if (!row || Object.keys(row).length === 0) continue
+        const id = String(row.id || key.replace(/^connection:/, ""))
+        rows.push({ ...row, id })
+        await client.sadd("connections", id).catch(() => {})
       }
 
-      await client.hset("app_settings", ratioSettings).catch(() => {})
-      await client.hset("settings:system", ratioSettings).catch(() => {})
-
-      const connectionIds = new Set<string>([
-        ...((await client.smembers("connections").catch(() => [])) || []),
-        ...((await client.smembers("connections:main:enabled").catch(() => [])) || []),
-        "bingx-x01",
-      ].map(String).filter(Boolean))
-
-      for (const connId of connectionIds) {
-        await client.hset(`connection_settings:${connId}`, {
-          tp_sl_ratio_version: "2",
-          takeprofit_min: "2",
-          takeprofit_max: "22",
-          takeprofit_step: "1",
-          stoploss_ratio_min: "0.2",
-          stoploss_ratio_max: "2.2",
-          stoploss_ratio_step: "0.1",
-          updated_at: now,
-        }).catch(() => {})
+      if (rows.length > 0) {
+        await client.set("all_connections", JSON.stringify(rows))
       }
 
-      console.log(`[v0] Migration 045: canonical TP/SL ratio v2 settings applied to ${connectionIds.size} connection(s)`)
+      console.log(`[v0] Migration 045: rebuilt all_connections from ${rows.length} connection hashes`)
     },
     down: async (client: any) => {
       await client.set("_schema_version", "44")
+    },
+  },
+  {
+    version: 46,
+    name: "046-volume-step-ratio-defaults",
+    description: "Seed volume step ratio defaults for stable balance-threshold sizing",
+    up: async (client: any) => {
+      const DEFAULT_STEP = "0.6"
+      const app = ((await client.hgetall("app_settings").catch(() => ({}))) || {}) as Record<string, unknown>
+      const legacy = ((await client.hgetall("all_settings").catch(() => ({}))) || {}) as Record<string, unknown>
+      if (app.volume_step_ratio === undefined || app.volume_step_ratio === null || app.volume_step_ratio === "") {
+        await client.hset("app_settings", { volume_step_ratio: DEFAULT_STEP })
+      }
+      if (legacy.volume_step_ratio === undefined || legacy.volume_step_ratio === null || legacy.volume_step_ratio === "") {
+        await client.hset("all_settings", { volume_step_ratio: DEFAULT_STEP })
+      }
+
+      const connectionKeys = ((await client.keys("connection:*").catch(() => [])) || [])
+        .filter((key: string) => typeof key === "string" && key.startsWith("connection:") && key.indexOf(":", "connection:".length) === -1)
+      for (const key of connectionKeys) {
+        const row = ((await client.hgetall(key).catch(() => ({}))) || {}) as Record<string, unknown>
+        if (row.volume_step_ratio === undefined || row.volume_step_ratio === null || row.volume_step_ratio === "") {
+          await client.hset(key, { volume_step_ratio: DEFAULT_STEP })
+        }
+        const id = String(row.id || key.replace(/^connection:/, ""))
+        const settingsKey = `connection_settings:${id}`
+        const settings = ((await client.hgetall(settingsKey).catch(() => ({}))) || {}) as Record<string, unknown>
+        if (settings.volume_step_ratio === undefined || settings.volume_step_ratio === null || settings.volume_step_ratio === "") {
+          await client.hset(settingsKey, { volume_step_ratio: DEFAULT_STEP })
+        }
+      }
+
+      console.log("[v0] Migration 046: seeded volume_step_ratio=0.6 defaults")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "45")
+    },
+  },
+  {
+    version: 47,
+    name: "047-clear-stale-engine-restart-flags",
+    description: "Remove legacy settings-save restart flags so running engines stay hot-reloadable",
+    up: async (client: any) => {
+      const stateKeys = [
+        ...(((await client.keys("settings:trade_engine_state:*").catch(() => [])) || []) as string[]),
+        ...(((await client.keys("trade_engine_state:*").catch(() => [])) || []) as string[]),
+      ]
+      let cleaned = 0
+      for (const key of new Set(stateKeys)) {
+        const removed = await client
+          .hdel(key, "restart_required", "restart_reason", "restart_requested_at")
+          .catch(() => 0)
+        if (Number(removed) > 0) cleaned++
+      }
+      console.log(`[v0] Migration 047: cleared stale restart flags from ${cleaned} trade-engine state hashes`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "46")
+    },
+  },
+  {
+    version: 48,
+    name: "048-clear-stale-engine-reload-flags",
+    description: "Remove orphaned reload flags left after older dev/settings saves consumed their change events",
+    up: async (client: any) => {
+      const stateKeys = [
+        ...(((await client.keys("settings:trade_engine_state:*").catch(() => [])) || []) as string[]),
+        ...(((await client.keys("trade_engine_state:*").catch(() => [])) || []) as string[]),
+      ]
+      let cleaned = 0
+      for (const key of new Set(stateKeys)) {
+        const connectionId = key.split(":").pop()
+        const pending = connectionId
+          ? await client.hgetall(`settings:settings_change:${connectionId}`).catch(() => ({}))
+          : {}
+        if (pending && typeof pending.connectionId === "string" && pending.connectionId.length > 0) continue
+        const removed = await client
+          .hdel(key, "reload_required", "reload_fields", "reload_requested_at")
+          .catch(() => 0)
+        if (Number(removed) > 0) cleaned++
+      }
+      console.log(`[v0] Migration 048: cleared orphaned reload flags from ${cleaned} trade-engine state hashes`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "47")
     },
   },
 ]

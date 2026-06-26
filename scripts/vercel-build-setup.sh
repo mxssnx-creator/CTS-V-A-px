@@ -10,9 +10,16 @@ echo "[Vercel Build] NODE_ENV: ${NODE_ENV:-production}"
 echo "[Vercel Build] Node version: $(node --version 2>/dev/null || echo 'unknown')"
 echo "[Vercel Build] NPM version: $(npm --version 2>/dev/null || echo 'unknown')"
 
-# 1. Install (Vercel already runs installCommand, but keep for local `vercel-build-setup` usage)
-echo "[Vercel Build] Ensuring dependencies are present..."
-npm install --legacy-peer-deps --no-audit --no-fund 2>&1 | tail -5 || true
+# 1. Install is handled by Vercel's installCommand before buildCommand.
+# Avoid running npm install inside buildCommand because it can mutate
+# package-lock.json, re-resolve optional SWC packages, and fail deployments
+# after dependencies were already installed successfully.
+if [ ! -d "node_modules" ]; then
+  echo "[Vercel Build] node_modules missing; installing dependencies for local build..."
+  npm install --legacy-peer-deps --no-audit --no-fund
+else
+  echo "[Vercel Build] Dependencies already installed; skipping nested npm install"
+fi
 
 # 2. Prepare minimal runtime dirs (Redis file fallback + Next cache)
 echo "[Vercel Build] Creating required directories..."
@@ -31,10 +38,11 @@ NODE_OPTIONS='--max-old-space-size=12288 --max-semi-space-size=128' npm run verc
 
 # 5. Verify migrations are properly defined
 echo "[Vercel Build] Verifying migrations are compiled..."
-if grep -q "version: 44" lib/redis-migrations.ts; then
-  echo "[Vercel Build] ✓ Migration 44 present (production progression initialization)"
+LATEST_MIGRATION=$(node -e "const fs=require('fs'); const s=fs.readFileSync('lib/redis-migrations.ts','utf8'); const versions=[...s.matchAll(/version:\s*(\d+)/g)].map(m=>Number(m[1])); console.log(Math.max(...versions));")
+if [ "${LATEST_MIGRATION:-0}" -ge 46 ]; then
+  echo "[Vercel Build] ✓ Migration ${LATEST_MIGRATION} present (latest production migrations compiled)"
 else
-  echo "[Vercel Build] INFO: Latest migration version may be older than 44"
+  echo "[Vercel Build] WARNING: Latest migration version ${LATEST_MIGRATION:-unknown} is older than expected"
 fi
 
 # 6. Verify critical production coordination modules are included
@@ -53,6 +61,6 @@ echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .next/deployment-timestamp.txt || true
 # 8. Done
 echo "[Vercel Build] ✓ Pre-build setup completed successfully"
 echo "[Vercel Build] Production coordination (instrumentation → completeStartup → auto-start self-heal) will initialize on first request"
-echo "[Vercel Build] Migrations (v44 production progression initialization) will run on first API request"
+echo "[Vercel Build] Migrations (latest compiled Redis migrations) will run on first API request"
 echo "[Vercel Build] Build artifacts ready at .next/"
 ls -la .next/ 2>/dev/null | head -8 || true
