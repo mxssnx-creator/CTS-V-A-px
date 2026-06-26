@@ -874,7 +874,6 @@ return {
    * solid for the actual current configuration.
    */
   static async recoordinateForActualOne(connectionId: string, engineType = "main"): Promise<RecoordinateProgressionResult> {
-  static async recoordinateForActualOne(connectionId: string): Promise<RecoordinateProgressionResult> {
     try {
       await initRedis()
       const client = getRedisClient()
