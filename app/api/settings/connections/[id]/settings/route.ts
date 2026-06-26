@@ -315,8 +315,7 @@ export async function PATCH(
           | Record<string, unknown>
           | undefined
         if (coord && typeof coord === "object") {
-          // Variant toggles:  variants.{trailing,block,dca}; pause is an axis, not a strategy variant.
-          // Variant toggles:  variants.{trailing,block,dca}
+          // Variant toggles: variants.{trailing,block,dca}; pause is an axis, not a strategy variant.
           //   → flat key variantTrailingEnabled, variantBlockEnabled, …
           const variantsObj = coord.variants as Record<string, unknown> | undefined
           if (variantsObj && typeof variantsObj === "object") {
@@ -372,6 +371,10 @@ export async function PATCH(
         const vfp = Number((merged as Record<string, unknown>).volume_factor_preset)
         if (Number.isFinite(vfp) && vfp > 0) {
           flatKnobs.volume_factor_preset = String(Math.max(0.1, Math.min(10, vfp)))
+        }
+        const vsr = Number((merged as Record<string, unknown>).volume_step_ratio ?? (merged as Record<string, unknown>).volumeStepRatio)
+        if (Number.isFinite(vsr) && vsr > 0) {
+          flatKnobs.volume_step_ratio = String(Math.max(0.2, Math.min(1.8, vsr)))
         }
         // control_orders flag — whether to place SL/TP orders
         const co = (merged as Record<string, unknown>).control_orders
@@ -449,6 +452,9 @@ export async function PATCH(
         }
         if (flatKnobs.volume_factor_preset !== undefined) {
           volumeConnectionPatch.preset_volume_factor = flatKnobs.volume_factor_preset
+        }
+        if (flatKnobs.volume_step_ratio !== undefined) {
+          volumeConnectionPatch.volume_step_ratio = flatKnobs.volume_step_ratio
         }
         if (flatKnobs.volume_factor !== undefined) {
           volumeConnectionPatch.volume_factor = flatKnobs.volume_factor
@@ -699,23 +705,6 @@ export async function PATCH(
       scalarChanged("is_testnet", (connection as Record<string, unknown>).is_testnet, (updated as Record<string, unknown>).is_testnet) ||
       scalarChanged("is_preset_trade", (connection as Record<string, unknown>).is_preset_trade, (updated as Record<string, unknown>).is_preset_trade) ||
       scalarChanged("connection_method", (connection as Record<string, unknown>).connection_method, (updated as Record<string, unknown>).connection_method)
-    let progressionChangedForActualOne = false
-    if (symbolsModeChanged) {
-      try {
-        const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
-        progressionChangedForActualOne = recoordination.changed
-
-        // If recoordination archived/recreated progression state, a running
-        // manager must not continue through the normal hot-reload path while
-        // still holding the previous epoch/ownership. Restarting rebinds it to
-        // the fresh progression lock before processors can write again.
-        if (recoordination.changed) {
-          const coordinator = getGlobalTradeEngineCoordinator()
-          if (coordinator.isEngineRunning(id)) {
-            console.log(
-              `[v0] [Settings PATCH] Progression re-coordinated for ${id} (${recoordination.reason ?? "changed"}); restarting running engine instead of hot reload.`,
-            )
-            await coordinator.restartEngine(id)
     let progressionRestartHandled = false
     if (symbolsModeChanged) {
       try {
@@ -817,18 +806,6 @@ export async function PATCH(
     // would report zero changes — pass an explicit override listing the
     // settings keys the caller touched, so the recoordinator knows
     // something inside `connection_settings` actually changed.
-    if (!progressionChangedForActualOne) {
-    if (!progressionRestartHandled) {
-      await recoordinateAfterSettingsChange(
-        id,
-        { ...connection, connection_settings: current },
-        { ...connection, connection_settings: merged, updated_at: updated.updated_at },
-        {
-          logTag: "PATCH /settings",
-          changedFieldsOverride: Object.keys(settings).length > 0 ? ["connection_settings"] : [],
-        },
-      )
-    }
     await recoordinateAfterSettingsChange(
       id,
       { ...connection, connection_settings: current },

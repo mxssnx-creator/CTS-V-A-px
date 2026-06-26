@@ -1,4 +1,4 @@
-import { MIN_VOLUME_FACTOR } from "@/lib/constants"
+import { DEFAULT_VOLUME_STEP_RATIO, MAX_VOLUME_STEP_RATIO, MIN_VOLUME_FACTOR, MIN_VOLUME_STEP_RATIO } from "@/lib/constants"
 import { type NextRequest, NextResponse } from "next/server"
 import { getConnection, updateConnection, initRedis } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
@@ -35,6 +35,13 @@ import { notifySettingsChanged } from "@/lib/settings-coordinator"
 const FACTOR_MIN = MIN_VOLUME_FACTOR
 const FACTOR_MAX = 10
 
+function clampStepRatio(raw: unknown): number | null {
+  if (raw === undefined || raw === null) return null
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return null
+  return Math.max(MIN_VOLUME_STEP_RATIO, Math.min(MAX_VOLUME_STEP_RATIO, n))
+}
+
 function clampFactor(raw: unknown): number | null {
   if (raw === undefined || raw === null) return null
   const n = Number(raw)
@@ -51,19 +58,16 @@ export async function GET(_request: NextRequest, { params }: { params: Promise<{
     if (!conn) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
-    // Default to the minimum volume factor for unset connections — this
-    // matches `VolumeCalculator.resolveLiveEngine` and guarantees the
-    // slider hydrates at exactly the value the engine will apply.
-    const liveFactor = clampFactor(conn.live_volume_factor) ?? MIN_VOLUME_FACTOR
-    const presetFactor = clampFactor(conn.preset_volume_factor) ?? MIN_VOLUME_FACTOR
     // Default unset connections to the canonical minimum so the
     // slider hydrates at exactly the value the engine will apply.
     const liveFactor = clampFactor(conn.live_volume_factor) ?? FACTOR_MIN
     const presetFactor = clampFactor(conn.preset_volume_factor) ?? FACTOR_MIN
+    const stepRatio = clampStepRatio(conn.volume_step_ratio) ?? DEFAULT_VOLUME_STEP_RATIO
     return NextResponse.json({
       connectionId: id,
       live_volume_factor: liveFactor,
       preset_volume_factor: presetFactor,
+      volume_step_ratio: stepRatio,
     })
   } catch (error) {
     console.error("[v0] Failed to load volume factors:", error)
@@ -85,15 +89,17 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     // a no-op malformed request (clearer error than silent 200).
     const liveRaw = body.live_volume_factor
     const presetRaw = body.preset_volume_factor
+    const stepRaw = body.volume_step_ratio
     const live = clampFactor(liveRaw)
     const preset = clampFactor(presetRaw)
+    const stepRatio = clampStepRatio(stepRaw)
 
-    if (live === null && preset === null) {
+    if (live === null && preset === null && stepRatio === null) {
       return NextResponse.json(
         {
           error: "At least one factor required",
           details:
-            "POST must include `live_volume_factor` and/or `preset_volume_factor`, each a number in [0.1, 10].",
+            "POST must include `live_volume_factor` / `preset_volume_factor` in [0.1, 10] and/or `volume_step_ratio` in [0.2, 1.8].",
         },
         { status: 400 },
       )
@@ -112,6 +118,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const patch: Record<string, string> = {}
     if (live !== null) patch.live_volume_factor = String(live)
     if (preset !== null) patch.preset_volume_factor = String(preset)
+    if (stepRatio !== null) patch.volume_step_ratio = String(stepRatio)
 
     await updateConnection(id, patch)
     await SystemLogger.logConnection(
@@ -131,10 +138,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     return NextResponse.json({
       success: true,
       connectionId: id,
-      live_volume_factor: live ?? clampFactor(conn.live_volume_factor) ?? MIN_VOLUME_FACTOR,
-      preset_volume_factor: preset ?? clampFactor(conn.preset_volume_factor) ?? MIN_VOLUME_FACTOR,
       live_volume_factor: live ?? clampFactor(conn.live_volume_factor) ?? FACTOR_MIN,
       preset_volume_factor: preset ?? clampFactor(conn.preset_volume_factor) ?? FACTOR_MIN,
+      volume_step_ratio: stepRatio ?? clampStepRatio(conn.volume_step_ratio) ?? DEFAULT_VOLUME_STEP_RATIO,
     })
   } catch (error) {
     console.error("[v0] Failed to update volume factors:", error)

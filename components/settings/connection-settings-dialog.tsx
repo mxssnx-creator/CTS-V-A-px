@@ -1,6 +1,6 @@
 "use client"
 
-import { MIN_VOLUME_FACTOR } from "@/lib/constants"
+import { DEFAULT_VOLUME_STEP_RATIO, MAX_VOLUME_STEP_RATIO, MIN_VOLUME_FACTOR, MIN_VOLUME_STEP_RATIO } from "@/lib/constants"
 import { useState, useEffect, useCallback, useMemo } from "react"
 import {
   Dialog,
@@ -123,10 +123,16 @@ function parseVolumeFactor(raw: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+function parseVolumeStepRatio(raw: unknown, fallback = DEFAULT_VOLUME_STEP_RATIO): number {
+  const parsed = parseVolumeFactor(raw, fallback)
+  return Math.max(MIN_VOLUME_STEP_RATIO, Math.min(MAX_VOLUME_STEP_RATIO, parsed))
+}
+
 interface OverviewSettings {
   volumeFactorBase:   number
   volumeFactorLive:   number
   volumeFactorPreset: number
+  volumeStepRatio: number
   marginMode:  "cross" | "isolated"
   volumeType:  "usdt" | "contract" | "spot"
   positionMode: "one_way" | "hedge"
@@ -187,6 +193,7 @@ export function ConnectionSettingsDialog({
     volumeFactorBase: MIN_VOLUME_FACTOR,
     volumeFactorLive: MIN_VOLUME_FACTOR,
     volumeFactorPreset: MIN_VOLUME_FACTOR,
+    volumeStepRatio: DEFAULT_VOLUME_STEP_RATIO,
     marginMode: "cross",
     volumeType: "usdt",
     positionMode: "one_way",
@@ -250,6 +257,7 @@ export function ConnectionSettingsDialog({
       const payload = {
         volume_factor_live:   overview.volumeFactorLive,
         volume_factor_preset: overview.volumeFactorPreset,
+        volume_step_ratio:   overview.volumeStepRatio,
         margin_mode:          overview.marginMode,
         volume_type:          overview.volumeType,
         position_mode:        overview.positionMode,
@@ -303,6 +311,7 @@ export function ConnectionSettingsDialog({
         volumeFactorBase:   parseVolumeFactor(p.volume_factor, prev.volumeFactorBase),
         volumeFactorLive:   parseVolumeFactor(p.volume_factor_live, prev.volumeFactorLive),
         volumeFactorPreset: parseVolumeFactor(p.volume_factor_preset, prev.volumeFactorPreset),
+        volumeStepRatio:   parseVolumeStepRatio(p.volume_step_ratio ?? p.volumeStepRatio, prev.volumeStepRatio),
         marginMode:        (p.margin_mode    as "cross" | "isolated") || prev.marginMode,
         volumeType:        (p.volume_type    as "usdt" | "contract" | "spot") || prev.volumeType,
         positionMode:      (p.position_mode  as "one_way" | "hedge") || prev.positionMode,
@@ -387,6 +396,7 @@ export function ConnectionSettingsDialog({
           // always reflected when the dialog opens.
           volumeFactorLive:   parseVolumeFactor(settings.volume_factor_live, parseVolumeFactor(conn.live_volume_factor, MIN_VOLUME_FACTOR)),
           volumeFactorPreset: parseVolumeFactor(settings.volume_factor_preset, parseVolumeFactor(conn.preset_volume_factor, MIN_VOLUME_FACTOR)),
+          volumeStepRatio:   parseVolumeStepRatio(settings.volume_step_ratio ?? conn.volume_step_ratio),
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
           positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
@@ -516,6 +526,7 @@ export function ConnectionSettingsDialog({
         // Overview
         volume_factor_live:   overview.volumeFactorLive,
         volume_factor_preset: overview.volumeFactorPreset,
+        volume_step_ratio:   overview.volumeStepRatio,
         margin_mode: overview.marginMode,
         volume_type: overview.volumeType,
         position_mode: overview.positionMode,
@@ -578,6 +589,7 @@ export function ConnectionSettingsDialog({
           body:    JSON.stringify({
             live_volume_factor:   overview.volumeFactorLive,
             preset_volume_factor: overview.volumeFactorPreset,
+            volume_step_ratio:   overview.volumeStepRatio,
           }),
         }).catch(() => { /* non-fatal — connection hash is a secondary write */ }),
       ])
@@ -1002,6 +1014,10 @@ export function ConnectionSettingsDialog({
                     description="Applied to the preset profile when active."
                     value={overview.volumeFactorPreset}
                     onChange={(v) => setOverview(p => ({ ...p, volumeFactorPreset: v }))}
+                  />
+                  <VolumeStepSlider
+                    value={overview.volumeStepRatio}
+                    onChange={(v) => setOverview(p => ({ ...p, volumeStepRatio: v }))}
                   />
 
                   <Separator className="my-4" />
@@ -1459,6 +1475,31 @@ function VolumeSlider({
       />
       <div className="flex justify-between text-[10px] text-muted-foreground">
         <span>0.1×</span><span>1.0×</span><span>5.0×</span>
+      </div>
+    </div>
+  )
+}
+
+function VolumeStepSlider({
+  value, onChange,
+}: { value: number; onChange: (v: number) => void }) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <div>
+          <Label className="text-xs">Volume Step Ratio</Label>
+          <div className="text-[10px] text-muted-foreground">Recalculate volume after balance crosses the next profit step; drawdowns reset immediately.</div>
+        </div>
+        <span className="text-xs font-mono tabular-nums w-16 text-right">{value.toFixed(1)}×</span>
+      </div>
+      <Slider
+        min={MIN_VOLUME_STEP_RATIO} max={MAX_VOLUME_STEP_RATIO} step={0.2}
+        value={[value]}
+        onValueChange={([v]) => onChange(v)}
+        className="py-1"
+      />
+      <div className="flex justify-between text-[10px] text-muted-foreground">
+        <span>0.2</span><span>0.6 default</span><span>1.8</span>
       </div>
     </div>
   )
