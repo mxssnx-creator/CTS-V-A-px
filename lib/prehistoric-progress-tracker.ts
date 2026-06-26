@@ -149,22 +149,43 @@ export class PrehistoricProgressTracker {
   }
 
   /**
-   * Mark prehistoric load as complete
+   * Mark prehistoric load as complete - writes the critical realtime gate flag
+   * also updates tracker for UI reporting. Retries on failure to ensure durability.
    */
   async markComplete(dataSource: "live" | "synthetic" | "cache" = "live"): Promise<void> {
     const now = Date.now()
     const client = getRedisClient()
     if (!client) return
 
-    try {
-      await client.hset(this.trackingKey, {
-        is_complete: "1",
-        current_symbol: "",
-        data_source: dataSource,
-        last_update: String(now),
-      })
-    } catch (err) {
-      console.warn(`[v0] Failed to mark prehistoric complete: ${err}`)
+    const doneKey = `prehistoric:${this.connectionId}:done`
+    let retries = 3
+    let success = false
+
+    while (retries > 0 && !success) {
+      try {
+        // Update progress tracker
+        await client.hset(this.trackingKey, {
+          is_complete: "1",
+          current_symbol: "",
+          data_source: dataSource,
+          last_update: String(now),
+        })
+        
+        // Write the critical realtime gate flag — must be durable
+        await client.set(doneKey, "1")
+        await client.expire(doneKey, 86400) // 24h ttl
+        
+        success = true
+        console.log(`[v0] Prehistoric complete for ${this.connectionId} at ${new Date(now).toISOString()}`)
+      } catch (err) {
+        retries--
+        if (retries === 0) {
+          console.error(`[v0] CRITICAL: Failed to mark prehistoric complete after retries: ${err}`)
+        } else {
+          console.warn(`[v0] Retry marking prehistoric complete (${retries} left): ${err}`)
+          await new Promise(resolve => setTimeout(resolve, 500)) // backoff
+        }
+      }
     }
   }
 

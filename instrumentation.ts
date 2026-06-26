@@ -1,6 +1,6 @@
 // CRITICAL: Define totalStrategiesEvaluated globally BEFORE any other code loads
 // This fixes ReferenceError in stale closures from previous code versions
-// eslint-disable-next-line no-var
+
 declare global { var totalStrategiesEvaluated: number }
 ;(globalThis as any).totalStrategiesEvaluated = 0
 
@@ -12,8 +12,37 @@ declare global { var totalStrategiesEvaluated: number }
 // real timer cleanup belongs to `EngineManager.stop()`. The clear is now
 // removed; in-flight engines keep running across module reload.
 
+function isNextBuildPhase(): boolean {
+  const npmLifecycle = process.env.npm_lifecycle_event || ""
+  const argv = process.argv.join(" ")
+  return (
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    npmLifecycle === "build" ||
+    npmLifecycle === "vercel-build" ||
+    /\bnext(\.js)?\s+build\b/.test(argv)
+  )
+}
+
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") {
+    return
+  }
+
+  const npmLifecycle = process.env.npm_lifecycle_event || ""
+  const isNextBuild =
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    npmLifecycle === "build" ||
+    npmLifecycle === "vercel-build" ||
+    process.argv.some((arg) => arg === "build" || arg.endsWith("/next") || arg.endsWith("\\next")) &&
+      process.argv.includes("build")
+
+  if (isNextBuildPhase()) {
+    // `next build` imports instrumentation while collecting page data. Running
+    // Redis migrations/startup/auto-start here makes deployment builders spend
+    // tens of seconds doing runtime work and can hit hosted builder deadlines
+    // (observed on kilo.ai). Runtime startup still runs on `next start` /
+    // serverless invocation where npm_lifecycle_event is not build.
+    console.log("[v0] [Instrumentation] Build phase detected — skipping runtime Redis/engine startup")
     return
   }
 

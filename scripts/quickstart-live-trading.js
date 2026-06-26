@@ -4,7 +4,7 @@
  * Usage: npm run quickstart
  * 
  * Triggers the full quickstart flow with:
- * - 10 symbols (auto-picked volatile ones)
+ * - 32 symbols (auto-picked volatile ones)
  * - Minimal volume (live_volume_factor=0.1 forced by API)
  * - Live trade enabled (is_live_trade=1 forced by API)
  * 
@@ -16,9 +16,9 @@ const PORT = process.env.PORT || 3002;
 const BASE = `http://localhost:${PORT}`;
 
 async function main() {
-  console.log("[Quickstart] Starting dev-mode live trading quickstart test...");
+  console.log("[Quickstart] Starting live trading quickstart test (dev or production server)...");
   console.log(`[Quickstart] Target: ${BASE}`);
-  console.log("[Quickstart] Config: 10 symbols, minimal volume (0.1), live trade ENABLED");
+  console.log("[Quickstart] Config: 32 symbols, minimal volume (0.1), live trade ENABLED");
 
   try {
     // First check if server is up (dev mode)
@@ -27,14 +27,14 @@ async function main() {
     }).catch(() => null);
 
     if (!health || !health.ok) {
-      console.warn("[Quickstart] No dev server — falling back to standalone diagnostic test (inline Redis) with 10 symbols, min-vol, live-trade semantics.");
-      // Fallback: run the comprehensive diagnostic exercising the same 10-symbol quickstart path + live close independence checks.
+      console.warn("[Quickstart] No dev server — falling back to standalone diagnostic test (inline Redis) with 32 symbols, min-vol, live-trade semantics.");
+      // Fallback: run the comprehensive diagnostic exercising the same 32-symbol quickstart path + live close independence checks.
       try {
         const { spawnSync } = require("child_process");
+        const symbols = ["PLAYSOUTUSDT","XANUSDT","BSBUSDT","NILUSDT","BILLUSDT","GITLAWBUSDT","UBUSDT","ASTEROIDETHUSDT","RKCUSDT","ERAUSDT","DRIFTUSDT","WIFUSDT","1000PEPEUSDT","DOGEUSDT","XRPUSDT","ADAUSDT","SOLUSDT","SUIUSDT","LINKUSDT","AVAXUSDT","OPUSDT","ARBUSDT","APTUSDT","NEARUSDT","FILUSDT","DOTUSDT","LTCUSDT","BCHUSDT","UNIUSDT","TRXUSDT","ETCUSDT","ATOMUSDT"]
         const diag = spawnSync(process.execPath, [
-          "./node_modules/.bin/tsx",
-          "--eval",
-          `import runDiagnostic from "./COMPREHENSIVE_DIAGNOSTIC_TEST.ts"; runDiagnostic("bingx-x01", ["PLAYSOUTUSDT","XANUSDT","BSBUSDT","NILUSDT","BILLUSDT","GITLAWBUSDT","UBUSDT","ASTEROIDETHUSDT","RKCUSDT","ERAUSDT"]).then(r => { console.log("DIAG_RESULT:", JSON.stringify(r, null, 2)); process.exit(r.summary.failed > 0 ? 1 : 0); }).catch(e => { console.error("DIAG_ERR:", e); process.exit(1); });`
+          "scripts/standalone-bingx-live-diagnostic.mjs",
+          JSON.stringify(symbols),
         ], { stdio: "inherit", timeout: 45000 });
         console.log("[Quickstart] Standalone diagnostic completed with exit", diag.status);
         process.exit(diag.status || 0);
@@ -44,13 +44,13 @@ async function main() {
       }
     }
 
-    // Trigger quickstart with 10 symbols, live trade, minimal vol (API forces the last two)
+    // Trigger quickstart with 32 symbols, live trade, minimal vol (API forces the last two)
     const res = await fetch(`${BASE}/api/trade-engine/quick-start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         action: "enable",
-        symbolCount: 10,           // Request 10 symbols (auto volatile pick)
+        symbolCount: 32,           // Request 32 symbols (auto volatile pick)
         // connectionId can be passed if needed; API auto-discovers BingX with creds
       }),
       signal: AbortSignal.timeout(120000),

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server"
 import { getRedisClient } from "@/lib/redis-db"
 
+export const dynamic = "force-dynamic"
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url)
@@ -29,12 +30,14 @@ export async function GET(req: Request) {
     }
 
     // ── 2. Read strategy counts ──────────────────────────────────────────────────
-    // PRIMARY: progression hash — these are now written with hset every cycle (not hincrby),
-    // so they represent the actual current number of Sets at each stage.
+    // PRIMARY: progression hash. Live total is cumulative selected/created Live
+    // sets after active dispatch-model selection; candidate totals are tracked
+    // separately as strategies_live_candidates_total.
     let baseSetCount = parseInt(progHash.strategies_base_total || "0", 10)
     let mainSetCount = parseInt(progHash.strategies_main_total || "0", 10)
     let realSetCount = parseInt(progHash.strategies_real_total || "0", 10)
     let liveSetCount = parseInt(progHash.strategies_live_total || "0", 10)
+    const liveCandidateCount = parseInt(progHash.strategies_live_candidates_total || "0", 10)
 
     // FALLBACK: settings:strategies:{connId}:*:sets hash keys (written by setSettings).
     // Only use if progression hash has no data yet (engine just started).
@@ -158,6 +161,7 @@ export async function GET(req: Request) {
       mainStrategyCount:  mainSetCount,
       realStrategyCount:  realSetCount,
       liveStrategyCount:  liveSetCount,
+      liveStrategyCandidateCount: liveCandidateCount,
       totalStrategyCount: totalStrategySets,
       positionsCount,
       totalProfit: 0, // calculated from closed positions if needed
@@ -173,6 +177,7 @@ export async function GET(req: Request) {
         main: mainSetCount,
         real: realSetCount,
         live: liveSetCount,
+        liveCandidates: liveCandidateCount,
         total: totalStrategySets,
         totalRecords: totalStrategySets,
       },

@@ -89,6 +89,18 @@
 
 import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 
+export interface ProgressionRecoordinationResult {
+  changed: boolean
+  reason?: string
+  newEpoch?: number
+}
+
+export interface RecoordinateProgressionResult {
+  changed: boolean
+  reason?: string
+  newEpoch?: number
+}
+
 export interface ProgressionState {
   connectionId: string
   // Session identity — increments each time a new progression starts
@@ -217,7 +229,7 @@ return {
           lastCycleTime: data.last_cycle_time ? new Date(data.last_cycle_time) : undefined,
           lastUpdate: new Date(data.last_update || new Date()),
           prehistoricCyclesCompleted: parseInt(data.prehistoric_cycles_completed || "0", 10),
-          prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? JSON.parse(data.prehistoric_symbols_processed) : [],
+          prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? (() => { try { return JSON.parse(data.prehistoric_symbols_processed) } catch { return [] } })() : [],
           prehistoricPhaseActive: data.prehistoric_phase_active === "true",
           prehistoricCandlesProcessed: parseInt(data.prehistoric_candles_processed || "0", 10),
           prehistoricSymbolsProcessedCount: parseInt(data.prehistoric_symbols_processed_count || "0", 10),
@@ -238,7 +250,7 @@ return {
           indicationsCount: parseInt(data.indications_count || "0", 10),
           strategiesCount: parseInt(data.strategies_count || "0", 10),
           // Uniqueness / solidity snapshot fields (captured at progression start)
-          progressSettingsSnapshot: data.progress_settings_snapshot ? JSON.parse(data.progress_settings_snapshot) : {},
+          progressSettingsSnapshot: data.progress_settings_snapshot ? (() => { try { return JSON.parse(data.progress_settings_snapshot) } catch { return {} } })() : {},
           symbolCount: data.symbol_count ? parseInt(data.symbol_count, 10) : 0,
           activeSymbolsHash: data.active_symbols_hash || "",
           startedForSettingsVersion: data.started_for_settings_version || "",
@@ -791,7 +803,7 @@ return {
         started_at: String(now),
         last_update: new Date(now).toISOString(),
         // State
-        engine_started: "true",
+        engine_started: "false",
         // Prehistoric phase explicitly closed so a new engine start never
         // inherits a stuck prehistoric_phase_active="true" from a prior
         // crashed session, which would block the realtime phase from starting.
@@ -861,11 +873,11 @@ return {
    * Guarantees: previous progress is stopped (via archive + epoch bump), new one is
    * solid for the actual current configuration.
    */
-  static async recoordinateForActualOne(connectionId: string): Promise<void> {
+  static async recoordinateForActualOne(connectionId: string): Promise<RecoordinateProgressionResult> {
     try {
       await initRedis()
       const client = getRedisClient()
-      if (!client) return
+      if (!client) return { changed: false, reason: "redis-unavailable" }
 
       const key = `progression:${connectionId}`
       const existing = await client.hgetall(key).catch(() => null)
@@ -877,7 +889,7 @@ return {
         // beginning the prehistoric phase.
         const epoch = Date.now()
         await this.archiveAndStartNewProgression(connectionId, epoch)
-        return
+        return { changed: true, reason: "no active progression", newEpoch: epoch }
       }
 
       // Resolve current live state
@@ -921,7 +933,7 @@ return {
       }
 
       const liveSymbolCount = currentSymbols.length
-      const liveSymbolsHash = currentSymbols.sort().join("|")
+      const liveSymbolsHash = currentSymbols.slice().sort().join("|")
 
       // ── Settings fingerprint ────────────────────────────────────────────
       // Fields that fundamentally change what the progression computes.
@@ -933,6 +945,7 @@ return {
       // *stored* snapshot (captured at engine-start) to the *live* values
       // so the first settings-save that differs triggers a clean restart.
       const liveFingerprint = [
+        engineType || "main",
         connData.is_live_trade   || "0",
         connData.is_testnet      || "0",
         connData.is_preset_trade || "0",
@@ -948,6 +961,7 @@ return {
           ? JSON.parse(existing.progress_settings_snapshot)
           : {}
         storedFingerprint = [
+          snap.engine_type || existing.engine_type || "main",
           snap.is_live_trade   || "0",
           snap.is_testnet      || "0",
           snap.is_preset_trade || "0",
@@ -960,6 +974,7 @@ return {
       const liveSnapshot = {
         symbol_count: liveSymbolCount,
         symbols_hash: liveSymbolsHash,
+        engine_type: engineType || "main",
         is_live_trade: connData.is_live_trade || "0",
         is_testnet: connData.is_testnet || "0",
         is_preset_trade: connData.is_preset_trade || "0",
@@ -999,9 +1014,25 @@ return {
         await Promise.all([
           client.del(`prehistoric:${connectionId}:done`).catch(() => {}),
           client.del(`prehistoric:${connectionId}:firstpass:done`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}:verified`).catch(() => {}),
+          client.del(`prehistoric:progress:${connectionId}`).catch(() => {}),
           client.del(`prehistoric:${connectionId}`).catch(() => {}),
           client.del(`prehistoric:${connectionId}:symbols`).catch(() => {}),
+          client.del(`progression:${connectionId}:prehistoric_symbols_set`).catch(() => {}),
         ])
+
+        try {
+          // Do not run a broad KEYS scan on every settings save; that can
+          // block the in-memory Redis emulator and make progress/stat polling
+          // look stalled under large datasets. The live symbol list is exactly
+          // the namespace that must be invalidated for the next prehistoric
+          // run, so delete those bounded per-symbol interval gates directly.
+          const intervalKeys = currentSymbols.map((symbol) => `prehistoric:${connectionId}:${symbol}:processed_intervals`)
+          if (intervalKeys.length > 0) {
+            await client.del(...intervalKeys).catch(() => {})
+          }
+        } catch { /* non-critical */ }
 
         // Immediately solidify the new progression with the *actual* live data
         await client.hset(key, {
@@ -1009,11 +1040,37 @@ return {
           active_symbols_hash: liveSymbolsHash,
           started_for_settings_version: new Date().toISOString(),
           progress_settings_snapshot: JSON.stringify(liveSnapshot),
+          engine_type: engineType || "main",
           prehistoric_phase_active: "false",
         }).catch(() => {})
+
+        return { changed: true, reason, newEpoch }
       }
+
+      return { changed: false, reason: "active progression already matches current state" }
     } catch (err) {
       console.warn(`[v0] [Progression] recoordinateForActualOne failed for ${connectionId}:`, err)
+      return {
+        changed: false,
+        reason: err instanceof Error ? err.message : String(err),
+      }
+        return { changed: true, reason, newEpoch }
+
+        await setSettings(`engine_progression:${connectionId}`, {
+          phase: "prehistoric_data",
+          progress: 0,
+          detail: `Settings changed — queued fresh prehistoric run for ${liveSymbolCount} symbols`,
+          sub_current: 0,
+          sub_total: liveSymbolCount,
+          connection_id: connectionId,
+          updated_at: new Date().toISOString(),
+        }).catch(() => {})
+      }
+
+      return { changed: false, reason: "already current" }
+    } catch (err) {
+      console.warn(`[v0] [Progression] recoordinateForActualOne failed for ${connectionId}:`, err)
+      return { changed: false, reason: err instanceof Error ? err.message : String(err) }
     }
   }
 
@@ -1030,7 +1087,8 @@ return {
    * No concurrent multiple progressions/instances for the same connection.
    */
   static async ensureJustUniqueProgression(
-    connectionId: string
+    connectionId: string,
+    options: { ownerEpoch?: number; engineType?: string } = {},
   ): Promise<{ sessionNumber: number; epoch: number; wasNew: boolean }> {
     try {
       await initRedis()
@@ -1042,7 +1100,8 @@ return {
       }
 
       // First, make sure we are coordinated to actual current state
-      await this.recoordinateForActualOne(connectionId)
+      const engineType = options.engineType || "main"
+      await this.recoordinateForActualOne(connectionId, engineType)
 
       const key = `progression:${connectionId}`
       const existing = await client.hgetall(key).catch(() => null)
@@ -1064,6 +1123,55 @@ return {
       // a new engine start to a zombie session (wrong epoch, wrong counters).
       const STALENESS_MS = 30 * 60 * 1000
 
+      const ownerEpoch = options.ownerEpoch && Number.isFinite(options.ownerEpoch) && options.ownerEpoch > 0
+        ? options.ownerEpoch
+        : now
+
+      if (existing && Object.keys(existing).length > 0 && existing.engine_started !== "true") {
+        const sessionNumber = parseInt(existing.session_number || "1", 10)
+        const lastUpdateMs = existing.last_update
+          ? new Date(existing.last_update).getTime()
+          : (existing.started_at ? Number(existing.started_at) : 0)
+        const sessionAge = now - lastUpdateMs
+        const endedAt = Number(existing.ended_at || "0") || 0
+        const isReusableStopped =
+          !endedAt &&
+          lastUpdateMs &&
+          Number.isFinite(lastUpdateMs) &&
+          sessionAge <= STALENESS_MS
+
+        if (!isReusableStopped) {
+          const newSession = await this.archiveAndStartNewProgression(connectionId, ownerEpoch)
+          await client.hset(key, {
+            last_visited: nowIso,
+            last_update: nowIso,
+            engine_started: "true",
+            engine_type: engineType,
+          }).catch(() => {})
+          console.log(
+            `[v0] [Progression] Stopped/stale progression for ${connectionId} was not reusable ` +
+            `(ended_at=${endedAt || "none"}, age=${Math.round(sessionAge / 1000)}s) — started fresh ` +
+            `(session=${newSession}, epoch=${ownerEpoch})`,
+          )
+          return { sessionNumber: newSession, epoch: ownerEpoch, wasNew: true }
+        }
+
+        const epoch = ownerEpoch
+        await client.hset(key, {
+          last_update: nowIso,
+          last_visited: nowIso,
+          engine_started: "true",
+          epoch: String(epoch),
+          engine_type: engineType,
+        }).catch(() => {})
+        await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})
+        console.log(
+          `[v0] [Progression] Activated coordinated progression for ${connectionId} ` +
+          `(session=${sessionNumber}, epoch=${epoch})`,
+        )
+        return { sessionNumber, epoch, wasNew: false }
+      }
+
       if (existing && Object.keys(existing).length > 0 && existing.engine_started === "true") {
         // Check that the session is actually fresh — not a zombie from a prior
         // crashed engine that set engine_started but never ran its first tick.
@@ -1076,13 +1184,15 @@ return {
         if (!isStale) {
           // There is already one healthy unique active progression (recoordinate ensured it matches current live state)
           const sessionNumber = parseInt(existing.session_number || "1", 10)
-          const epoch = Number(existing.epoch) || now
+          const epoch = ownerEpoch
 
           // Light attach: update activity timestamps, keep the same unique session/epoch
           await client.hset(key, {
             last_update: nowIso,
             last_visited: nowIso,
             engine_started: "true",
+            epoch: String(epoch),
+            engine_type: engineType,
           }).catch(() => {})
 
           await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})
@@ -1103,13 +1213,14 @@ return {
       }
 
       // No active unique progression (or it was cleaned by recoordinate) → start one
-      const newEpoch = now
+      const newEpoch = ownerEpoch
       const newSession = await this.archiveAndStartNewProgression(connectionId, newEpoch)
 
       await client.hset(key, {
         last_visited: nowIso,
         last_update: nowIso,
         engine_started: "true",
+        engine_type: engineType,
       }).catch(() => {})
 
       console.log(

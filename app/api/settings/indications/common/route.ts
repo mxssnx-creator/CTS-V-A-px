@@ -70,6 +70,7 @@ const DEFAULT_SETTINGS = {
   },
 }
 
+export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     await initRedis()
