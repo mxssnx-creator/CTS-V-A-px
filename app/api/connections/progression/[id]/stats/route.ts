@@ -1937,6 +1937,21 @@ export async function GET(
 
       // Derive stratDetail.live metrics from the shared parsed array
       // (first 200 entries mirror the old lrange(0, 199) behaviour).
+      // Keep PnL normalization in lock-step with evaluateClosedBatch():
+      // realizedPnL → realized_pnl → pnl.
+      const sampledClosedEval = evaluateClosedBatch(sharedClosedParsed.slice(0, 200))
+      const countSampled = sampledClosedEval.count
+      const avgHoldMin  = countSampled > 0 ? (sampledClosedEval.sumHoldMs / countSampled) / 60_000 : 0
+      const avgPnl      = countSampled > 0 ? sampledClosedEval.sumPnl / countSampled : 0
+      const avgRoi      = countSampled > 0 ? sampledClosedEval.sumRoe / countSampled : 0
+      const profitFactor = sampledClosedEval.sumGrossLoss > 0
+        ? sampledClosedEval.sumGrossProfit / sampledClosedEval.sumGrossLoss
+        : sampledClosedEval.sumGrossProfit > 0 ? 999 : 0
+      const passRate   = livePlaced > 0 ? liveFilled / livePlaced : 0
+      const winRate    = liveClosed > 0 ? liveWins / liveClosed : 0
+      const avgPosSize = countSampled > 0
+        ? sampledClosedEval.sumVolumeUsd / countSampled
+        : liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
       const sampledClosed = sharedClosedParsed.slice(0, 200)
       const closedEval = evaluateClosedBatch(sampledClosed)
       const lastXClosed = aggregateLastXClosedPositions(sampledClosed, sampledClosed.length)
@@ -2042,6 +2057,8 @@ export async function GET(
         passed:    liveOutputSets,
         failed:    Math.max(0, liveEvaluatedSets - liveOutputSets),
         // Live-exclusive fields for richer UI display:
+        winRate:        Math.round(winRate * 1000) / 10,
+        totalPnl:       Math.round(sampledClosedEval.sumPnl * 100) / 100,
         winRate:        lastXClosed.winRate,
         totalPnl:       Math.round(sumPnl * 100) / 100,
         avgPnl:         Math.round(avgPnl * 100) / 100,
