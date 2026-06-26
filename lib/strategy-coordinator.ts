@@ -94,7 +94,6 @@ export interface StrategySet {
   
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
-  variant?: "default" | "trailing" | "block" | "dca"
   variant?: "default" | "trailing" | "block" | "dca" | "pause"
   /**
    * ── Position-count axis windows that this Set satisfies ────────────
@@ -603,13 +602,6 @@ function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
   sizeMultiplier = 1,
-): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
-  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
-  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
-  // Tie SL to the actual position-cost budget, then apply variant scaling.
-  // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
-  const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
-  const takeProfitPct = clampNumber(stopLossPct * Math.max(1, pf), 0.2, 22)
   costModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic"),
 ): DerivedProtection & ProfitFactorProtection {
   const pf = sanitizeLiveProfitFactor(profitFactor, 1)
@@ -3548,7 +3540,6 @@ export class StrategyCoordinator {
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
-        }
         pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       }
       // Slim-path Real Sets carry entries:[] — use set-level scalar aggregates
@@ -4139,7 +4130,6 @@ export class StrategyCoordinator {
               for (const s of qualifying) {
                 const isBlock = s.variant === "block"
                 const isDca   = s.variant === "dca"
-                const isNew   = !isBlock && !isDca // default / trailing
                 const isNew   = !isBlock && !isDca // default / trailing / pause
                 if (s.direction === "long") {
                   if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
@@ -5062,7 +5052,6 @@ export class StrategyCoordinator {
    */
   private variantFingerprint(
     baseSet: StrategySet,
-    variant: "default" | "trailing" | "block" | "dca",
     variant: "default" | "trailing" | "block" | "dca" | "pause",
     ctx: PositionContext,
   ): string {
