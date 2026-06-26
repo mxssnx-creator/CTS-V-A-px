@@ -59,6 +59,14 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
   const connection = (await getConnection(connectionId).catch(() => null)) || {}
   if (hasLiveTradeBlock(connection as Record<string, any>)) return false
 
+function hasLiveTradeBlock(settings: Record<string, any>): boolean {
+  return String(settings.live_trade_blocked_reason || "").trim().length > 0
+}
+
+async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
+  const connection = (await getConnection(connectionId).catch(() => null)) || {}
+  if (hasLiveTradeBlock(connection as Record<string, any>)) return false
+
 async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
   const connection = (await getConnection(connectionId).catch(() => null)) || {}
   if (hasLiveTradeBlock(connection as Record<string, any>)) return false
@@ -145,6 +153,8 @@ interface LivePosition {
   status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "pending_fill" | "placed_unconfirmed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
   statusReason?: string
   closeReason?: string
+  system_tracking_id?: string
+  connection_tracking_id?: string
   setKey?: string
   exchangeData?: Record<string, unknown>
   orderId?: string
@@ -162,6 +172,24 @@ interface LivePosition {
   accumulatedSetKeys?: string[]
   
   progression?: { step: string; timestamp: number; success: boolean; details: string }[]
+}
+
+function makeConnectionTrackingId(connectionId: string): string {
+  return `conn-${connectionId}`
+}
+
+function makeSystemTrackingId(connectionId: string): string {
+  return `sys-${connectionId}-${nanoid(10)}`
+}
+
+function isSystemTrackedLivePosition(position: Partial<LivePosition> | any, connectionId: string): boolean {
+  const systemTrackingId = String(position?.system_tracking_id ?? position?.systemTrackingId ?? "").trim()
+  const connectionTrackingId = String(position?.connection_tracking_id ?? position?.connectionTrackingId ?? "").trim()
+  return (
+    systemTrackingId.startsWith(`sys-${connectionId}-`) &&
+    systemTrackingId.length > `sys-${connectionId}-`.length &&
+    connectionTrackingId === makeConnectionTrackingId(connectionId)
+  )
 }
 
 interface FillRecord {
@@ -1337,6 +1365,15 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
  * every tiny rounding diff. Looser and we'd leave stale levels in place
  * after a real strategy adjustment.
  */
+}
+
+/**
+ * Has the desired protection price drifted enough from the currently
+ * placed one to warrant cancelling and re-placing? We use 0.25% as the
+ * tolerance — tighter than that and we'd thrash the exchange API on
+ * every tiny rounding diff. Looser and we'd leave stale levels in place
+ * after a real strategy adjustment.
+ */
 
 function getProtectionReferencePrice(pos: LivePosition): number {
   const markRaw = pos.exchangeData?.markPrice
@@ -1850,6 +1887,7 @@ export async function executeLivePosition(
 ): Promise<LivePosition> {
   await initRedis()
   const client = getRedisClient()
+  const connectionTrackingId = makeConnectionTrackingId(connectionId)
 
   // ── Exchange circuit-breaker gate (per-symbol) ───────────────────────
   // BingX code 109400 — "API orders temporarily disabled due to market
@@ -1859,6 +1897,8 @@ export async function executeLivePosition(
     const cbSkipped: LivePosition = {
       id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${nanoid(8)}`,
       connectionId,
+      system_tracking_id: makeSystemTrackingId(connectionId),
+      connection_tracking_id: connectionTrackingId,
       symbol: realPosition.symbol,
       direction: realPosition.direction,
       realPositionId: realPosition.id,
@@ -1914,6 +1954,8 @@ export async function executeLivePosition(
     const skipped: LivePosition = {
       id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${nanoid(8)}`,
       connectionId,
+      system_tracking_id: makeSystemTrackingId(connectionId),
+      connection_tracking_id: connectionTrackingId,
       symbol: realPosition.symbol,
       direction: realPosition.direction,
       realPositionId: realPosition.id,
@@ -1959,6 +2001,8 @@ export async function executeLivePosition(
   const livePosition: LivePosition = {
     id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
     connectionId,
+    system_tracking_id: makeSystemTrackingId(connectionId),
+    connection_tracking_id: connectionTrackingId,
     symbol: realPosition.symbol,
     direction: realPosition.direction,
     realPositionId: realPosition.id,
@@ -3999,6 +4043,7 @@ async function checkAndForceCloseOnSltpCross(
   // detector in syncWithExchange handles the safety net; this is
   // intentionally silent for terminal statuses to avoid log spam.
   if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error") return null
+  if (!isSystemTrackedLivePosition(pos, connectionId)) return null
   if (pos.status === "placed") {
     // Rate-limit to once-per-minute per position by using updatedAt as
     // the throttle key — prevents log spam while still surfacing the
@@ -4169,6 +4214,7 @@ async function orphanCloseExpiredPositions(
     const allOpen = await getLivePositions(connectionId)
     const expired = allOpen.filter((p) => {
       if (p.status !== "open" && p.status !== "filled" && p.status !== "partially_filled") return false
+      if (!isSystemTrackedLivePosition(p, connectionId)) return false
       if ((p.executedQuantity ?? 0) <= 0) return false
       const openedAt = p.createdAt || p.updatedAt || 0
       return openedAt > 0 && Date.now() - openedAt > MAX_HOLD_TIME_MS
@@ -4606,6 +4652,7 @@ export async function reconcileLivePositions(
             MAX_HOLD_TIME_MS > 0 &&
             heldMs > MAX_HOLD_TIME_MS &&
             pos.executedQuantity > 0 &&
+            isSystemTrackedLivePosition(pos, connectionId) &&
             (pos.status === "open" || pos.status === "filled")
           ) {
             const exitPrice = markPrice || pos.averageExecutionPrice || pos.entryPrice
@@ -4877,6 +4924,7 @@ export async function processSimulatedPositions(
         if (
           MAX_HOLD_TIME_MS > 0 &&
           heldMs > MAX_HOLD_TIME_MS &&
+          isSystemTrackedLivePosition(pos, connectionId) &&
           (pos.executedQuantity ?? 0) > 0
         ) {
           const exitPrice = markPrice || pos.averageExecutionPrice || pos.entryPrice
@@ -5151,6 +5199,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             if (
               MAX_HOLD_TIME_MS > 0 &&
               heldMs > MAX_HOLD_TIME_MS &&
+              isSystemTrackedLivePosition(pos, connectionId) &&
               (pos.executedQuantity ?? 0) > 0
             ) {
               const exitPrice = markPrice || pos.averageExecutionPrice || pos.entryPrice
@@ -5220,6 +5269,11 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
 
           for (const exPos of exchangePositionsForAdoption) {
             try {
+              // Do not adopt or mutate manual/foreign exchange positions.
+              // Adoption is only safe for positions carrying this app's
+              // system id AND the matching connection id.
+              if (!isSystemTrackedLivePosition(exPos, connectionId)) continue
+
               const rawSym = String(exPos.symbol || (exPos as any).Symbol || "")
               const sym = normSym(rawSym)
               if (!sym) continue
@@ -5250,6 +5304,8 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               const adopted: LivePosition = {
                 id: adoptedId,
                 connectionId,
+                system_tracking_id: String(exPos.system_tracking_id ?? (exPos as any).systemTrackingId ?? ""),
+                connection_tracking_id: String(exPos.connection_tracking_id ?? (exPos as any).connectionTrackingId ?? ""),
                 symbol: sym,
                 direction,
                 realPositionId: adoptedId, // self-reference — no Real-stage parent
@@ -5287,7 +5343,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                     step: "adopt",
                     timestamp: Date.now(),
                     success: true,
-                    details: `Adopted untracked exchange position size=${size} @ ${entryPrice} (default SL=${defaultSlPct}% TP=${defaultTpPct}%)`,
+                    details: `Adopted system-tracked exchange position size=${size} @ ${entryPrice} (default SL=${defaultSlPct}% TP=${defaultTpPct}%)`,
                   },
                 ],
                 createdAt: Date.now(),
@@ -5301,7 +5357,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                 connectionId,
                 "live_trading",
                 "warning",
-                `Adopted untracked exchange position ${sym} ${direction} — applying default SL=${defaultSlPct}% TP=${defaultTpPct}%`,
+                `Adopted system-tracked exchange position ${sym} ${direction} — applying default SL=${defaultSlPct}% TP=${defaultTpPct}%`,
                 { positionId: adoptedId, size, entryPrice, markPrice, leverage },
               )
               // Push adopted position into openPositions so the per-position
@@ -5679,6 +5735,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           MAX_HOLD_TIME_MS > 0 &&
           heldMs > MAX_HOLD_TIME_MS &&
           position.executedQuantity > 0 &&
+          isSystemTrackedLivePosition(position, connectionId) &&
           (position.status === "open" || position.status === "filled")
         ) {
           const exitPrice = markPrice || position.averageExecutionPrice || position.entryPrice

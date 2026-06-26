@@ -2422,9 +2422,13 @@ export async function savePosition(position: any): Promise<void> {
 	      const trackingIds = new Set<string>()
 	      for (const candidate of [
 	        position.trackingId,
+	        position.system_tracking_id,
+	        position.connection_tracking_id,
 	        position.exchangeTrackingId,
 	        position.clientOrderId,
 	        exchangeData.trackingId,
+	        exchangeData.system_tracking_id,
+	        exchangeData.connection_tracking_id,
 	        exchangeData.exchangeTrackingId,
 	        exchangeData.clientOrderId,
 	      ]) {
