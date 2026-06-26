@@ -90,6 +90,11 @@
 import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 
 export interface ProgressionRecoordinationResult {
+  changed: boolean
+  reason?: string
+  newEpoch?: number
+}
+
 export interface RecoordinateProgressionResult {
   changed: boolean
   reason?: string
@@ -868,12 +873,6 @@ return {
    * Guarantees: previous progress is stopped (via archive + epoch bump), new one is
    * solid for the actual current configuration.
    */
-  static async recoordinateForActualOne(connectionId: string): Promise<ProgressionRecoordinationResult> {
-  static async recoordinateForActualOne(connectionId: string, engineType = "main"): Promise<void> {
-    try {
-      await initRedis()
-      const client = getRedisClient()
-      if (!client) return { changed: false, reason: "redis client unavailable" }
   static async recoordinateForActualOne(connectionId: string): Promise<RecoordinateProgressionResult> {
     try {
       await initRedis()
@@ -891,7 +890,6 @@ return {
         const epoch = Date.now()
         await this.archiveAndStartNewProgression(connectionId, epoch)
         return { changed: true, reason: "no active progression", newEpoch: epoch }
-        return { changed: true, reason: "missing progression", newEpoch: epoch }
       }
 
       // Resolve current live state

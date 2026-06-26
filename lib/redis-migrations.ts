@@ -2705,6 +2705,8 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "41")
+    },
+  },
 
   // ── Migration 042 ──────────────────────────────────────────────────────────
   // Reconcile operator volume settings across raw + settings hashes without

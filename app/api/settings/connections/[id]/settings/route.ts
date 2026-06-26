@@ -817,18 +817,6 @@ export async function PATCH(
     // would report zero changes — pass an explicit override listing the
     // settings keys the caller touched, so the recoordinator knows
     // something inside `connection_settings` actually changed.
-    if (!progressionChangedForActualOne) {
-    if (!progressionRestartHandled) {
-      await recoordinateAfterSettingsChange(
-        id,
-        { ...connection, connection_settings: current },
-        { ...connection, connection_settings: merged, updated_at: updated.updated_at },
-        {
-          logTag: "PATCH /settings",
-          changedFieldsOverride: Object.keys(settings).length > 0 ? ["connection_settings"] : [],
-        },
-      )
-    }
     await recoordinateAfterSettingsChange(
       id,
       { ...connection, connection_settings: current },

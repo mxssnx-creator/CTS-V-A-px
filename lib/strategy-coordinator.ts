@@ -763,8 +763,8 @@ export function sanitizeLiveProfitFactor(profitFactor: unknown, fallback = 1): n
   return Number.isFinite(pf) && pf > 0 ? pf : fb
 }
 
-export function deriveProtectionFromProfitFactor(
 const LIVE_PROTECTION_FEE_BUFFER_PCT = 0.12
+
 type LiveExecutionCostProfile = {
   exchange: string
   takerFeePct: number
@@ -783,7 +783,6 @@ type ProfitFactorProtection = {
   netEffectivePF: number
   adjustedTakeProfitPct: number
 }
-
 
 type LiveDispatchDecision = {
   setKey: string
@@ -810,18 +809,9 @@ function deriveProtectionFromProfitFactor(
   positionCostPct: number,
   sizeMultiplier = 1,
   costModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic"),
-): DerivedProtection {
-): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
+): DerivedProtection & ProfitFactorProtection {
   const pf = sanitizeLiveProfitFactor(profitFactor, 1)
-): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number; feeBufferPct: number } {
-  costBufferPct = 0,
-): ProfitFactorProtection {
-  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
-  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.02
   const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
-  const normalizedCostBufferPct = Number.isFinite(costBufferPct) && costBufferPct > 0 ? costBufferPct : 0
-  // Tie SL to the actual position-cost budget, then apply variant scaling.
-  // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
   const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
   const costBufferPct = (
     (costModel.takerFeeBpsPerSide * 2) +
@@ -829,36 +819,21 @@ function deriveProtectionFromProfitFactor(
     (costModel.estimatedMarketSlippageBps * 2) +
     (costModel.fundingHoldCostBufferBps ?? 0)
   ) / 100
-  // Gross TP includes the full round-trip friction budget. After entry/exit
-  // taker fees, spread, market slippage, and optional hold-cost buffer, the
-  // net reward still approximates pf × stopLossPct unless the venue cap binds.
-  const takeProfitPct = clampNumber((stopLossPct * Math.max(1, pf)) + costBufferPct, 0.2, 22)
+  const grossTakeProfitPct = Math.max(0.2, stopLossPct * Math.max(1, pf))
+  const adjustedTakeProfitPct = grossTakeProfitPct + Math.max(costBufferPct, LIVE_PROTECTION_FEE_BUFFER_PCT)
+  const takeProfitPct = clampNumber(adjustedTakeProfitPct, 0.2, MAX_LIVE_TAKE_PROFIT_PCT)
   const effectiveTpPct = Math.max(0, takeProfitPct - costBufferPct)
   return {
     takeProfitPct,
     stopLossPct,
+    effectiveProfitFactor: takeProfitPct / stopLossPct,
     grossPF: takeProfitPct / stopLossPct,
     netPF: effectiveTpPct / stopLossPct,
     costBufferPct,
+    netEffectivePF: effectiveTpPct / stopLossPct,
+    adjustedTakeProfitPct,
     effectiveTpPct,
     effectiveSlPct: stopLossPct,
-  // Live exchange PnL includes entry/exit fees, spread, and protection-order
-  // slippage that the Real-stage PF model does not see. Add a small TP buffer
-  // so a Real-positive PF remains positive after round-trip exchange costs.
-  const takeProfitPct = clampNumber((stopLossPct * Math.max(1, pf)) + LIVE_PROTECTION_FEE_BUFFER_PCT, 0.2, 22)
-  const grossTakeProfitPct = Math.max(0.2, stopLossPct * Math.max(1, pf))
-  const adjustedTakeProfitPct = grossTakeProfitPct + normalizedCostBufferPct
-  const takeProfitPct = clampNumber(adjustedTakeProfitPct, 0.2, MAX_LIVE_TAKE_PROFIT_PCT)
-  const netRewardPct = Math.max(0, grossTakeProfitPct - normalizedCostBufferPct)
-  return {
-    takeProfitPct,
-    stopLossPct,
-    effectiveProfitFactor: takeProfitPct / stopLossPct,
-    feeBufferPct: LIVE_PROTECTION_FEE_BUFFER_PCT,
-    grossPF: pf,
-    costBufferPct: normalizedCostBufferPct,
-    netEffectivePF: netRewardPct / stopLossPct,
-    adjustedTakeProfitPct,
   }
 }
 

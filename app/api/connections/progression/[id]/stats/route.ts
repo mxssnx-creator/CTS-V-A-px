@@ -1609,7 +1609,6 @@ export async function GET(
         const pct = (num: number, den: number): number => den > 0
           ? Math.min(100, Math.round((num / den) * 1000) / 10)
           : 0
-          : detailHashCurrent ? parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0") : 0
 
         // ── evaluated / passed / passRatio ───���────────────────────────
         // Source priority:
