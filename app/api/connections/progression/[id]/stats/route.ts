@@ -1519,38 +1519,21 @@ export async function GET(
 
       // Derive stratDetail.live metrics from the shared parsed array
       // (first 200 entries mirror the old lrange(0, 199) behaviour).
-      let sumPnl = 0
-      let sumGrossProfit = 0
-      let sumGrossLoss = 0
-      let sumHoldMs = 0
-      let sumRoi = 0
-      let countSampled = 0
-      for (const pos of sharedClosedParsed.slice(0, 200)) {
-        try {
-          const pnl = Number(pos.realizedPnL) || 0
-          sumPnl += pnl
-          if (pnl > 0) sumGrossProfit += pnl
-          if (pnl < 0) sumGrossLoss += Math.abs(pnl)
-          const created  = Number(pos.createdAt) || 0
-          const closedAt = Number(pos.closedAt) || Number(pos.updatedAt) || 0
-          if (created > 0 && closedAt > created) sumHoldMs += closedAt - created
-          const qty  = Number(pos.executedQuantity || pos.quantity) || 0
-          const avgP = Number(pos.averageExecutionPrice || pos.entryPrice) || 0
-          const notional = qty * avgP
-          if (notional > 0) sumRoi += pnl / notional
-          countSampled++
-        } catch { /* skip malformed */ }
-      }
-
-      const avgHoldMin  = countSampled > 0 ? (sumHoldMs / countSampled) / 60_000 : 0
-      const avgPnl      = countSampled > 0 ? sumPnl / countSampled : 0
-      const avgRoi      = countSampled > 0 ? sumRoi / countSampled : 0
-      const profitFactor = sumGrossLoss > 0
-        ? sumGrossProfit / sumGrossLoss
-        : sumGrossProfit > 0 ? 999 : 0
+      // Keep PnL normalization in lock-step with evaluateClosedBatch():
+      // realizedPnL → realized_pnl → pnl.
+      const sampledClosedEval = evaluateClosedBatch(sharedClosedParsed.slice(0, 200))
+      const countSampled = sampledClosedEval.count
+      const avgHoldMin  = countSampled > 0 ? (sampledClosedEval.sumHoldMs / countSampled) / 60_000 : 0
+      const avgPnl      = countSampled > 0 ? sampledClosedEval.sumPnl / countSampled : 0
+      const avgRoi      = countSampled > 0 ? sampledClosedEval.sumRoe / countSampled : 0
+      const profitFactor = sampledClosedEval.sumGrossLoss > 0
+        ? sampledClosedEval.sumGrossProfit / sampledClosedEval.sumGrossLoss
+        : sampledClosedEval.sumGrossProfit > 0 ? 999 : 0
       const passRate   = livePlaced > 0 ? liveFilled / livePlaced : 0
       const winRate    = liveClosed > 0 ? liveWins / liveClosed : 0
-      const avgPosSize = liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
+      const avgPosSize = countSampled > 0
+        ? sampledClosedEval.sumVolumeUsd / countSampled
+        : liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
 
       stratDetail.live = {
         // Same shape as base/main/real so the UI can reuse its row renderer:
@@ -1570,7 +1553,7 @@ export async function GET(
         failed:    Math.max(0, livePlaced - liveFilled),
         // Live-exclusive fields for richer UI display:
         winRate:        Math.round(winRate * 1000) / 10,
-        totalPnl:       Math.round(sumPnl * 100) / 100,
+        totalPnl:       Math.round(sampledClosedEval.sumPnl * 100) / 100,
         avgPnl:         Math.round(avgPnl * 100) / 100,
         openPositions:  Math.max(0, liveCreated - liveClosed),
         volumeUsdTotal: Math.round(liveVolumeUsd * 100) / 100,
