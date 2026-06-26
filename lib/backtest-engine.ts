@@ -363,9 +363,6 @@ export class BacktestEngine {
     const signedPricePercent = (profitLoss / entryPrice) * 100
     const positionCostPct = this.getPositionCostPct(strategy)
     const signedResultR = signedPricePercent / positionCostPct
-    // Calculate P&L and signed, cost-normalized return (R).
-    const profitLoss = side === "long" ? exitPrice - entryPrice : entryPrice - exitPrice
-    const signedResultR = calculateSignedResultR(entryPrice, exitPrice, side)
 
     return {
       symbol,
