@@ -3856,6 +3856,8 @@ export class StrategyCoordinator {
 
 
 
+
+
     // Persist LIVE sets — slim format (coord keys only). Skip in dev:
     // setSettings writes to InlineLocalRedis (on-heap Map) on every cycle for
     // every symbol; 20 symbols × every 0.3s = 67 writes/s with no reclaim.

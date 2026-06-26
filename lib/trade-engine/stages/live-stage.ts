@@ -22,7 +22,7 @@
  * records a "simulated" live position without touching the exchange.
  */
 
-import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
+import { getConnection, getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 import { nanoid } from "@/lib/trade-engine/pseudo-position-manager"
 import { getVenueMinQty } from "@/lib/exchange-min-qty"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
@@ -38,9 +38,15 @@ import {
   logLiveOrderFinal,
   type LiveOrderTrace,
 } from "@/lib/live-order-logger"
+import { isTruthyFlag } from "@/lib/connection-state-utils"
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
+
+async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
+  const connection = (await getConnection(connectionId).catch(() => null)) || {}
+  return isTruthyFlag((connection as any).is_live_trade) || isTruthyFlag((connection as any).live_trade_enabled)
+}
 
 // ── Exchange call timeouts ────────────────────────────────────────────────
 // Target: syncWithExchange completes in <1 s on the hot path.
@@ -4285,6 +4291,20 @@ export async function reconcileLivePositions(
       } catch { /* processSimulatedPositions is self-defensive */ }
     }
 
+    // QuickStart intentionally keeps the engine progression running when the
+    // BingX connection test fails, but writes is_live_trade=0 so no private
+    // exchange endpoints should be touched. The sync loop already had this
+    // guard; the reconcile path also needs it because the coordinator can call
+    // reconcile directly every 30s. Without this, dev mode kept polling
+    // getPositions/getOpenOrders and spammed "fetch failed" after a blocked
+    // quickstart.
+    if (!(await isLiveTradeEnabledForConnection(connectionId))) {
+      if (!skipOrphanAdoption) {
+        await orphanCloseExpiredPositions(connectionId, null, summary)
+      }
+      return summary
+    }
+
     // ── Step 4+ from reconcileLivePositions ────────────────────────────────
     // Nothing to do if connector absent (sim-only is already done above)
     if (!exchangeConnector || typeof exchangeConnector.getPositions !== "function") {
@@ -4973,12 +4993,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // positions/open orders; doing so produced continuous "fetch failed" error
     // spam in dev and could make closed legacy live records look actionable.
     // Simulated positions still get processed locally below.
-    const { getConnection: _getConnForSync } = await import("@/lib/redis-db")
-    const { isTruthyFlag: _isTruthyFlagForSync } = await import("@/lib/connection-state-utils")
-    const connForSync = (await _getConnForSync(connectionId).catch(() => null)) || {}
-    const liveTradeOn =
-      _isTruthyFlagForSync((connForSync as any).is_live_trade) ||
-      _isTruthyFlagForSync((connForSync as any).live_trade_enabled)
+    const liveTradeOn = await isLiveTradeEnabledForConnection(connectionId)
     if (!liveTradeOn) {
       const simSummary = await processSimulatedPositions(connectionId)
       const statusBreakdown = allOpen.reduce<Record<string, number>>((acc, p) => {
