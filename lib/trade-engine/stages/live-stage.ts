@@ -51,6 +51,14 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
   const connection = (await getConnection(connectionId).catch(() => null)) || {}
   if (hasLiveTradeBlock(connection as Record<string, any>)) return false
 
+function hasLiveTradeBlock(settings: Record<string, any>): boolean {
+  return String(settings.live_trade_blocked_reason || "").trim().length > 0
+}
+
+async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
+  const connection = (await getConnection(connectionId).catch(() => null)) || {}
+  if (hasLiveTradeBlock(connection as Record<string, any>)) return false
+
 async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
   const connection = (await getConnection(connectionId).catch(() => null)) || {}
   if (hasLiveTradeBlock(connection as Record<string, any>)) return false
