@@ -43,6 +43,29 @@ export interface SettingsChangeEvent {
   newValues?: Record<string, unknown>
 }
 
+async function clearEngineRestartFlags(connectionId: string): Promise<void> {
+  try {
+    const client = getRedisClient()
+    if (!client) return
+    await Promise.all([
+      client.hdel(
+        `settings:trade_engine_state:${connectionId}`,
+        "restart_required",
+        "restart_reason",
+        "restart_requested_at",
+      ).catch(() => 0),
+      client.hdel(
+        `trade_engine_state:${connectionId}`,
+        "restart_required",
+        "restart_reason",
+        "restart_requested_at",
+      ).catch(() => 0),
+    ])
+  } catch {
+    /* non-critical: stale restart flags should never block a settings save */
+  }
+}
+
 /**
  * Determine the type of change based on which fields were modified
  */
@@ -114,8 +137,12 @@ export async function notifySettingsChanged(
   if (changeType === "reload") {
     const engineState = await getSettings(`trade_engine_state:${connectionId}`)
     if (engineState && (engineState.status === "running" || engineState.status === "ready")) {
+      await clearEngineRestartFlags(connectionId)
       await setSettings(`trade_engine_state:${connectionId}`, {
         ...engineState,
+        restart_required: undefined,
+        restart_reason: undefined,
+        restart_requested_at: undefined,
         reload_required: true,
         reload_fields: changedFields,
         reload_requested_at: new Date().toISOString(),

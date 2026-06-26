@@ -2650,6 +2650,55 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "45")
     },
   },
+  {
+    version: 47,
+    name: "047-clear-stale-engine-restart-flags",
+    description: "Remove legacy settings-save restart flags so running engines stay hot-reloadable",
+    up: async (client: any) => {
+      const stateKeys = [
+        ...(((await client.keys("settings:trade_engine_state:*").catch(() => [])) || []) as string[]),
+        ...(((await client.keys("trade_engine_state:*").catch(() => [])) || []) as string[]),
+      ]
+      let cleaned = 0
+      for (const key of new Set(stateKeys)) {
+        const removed = await client
+          .hdel(key, "restart_required", "restart_reason", "restart_requested_at")
+          .catch(() => 0)
+        if (Number(removed) > 0) cleaned++
+      }
+      console.log(`[v0] Migration 047: cleared stale restart flags from ${cleaned} trade-engine state hashes`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "46")
+    },
+  },
+  {
+    version: 48,
+    name: "048-clear-stale-engine-reload-flags",
+    description: "Remove orphaned reload flags left after older dev/settings saves consumed their change events",
+    up: async (client: any) => {
+      const stateKeys = [
+        ...(((await client.keys("settings:trade_engine_state:*").catch(() => [])) || []) as string[]),
+        ...(((await client.keys("trade_engine_state:*").catch(() => [])) || []) as string[]),
+      ]
+      let cleaned = 0
+      for (const key of new Set(stateKeys)) {
+        const connectionId = key.split(":").pop()
+        const pending = connectionId
+          ? await client.hgetall(`settings:settings_change:${connectionId}`).catch(() => ({}))
+          : {}
+        if (pending && typeof pending.connectionId === "string" && pending.connectionId.length > 0) continue
+        const removed = await client
+          .hdel(key, "reload_required", "reload_fields", "reload_requested_at")
+          .catch(() => 0)
+        if (Number(removed) > 0) cleaned++
+      }
+      console.log(`[v0] Migration 048: cleared orphaned reload flags from ${cleaned} trade-engine state hashes`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "47")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
