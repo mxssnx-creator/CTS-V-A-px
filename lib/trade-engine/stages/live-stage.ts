@@ -2154,8 +2154,8 @@ export async function executeLivePosition(
       // checkAndForceCloseOnSltpCross have valid price targets.
       if (simEntryPrice > 0) {
         const simProtection = computeDesiredProtectionPrices(livePosition)
-        if (simProtection.desiredSl > 0) livePosition.assignedStopLoss  = simProtection.desiredSl
-        if (simProtection.desiredTp > 0) livePosition.assignedTakeProfit = simProtection.desiredTp
+        if (simProtection.desiredSl > 0) livePosition.stopLossPrice = simProtection.desiredSl
+        if (simProtection.desiredTp > 0) livePosition.takeProfitPrice = simProtection.desiredTp
       }
       livePosition.executedQuantity = simQty
       livePosition.remainingQuantity = 0
