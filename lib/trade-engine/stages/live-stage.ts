@@ -1799,6 +1799,8 @@ export async function executeLivePosition(
     const failures = entry?.consecutiveFailures ?? 1
     const stepIdx = Math.min(failures - 1, MARGIN_COOLDOWN_STEPS_MS.length - 1)
     const cooldownSec = Math.round((MARGIN_COOLDOWN_STEPS_MS[stepIdx] ?? MARGIN_COOLDOWN_MAX_MS) / 1000)
+    const normalizedSkippedSl = normalizeStopLossPercent(realPosition.stopLoss).value
+    const normalizedSkippedTp = Math.max(0, Number(realPosition.takeProfit) || 0)
     const skipped: LivePosition = {
       id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${nanoid(8)}`,
       connectionId,
@@ -1813,12 +1815,12 @@ export async function executeLivePosition(
       volumeUsd: 0,
       leverage: realPosition.leverage,
       marginType: "cross",
-      stopLoss: realPosition.stopLoss,
-      takeProfit: realPosition.takeProfit,
+      stopLoss: normalizedSkippedSl,
+      takeProfit: normalizedSkippedTp,
       // Immutable snapshot of the originally-assigned values — survives
       // any later override via `recalculateAndApplySLTP`. See type def.
-      assignedStopLoss: realPosition.stopLoss,
-      assignedTakeProfit: realPosition.takeProfit,
+      assignedStopLoss: normalizedSkippedSl,
+      assignedTakeProfit: normalizedSkippedTp,
       status: "rejected",
       statusReason:
         `Skipped — margin-error cooldown active (attempt ${failures}, cooldown=${cooldownSec}s). Top up exchange balance to resume.`,
