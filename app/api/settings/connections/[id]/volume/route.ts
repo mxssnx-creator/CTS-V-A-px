@@ -51,11 +51,6 @@ export async function GET(_request: NextRequest, { params }: { params: Promise<{
     if (!conn) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
-    // Default to the minimum volume factor for unset connections — this
-    // matches `VolumeCalculator.resolveLiveEngine` and guarantees the
-    // slider hydrates at exactly the value the engine will apply.
-    const liveFactor = clampFactor(conn.live_volume_factor) ?? MIN_VOLUME_FACTOR
-    const presetFactor = clampFactor(conn.preset_volume_factor) ?? MIN_VOLUME_FACTOR
     // Default unset connections to the canonical minimum so the
     // slider hydrates at exactly the value the engine will apply.
     const liveFactor = clampFactor(conn.live_volume_factor) ?? FACTOR_MIN
@@ -131,8 +126,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     return NextResponse.json({
       success: true,
       connectionId: id,
-      live_volume_factor: live ?? clampFactor(conn.live_volume_factor) ?? MIN_VOLUME_FACTOR,
-      preset_volume_factor: preset ?? clampFactor(conn.preset_volume_factor) ?? MIN_VOLUME_FACTOR,
       live_volume_factor: live ?? clampFactor(conn.live_volume_factor) ?? FACTOR_MIN,
       preset_volume_factor: preset ?? clampFactor(conn.preset_volume_factor) ?? FACTOR_MIN,
     })

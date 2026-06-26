@@ -412,7 +412,6 @@ export class InlineLocalRedis {
     // in dev — even if totalKeys is low — because the OOM-causing families
     // (strategies: lists, indication: strings, pseudo_position: hashes) can hold
     // 20+ MB each while only occupying a few hundred key slots.
-    try {
       try {
         if (process.env.NODE_ENV === "development") {
           let flushed = 0
@@ -1758,8 +1757,6 @@ export async function initRedis(): Promise<void> {
       // responsive. The underlying migration may still resolve later, but
       // the server is unblocked. The migration runner also has its own
       // per-migration 30-second deadline for individual migrations.
-      const { runMigrations, resetMigrationRunState } = await import("@/lib/redis-migrations")
-      const MIGRATIONS_DEADLINE_MS = 90_000
       try {
         await Promise.race([
           runMigrations(),
