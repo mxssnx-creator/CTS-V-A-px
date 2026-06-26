@@ -603,13 +603,6 @@ function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
   sizeMultiplier = 1,
-): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number } {
-  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
-  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
-  // Tie SL to the actual position-cost budget, then apply variant scaling.
-  // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
-  const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
-  const takeProfitPct = clampNumber(stopLossPct * Math.max(1, pf), 0.2, 22)
   costModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic"),
 ): DerivedProtection & ProfitFactorProtection {
   const pf = sanitizeLiveProfitFactor(profitFactor, 1)
