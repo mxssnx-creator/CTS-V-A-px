@@ -286,7 +286,7 @@ export class GlobalTradeEngineCoordinator {
           console.warn(
             `[v0] [STARTUP LOCK] Retry failed for ${connectionId}; still owned by ${acquired.existingOwner ?? "unknown"}.`,
           )
-          return
+          return false
         }
       }
       lockHandle = acquired.handle
