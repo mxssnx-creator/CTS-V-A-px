@@ -36,6 +36,15 @@
     {
       "path": "/api/cron/server-continuity",
       "schedule": "* * * * *"
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/sync-live-positions",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/generate-indications",
+      "schedule": "* * * * *"
     }
   ],
   "headers": [
