@@ -617,7 +617,7 @@ function getDefaultMainIndicationSettings(): MainIndicationSettings {
   return {
     direction: {
       enabled: true,
-      range: { from: 3, to: 30, step: 1 },
+      range: { from: 2, to: 30, step: 1 },
       drawdown_ratio: { from: 0.1, to: 0.5, step: 0.1 },
       market_change_range: { from: 1, to: 10, step: 2 }, // 5 variations: 1, 3, 5, 7, 9
       market_change_lastpart_base: 20, // 20% = 0.2 ratio
@@ -628,7 +628,7 @@ function getDefaultMainIndicationSettings(): MainIndicationSettings {
     },
     move: {
       enabled: true,
-      range: { from: 3, to: 30, step: 1 },
+      range: { from: 2, to: 30, step: 1 },
       drawdown_ratio: { from: 0.1, to: 0.5, step: 0.1 },
       market_change_range: { from: 1, to: 10, step: 2 }, // 5 variations: 1, 3, 5, 7, 9
       market_change_lastpart_base: 20, // 20% = 0.2 ratio
@@ -651,7 +651,7 @@ function getDefaultMainIndicationSettings(): MainIndicationSettings {
     },
     optimal: {
       enabled: false,
-      range: { from: 3, to: 30, step: 1 },
+      range: { from: 2, to: 30, step: 1 },
       drawdown_ratio: { from: 0.1, to: 0.5, step: 0.1 },
       market_change_range: { from: 1, to: 10, step: 2 },
       market_change_lastpart_base: 20,

@@ -412,7 +412,6 @@ export class InlineLocalRedis {
     // in dev — even if totalKeys is low — because the OOM-causing families
     // (strategies: lists, indication: strings, pseudo_position: hashes) can hold
     // 20+ MB each while only occupying a few hundred key slots.
-    try {
       try {
         if (process.env.NODE_ENV === "development") {
           let flushed = 0

@@ -218,7 +218,9 @@ export class GlobalTradeEngineCoordinator {
         console.warn(
           `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Requesting prior progress stop and retrying once.`,
         )
-        return false
+        // Signal the previous owner to stop, then forcibly reclaim the lock and
+        // retry once. This is the "first stop previous progress and initiate a
+        // new one" recovery path — it must run, so do NOT early-return here.
         try {
           const { getRedisClient } = await import("@/lib/redis-db")
           const client = getRedisClient()
@@ -249,7 +251,7 @@ export class GlobalTradeEngineCoordinator {
           console.warn(
             `[v0] [STARTUP LOCK] Retry failed for ${connectionId}; still owned by ${acquired.existingOwner ?? "unknown"}.`,
           )
-          return
+          return false
         }
       }
       lockHandle = acquired.handle

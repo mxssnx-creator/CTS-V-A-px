@@ -14,7 +14,7 @@ export default function OptimalIndicationSettingsPage() {
   const [settings, setSettings] = useState({
     optimal: {
       enabled: false,
-      range: { from: 3, to: 30, step: 1 },
+      range: { from: 2, to: 30, step: 1 },
       drawdown_ratio: { from: 0.1, to: 0.5, step: 0.1 },
       market_change_range: { from: 1, to: 10, step: 2 },
       market_change_lastpart_base: 20,

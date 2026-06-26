@@ -2838,6 +2838,65 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "43")
     },
   },
+  {
+    version: 45,
+    name: "045-base-pseudo-position-range-2-30",
+    description: "Lower base pseudo-position range floor from 3 to 2 for direction/move/optimal indication types",
+    up: async (client: any) => {
+      await client.set("_schema_version", "45")
+
+      // The base pseudo-position count range default changed from 3-30 to 2-30.
+      // Patch any persisted settings blobs that still carry the old `from: 3`
+      // floor so existing connections pick up the wider range. Only the
+      // direction/move/optimal types use the 3-30 default; `active` legitimately
+      // uses 1-10 and must NOT be touched.
+      const patchRangeFloor = (typeObj: any): boolean => {
+        if (
+          typeObj &&
+          typeof typeObj === "object" &&
+          typeObj.range &&
+          typeof typeObj.range === "object" &&
+          Number(typeObj.range.from) === 3 &&
+          Number(typeObj.range.to) === 30
+        ) {
+          typeObj.range.from = 2
+          return true
+        }
+        return false
+      }
+
+      let patched = 0
+      for (const key of ["indications:main", "indications:optimal"]) {
+        try {
+          const raw = await client.get(key)
+          if (!raw) continue
+          const parsed = typeof raw === "string" ? JSON.parse(raw) : raw
+          if (!parsed || typeof parsed !== "object") continue
+
+          let changed = false
+          // Main settings nest types under top-level keys; optimal stores a
+          // single `optimal` object. Handle both shapes generically.
+          for (const typeName of ["direction", "move", "optimal"]) {
+            if (parsed[typeName] && patchRangeFloor(parsed[typeName])) changed = true
+          }
+          // Some optimal blobs store the range at the root level.
+          if (patchRangeFloor(parsed)) changed = true
+
+          if (changed) {
+            await client.set(key, JSON.stringify(parsed))
+            patched++
+          }
+        } catch (err: any) {
+          console.warn(`[v0] Migration 045: failed to patch ${key}: ${err?.message}`)
+        }
+      }
+
+      console.log(`[v0] Migration 045: patched base pseudo-position range floor (3→2) in ${patched} settings blob(s)`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "44")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

@@ -234,21 +234,91 @@ export abstract class BaseExchangeConnector {
 
   protected async rateLimitedFetch(url: string, options?: RequestInit): Promise<Response> {
     return this.rateLimiter.execute(async () => {
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), this.timeout)
+      // Transient network errors (Node/undici "fetch failed", ECONNRESET,
+      // ETIMEDOUT, EAI_AGAIN, socket hang up) are common when talking to an
+      // exchange over the public internet. A single blip would otherwise abort
+      // the entire order placement ("Failed to place order: fetch failed") and
+      // leave the system showing a live-order count with no actual exchange
+      // position. Retry transient failures a few times with exponential backoff.
+      // HTTP-level errors (4xx/5xx) are NOT retried here — they return a
+      // Response and the caller decides how to handle the status code.
+      const MAX_ATTEMPTS = 3
+      let lastError: unknown
 
-      try {
-        const response = await fetch(url, {
-          ...options,
-          signal: controller.signal,
-        })
-        clearTimeout(timeoutId)
-        return response
-      } catch (error) {
-        clearTimeout(timeoutId)
-        throw error
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), this.timeout)
+
+        try {
+          const response = await fetch(url, {
+            ...options,
+            signal: controller.signal,
+          })
+          clearTimeout(timeoutId)
+          return response
+        } catch (error) {
+          clearTimeout(timeoutId)
+          lastError = error
+
+          const isTransient = this.isTransientNetworkError(error)
+          if (!isTransient || attempt === MAX_ATTEMPTS) {
+            throw error
+          }
+
+          // Exponential backoff: 250ms, 500ms (capped). Short enough to keep
+          // live-trade latency low, long enough to ride out a brief blip.
+          const backoffMs = Math.min(250 * 2 ** (attempt - 1), 1000)
+          this.log(
+            `Transient network error (attempt ${attempt}/${MAX_ATTEMPTS}): ${
+              error instanceof Error ? error.message : String(error)
+            } — retrying in ${backoffMs}ms`,
+          )
+          await new Promise((resolve) => setTimeout(resolve, backoffMs))
+        }
       }
+
+      // Unreachable in practice (loop either returns or throws), but satisfies
+      // the type checker and guards against an empty-loop edge case.
+      throw lastError instanceof Error ? lastError : new Error("fetch failed after retries")
     })
+  }
+
+  /**
+   * Classify whether an error thrown by `fetch` is a transient network-level
+   * failure that is safe to retry. We inspect both the error message and the
+   * underlying `cause.code` that Node/undici attaches (e.g. ECONNRESET).
+   */
+  protected isTransientNetworkError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false
+
+    const msg = error.message?.toLowerCase() ?? ""
+    // Node/undici wraps low-level socket errors in `error.cause`.
+    const causeCode =
+      (error as any)?.cause?.code != null ? String((error as any).cause.code).toUpperCase() : ""
+
+    const transientCodes = [
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "ECONNREFUSED",
+      "EAI_AGAIN",
+      "ENOTFOUND",
+      "EPIPE",
+      "UND_ERR_CONNECT_TIMEOUT",
+      "UND_ERR_SOCKET",
+      "UND_ERR_HEADERS_TIMEOUT",
+    ]
+    if (transientCodes.includes(causeCode)) return true
+
+    return (
+      msg.includes("fetch failed") ||
+      msg.includes("network") ||
+      msg.includes("socket hang up") ||
+      msg.includes("econnreset") ||
+      msg.includes("etimedout") ||
+      msg.includes("timeout") ||
+      // AbortError from our own timeout — worth one more try.
+      error.name === "AbortError"
+    )
   }
 
   abstract testConnection(): Promise<ExchangeConnectorResult>
