@@ -3,6 +3,7 @@ import { sql } from "@/lib/db"
 import { type ExchangeConnection } from "@/lib/types"
 
 // POST retrieve capabilities from exchange
+export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params

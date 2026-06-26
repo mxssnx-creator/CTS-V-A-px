@@ -56,6 +56,7 @@ export interface PipelineCycleResult {
   mode: PipelineMode
   asOfMs?: number
   indicationCount: number
+  indicationTypeCounts: Record<string, number>
   pseudoUpdates: number
   strategiesEvaluated: number
   liveReady: number
@@ -80,8 +81,6 @@ export interface PipelineDeps {
   asOfMs?: number
   asOfCandle?: any
   setsProcessor?: IndicationSetsProcessor
-  /** Live stage exports — contains executeLivePosition for realtime order placement. */
-  liveStage?: any
 }
 
 // ── Lazy-import cache for Phase 4 live-order path ───────────────────
@@ -238,7 +237,8 @@ async function executeReadyStrategiesAsLiveOrders(
         }
 
         const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
-        if (livePos?.status === "filled" || livePos?.status === "placed") {
+        if (livePos?.status === "filled" || livePos?.status === "placed" || livePos?.status === "pending_fill" || livePos?.status === "placed_unconfirmed") {
+        if (livePos?.status === "filled" || livePos?.status === "placed" || livePos?.status === "pending_fill") {
           createdCount++
           // ── CRITICAL FIX: Log full RealPosition context to progression ──
           // When a live position is created, the progression logs need to capture:
@@ -288,6 +288,13 @@ async function executeReadyStrategiesAsLiveOrders(
     console.error(`[v0] [Phase4] error: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
+// ── Live dispatch ownership ───────────────────────────────────────
+// Live exchange dispatch is intentionally owned by
+// `StrategyCoordinator.createLiveSets()` in Phase 3. This shared pipeline
+// must not read `real:sets` or perform a second dispatch pass: slim Real
+// set storage can contain coord/axis identities that cannot be recovered by
+// filtering Base sets alone, and a second selector risks duplicate or
+// conflicting live orders.
 
 /**
  * Run one full per-symbol pipeline pass. Errors are isolated to the
@@ -305,6 +312,7 @@ export async function runIndStratCycle(
     mode,
     asOfMs: deps.asOfMs,
     indicationCount: 0,
+    indicationTypeCounts: {},
     pseudoUpdates: 0,
     strategiesEvaluated: 0,
     liveReady: 0,
@@ -325,6 +333,19 @@ export async function runIndStratCycle(
         return [] as any[]
       })
     result.indicationCount = Array.isArray(indications) ? indications.length : 0
+    if (Array.isArray(indications)) {
+      for (const indication of indications) {
+        const rawType =
+          typeof indication?.type === "string" ? indication.type
+            : typeof indication?.indication_type === "string" ? indication.indication_type
+              : typeof indication?.indicationType === "string" ? indication.indicationType
+                : ""
+        const type = rawType.trim()
+        if (type.length > 0) {
+          result.indicationTypeCounts[type] = (result.indicationTypeCounts[type] ?? 0) + 1
+        }
+      }
+    }
 
     // ── Phase 1b: Sets-fill (replay only) ─────────────────────────────
     // The shared `indication_set:*` keyspace is the bridge between the
@@ -378,16 +399,10 @@ export async function runIndStratCycle(
       result.liveReady = stratResult.liveReady || 0
 
       // ── Phase 4: REMOVED — live dispatch is handled exclusively by Phase 3 ──
-      // `processStrategy → StrategyCoordinator.createLiveSets` already dispatches
-      // exactly 1 executeLivePosition call per direction (the highest-PF qualifying
-      // Real Set). Running Phase 4 here caused a DOUBLE DISPATCH every cycle:
-      //   Phase 3 → dispatches L+S → dedup lock acquired for both directions
-      //   Phase 4 → reads real:sets → attempts L+S again → dedup lock skips them
-      //             but still burns 3-5 Redis round-trips × 2 × N symbols per cycle.
-      // With 15 symbols × 2 directions = 60 wasted round-trips per cycle at ~1Hz.
-      // The secondary `executeReadyStrategiesAsLiveOrders` function below is kept
-      // for now (it is still exported and may be invoked from other callers) but is
-      // no longer called from this cycle hot-path.
+      // `processStrategy → StrategyCoordinator.createLiveSets` owns live selection
+      // and dispatch. Keeping a second shared-pipeline Phase 4 reader here would
+      // re-consume slim `real:sets` without the in-cycle coord/axis registry and
+      // could double-dispatch or conflict with the coordinator's selected buckets.
     }
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err)

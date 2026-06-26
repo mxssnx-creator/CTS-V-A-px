@@ -2,6 +2,8 @@ import { NextResponse } from "next/server"
 import { getSettings, initRedis, getRedisClient, getAllConnections } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 
+export const dynamic = "force-dynamic"
+
 /**
  * Comprehensive Engine System Verification
  * Returns detailed status of: prehistoric data, indications, strategies, realtime, live trading.

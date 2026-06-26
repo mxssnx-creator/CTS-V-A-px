@@ -21,6 +21,8 @@ import { getRedisClient } from "@/lib/redis-db"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { StrategyConfigManager, type PseudoPosition } from "@/lib/strategy-config-manager"
+import { trackTrailingStopMetrics } from "@/lib/statistics-tracker"
+import { validateTrailingStopEdgeCases, logValidationWarnings, isAnomalousPrice } from "@/lib/validation-guards"
 // Shared module-level market-data cache with a 200ms TTL, in-flight
 // deduplication, and pipelined batch prefetch. We delegate price reads
 // to it instead of maintaining a second per-processor cache — a single
@@ -101,6 +103,8 @@ export class RealtimeProcessor {
   private lastPositionsCount = -1
   /** Per-position in-flight gate to prevent concurrent processPosition calls on same ID. */
   private _inflightProcessPosition = new Set<string>()
+  /** Per-symbol streaming lock: prevents concurrent market data updates for the same symbol. */
+  private _perSymbolLocks = new Map<string, boolean>()
   private static readonly HEARTBEAT_INTERVAL_MS = 1000
 
   // ── Live-position exchange sync throttle ───────────────────────────────
@@ -134,8 +138,8 @@ export class RealtimeProcessor {
   private lastLiveSyncStartedAt = 0
   private lastLiveSyncCompletedAt = 0
   private liveSyncInFlight = false
-  private static readonly LIVE_SYNC_INTERVAL_MS = 200
-  private static readonly LIVE_SYNC_PAUSE_MS = 50
+  private static readonly LIVE_SYNC_INTERVAL_MS = 120
+  private static readonly LIVE_SYNC_PAUSE_MS = 30
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -839,6 +843,29 @@ export class RealtimeProcessor {
           position.trailing_active = "1"
           position.trailing_anchor = String(anchor)
           position.trailing_stop_price = String(newStop)
+          
+          // Track trailing stop creation
+          void trackTrailingStopMetrics(
+            this.connectionId,
+            position.symbol,
+            "created",
+            stopRatio,
+            undefined,
+            newStop
+          ).catch(() => {})
+          
+          // Validate edge cases
+          const trailingWarnings = validateTrailingStopEdgeCases(
+            position.symbol,
+            entryPrice,
+            parseFloat(position.leverage || "1"),
+            stopRatio,
+            true,
+            newStop,
+            currentPrice
+          )
+          logValidationWarnings(trailingWarnings, `${position.symbol} trailing created`)
+          
           // Spec §6: trailing just armed — sync to live position now
           // so the exchange SL/TP reflects the activated stop level.
           void this.fireSyncLiveFromPseudo(position).catch(() => {})
@@ -876,6 +903,7 @@ export class RealtimeProcessor {
           // Spec §6: re-arm matching live position's exchange SL/TP.
           void this.fireSyncLiveFromPseudo(position).catch(() => {})
         } else {
+          // SHORT: ratchet when price drops below anchor - step distance
           if (currentPrice >= anchorStored - stepDistance) return
           const newAnchor = currentPrice
           const newStop = newAnchor * (1 + stopRatio)
