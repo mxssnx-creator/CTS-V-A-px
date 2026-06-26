@@ -3,10 +3,14 @@
 const nextConfig = {
   reactStrictMode: false,
   typescript: {
-    ignoreBuildErrors: true,
+    // Production deployments must fail on type or syntax drift instead of
+    // shipping a partially-compiled bundle.
+    ignoreBuildErrors: false,
   },
   eslint: {
-    ignoreDuringBuilds: true,
+    // Keep lint validation enabled during builds so deployment catches the
+    // same issues local checks catch before runtime.
+    ignoreDuringBuilds: false,
   },
   images: {
     unoptimized: true,
