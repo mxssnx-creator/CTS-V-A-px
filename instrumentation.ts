@@ -108,5 +108,12 @@ export async function register() {
     console.error("[Instrumentation] auto-start init failed:", error)
   }
 
+  try {
+    const { startServerContinuityRunner } = await import(/* webpackMode: "eager" */ "@/lib/server-continuity-runner")
+    startServerContinuityRunner()
+  } catch (error) {
+    console.error("[Instrumentation] continuity runner init failed:", error)
+  }
+
   return
 }

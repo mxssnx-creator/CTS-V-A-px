@@ -915,6 +915,14 @@ export class InlineLocalRedis {
     return this.data.strings.get(key) ?? null
   }
 
+  async mget(...keys: string[]): Promise<Array<string | null>> {
+    this.trackOperation()
+    return keys.map((key) => {
+      if (this.isExpired(key)) return null
+      return this.data.strings.get(key) ?? null
+    })
+  }
+
   /**
    * Set a string value with optional TTL and atomic-acquire semantics.
    *
@@ -1792,12 +1800,13 @@ export async function initRedis(): Promise<void> {
   try {
     await globalForRedis.__redis_init_promise
   } catch (error) {
-    // Boot must never crash the runtime. Log, reset retry state, and let the
-    // next caller re-attempt the full sequence (a transient migration failure
-    // should not permanently disable migrations for the whole process, which
-    // is exactly what the previous `migrationsRan = true`-on-failure did).
+    // Runtime must never continue on a partially migrated schema. Log, reset
+    // retry state, and propagate the failure so the current route/startup path
+    // does not serve stale or missing progression containers. The next caller
+    // gets a fresh attempt because the shared promise is cleared below.
     console.error("[v0] [Redis] initialization error (will retry on next call):", error)
     migrationsRan = false
+    throw error
   } finally {
     // Clear the shared promise unless we fully succeeded, so retries get a
     // fresh run. Once isConnected is true the top-of-function guard short-

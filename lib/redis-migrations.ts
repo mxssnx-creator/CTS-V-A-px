@@ -3483,6 +3483,16 @@ export async function runMigrations(): Promise<{ success: boolean; message: stri
 
   const promise = runMigrationsInternal()
   setMigrationRunPromise(promise)
+  void promise.catch(() => {
+    // Do not cache a rejected migration promise forever. initRedis() also
+    // resets this state on migration errors, but runMigrations() is exported
+    // and can be called directly by admin/maintenance routes. If a direct call
+    // hits a transient Redis error or per-migration deadline, the next caller
+    // must be able to retry instead of receiving the same stale rejection.
+    if (getMigrationRunPromise() === promise) {
+      setMigrationRunPromise(null)
+    }
+  })
   return promise
 }
 
