@@ -350,7 +350,7 @@ function createRealPosition(
     // and size multiplier so the live executor applies correct position sizing.
     // 
     // Strategy types:
-    //   - "standard": Position-count based (axis sets, default/trailing/pause)
+    //   - "standard": Position-count based (axis sets, default/trailing)
     //     Qty applies continuousCount scaling in Live stage
     //   - "adjust": Adjustment strategies (Block/DCA)
     //     Qty applies baseMultiplier (volume-ratio scaled) directly

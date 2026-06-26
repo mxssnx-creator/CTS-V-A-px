@@ -744,10 +744,6 @@ export default function SettingsPage() {
   const [settings, setSettings] = useState<Settings>({
     ...initialSettings,
     // Ensure defaults are applied if not present in initialSettings
-    positionCost: initialSettings.positionCost ?? 0.02, // 0.02% default (slider value)
-    exchangePositionCost: initialSettings.exchangePositionCost ?? 0.02, // Sync with positionCost
-    baseVolumeFactorLive: initialSettings.baseVolumeFactorLive ?? 1.0,
-    baseVolumeFactorPreset: initialSettings.baseVolumeFactorPreset ?? 1.0,
     positionCost: initialSettings.positionCost ?? 0.1, // 0.1% default (slider value)
     exchangePositionCost: initialSettings.exchangePositionCost ?? 0.1, // Sync with positionCost
     baseVolumeFactorLive: initialSettings.baseVolumeFactorLive ?? MIN_VOLUME_FACTOR,

@@ -10,7 +10,9 @@
     "NEXT_PUBLIC_ANALYTICS_ID": "default"
   },
   "framework": "nextjs",
-  "regions": ["iad1"],
+  "regions": [
+    "iad1"
+  ],
   "trailingSlash": false,
   "cleanUrls": true,
   "rewrites": [
@@ -40,7 +42,7 @@
     },
     {
       "path": "/api/cron/generate-indications",
-      "schedule": "*/2 * * * *"
+      "schedule": "* * * * *"
     }
   ],
   "headers": [

@@ -464,7 +464,6 @@ export async function POST(request: Request) {
        force_symbols: JSON.stringify(symbols),
        // QuickStart uses the minimum live volume factor so live-trade smoke tests
        // place only exchange-minimum orders when credentials are available.
-       live_volume_factor: "0.1",
        // Symbol ordering: operator spec is volatility_1h for quickstart.
        symbol_order: "volatility_1h",
        symbol_count: String(symbols.length),
@@ -507,7 +506,6 @@ export async function POST(request: Request) {
       // Volume factor
       volume_factor_live:   QUICKSTART_LIVE_VOLUME_FACTOR,
       live_volume_factor:   QUICKSTART_LIVE_VOLUME_FACTOR,
-      volume_factor_live:   "0.1",
       volume_factor_preset: "1.0",
       // Symbol order
       symbol_order: "volatility_1h",
