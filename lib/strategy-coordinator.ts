@@ -94,7 +94,6 @@ export interface StrategySet {
   
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
-  variant?: "default" | "trailing" | "block" | "dca"
   variant?: "default" | "trailing" | "block" | "dca" | "pause"
   /**
    * ── Position-count axis windows that this Set satisfies ────────────
@@ -4131,7 +4130,6 @@ export class StrategyCoordinator {
               for (const s of qualifying) {
                 const isBlock = s.variant === "block"
                 const isDca   = s.variant === "dca"
-                const isNew   = !isBlock && !isDca // default / trailing
                 const isNew   = !isBlock && !isDca // default / trailing / pause
                 if (s.direction === "long") {
                   if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
@@ -5054,7 +5052,6 @@ export class StrategyCoordinator {
    */
   private variantFingerprint(
     baseSet: StrategySet,
-    variant: "default" | "trailing" | "block" | "dca",
     variant: "default" | "trailing" | "block" | "dca" | "pause",
     ctx: PositionContext,
   ): string {
