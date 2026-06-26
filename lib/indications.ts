@@ -235,8 +235,6 @@ export class IndicationEngine {
           : ((position.entry_price - currentPrice) / position.entry_price) * 100
       const positionCostPct = Number.isFinite(position.position_cost) && position.position_cost > 0 ? position.position_cost : 0.1
       const signedResultR = signedPricePercent / positionCostPct
-      const direction = position.direction || "long"
-      const signedResultR = calculateSignedResultR(position.entry_price, currentPrice, direction, position.position_cost)
 
       return {
         ...position,

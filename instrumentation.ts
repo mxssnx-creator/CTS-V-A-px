@@ -36,7 +36,6 @@ export async function register() {
     process.argv.some((arg) => arg === "build" || arg.endsWith("/next") || arg.endsWith("\\next")) &&
       process.argv.includes("build")
 
-  if (isNextBuild) {
   if (isNextBuildPhase()) {
     // `next build` imports instrumentation while collecting page data. Running
     // Redis migrations/startup/auto-start here makes deployment builders spend
