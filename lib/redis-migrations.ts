@@ -1675,6 +1675,8 @@ const migrations: Migration[] = [
     // Seed spec defaults idempotently (never clobbers operator-set values):
     //   variants:  trailing=true, block=true, dca=false
     //   axes:      all disabled by default, including pause-axis; maxWindow seeded to spec defaults
+    //   variants:  trailing=true, block=true, dca=false, pause=true
+    //   axes:      all disabled by default, maxWindow seeded to spec defaults
     //   block knobs: blockVolumeRatio=1.0, blockMaxStack=3
     //
     // Also seeds app_settings so global fallback works the same way.
@@ -1688,6 +1690,7 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false",  // off by spec default
+        variantPauseEnabled:    "true",
         // Axis toggles — disabled by default (operator must opt-in)
         axisPrevEnabled:   "false",
         axisPrevMaxWindow: "12",
@@ -1950,6 +1953,8 @@ const migrations: Migration[] = [
   //       that StrategyCoordinator.loadProfitFactors() reads (NOT the
   //       pf_base_min snake_case names used by the old settings UI)
   //   • variantTrailingEnabled / variantBlockEnabled / variantDcaEnabled → written to connection_settings:bingx-x01
+  //   • variantTrailingEnabled / variantBlockEnabled / variantDcaEnabled /
+  //     variantPauseEnabled → written to connection_settings:bingx-x01
   //     using the camelCase keys that loadCoordinationSettings() reads
   //   • minStep=5, mainEvalPosCount=15, realEvalPosCount=10 →
   //     connection_settings:bingx-x01
@@ -2017,6 +2022,7 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false",
+        variantPauseEnabled:    "true",
         // Block knobs
         blockVolumeRatio:     "1.0",
         blockMaxStack:        "3",
@@ -2397,6 +2403,7 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false",
+        variantPauseEnabled:    "true",
         blockVolumeRatio:       "1.0",
         blockMaxStack:          "3",
         mainEvalPosCount:       "3",
@@ -2581,6 +2588,11 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "41")
     },
   },
+
+  // ── Migration 042 ──────────────────────────────────────────────────────────
+  // Reconcile operator volume settings across raw + settings hashes without
+  // clobbering low-but-valid stress-test factors, and clear stale prehistoric
+  // gates once more for installations that already ran the old 041.
   {
     version: 45,
     name: "045-rebuild-connection-list-cache",
