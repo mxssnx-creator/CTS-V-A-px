@@ -567,35 +567,23 @@ export function ConnectionSettingsDialog({
         variant_dca:      coordination.variants.dca      === true,
       }
 
-      const [settingsRes, indRes] = await Promise.all([
-        fetch(`/api/settings/connections/${connectionId}/settings`, {
-          method:  "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify(payload),
-        }),
-        fetch(`/api/settings/connections/${connectionId}/active-indications`, {
-          method:  "PUT",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify({ channels: { main: indMain, preset: indPreset } }),
-        }),
-        // Keep the connection hash (live_volume_factor / preset_volume_factor)
-        // in sync with the settings hash. The card's inline volume sliders and
-        // VolumeCalculator both read from the connection hash via getConnection().
-        // Without this extra write the two storage locations diverge as soon as
-        // the user saves from the dialog.
-        fetch(`/api/settings/connections/${connectionId}/volume`, {
-          method:  "POST",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify({
-            live_volume_factor:   overview.volumeFactorLive,
-            preset_volume_factor: overview.volumeFactorPreset,
-            volume_step_ratio:   overview.volumeStepRatio,
-          }),
-        }).catch(() => { /* non-fatal — connection hash is a secondary write */ }),
-      ])
-
+      // Save in a deterministic order. The settings PATCH already mirrors
+      // volume factors into both the connection hash and `connection_settings`,
+      // so issuing a parallel `/volume` write here created a race between two
+      // change envelopes and occasionally hot-reloaded stale values.
+      const settingsRes = await fetch(`/api/settings/connections/${connectionId}/settings`, {
+        method:  "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(payload),
+      })
       if (!settingsRes.ok) throw new Error("Settings save failed")
-      if (!indRes.ok)      throw new Error("Indications save failed")
+
+      const indRes = await fetch(`/api/settings/connections/${connectionId}/active-indications`, {
+        method:  "PUT",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ channels: { main: indMain, preset: indPreset } }),
+      })
+      if (!indRes.ok) throw new Error("Indications save failed")
 
       // Re-read active_symbols from the updated settings response so the
       // toast can show what the engine will actually run next cycle.
@@ -618,7 +606,17 @@ export function ConnectionSettingsDialog({
       } catch { /* non-fatal — description falls back to connection name */ }
 
       toast.success("Settings saved", { description: resolvedDesc })
-      window.dispatchEvent(new CustomEvent("connection-settings-updated", { detail: { connectionId } }))
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", {
+        detail: {
+          connectionId,
+          settings: {
+            ...payload,
+            live_volume_factor: overview.volumeFactorLive,
+            preset_volume_factor: overview.volumeFactorPreset,
+            volume_step_ratio: overview.volumeStepRatio,
+          },
+        },
+      }))
       onOpenChange(false)
     } catch (err) {
       console.error("[v0] [Settings Dialog] save error:", err)

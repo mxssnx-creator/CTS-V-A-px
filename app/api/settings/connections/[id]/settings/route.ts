@@ -3,7 +3,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import { updateConnection, initRedis, getConnection, getRedisClient, setSettings, getSettings, persistNow } from "@/lib/redis-db"
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
-import { getGlobalTradeEngineCoordinator, getTradeEngine } from "@/lib/trade-engine"
+import { getTradeEngine } from "@/lib/trade-engine"
 import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { toRedisFlag } from "@/lib/boolean-utils"
@@ -705,46 +705,25 @@ export async function PATCH(
       scalarChanged("is_testnet", (connection as Record<string, unknown>).is_testnet, (updated as Record<string, unknown>).is_testnet) ||
       scalarChanged("is_preset_trade", (connection as Record<string, unknown>).is_preset_trade, (updated as Record<string, unknown>).is_preset_trade) ||
       scalarChanged("connection_method", (connection as Record<string, unknown>).connection_method, (updated as Record<string, unknown>).connection_method)
-    let progressionRestartHandled = false
     if (symbolsModeChanged) {
       try {
         const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
         if (recoordination.changed) {
-          progressionRestartHandled = true
-
-          // The progression epoch/lock changed, so this is no longer a safe
-          // in-place hot reload for a running manager. Publish a restart-class
-          // settings event and explicitly restart an active manager so it binds
-          // to the newly-created progression instead of continuing to write
-          // underneath an archived epoch.
+          // Progression state changed, but the running engine must stay live.
+          // Publish a reload-class event so the owning process invalidates symbol
+          // and strategy caches in place instead of stopping/restarting live trade.
           try {
             const { notifySettingsChanged } = await import("@/lib/settings-coordinator")
             await notifySettingsChanged(
               id,
-              ["progression_epoch", "connection_settings"],
+              ["connection_settings", "active_symbols", "force_symbols", "symbol_count", "symbol_order"],
               { ...connection, connection_settings: current },
               { ...connection, connection_settings: merged, updated_at: updated.updated_at },
             )
           } catch (notifyErr) {
             console.warn(
-              `[v0] [Settings PATCH] restart-class notify failed for ${id}:`,
+              `[v0] [Settings PATCH] reload notify failed for ${id}:`,
               notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
-            )
-          }
-
-          try {
-            const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
-            const coordinator = getGlobalTradeEngineCoordinator()
-            if (coordinator.isEngineRunning(id)) {
-              console.log(
-                `[v0] [Settings PATCH] Restarting ${id} after progression recoordination (${recoordination.reason || "changed"})`,
-              )
-              await coordinator.restartEngine(id)
-            }
-          } catch (restartErr) {
-            console.warn(
-              `[v0] [Settings PATCH] engine restart after progression recoordination failed for ${id}:`,
-              restartErr instanceof Error ? restartErr.message : String(restartErr),
             )
           }
         }
@@ -755,50 +734,11 @@ export async function PATCH(
         )
       }
 
-      // The durable settings-change envelope below now carries the concrete
-      // symbol/mode field names, so the engine-owning process classifies this
-      // as a serialized restart event. Do not also queue a separate route-local
-      // restart here: in production the route can run in a different worker than
-      // the engine, and the old double path raced hot-reload vs stop/start,
-      // producing duplicate progressions and stalled stats after settings saves.
-      // A symbol/mode change invalidates the currently running prehistoric
-      // gates. Recoordination clears Redis state; this background restart makes
-      // the active manager actually start processing the new symbols instead of
-      // waiting for a later watchdog tick. It is intentionally queued and
-      // cooldown-protected so the settings dialog response stays fast and a
-      // double-save cannot spawn duplicate restarts.
-      try {
-        const coordinator = getTradeEngine()
-        const client = getRedisClient()
-        const restartKey = `engine_restart_cooldown:${id}`
-        const lastRestartRaw = await client.get(restartKey).catch(() => null)
-        const lastRestartMs = Number(lastRestartRaw)
-        if (
-          coordinator &&
-          typeof (coordinator as any).isEngineRunning === "function" &&
-          (coordinator as any).isEngineRunning(id) &&
-          (!Number.isFinite(lastRestartMs) || Date.now() - lastRestartMs > 2_000)
-        ) {
-          await client.set(restartKey, String(Date.now()), { EX: 5 }).catch(() => null)
-          setImmediate(() => {
-            void (async () => {
-              try {
-                await (coordinator as any).restartEngine(id)
-              } catch (restartErr) {
-                console.warn(
-                  `[v0] [Settings PATCH] background restart failed for ${id}:`,
-                  restartErr instanceof Error ? restartErr.message : String(restartErr),
-                )
-              }
-            })()
-          })
-        }
-      } catch (restartScheduleErr) {
-        console.warn(
-          `[v0] [Settings PATCH] failed to schedule symbol/mode restart for ${id}:`,
-          restartScheduleErr instanceof Error ? restartScheduleErr.message : String(restartScheduleErr),
-        )
-      }
+      // The durable reload envelope below carries the concrete symbol/mode
+      // field names, so the engine-owning process hot-reloads in place. Do not
+      // queue a route-local restart: in production the API route can run in a
+      // different worker than the engine, and stop/start races make live trade
+      // unstable during normal settings saves.
     }
 
     // Full propagation. PATCH only ships a partial settings payload, so

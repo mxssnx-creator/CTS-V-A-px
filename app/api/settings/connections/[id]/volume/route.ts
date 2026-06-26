@@ -1,6 +1,6 @@
 import { DEFAULT_VOLUME_STEP_RATIO, MAX_VOLUME_STEP_RATIO, MIN_VOLUME_FACTOR, MIN_VOLUME_STEP_RATIO } from "@/lib/constants"
 import { type NextRequest, NextResponse } from "next/server"
-import { getConnection, updateConnection, initRedis } from "@/lib/redis-db"
+import { getConnection, updateConnection, initRedis, getRedisClient } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
@@ -121,6 +121,21 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     if (stepRatio !== null) patch.volume_step_ratio = String(stepRatio)
 
     await updateConnection(id, patch)
+
+    // Keep all settings sections in sync. The dashboard volume panel writes
+    // `live_volume_factor` / `preset_volume_factor` to the connection hash,
+    // while the connection settings dialog hydrates `volume_factor_live` /
+    // `volume_factor_preset` from `connection_settings:{id}`. Mirror both
+    // naming styles atomically so changing a slider in one section is visible
+    // in every other section without an extra save or page refresh.
+    const settingsPatch: Record<string, string> = {}
+    if (patch.live_volume_factor !== undefined) settingsPatch.volume_factor_live = patch.live_volume_factor
+    if (patch.preset_volume_factor !== undefined) settingsPatch.volume_factor_preset = patch.preset_volume_factor
+    if (patch.volume_step_ratio !== undefined) settingsPatch.volume_step_ratio = patch.volume_step_ratio
+    if (Object.keys(settingsPatch).length > 0) {
+      await getRedisClient().hset(`connection_settings:${id}`, settingsPatch)
+    }
+
     await SystemLogger.logConnection(
       `Volume factors updated: ${Object.entries(patch).map(([k, v]) => `${k}=${v}`).join(", ")}`,
       id,
@@ -130,7 +145,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     // Signal the running engine to reload volume factors immediately
     // so the very next order cycle uses the new live/preset multipliers.
     try {
-      await notifySettingsChanged(id, Object.keys(patch))
+      await notifySettingsChanged(id, Array.from(new Set([...Object.keys(patch), ...Object.keys(settingsPatch), "connection_settings"])))
       const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
       await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
     } catch { /* non-critical — watcher will pick it up */ }

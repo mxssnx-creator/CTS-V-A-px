@@ -340,11 +340,15 @@ export function ActiveConnectionCard({
   const handleLiveVolumeChange = useCallback(async (value: number) => {
     setLiveVolumeFactor(value)
     try {
-      await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
+      const res = await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ live_volume_factor: value }),
       })
+      if (!res.ok) throw new Error("Failed to save live volume factor")
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", {
+        detail: { connectionId: connection.connectionId, settings: { live_volume_factor: value, volume_factor_live: value } },
+      }))
     } catch (error) {
       console.error("[v0] Failed to save live volume factor:", error)
     }
@@ -353,11 +357,15 @@ export function ActiveConnectionCard({
   const handlePresetVolumeChange = useCallback(async (value: number) => {
     setPresetVolumeFactor(value)
     try {
-      await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
+      const res = await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ preset_volume_factor: value }),
       })
+      if (!res.ok) throw new Error("Failed to save preset volume factor")
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", {
+        detail: { connectionId: connection.connectionId, settings: { preset_volume_factor: value, volume_factor_preset: value } },
+      }))
     } catch (error) {
       console.error("[v0] Failed to save preset volume factor:", error)
     }
@@ -366,11 +374,15 @@ export function ActiveConnectionCard({
   const handleVolumeStepRatioChange = useCallback(async (value: number) => {
     setVolumeStepRatio(value)
     try {
-      await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
+      const res = await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ volume_step_ratio: value }),
       })
+      if (!res.ok) throw new Error("Failed to save volume step ratio")
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", {
+        detail: { connectionId: connection.connectionId, settings: { volume_step_ratio: value } },
+      }))
     } catch (error) {
       console.error("[v0] Failed to save volume step ratio:", error)
     }
@@ -500,6 +512,13 @@ export function ActiveConnectionCard({
     const handleLiveTradeToggled = (event: Event) => {
       const customEvent = event as CustomEvent
       if (customEvent.detail?.connectionId === connection.connectionId) {
+        const updatedSettings = customEvent.detail?.settings || {}
+        const liveFactor = Number(updatedSettings.live_volume_factor ?? updatedSettings.volume_factor_live)
+        const presetFactor = Number(updatedSettings.preset_volume_factor ?? updatedSettings.volume_factor_preset)
+        const stepRatio = Number(updatedSettings.volume_step_ratio)
+        if (Number.isFinite(liveFactor) && liveFactor > 0) setLiveVolumeFactor(liveFactor)
+        if (Number.isFinite(presetFactor) && presetFactor > 0) setPresetVolumeFactor(presetFactor)
+        if (Number.isFinite(stepRatio) && stepRatio > 0) setVolumeStepRatio(stepRatio)
         fetchProgression()
       }
     }
