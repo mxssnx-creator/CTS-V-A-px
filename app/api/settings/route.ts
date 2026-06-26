@@ -1,3 +1,4 @@
+import { DEFAULT_VOLUME_STEP_RATIO } from "@/lib/constants"
 import { NextResponse } from "next/server"
 import {
   getAppSettings,
@@ -93,6 +94,7 @@ function getDefaultSettings(): Record<string, any> {
     useMaximalLeverage: true,
     leveragePercentage: 100,
     default_volume: 100,
+    volume_step_ratio: DEFAULT_VOLUME_STEP_RATIO,
     max_open_positions: 10,
     max_drawdown_percent: 20,
     daily_loss_limit: 1000,
