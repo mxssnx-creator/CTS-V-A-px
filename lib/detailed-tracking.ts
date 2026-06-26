@@ -34,7 +34,7 @@
  *   ┌─────────────────────────────────────────────────────────────────┐
  *   │ REAL  — ACCUMULATION stage (cumulative across cycles)           │
  *   │   • This is where multiplied/dimensional sets ACCUMULATE        │
- *   │   • per-axis variant counts: prev / last / cont / pause         │
+ *   │   • per-axis counts: prev / last / cont / pause                 │
  *   │   • per-variant counts: default / block / dca / trailing        │
  *   │   • cumulative entries_count grows across cycles                │
  *   └─────────────┬───────────────────────────────────────────────────┘

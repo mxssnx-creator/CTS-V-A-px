@@ -15,16 +15,40 @@
 const PORT = process.env.PORT || 3002;
 const BASE = `http://localhost:${PORT}`;
 
+async function waitForHealth(timeoutMs = 90000) {
+  const started = Date.now();
+  let lastError = "";
+
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const health = await fetch(`${BASE}/api/health`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (health.ok) return health;
+      lastError = `HTTP ${health.status}`;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+
+  console.warn(`[Quickstart] Dev server health was not ready after ${timeoutMs}ms: ${lastError || "unknown error"}`);
+  return null;
+}
+
 async function main() {
   console.log("[Quickstart] Starting live trading quickstart test (dev or production server)...");
   console.log(`[Quickstart] Target: ${BASE}`);
   console.log("[Quickstart] Config: 32 symbols, minimal volume (0.1), live trade ENABLED");
 
   try {
-    // First check if server is up (dev mode)
-    const health = await fetch(`${BASE}/api/health`, { 
-      signal: AbortSignal.timeout(5000) 
-    }).catch(() => null);
+    // First check if server is up (dev mode). Next.js dev can spend several
+    // seconds compiling instrumentation and /api/health on a cold start; a
+    // single 5s probe made the script incorrectly fall back to standalone mode
+    // even though `npm run dev` was still booting. Poll for readiness so the
+    // quickstart script actually exercises the API path in dev mode.
+    const health = await waitForHealth();
 
     if (!health || !health.ok) {
       console.warn("[Quickstart] No dev server — falling back to standalone diagnostic test (inline Redis) with 32 symbols, min-vol, live-trade semantics.");
