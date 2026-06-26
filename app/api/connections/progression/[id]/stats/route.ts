@@ -1115,11 +1115,7 @@ export async function GET(
     //
     // We surface these alongside the stage-level detail so the dashboard can
     // show "Avg PF / Avg DDT per variant" over the lifetime of the run.
-    // Pause is intentionally not a strategy variant. It is exposed below as
-    // an axis/window accumulation (`axisWindows.pause`), not in
-    // `strategyVariants`.
-    const variantKeys = ["default", "trailing", "block", "dca"] as const
-    // ���─ PAUSE VARIANT ────────────────────────────────────────────────
+    // ─ PAUSE VARIANT ────────────────────────────────────────────────
     // The Real stage and StrategyCoordinator both write a 5th variant
     // bucket — `pause` — for entries placed under the global pause-axis
     // ratio config. The previous `variantKeys` list dropped this row so
