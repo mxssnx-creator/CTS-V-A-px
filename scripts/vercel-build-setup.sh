@@ -10,9 +10,16 @@ echo "[Vercel Build] NODE_ENV: ${NODE_ENV:-production}"
 echo "[Vercel Build] Node version: $(node --version 2>/dev/null || echo 'unknown')"
 echo "[Vercel Build] NPM version: $(npm --version 2>/dev/null || echo 'unknown')"
 
-# 1. Install (Vercel already runs installCommand, but keep for local `vercel-build-setup` usage)
-echo "[Vercel Build] Ensuring dependencies are present..."
-npm install --legacy-peer-deps --no-audit --no-fund 2>&1 | tail -5 || true
+# 1. Install is handled by Vercel's installCommand before buildCommand.
+# Avoid running npm install inside buildCommand because it can mutate
+# package-lock.json, re-resolve optional SWC packages, and fail deployments
+# after dependencies were already installed successfully.
+if [ ! -d "node_modules" ]; then
+  echo "[Vercel Build] node_modules missing; installing dependencies for local build..."
+  npm install --legacy-peer-deps --no-audit --no-fund
+else
+  echo "[Vercel Build] Dependencies already installed; skipping nested npm install"
+fi
 
 # 2. Prepare minimal runtime dirs (Redis file fallback + Next cache)
 echo "[Vercel Build] Creating required directories..."

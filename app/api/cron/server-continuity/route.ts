@@ -11,6 +11,17 @@ export const maxDuration = 60
 const LOCK_KEY = "cron:server-continuity:lock"
 const LOCK_TTL_SECONDS = 55
 
+async function runCronTask(name: string, task: () => Promise<unknown>): Promise<{ name: string; ok: boolean; error?: string }> {
+  try {
+    await task()
+    return { name, ok: true }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.warn(`[v0] [ContinuityCron] ${name} failed:`, message)
+    return { name, ok: false, error: message }
+  }
+}
+
 /**
  * Durable server-side continuity tick.
  *
@@ -34,13 +45,26 @@ export async function GET() {
 
     try {
       // On long-lived Node deployments this ensures the in-process runner is
-      // active. On Vercel/serverless the runner intentionally no-ops and this
-      // cron invocation itself is the durable heartbeat.
+      // active. On Vercel/serverless the runner intentionally no-ops, so this
+      // single cron invocation runs the durable heartbeat tasks directly. This
+      // keeps production deploys within conservative cron quotas while still
+      // covering auto-start, indication generation, and live-position sync.
       startServerContinuityRunner()
-      await initializeTradeEngineAutoStart()
+      const tasks = await Promise.all([
+        runCronTask("auto-start", () => initializeTradeEngineAutoStart()),
+        runCronTask("generate-indications", async () => {
+          const mod = await import("@/app/api/cron/generate-indications/route")
+          return mod.GET()
+        }),
+        runCronTask("sync-live-positions", async () => {
+          const mod = await import("@/app/api/cron/sync-live-positions/route")
+          return mod.GET()
+        }),
+      ])
 
       return NextResponse.json({
-        success: true,
+        success: tasks.every((task) => task.ok),
+        tasks,
         durationMs: Date.now() - startedAt,
       })
     } finally {
