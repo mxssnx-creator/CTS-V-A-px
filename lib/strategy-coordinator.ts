@@ -95,6 +95,7 @@ export interface StrategySet {
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
   variant?: "default" | "trailing" | "block" | "dca"
+  variant?: "default" | "trailing" | "block" | "dca" | "pause"
   /**
    * ── Position-count axis windows that this Set satisfies ────────────
    *
@@ -298,7 +299,7 @@ export interface SetCoordRecord {
   /** Points at the originating Base Set in BaseRegistry. */
   parentKey: string
   /** Variant profile this record represents. */
-  variant: "default" | "trailing" | "block" | "dca"
+  variant: "default" | "trailing" | "block" | "dca" | "pause"
   /** Axis tuple — null for profile-variant (non-axis) records. */
   axisWindows: StrategySet["axisWindows"] | null
   /**
@@ -492,6 +493,112 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
+type ProtectionCostModel = {
+  takerFeeBpsPerSide: number
+  estimatedSpreadBps: number
+  estimatedMarketSlippageBps: number
+  fundingHoldCostBufferBps?: number
+  source?: string
+}
+
+type DerivedProtection = {
+  takeProfitPct: number
+  stopLossPct: number
+  grossPF: number
+  netPF: number
+  costBufferPct: number
+  effectiveTpPct: number
+  effectiveSlPct: number
+}
+
+function conservativeCostFallbackForExchange(exchange: string): ProtectionCostModel {
+  const ex = exchange.toLowerCase()
+  if (ex === "binance" || ex === "binanceusdm") {
+    return { takerFeeBpsPerSide: 5, estimatedSpreadBps: 2, estimatedMarketSlippageBps: 4, fundingHoldCostBufferBps: 2, source: "fallback:binance" }
+  }
+  if (ex === "okx" || ex === "okex") {
+    return { takerFeeBpsPerSide: 5, estimatedSpreadBps: 3, estimatedMarketSlippageBps: 5, fundingHoldCostBufferBps: 2, source: "fallback:okx" }
+  }
+  if (ex === "bybit") {
+    return { takerFeeBpsPerSide: 6, estimatedSpreadBps: 3, estimatedMarketSlippageBps: 5, fundingHoldCostBufferBps: 2, source: "fallback:bybit" }
+  }
+  if (ex === "bingx") {
+    return { takerFeeBpsPerSide: 7, estimatedSpreadBps: 5, estimatedMarketSlippageBps: 8, fundingHoldCostBufferBps: 3, source: "fallback:bingx" }
+  }
+  return { takerFeeBpsPerSide: 8, estimatedSpreadBps: 6, estimatedMarketSlippageBps: 10, fundingHoldCostBufferBps: 4, source: "fallback:generic" }
+}
+
+function pickFiniteBps(settings: Record<string, unknown>, keys: string[], fallback: number): number {
+  for (const key of keys) {
+    const n = Number(settings[key])
+    if (Number.isFinite(n) && n >= 0) return n
+  }
+  return fallback
+}
+
+function resolveProtectionCostModel(exchange: string, settings: Record<string, unknown>): ProtectionCostModel {
+  const fallback = conservativeCostFallbackForExchange(exchange)
+  const hasExplicit = (...keys: string[]) => keys.some((k) => settings[k] !== undefined && settings[k] !== null && settings[k] !== "")
+  return {
+    takerFeeBpsPerSide: pickFiniteBps(settings, ["takerFeeBpsPerSide", "takerFeeBps", "exchangeTakerFeeBps", "taker_fee_bps"], fallback.takerFeeBpsPerSide),
+    estimatedSpreadBps: pickFiniteBps(settings, ["estimatedSpreadBps", "spreadBps", "exchangeSpreadBps", "estimated_spread_bps"], fallback.estimatedSpreadBps),
+    estimatedMarketSlippageBps: pickFiniteBps(settings, ["estimatedMarketSlippageBps", "marketSlippageBps", "slippageBps", "estimated_market_slippage_bps"], fallback.estimatedMarketSlippageBps),
+    fundingHoldCostBufferBps: pickFiniteBps(settings, ["fundingHoldCostBufferBps", "fundingBufferBps", "holdCostBufferBps", "funding_hold_cost_buffer_bps"], fallback.fundingHoldCostBufferBps ?? 0),
+    source: hasExplicit(
+      "takerFeeBpsPerSide", "takerFeeBps", "exchangeTakerFeeBps", "taker_fee_bps",
+      "estimatedSpreadBps", "spreadBps", "exchangeSpreadBps", "estimated_spread_bps",
+      "estimatedMarketSlippageBps", "marketSlippageBps", "slippageBps", "estimated_market_slippage_bps",
+      "fundingHoldCostBufferBps", "fundingBufferBps", "holdCostBufferBps", "funding_hold_cost_buffer_bps",
+    ) ? "settings" : fallback.source,
+  }
+}
+export function sanitizeLiveProfitFactor(profitFactor: unknown, fallback = 1): number {
+  const pf = Number(profitFactor)
+  const fb = Number.isFinite(fallback) && fallback > 0 ? fallback : 1
+  return Number.isFinite(pf) && pf > 0 ? pf : fb
+}
+
+const LIVE_PROTECTION_FEE_BUFFER_PCT = 0.12
+
+type LiveExecutionCostProfile = {
+  exchange: string
+  takerFeePct: number
+  estimatedSpreadPct: number
+  slippagePct: number
+  fundingBufferPct: number
+  costBufferPct: number
+}
+
+type ProfitFactorProtection = {
+  takeProfitPct: number
+  stopLossPct: number
+  effectiveProfitFactor: number
+  grossPF: number
+  costBufferPct: number
+  netEffectivePF: number
+  adjustedTakeProfitPct: number
+}
+
+type LiveDispatchDecision = {
+  setKey: string
+  parentSetKey?: string
+  variant: string
+  symbol: string
+  direction: "long" | "short"
+  grossPF: number
+  costBufferPct: number
+  netEffectivePF: number
+  takeProfitPct: number
+  adjustedTakeProfitPct: number
+  stopLossPct: number
+  effectiveProfitFactor: number
+  liveThresholdPF: number
+  costs: LiveExecutionCostProfile
+  reason?: "net_pf_after_costs_low" | "tp_after_costs_exceeds_max"
+}
+
+const MAX_LIVE_TAKE_PROFIT_PCT = 22
+
 function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
@@ -503,10 +610,84 @@ function deriveProtectionFromProfitFactor(
   // This keeps PF mathematically grounded in TP/SL: effectivePF = TP / SL.
   const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
   const takeProfitPct = clampNumber(stopLossPct * Math.max(1, pf), 0.2, 22)
+  costModel: ProtectionCostModel = conservativeCostFallbackForExchange("generic"),
+): DerivedProtection & ProfitFactorProtection {
+  const pf = sanitizeLiveProfitFactor(profitFactor, 1)
+  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  const stopLossPct = clampNumber(baseRiskPct * Math.max(0.1, sizeMultiplier), 0.2, 5)
+  const costBufferPct = (
+    (costModel.takerFeeBpsPerSide * 2) +
+    costModel.estimatedSpreadBps +
+    (costModel.estimatedMarketSlippageBps * 2) +
+    (costModel.fundingHoldCostBufferBps ?? 0)
+  ) / 100
+  const grossTakeProfitPct = Math.max(0.2, stopLossPct * Math.max(1, pf))
+  const adjustedTakeProfitPct = grossTakeProfitPct + Math.max(costBufferPct, LIVE_PROTECTION_FEE_BUFFER_PCT)
+  const takeProfitPct = clampNumber(adjustedTakeProfitPct, 0.2, MAX_LIVE_TAKE_PROFIT_PCT)
+  const effectiveTpPct = Math.max(0, takeProfitPct - costBufferPct)
   return {
     takeProfitPct,
     stopLossPct,
     effectiveProfitFactor: takeProfitPct / stopLossPct,
+    grossPF: takeProfitPct / stopLossPct,
+    netPF: effectiveTpPct / stopLossPct,
+    costBufferPct,
+    netEffectivePF: effectiveTpPct / stopLossPct,
+    adjustedTakeProfitPct,
+    effectiveTpPct,
+    effectiveSlPct: stopLossPct,
+  }
+}
+
+function normalizePercentSetting(value: unknown, fallbackPct: number): number {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return fallbackPct
+  // Settings often store tolerances as ratios (0.0006 = 0.06%). Accept both.
+  return n <= 1 ? n * 100 : n
+}
+
+function defaultTakerFeePct(exchange: string): number {
+  switch (exchange) {
+    case "binance": return 0.04
+    case "bybit": return 0.055
+    case "okx": return 0.05
+    case "bingx": return 0.05
+    default: return 0.06
+  }
+}
+
+function resolveLiveExecutionCostProfile(exchange: string, connSettings: Record<string, unknown>): LiveExecutionCostProfile {
+  const takerFeePct = normalizePercentSetting(connSettings.takerFeePct ?? connSettings.takerFee ?? connSettings.exchangeTakerFeePct, defaultTakerFeePct(exchange))
+  const estimatedSpreadPct = normalizePercentSetting(connSettings.estimatedSpreadPct ?? connSettings.spreadPct ?? connSettings.exchangeSpreadPct, 0.02)
+  const slippagePct = normalizePercentSetting(connSettings.slippageTolerance ?? connSettings.slippagePct ?? connSettings.exchangeSlippagePct, 0.06)
+  const fundingBufferPct = normalizePercentSetting(connSettings.fundingBufferPct ?? connSettings.fundingPct ?? connSettings.exchangeFundingBufferPct, 0)
+  return {
+    exchange,
+    takerFeePct,
+    estimatedSpreadPct,
+    slippagePct,
+    fundingBufferPct,
+    costBufferPct: (takerFeePct * 2) + estimatedSpreadPct + (slippagePct * 2) + fundingBufferPct,
+  }
+}
+
+
+function deriveConfiguredStatsFromProfitFactor(
+  profitFactor: number,
+  positionCostPct: number,
+): { takeProfitPct: number; stopLossPct: number; tpR: number; slR: number; rewardRisk: number } {
+  const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
+  const posCost = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
+  // Mirrors the live pseudo-position TP/SL configuration so configured
+  // reward/risk stays separate from realized performance factor.
+  const takeProfitPct = Math.max(0.5, (pf - 1) * 100)
+  const stopLossPct = Math.min(5, 100 / Math.max(1, pf) * 0.5)
+  return {
+    takeProfitPct,
+    stopLossPct,
+    tpR: takeProfitPct / posCost,
+    slR: stopLossPct / posCost,
+    rewardRisk: stopLossPct > 0 ? takeProfitPct / stopLossPct : 0,
   }
 }
 
@@ -574,7 +755,7 @@ export class StrategyCoordinator {
    * Per-cycle cached coordination settings (axes + variants toggles).
    * The coordinator loads this from connection settings on each flow and
    * respects the operator's toggles for position-count axes and categorical
-   * variants (trailing, block, dca). Cached for `_coordinationTtlMs`
+   * variants (trailing, block, dca, pause). Cached for `_coordinationTtlMs`
    * (5s) to avoid spamming Redis on every symbol's evaluation.
    */
   private _coordinationSettings: {
@@ -588,6 +769,7 @@ export class StrategyCoordinator {
       trailing: boolean
       block:    boolean
       dca:      boolean
+      pause:    boolean
     }
     /**
      * Block-strategy live-position × volume-ratio coordination knobs.
@@ -643,6 +825,7 @@ export class StrategyCoordinator {
       trailing: true,
       block:    true, // ← ENABLED by default (per spec)
       dca:      true,
+      pause:    true,
     },
     blockVolumeRatio: 1.0,
     blockMaxStack:    3,
@@ -1125,11 +1308,13 @@ export class StrategyCoordinator {
       this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  0)
 
       // Variant toggles. Defaults: trailing=true, block=true, dca=false
+      // Variant toggles. Defaults: trailing=true, block=true, dca=false, pause=true
       // (spec: DCA off by default). The bool() helper only falls back to the
       // default when the key is genuinely absent — an explicit "false" is honoured.
       this._coordinationSettings.variants.trailing = bool(s.variantTrailingEnabled, true)
       this._coordinationSettings.variants.block    = bool(s.variantBlockEnabled,    true)
       this._coordinationSettings.variants.dca      = bool(s.variantDcaEnabled,      false)
+      this._coordinationSettings.variants.pause    = bool(s.variantPauseEnabled,    true)
 
       // ── Block-strategy tuning (previously never read from settings) ─────
       // blockVolumeRatio and blockMaxStack control the Block variant's live
@@ -2228,6 +2413,7 @@ export class StrategyCoordinator {
       trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+      pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
     }
     // Aggregate scalars — computed in the same pass as variantAgg to avoid
     // 4 extra reduce/filter sweeps that each allocate a result value.
@@ -3049,7 +3235,7 @@ export class StrategyCoordinator {
             sizeDelta     = pfBias < 1.0 ? Math.max(-0.7, pfBias - 1) : 0
             leverageDelta = pfBias < 1.0 ? pfBias - 1 : undefined
           } else {
-            // default / trailing / axis — symmetric bias ±0.5.
+            // default / trailing / pause / axis — symmetric bias ±0.5.
             sizeDelta = Math.max(-0.5, Math.min(0.5, combined - 1))
           }
 
@@ -3363,6 +3549,8 @@ export class StrategyCoordinator {
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         }
+        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+      }
       // Slim-path Real Sets carry entries:[] — use set-level scalar aggregates
       // (entryCount, avgProfitFactor, avgDrawdownTime) instead of iterating
       // entries. This mirrors the Main-stage variantAgg fix and ensures
@@ -3378,7 +3566,7 @@ export class StrategyCoordinator {
         agg.sumPF          += set.avgProfitFactor * ec
         agg.sumDDT         += (set.avgDrawdownTime || 0) * ec
       }
-      for (const variant of ["default", "trailing", "block", "dca"] as const) {
+      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
         const agg = realVariantAgg[variant]
         // Guard on setsContaining (not entries) so sets with entryCount=0 still
         // contribute their count metadata to the variant hash.
@@ -3477,7 +3665,7 @@ export class StrategyCoordinator {
       // so the stats API can read them without recomputing.
       try {
         const recompute: Promise<any>[] = []
-        for (const variant of ["default", "trailing", "block", "dca"] as const) {
+        for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
           if (realVariantAgg[variant].setsContaining === 0) continue
           const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
           recompute.push(
@@ -3671,6 +3859,11 @@ export class StrategyCoordinator {
 
 
 
+
+
+
+
+
     // Persist LIVE sets — slim format (coord keys only). Skip in dev:
     // setSettings writes to InlineLocalRedis (on-heap Map) on every cycle for
     // every symbol; 20 symbols × every 0.3s = 67 writes/s with no reclaim.
@@ -3722,6 +3915,7 @@ export class StrategyCoordinator {
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
       }
       for (const set of qualifying) {
         // Slim-path sets carry entries: [] — use entryCount + set-level avgPF/DDT
@@ -3763,7 +3957,7 @@ export class StrategyCoordinator {
       }
 
       const liveVariantWrites: Promise<any>[] = []
-      for (const variant of ["default", "trailing", "block", "dca"] as const) {
+      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
         const agg = liveVariantAgg[variant]
         // Guard on setsContaining — a variant bucket with sets but entryCount=0
         // still contributes count metadata. Avoids writing empty buckets.
@@ -3921,6 +4115,7 @@ export class StrategyCoordinator {
             //
             // Preselection rules:
             //   • "new" variants (default, trailing): at most 1 per
+            //   • "new" variants (default, trailing, pause): at most 1 per
             //     direction — first (highest-PF) wins.
             //   • "block" variant: allowed through even when the direction
             //     already has a "new" set selected. Block places an ADD-ON
@@ -3945,6 +4140,7 @@ export class StrategyCoordinator {
                 const isBlock = s.variant === "block"
                 const isDca   = s.variant === "dca"
                 const isNew   = !isBlock && !isDca // default / trailing
+                const isNew   = !isBlock && !isDca // default / trailing / pause
                 if (s.direction === "long") {
                   if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
                   if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
@@ -4060,7 +4256,7 @@ export class StrategyCoordinator {
                     // structured fields are what downstream code reads.
                     setKey:       set.setKey,
                     parentSetKey: set.parentSetKey,
-                    setVariant:   set.variant,
+                    setVariant:   set.variant === "pause" ? undefined : set.variant,
                     axisWindows:  set.axisWindows,
                     // Forward the variant size multiplier so VolumeCalculator
                     // can apply Block (1.5–2.0×) or DCA (0.5×) notional scaling
@@ -4757,7 +4953,7 @@ export class StrategyCoordinator {
   }
 
   private variantProfiles(): Array<{
-    name: "default" | "trailing" | "block" | "dca"
+    name: "default" | "trailing" | "block" | "dca" | "pause"
     gate: (ctx: PositionContext) => boolean
     configs: Array<{ size: number; leverage: number; state: string; pfBias: number; ddtBias: number }>
   }> {
@@ -4806,6 +5002,32 @@ export class StrategyCoordinator {
           { size: 0.5, leverage: 1, state: "close",  pfBias: 0.95, ddtBias: 30 },
         ],
       },
+      {
+        // ── Pause variant — 1..8 last-position validation windows (step 1) ─���
+        // Spec: *"add Pause 1-8 Pos step 1 to Main additional Sets creation
+        // after Pos prev,Last,cont .. add the 1-8 Last for counting Pause of
+        // validating."* Each sub-config encodes one validation lookback N
+        // (the last N closed positions) — when at least one of them was a
+        // loser the Pause Set throttles back the next entry. The 8 sub-
+        // configs ramp size DOWN and DDT-bias UP as the pause window
+        // widens, so a deeper-history pause produces a more conservative
+        // entry config than a shallow-history one. Gate fires whenever
+        // there is ≥1 closed position to validate against; the closed-only
+        // lookback enforced by `getPositionContext` (P2-1) means floating
+        // mark-to-market PnL never leaks into this trigger.
+        name: "pause",
+        gate: (c) => c.lastPosCount >= 1,
+        configs: [
+          { size: 0.90, leverage: 1, state: "new", pfBias: 1.00, ddtBias: 5  }, // last 1
+          { size: 0.85, leverage: 1, state: "new", pfBias: 1.00, ddtBias: 10 }, // last 2
+          { size: 0.80, leverage: 1, state: "new", pfBias: 1.01, ddtBias: 15 }, // last 3
+          { size: 0.75, leverage: 1, state: "new", pfBias: 1.02, ddtBias: 20 }, // last 4
+          { size: 0.70, leverage: 1, state: "new", pfBias: 1.03, ddtBias: 25 }, // last 5
+          { size: 0.65, leverage: 1, state: "new", pfBias: 1.04, ddtBias: 30 }, // last 6
+          { size: 0.60, leverage: 1, state: "new", pfBias: 1.05, ddtBias: 35 }, // last 7
+          { size: 0.55, leverage: 1, state: "new", pfBias: 1.06, ddtBias: 40 }, // last 8
+        ],
+      },
     ]
   }
 
@@ -4841,6 +5063,7 @@ export class StrategyCoordinator {
   private variantFingerprint(
     baseSet: StrategySet,
     variant: "default" | "trailing" | "block" | "dca",
+    variant: "default" | "trailing" | "block" | "dca" | "pause",
     ctx: PositionContext,
   ): string {
     const bPF = Math.round(baseSet.avgProfitFactor * 10) / 10
@@ -4850,6 +5073,10 @@ export class StrategyCoordinator {
     // the P2-1 gate in getPositionContext. lastPosCount remains in the
     // fingerprint for axis-window coordination so 3/5/8-count pause-axis
     // contexts do not collapse into the same cached Set.
+    // the P2-1 gate in getPositionContext. lastPosCount is the Pause
+    // variant's primary discriminator (1..8 windows) — adding it to the
+    // fingerprint guarantees a 3-loss / 5-loss / 8-loss pause produce
+    // distinct cached Sets instead of collapsing into the same bucket.
     const cont = Math.min(10, Math.max(0, ctx.continuousCount))
     const lW   = Math.min(4,  Math.max(0, ctx.lastWins))
     const lL   = Math.min(4,  Math.max(0, ctx.lastLosses))

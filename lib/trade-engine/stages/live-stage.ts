@@ -50,6 +50,21 @@ function hasLiveTradeBlock(settings: Record<string, any>): boolean {
 async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
   const connection = (await getConnection(connectionId).catch(() => null)) || {}
   if (hasLiveTradeBlock(connection as Record<string, any>)) return false
+
+function hasLiveTradeBlock(settings: Record<string, any>): boolean {
+  return String(settings.live_trade_blocked_reason || "").trim().length > 0
+}
+
+async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
+  const connection = (await getConnection(connectionId).catch(() => null)) || {}
+  if (hasLiveTradeBlock(connection as Record<string, any>)) return false
+
+async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
+  const connection = (await getConnection(connectionId).catch(() => null)) || {}
+  if (hasLiveTradeBlock(connection as Record<string, any>)) return false
+
+async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
+  const connection = (await getConnection(connectionId).catch(() => null)) || {}
   return isTruthyFlag((connection as any).is_live_trade) || isTruthyFlag((connection as any).live_trade_enabled)
 }
 
@@ -143,6 +158,7 @@ interface LivePosition {
   sizeMultiplier?: number
   parentSetKey?: string
   setVariant?: "default" | "trailing" | "block" | "dca"
+  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
   accumulatedSetKeys?: string[]
   
   progression?: { step: string; timestamp: number; success: boolean; details: string }[]
@@ -1321,6 +1337,84 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
  * every tiny rounding diff. Looser and we'd leave stale levels in place
  * after a real strategy adjustment.
  */
+
+function getProtectionReferencePrice(pos: LivePosition): number {
+  const markRaw = pos.exchangeData?.markPrice
+  const markPrice = typeof markRaw === "number" ? markRaw : parseFloat(String(markRaw ?? ""))
+  if (Number.isFinite(markPrice) && markPrice > 0) return markPrice
+  if (Number.isFinite(pos.averageExecutionPrice) && pos.averageExecutionPrice > 0) return pos.averageExecutionPrice
+  return Number.isFinite(pos.entryPrice) && pos.entryPrice > 0 ? pos.entryPrice : 0
+}
+
+function findCrossedProtectionTrigger(
+  pos: LivePosition,
+  desiredSl: number,
+  desiredTp: number,
+  referencePrice: number,
+): { leg: "StopLoss" | "TakeProfit"; triggerPrice: number; expectedSide: string } | null {
+  if (!Number.isFinite(referencePrice) || referencePrice <= 0) return null
+  const direction = pos.direction === "short" ? "short" : "long"
+
+  if (Number.isFinite(desiredSl) && desiredSl > 0) {
+    if (direction === "long" && desiredSl >= referencePrice) {
+      return { leg: "StopLoss", triggerPrice: desiredSl, expectedSide: "below" }
+    }
+    if (direction === "short" && desiredSl <= referencePrice) {
+      return { leg: "StopLoss", triggerPrice: desiredSl, expectedSide: "above" }
+    }
+  }
+
+  if (Number.isFinite(desiredTp) && desiredTp > 0) {
+    if (direction === "long" && desiredTp <= referencePrice) {
+      return { leg: "TakeProfit", triggerPrice: desiredTp, expectedSide: "above" }
+    }
+    if (direction === "short" && desiredTp >= referencePrice) {
+      return { leg: "TakeProfit", triggerPrice: desiredTp, expectedSide: "below" }
+    }
+  }
+
+  return null
+}
+
+async function closeIfProtectionTriggerAlreadyCrossed(
+  connector: any,
+  pos: LivePosition,
+  desiredSl: number,
+  desiredTp: number,
+  context: string,
+): Promise<boolean> {
+  const referencePrice = getProtectionReferencePrice(pos)
+  const crossed = findCrossedProtectionTrigger(pos, desiredSl, desiredTp, referencePrice)
+  if (!crossed) return false
+
+  const direction = pos.direction === "short" ? "short" : "long"
+  const detail =
+    `${crossed.leg} trigger already crossed for ${pos.symbol} ${direction}: ` +
+    `trigger=${crossed.triggerPrice} must be ${crossed.expectedSide} reference=${referencePrice}; forcing close instead of placing invalid protection order`
+  console.warn(`${LOG_PREFIX} [protection-crossed] ${detail}`)
+  pushStep(pos, "protection_trigger_already_crossed", true, detail)
+  await logProgressionEvent(
+    pos.connectionId,
+    "live_trading",
+    "warning",
+    `Protection trigger already crossed for ${pos.symbol} — force closing`,
+    {
+      livePositionId: pos.id,
+      symbol: pos.symbol,
+      direction,
+      leg: crossed.leg,
+      triggerPrice: crossed.triggerPrice,
+      referencePrice,
+      expectedSide: crossed.expectedSide,
+      context,
+      reason: "protection_trigger_already_crossed",
+    },
+  )
+  await savePosition(pos).catch(() => {})
+  await closeLivePosition(pos.connectionId, pos.id, referencePrice, connector, "protection_trigger_already_crossed")
+  return true
+}
+
 function priceDrifted(current: number | undefined, desired: number): boolean {
   if (!desired || desired <= 0) return false
   if (!current || current <= 0) return true // never placed or lost
@@ -1505,6 +1599,11 @@ async function updateProtectionOrders(
 
   const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
   const closeSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
+
+  if (await closeIfProtectionTriggerAlreadyCrossed(connector, pos, desiredSl, desiredTp, reason)) {
+    result.changed = true
+    return result
+  }
 
   // ── Quantity drift detection ──────────────────────────────────��───────
   // When more volume joins the position (delayed partial fills, accumulation
@@ -1810,6 +1909,8 @@ export async function executeLivePosition(
     const failures = entry?.consecutiveFailures ?? 1
     const stepIdx = Math.min(failures - 1, MARGIN_COOLDOWN_STEPS_MS.length - 1)
     const cooldownSec = Math.round((MARGIN_COOLDOWN_STEPS_MS[stepIdx] ?? MARGIN_COOLDOWN_MAX_MS) / 1000)
+    const normalizedSkippedSl = normalizeStopLossPercent(realPosition.stopLoss).value
+    const normalizedSkippedTp = Math.max(0, Number(realPosition.takeProfit) || 0)
     const skipped: LivePosition = {
       id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${nanoid(8)}`,
       connectionId,
@@ -1824,12 +1925,12 @@ export async function executeLivePosition(
       volumeUsd: 0,
       leverage: realPosition.leverage,
       marginType: "cross",
-      stopLoss: realPosition.stopLoss,
-      takeProfit: realPosition.takeProfit,
+      stopLoss: normalizedSkippedSl,
+      takeProfit: normalizedSkippedTp,
       // Immutable snapshot of the originally-assigned values — survives
       // any later override via `recalculateAndApplySLTP`. See type def.
-      assignedStopLoss: realPosition.stopLoss,
-      assignedTakeProfit: realPosition.takeProfit,
+      assignedStopLoss: normalizedSkippedSl,
+      assignedTakeProfit: normalizedSkippedTp,
       status: "rejected",
       statusReason:
         `Skipped — margin-error cooldown active (attempt ${failures}, cooldown=${cooldownSec}s). Top up exchange balance to resume.`,
@@ -2000,7 +2101,7 @@ export async function executeLivePosition(
       // occupied — don't open a second default", not "all orders blocked").
       //
       // We use a variant-scoped lock key for block sets:
-      //   default/trailing/dca: live:lock:{conn}:{sym}:{dir}
+      //   default/trailing/pause/dca: live:lock:{conn}:{sym}:{dir}
       //   block:                      live:lock:{conn}:{sym}:{dir}:block
       //
       // This allows at most 1 default + 1 block position per direction per
@@ -2945,9 +3046,38 @@ export async function executeLivePosition(
     // identically), with no duplicate inline computation that could
     // drift out of sync with the rest of the file.
     if (livePosition.executedQuantity > 0) {
+      if (typeof exchangeConnector.getPosition === "function") {
+        try {
+          const exPos = await exchangeConnector.getPosition(realPosition.symbol)
+          if (exPos) {
+            livePosition.exchangeData = {
+              ...(livePosition.exchangeData || {}),
+              marginType: (exPos as any).marginType,
+              markPrice: (exPos as any).markPrice,
+              liquidationPrice: (exPos as any).liquidationPrice,
+              unrealizedPnl: (exPos as any).unrealizedPnl,
+              roi: (exPos as any).roi,
+            }
+          }
+        } catch (err) {
+          console.warn(
+            `${LOG_PREFIX} pre-protection mark sync failed for ${realPosition.symbol}:`,
+            err instanceof Error ? err.message : String(err),
+          )
+        }
+      }
+
       const sideClose: "buy" | "sell" = realPosition.direction === "long" ? "sell" : "buy"
       const { desiredSl: slPrice, desiredTp: tpPrice } =
         computeDesiredProtectionPrices(livePosition)
+
+      if (await closeIfProtectionTriggerAlreadyCrossed(exchangeConnector, livePosition, slPrice, tpPrice, "initial_placement")) {
+        return livePosition
+      }
+      liveOrderAudit.intendedStopLossPrice = slPrice || 0
+      liveOrderAudit.intendedTakeProfitPrice = tpPrice || 0
+      await persistLiveOrderAudit(liveOrderAudit)
+      livePosition.protectionState = "unprotected"
       // Duplicate-prevention is handled inside the Promise.all below:
       // each leg resolves to the existing orderId when an order is already
       // present (`!livePosition.stopLossOrderId` guard on the ternary),
