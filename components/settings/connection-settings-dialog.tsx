@@ -182,7 +182,7 @@ export function ConnectionSettingsDialog({
   connectionName,
   exchange = "bingx",
 }: ConnectionSettingsDialogProps) {
-  const [tab, setTab] = useState<"overview" | "symbols" | "indications" | "strategies">("overview")
+  const [tab, setTab] = useState<"overview" | "live" | "symbols" | "indications" | "strategies">("overview")
 
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -758,7 +758,7 @@ export function ConnectionSettingsDialog({
                 Update Settings — {connectionName}
               </DialogTitle>
               <DialogDescription className="text-xs">
-                Configure volumes, symbols, indications and strategies for this connection.
+                Configure live execution, volumes, symbols, indications and strategies for this connection.
               </DialogDescription>
             </div>
             <Badge variant="outline" className="text-[10px] uppercase">
@@ -769,9 +769,12 @@ export function ConnectionSettingsDialog({
 
         {/* Top Tabs */}
         <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="flex-1 flex flex-col overflow-hidden min-h-0">
-          <TabsList className="mx-5 mt-3 grid grid-cols-4 h-9 shrink-0 z-10">
+          <TabsList className="mx-5 mt-3 grid grid-cols-5 h-9 shrink-0 z-10">
             <TabsTrigger value="overview" className="text-xs gap-1.5">
               <Activity className="h-3.5 w-3.5" /> Overview
+            </TabsTrigger>
+            <TabsTrigger value="live" className="text-xs gap-1.5">
+              <Flame className="h-3.5 w-3.5" /> Live
             </TabsTrigger>
             <TabsTrigger value="symbols" className="text-xs gap-1.5">
               <Database className="h-3.5 w-3.5" /> Symbols
@@ -1121,6 +1124,197 @@ export function ConnectionSettingsDialog({
                       checked={overview.useSystemCloseOnly}
                       onCheckedChange={(checked) => setOverview(p => ({ ...p, useSystemCloseOnly: checked }))}
                     />
+                  </div>
+                </TabsContent>
+
+                {/* LIVE ─────────────────────────────────────────── */}
+                <TabsContent value="live" className="mt-0 space-y-5">
+                  <div className="relative overflow-hidden rounded-xl border border-emerald-500/30 bg-gradient-to-br from-emerald-500/10 via-background to-cyan-500/10 p-4">
+                    <div className="absolute right-0 top-0 h-24 w-24 rounded-full bg-emerald-500/10 blur-2xl" />
+                    <div className="relative flex items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/15">
+                            <Flame className="h-4 w-4 text-emerald-500" />
+                          </div>
+                          <div>
+                            <div className="text-sm font-semibold">Live Exchange Execution</div>
+                            <div className="text-[11px] text-muted-foreground">Venue sizing, leverage caps, order protection and live-stage limits.</div>
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5 pt-2">
+                          <Badge variant="outline" className="text-[10px] uppercase">{exchangeKey}</Badge>
+                          <Badge variant="secondary" className="text-[10px]">{overview.marginMode} margin</Badge>
+                          <Badge variant="secondary" className="text-[10px]">{overview.positionMode.replace("_", " ")}</Badge>
+                          <Badge variant="secondary" className="text-[10px]">{activeSymbols.length || symbolsCfg.symbolCount} symbols</Badge>
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-emerald-500/20 bg-background/70 px-3 py-2 text-right shadow-sm">
+                        <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Reload mode</div>
+                        <div className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">Hot reload, no restart</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded-xl border bg-card p-4 space-y-4">
+                      <SectionHeading icon={ArrowDownUp} title="Sizing & Balance Caps" subtitle="Live notional and balance-step recalculation controls." />
+                      <VolumeSlider
+                        label="Live Volume Factor"
+                        description="Multiplier used only for exchange live orders."
+                        value={overview.volumeFactorLive}
+                        onChange={(v) => setOverview(p => ({ ...p, volumeFactorLive: v }))}
+                      />
+                      <VolumeStepSlider
+                        value={overview.volumeStepRatio}
+                        onChange={(v) => setOverview(p => ({ ...p, volumeStepRatio: v }))}
+                      />
+                      <div className="space-y-1.5 rounded-lg border border-dashed p-3">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <Label className="text-xs">Live Symbol Cap</Label>
+                            <div className="text-[10px] text-muted-foreground">Maximum exchange symbols this connection can run after save.</div>
+                          </div>
+                          <span className="text-xs font-mono tabular-nums">{symbolsCfg.symbolCount}</span>
+                        </div>
+                        <Slider
+                          min={1} max={32} step={1}
+                          value={[symbolsCfg.symbolCount]}
+                          onValueChange={([v]) => setSymbolsCfg(p => ({ ...p, symbolCount: v }))}
+                          className="py-1"
+                        />
+                        <div className="flex justify-between text-[10px] text-muted-foreground"><span>1</span><span>32 max</span></div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border bg-card p-4 space-y-4">
+                      <SectionHeading icon={ListFilter} title="Exchange Mode" subtitle="Venue mode applied to live orders without restarting the engine." />
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="space-y-1.5">
+                          <Label className="text-xs">Margin Mode</Label>
+                          <Select value={overview.marginMode} onValueChange={(v) => setOverview(p => ({ ...p, marginMode: v as "cross" | "isolated" }))}>
+                            <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="cross">Cross Margin</SelectItem>
+                              <SelectItem value="isolated">Isolated Margin</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="space-y-1.5">
+                          <Label className="text-xs">Position Mode</Label>
+                          <Select value={overview.positionMode} onValueChange={(v) => setOverview(p => ({ ...p, positionMode: v as "one_way" | "hedge" }))}>
+                            <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="one_way">One-way</SelectItem>
+                              <SelectItem value="hedge">Hedge</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="space-y-1.5 col-span-2">
+                          <Label className="text-xs">Volume Type</Label>
+                          <Select value={overview.volumeType} onValueChange={(v) => setOverview(p => ({ ...p, volumeType: v as "usdt" | "contract" | "spot" }))}>
+                            <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="usdt">USDT-M Linear</SelectItem>
+                              <SelectItem value="contract">Coin-M Inverse</SelectItem>
+                              <SelectItem value="spot">Spot</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2 rounded-lg border border-primary/20 bg-primary/5 p-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <Label className="text-xs">Use Exchange Max Leverage</Label>
+                            <div className="text-[10px] text-muted-foreground">When enabled, live orders use the exchange max; otherwise the percentage cap below is applied.</div>
+                          </div>
+                          <Switch checked={overview.useMaximalLeverage} onCheckedChange={(v) => setOverview(p => ({ ...p, useMaximalLeverage: v }))} />
+                        </div>
+                        <div className={`space-y-1 ${overview.useMaximalLeverage ? "opacity-50" : ""}`}>
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Leverage Cap</Label>
+                            <span className="text-xs font-mono">{overview.useMaximalLeverage ? "MAX" : `${overview.leveragePercentage}%`}</span>
+                          </div>
+                          <Slider
+                            min={1} max={100} step={1}
+                            value={[overview.leveragePercentage]}
+                            onValueChange={([v]) => setOverview(p => ({ ...p, leveragePercentage: v }))}
+                            disabled={overview.useMaximalLeverage}
+                            className="py-1"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded-xl border bg-card p-4 space-y-4">
+                      <SectionHeading icon={Zap} title="Protection & Close Logic" subtitle="Choose exchange control orders or engine-side system close." />
+                      <div className={`rounded-lg border p-3 transition-colors ${overview.useSystemCloseOnly ? "border-amber-500/40 bg-amber-500/10" : "border-emerald-500/30 bg-emerald-500/10"}`}>
+                        <div className="flex items-start justify-between gap-4">
+                          <div className="space-y-1">
+                            <Label className="text-xs font-semibold">System Close Only</Label>
+                            <div className="text-[11px] leading-relaxed text-muted-foreground">
+                              {overview.useSystemCloseOnly
+                                ? "Exchange SL/TP control orders are not placed; reconcile/sync ticks close by market reduce-only when the band is crossed."
+                                : "Reduce-only SL/TP control orders are placed on the venue and verified by reconcile/sync ticks."}
+                            </div>
+                          </div>
+                          <Switch checked={overview.useSystemCloseOnly} onCheckedChange={(checked) => setOverview(p => ({ ...p, useSystemCloseOnly: checked }))} />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 text-[11px]">
+                        <div className="rounded-md border bg-muted/30 p-2"><div className="text-muted-foreground">Control orders</div><div className="font-semibold">{overview.useSystemCloseOnly ? "Disabled" : "Enabled"}</div></div>
+                        <div className="rounded-md border bg-muted/30 p-2"><div className="text-muted-foreground">Close verification</div><div className="font-semibold">Every sync tick</div></div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border bg-card p-4 space-y-4">
+                      <SectionHeading icon={TrendingUp} title="Real → Live Limits" subtitle="Exchange promotion gates used by the live pipeline." />
+                      <div className="space-y-3">
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Live Min Profit Factor</Label>
+                            <span className="text-xs font-mono">{stratMain.real.min_profit_factor.toFixed(1)}</span>
+                          </div>
+                          <Slider
+                            min={0.1} max={3} step={0.1}
+                            value={[stratMain.real.min_profit_factor]}
+                            onValueChange={([v]) => setStratMain(p => ({ ...p, real: { ...p.real, min_profit_factor: Number(v.toFixed(1)) } }))}
+                            className="py-1"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Max Drawdown Time</Label>
+                            <span className="text-xs font-mono">{stratMain.real.max_drawdown_time}m</span>
+                          </div>
+                          <Slider
+                            min={20} max={1440} step={20}
+                            value={[stratMain.real.max_drawdown_time]}
+                            onValueChange={([v]) => setStratMain(p => ({ ...p, real: { ...p.real, max_drawdown_time: v } }))}
+                            className="py-1"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Live Position Cap</Label>
+                            <span className="text-xs font-mono">{stratMain.real.max_positions}</span>
+                          </div>
+                          <Slider
+                            min={1} max={10000} step={100}
+                            value={[stratMain.real.max_positions]}
+                            onValueChange={([v]) => setStratMain(p => ({ ...p, real: { ...p.real, max_positions: v } }))}
+                            className="py-1"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-cyan-500/25 bg-cyan-500/5 p-3 text-[11px] leading-relaxed text-muted-foreground">
+                    <span className="font-medium text-foreground">Stable save behavior:</span> Live settings are written to the connection hash, mirrored into connection settings, then delivered as hot-reload events. Running live positions keep their engine process while sizing, symbols, leverage and protection options refresh for the next cycle.
                   </div>
                 </TabsContent>
 
