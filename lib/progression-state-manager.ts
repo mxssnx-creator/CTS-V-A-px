@@ -873,6 +873,7 @@ return {
    * Guarantees: previous progress is stopped (via archive + epoch bump), new one is
    * solid for the actual current configuration.
    */
+  static async recoordinateForActualOne(connectionId: string, engineType = "main"): Promise<RecoordinateProgressionResult> {
   static async recoordinateForActualOne(connectionId: string): Promise<RecoordinateProgressionResult> {
     try {
       await initRedis()
@@ -1054,23 +1055,6 @@ return {
         changed: false,
         reason: err instanceof Error ? err.message : String(err),
       }
-        return { changed: true, reason, newEpoch }
-
-        await setSettings(`engine_progression:${connectionId}`, {
-          phase: "prehistoric_data",
-          progress: 0,
-          detail: `Settings changed — queued fresh prehistoric run for ${liveSymbolCount} symbols`,
-          sub_current: 0,
-          sub_total: liveSymbolCount,
-          connection_id: connectionId,
-          updated_at: new Date().toISOString(),
-        }).catch(() => {})
-      }
-
-      return { changed: false, reason: "already current" }
-    } catch (err) {
-      console.warn(`[v0] [Progression] recoordinateForActualOne failed for ${connectionId}:`, err)
-      return { changed: false, reason: err instanceof Error ? err.message : String(err) }
     }
   }
 

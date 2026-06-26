@@ -126,8 +126,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     return NextResponse.json({
       success: true,
       connectionId: id,
-      live_volume_factor: live ?? clampFactor(conn.live_volume_factor) ?? MIN_VOLUME_FACTOR,
-      preset_volume_factor: preset ?? clampFactor(conn.preset_volume_factor) ?? MIN_VOLUME_FACTOR,
       live_volume_factor: live ?? clampFactor(conn.live_volume_factor) ?? FACTOR_MIN,
       preset_volume_factor: preset ?? clampFactor(conn.preset_volume_factor) ?? FACTOR_MIN,
     })

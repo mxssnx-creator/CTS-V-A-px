@@ -699,23 +699,6 @@ export async function PATCH(
       scalarChanged("is_testnet", (connection as Record<string, unknown>).is_testnet, (updated as Record<string, unknown>).is_testnet) ||
       scalarChanged("is_preset_trade", (connection as Record<string, unknown>).is_preset_trade, (updated as Record<string, unknown>).is_preset_trade) ||
       scalarChanged("connection_method", (connection as Record<string, unknown>).connection_method, (updated as Record<string, unknown>).connection_method)
-    let progressionChangedForActualOne = false
-    if (symbolsModeChanged) {
-      try {
-        const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
-        progressionChangedForActualOne = recoordination.changed
-
-        // If recoordination archived/recreated progression state, a running
-        // manager must not continue through the normal hot-reload path while
-        // still holding the previous epoch/ownership. Restarting rebinds it to
-        // the fresh progression lock before processors can write again.
-        if (recoordination.changed) {
-          const coordinator = getGlobalTradeEngineCoordinator()
-          if (coordinator.isEngineRunning(id)) {
-            console.log(
-              `[v0] [Settings PATCH] Progression re-coordinated for ${id} (${recoordination.reason ?? "changed"}); restarting running engine instead of hot reload.`,
-            )
-            await coordinator.restartEngine(id)
     let progressionRestartHandled = false
     if (symbolsModeChanged) {
       try {
