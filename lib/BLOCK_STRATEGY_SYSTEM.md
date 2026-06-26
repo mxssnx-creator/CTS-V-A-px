@@ -89,7 +89,7 @@ baseMultiplier?: number
 ### RealPosition Interface (real-stage.ts:13)
 ```typescript
 sizeMultiplier?: number  // Applied directly in Live stage
-setVariant: "default" | "trailing" | "block" | "dca" | "pause"
+setVariant: "default" | "trailing" | "block" | "dca"
 ```
 
 ### LivePosition (live-stage.ts)

@@ -1673,6 +1673,8 @@ const migrations: Migration[] = [
     // `app_settings`. Existing hashes have no coordination fields, so the first
     // cycle after upgrade would fall back to global which may also be absent.
     // Seed spec defaults idempotently (never clobbers operator-set values):
+    //   variants:  trailing=true, block=true, dca=false
+    //   axes:      all disabled by default, including pause-axis; maxWindow seeded to spec defaults
     //   variants:  trailing=true, block=true, dca=false, pause=true
     //   axes:      all disabled by default, maxWindow seeded to spec defaults
     //   block knobs: blockVolumeRatio=1.0, blockMaxStack=3
@@ -1950,6 +1952,7 @@ const migrations: Migration[] = [
   //     → written to connection_settings:bingx-x01 using the camelCase keys
   //       that StrategyCoordinator.loadProfitFactors() reads (NOT the
   //       pf_base_min snake_case names used by the old settings UI)
+  //   • variantTrailingEnabled / variantBlockEnabled / variantDcaEnabled → written to connection_settings:bingx-x01
   //   • variantTrailingEnabled / variantBlockEnabled / variantDcaEnabled /
   //     variantPauseEnabled → written to connection_settings:bingx-x01
   //     using the camelCase keys that loadCoordinationSettings() reads

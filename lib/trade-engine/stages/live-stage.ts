@@ -137,6 +137,7 @@ interface LivePosition {
   // dca=0.5, others=1.0). Stored so accumulation can match original sizing.
   sizeMultiplier?: number
   parentSetKey?: string
+  setVariant?: "default" | "trailing" | "block" | "dca"
   setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
   accumulatedSetKeys?: string[]
   

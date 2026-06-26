@@ -94,6 +94,7 @@ export interface StrategySet {
   
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
+  variant?: "default" | "trailing" | "block" | "dca"
   variant?: "default" | "trailing" | "block" | "dca" | "pause"
   /**
    * ── Position-count axis windows that this Set satisfies ────────────
@@ -1306,6 +1307,7 @@ export class StrategyCoordinator {
       this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  false)
       this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  0)
 
+      // Variant toggles. Defaults: trailing=true, block=true, dca=false
       // Variant toggles. Defaults: trailing=true, block=true, dca=false, pause=true
       // (spec: DCA off by default). The bool() helper only falls back to the
       // default when the key is genuinely absent — an explicit "false" is honoured.
@@ -1960,7 +1962,7 @@ export class StrategyCoordinator {
    *      PositionContext. Each related Set carries `parentSetKey` = base
    *      setKey + `variant` = one of {default, trailing, block, dca}.
    *   2. Variant expansion uses a curated small config list (≤ 4 per variant,
-   *      ≤ 4 active variants) instead of the previous 4×4×4 = 64-entry
+   *      ≤ 3 active variants) instead of the previous 4×4×4 = 64-entry
    *      Cartesian product. At max this generates ~16 entries per Base
    *      entry — ~4× faster than the old path and no silently-rejected
    *      entries (every config is pre-filtered to satisfy the DDT cap).
@@ -3546,6 +3548,7 @@ export class StrategyCoordinator {
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        }
         pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       }
       // Slim-path Real Sets carry entries:[] — use set-level scalar aggregates
@@ -3858,6 +3861,9 @@ export class StrategyCoordinator {
 
 
 
+
+
+
     // Persist LIVE sets — slim format (coord keys only). Skip in dev:
     // setSettings writes to InlineLocalRedis (on-heap Map) on every cycle for
     // every symbol; 20 symbols × every 0.3s = 67 writes/s with no reclaim.
@@ -4108,6 +4114,7 @@ export class StrategyCoordinator {
             // The qualifying array is already sorted by avgProfitFactor desc.
             //
             // Preselection rules:
+            //   • "new" variants (default, trailing): at most 1 per
             //   • "new" variants (default, trailing, pause): at most 1 per
             //     direction — first (highest-PF) wins.
             //   • "block" variant: allowed through even when the direction
@@ -4132,6 +4139,7 @@ export class StrategyCoordinator {
               for (const s of qualifying) {
                 const isBlock = s.variant === "block"
                 const isDca   = s.variant === "dca"
+                const isNew   = !isBlock && !isDca // default / trailing
                 const isNew   = !isBlock && !isDca // default / trailing / pause
                 if (s.direction === "long") {
                   if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
@@ -5054,6 +5062,7 @@ export class StrategyCoordinator {
    */
   private variantFingerprint(
     baseSet: StrategySet,
+    variant: "default" | "trailing" | "block" | "dca",
     variant: "default" | "trailing" | "block" | "dca" | "pause",
     ctx: PositionContext,
   ): string {
@@ -5061,6 +5070,9 @@ export class StrategyCoordinator {
     const bEC = baseSet.entryCount
     // Clamp each context dimension to its spec maximum.
     // cont is live-open by spec; the other four are closed-only via
+    // the P2-1 gate in getPositionContext. lastPosCount remains in the
+    // fingerprint for axis-window coordination so 3/5/8-count pause-axis
+    // contexts do not collapse into the same cached Set.
     // the P2-1 gate in getPositionContext. lastPosCount is the Pause
     // variant's primary discriminator (1..8 windows) — adding it to the
     // fingerprint guarantees a 3-loss / 5-loss / 8-loss pause produce
