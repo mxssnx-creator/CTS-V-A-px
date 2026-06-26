@@ -162,7 +162,7 @@ export interface StrategySet {
      * from `StrategySet.direction` and leave this field undefined.
      *
      * Hedge netting in `evaluateRealSets` uses this field to group
-     * Sets by `(symbol × indicationType × triple × outcome)` and keep
+     * Sets by `(symbol �� indicationType × triple × outcome)` and keep
      * only the `|long − short|` dominant-direction remainder.
      */
     direction?: "long" | "short"
@@ -593,11 +593,9 @@ function deriveProtectionFromProfitFactor(
   profitFactor: number,
   positionCostPct: number,
   sizeMultiplier = 1,
-): { takeProfitPct: number; stopLossPct: number; effectiveProfitFactor: number; feeBufferPct: number } {
   costBufferPct = 0,
 ): ProfitFactorProtection {
   const pf = Number.isFinite(profitFactor) && profitFactor > 0 ? profitFactor : 1
-  const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.02
   const baseRiskPct = Number.isFinite(positionCostPct) && positionCostPct > 0 ? positionCostPct : 0.1
   const normalizedCostBufferPct = Number.isFinite(costBufferPct) && costBufferPct > 0 ? costBufferPct : 0
   // Tie SL to the actual position-cost budget, then apply variant scaling.
@@ -606,7 +604,6 @@ function deriveProtectionFromProfitFactor(
   // Live exchange PnL includes entry/exit fees, spread, and protection-order
   // slippage that the Real-stage PF model does not see. Add a small TP buffer
   // so a Real-positive PF remains positive after round-trip exchange costs.
-  const takeProfitPct = clampNumber((stopLossPct * Math.max(1, pf)) + LIVE_PROTECTION_FEE_BUFFER_PCT, 0.2, 22)
   const grossTakeProfitPct = Math.max(0.2, stopLossPct * Math.max(1, pf))
   const adjustedTakeProfitPct = grossTakeProfitPct + normalizedCostBufferPct
   const takeProfitPct = clampNumber(adjustedTakeProfitPct, 0.2, MAX_LIVE_TAKE_PROFIT_PCT)
@@ -615,7 +612,6 @@ function deriveProtectionFromProfitFactor(
     takeProfitPct,
     stopLossPct,
     effectiveProfitFactor: takeProfitPct / stopLossPct,
-    feeBufferPct: LIVE_PROTECTION_FEE_BUFFER_PCT,
     grossPF: pf,
     costBufferPct: normalizedCostBufferPct,
     netEffectivePF: netRewardPct / stopLossPct,

@@ -3310,24 +3310,6 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
   // normally calls initRedis(); invoking it from inside runMigrations() re-enters
   // the migration promise and deadlocks production cold start. We already have a
   // ready core Redis client here, so write the small site-instance hash directly.
-  try {
-    const siteKey = "site:unique_instance"
-    const existingSite = await client.hgetall(siteKey).catch(() => null)
-    if (existingSite?.site_session_id) {
-      await client.hset(siteKey, { last_activity: new Date().toISOString() }).catch(() => {})
-    } else {
-      const now = new Date().toISOString()
-      const siteSessionId = "site_" + Date.now() + "_" + Math.random().toString(36).slice(2, 12)
-      await client.hset(siteKey, {
-        site_session_id: siteSessionId,
-        created_at: now,
-        last_activity: now,
-        version: "1",
-      }).catch(() => {})
-      await client.hset("trade_engine:global", {
-        site_session_id: siteSessionId,
-        site_instance_created: now,
-      }).catch(() => {})
   // Ensure the entire Site/Project has ONE unique instance (independent of connections).
   // IMPORTANT: do not call redis-db.ensureUniqueSiteInstance() from inside
   // migrations; that helper calls initRedis(), and initRedis is currently

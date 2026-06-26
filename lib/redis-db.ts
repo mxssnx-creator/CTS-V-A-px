@@ -1744,8 +1744,6 @@ export async function initRedis(): Promise<void> {
       // responsive. The underlying migration may still resolve later, but
       // the server is unblocked. The migration runner also has its own
       // per-migration 30-second deadline for individual migrations.
-      const { runMigrations, resetMigrationRunState } = await import("@/lib/redis-migrations")
-      const MIGRATIONS_DEADLINE_MS = 90_000
       try {
         await Promise.race([
           runMigrations(),
