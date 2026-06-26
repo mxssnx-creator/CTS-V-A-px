@@ -1125,19 +1125,6 @@ export class IndicationSetsProcessor {
       requiredPrices,
       reason: "insufficient_price_history",
     }).catch(() => {})
-    const prices = marketData.prices || []
-    if (!Array.isArray(prices) || prices.length === 0) return null
-    
-    // Convert to numbers and filter out NaN/invalid values
-    const validPrices = prices
-      .slice(0, count)
-      .map((p: any) => {
-        const num = typeof p === "number" ? p : Number.parseFloat(String(p))
-        return Number.isFinite(num) ? num : null
-      })
-      .filter((p: number | null): p is number => p !== null)
-    
-    return validPrices.length > 0 ? validPrices : null
   }
 
   private getDirection(prices: number[]): number {
