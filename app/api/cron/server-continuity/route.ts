@@ -27,11 +27,15 @@ async function runCronTask(
     ]).finally(() => {
       if (timeout) clearTimeout(timeout)
     })
+async function runCronTask(name: string, task: () => Promise<unknown>): Promise<{ name: string; ok: boolean; error?: string }> {
+  try {
+    await task()
     return { name, ok: true }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     console.warn(`[v0] [ContinuityCron] ${name} failed:`, message)
     return { name, ok: false, error: message, timedOut: message.includes("timed out") }
+    return { name, ok: false, error: message }
   }
 }
 
@@ -81,6 +85,17 @@ export async function GET() {
         degraded: failedTasks.length > 0,
         tasks,
         warnings: failedTasks.map((task) => `${task.name}: ${task.error || "failed"}`),
+
+      return NextResponse.json({
+        success: tasks.every((task) => task.ok),
+        tasks,
+      // active. On Vercel/serverless the runner intentionally no-ops and this
+      // cron invocation itself is the durable heartbeat.
+      startServerContinuityRunner()
+      await initializeTradeEngineAutoStart()
+
+      return NextResponse.json({
+        success: true,
         durationMs: Date.now() - startedAt,
       })
     } finally {
