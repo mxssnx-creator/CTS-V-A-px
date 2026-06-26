@@ -11,6 +11,22 @@ export const maxDuration = 60
 const LOCK_KEY = "cron:server-continuity:lock"
 const LOCK_TTL_SECONDS = 55
 
+async function runCronTask(
+  name: string,
+  task: () => Promise<unknown>,
+  timeoutMs = 20_000,
+): Promise<{ name: string; ok: boolean; error?: string; timedOut?: boolean }> {
+  try {
+    let timeout: NodeJS.Timeout | undefined
+    await Promise.race([
+      task(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs)
+        timeout.unref?.()
+      }),
+    ]).finally(() => {
+      if (timeout) clearTimeout(timeout)
+    })
 async function runCronTask(name: string, task: () => Promise<unknown>): Promise<{ name: string; ok: boolean; error?: string }> {
   try {
     await task()
@@ -18,6 +34,7 @@ async function runCronTask(name: string, task: () => Promise<unknown>): Promise<
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     console.warn(`[v0] [ContinuityCron] ${name} failed:`, message)
+    return { name, ok: false, error: message, timedOut: message.includes("timed out") }
     return { name, ok: false, error: message }
   }
 }
@@ -61,6 +78,13 @@ export async function GET() {
           return mod.GET()
         }),
       ])
+      const failedTasks = tasks.filter((task) => !task.ok)
+
+      return NextResponse.json({
+        success: true,
+        degraded: failedTasks.length > 0,
+        tasks,
+        warnings: failedTasks.map((task) => `${task.name}: ${task.error || "failed"}`),
 
       return NextResponse.json({
         success: tasks.every((task) => task.ok),

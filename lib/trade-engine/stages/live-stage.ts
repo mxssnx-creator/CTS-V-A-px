@@ -53,6 +53,10 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
 
 async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
   const connection = (await getConnection(connectionId).catch(() => null)) || {}
+  if (hasLiveTradeBlock(connection as Record<string, any>)) return false
+
+async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
+  const connection = (await getConnection(connectionId).catch(() => null)) || {}
   return isTruthyFlag((connection as any).is_live_trade) || isTruthyFlag((connection as any).live_trade_enabled)
 }
 
