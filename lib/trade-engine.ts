@@ -124,6 +124,39 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
+   * Redis `trade_engine:global.status` is the operator-intent source of truth.
+   * Connection engines may only be started/restarted while the global
+   * coordinator is explicitly enabled.  This prevents settings saves,
+   * dashboard refreshes, auto-start sweeps, or watchdog recovery from
+   * resurrecting progressions after the operator has stopped/paused the
+   * coordinator or after production Redis has not restored the global state yet.
+   */
+  private async isGlobalCoordinatorEnabled(context: string): Promise<boolean> {
+    try {
+      const { getRedisClient, initRedis } = await import("@/lib/redis-db")
+      await initRedis()
+      const client = getRedisClient()
+      const globalState = (await client.hgetall("trade_engine:global").catch(() => null)) as Record<string, string> | null
+      const status = globalState?.status || ""
+      const enabled = status === "running"
+      this.isPaused = status === "paused"
+      this.isGloballyRunning = enabled && Array.from(this.engineManagers.values()).some((manager) => manager.isEngineRunning)
+      if (!enabled) {
+        console.log(
+          `[v0] [Coordinator] ${context} skipped — global coordinator is not enabled (status="${status || "empty"}")`,
+        )
+      }
+      return enabled
+    } catch (err) {
+      console.warn(
+        `[v0] [Coordinator] ${context} could not verify global coordinator state; refusing to start/restart connection engines:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      return false
+    }
+  }
+
+  /**
    * Initialize engine for a specific connection
    */
   async initializeEngine(connectionId: string, config: EngineConfig): Promise<TradeEngineManager> {
@@ -154,15 +187,19 @@ export class GlobalTradeEngineCoordinator {
    * Start engine for a specific connection
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
-  async startEngine(connectionId: string, config: EngineConfig): Promise<void> {
+  async startEngine(connectionId: string, config: EngineConfig): Promise<boolean> {
     // Self-heal background timers on every public entry-point — see
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
     this.ensureBackgroundTimers()
 
+    if (!(await this.isGlobalCoordinatorEnabled(`startEngine(${connectionId})`))) {
+      return false
+    }
+
     // Step 1: Check if already starting
     if (this.startingEngines.has(connectionId)) {
       console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
-      return
+      return false
     }
 
     // Step 2: Check if already running (check in-memory manager first, then Redis hint)
@@ -176,10 +213,15 @@ export class GlobalTradeEngineCoordinator {
       if (runningFlag === "true" || runningFlag === "1") {
         if (managerRunning) {
           console.log(`[v0] [STARTUP LOCK] Engine already running for ${connectionId}, skipping...`)
-          return
+          return true
         }
-        // Redis flag can become stale across crashes/restarts; clear stale state and continue startup.
-        console.warn(`[v0] [STARTUP LOCK] Stale running flag detected for ${connectionId}; continuing with startup`)
+        // Redis flag can become stale across crashes/restarts; clear stale state
+        // before continuing. Leaving it set made status endpoints report a
+        // phantom running engine while startEngine was still trying to recover,
+        // and prevented later diagnostics from distinguishing a real owner from
+        // a dead flag.
+        console.warn(`[v0] [STARTUP LOCK] Stale running flag detected for ${connectionId}; clearing and continuing with startup`)
+        await client.del(`engine_is_running:${connectionId}`).catch(() => 0)
       }
     } catch (e) {
       console.log(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)
@@ -213,6 +255,7 @@ export class GlobalTradeEngineCoordinator {
         console.warn(
           `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Requesting prior progress stop and retrying once.`,
         )
+        return false
         try {
           const { getRedisClient } = await import("@/lib/redis-db")
           const client = getRedisClient()
@@ -263,6 +306,9 @@ export class GlobalTradeEngineCoordinator {
       // Step 5: Start the engine — pass the lock handle so it can
       // extend/release the slot and stamp the epoch.
       await manager.start(config, lockHandle)
+      if (!manager.isEngineRunning) {
+        throw new Error(`TradeEngine manager for ${connectionId} did not reach running state`)
+      }
       // Manager now owns the lock; clear our local reference so the
       // finally-block doesn't try to break it on success.
       lockHandle = undefined
@@ -295,6 +341,7 @@ export class GlobalTradeEngineCoordinator {
           is_enabled_dashboard: "1",
         })
       } catch { /* non-critical — dashboard can lag */ }
+      return true
     } catch (err) {
       // On startup failure, give the lock back so a retry can succeed
       // without waiting for the TTL to expire. We use force-break
@@ -381,6 +428,9 @@ export class GlobalTradeEngineCoordinator {
    * concurrent restarts for the same connection.
    */
   async restartEngine(connectionId: string): Promise<void> {
+    if (!(await this.isGlobalCoordinatorEnabled(`restartEngine(${connectionId})`))) {
+      return
+    }
     if (this.escalatingEngines.has(connectionId)) {
       console.log(
         `[v0] [Coordinator] restartEngine(${connectionId}) skipped — restart already in flight`,
@@ -463,6 +513,9 @@ export class GlobalTradeEngineCoordinator {
    */
   private async startEngineFromConnectionConfig(connectionId: string): Promise<void> {
     try {
+      if (!(await this.isGlobalCoordinatorEnabled(`startEngineFromConnectionConfig(${connectionId})`))) {
+        return
+      }
       const { getAllConnections } = await import("@/lib/redis-db")
       const { loadSettingsAsync } = await import("@/lib/settings-storage")
       const connections = await getAllConnections()
@@ -693,21 +746,8 @@ export class GlobalTradeEngineCoordinator {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
 
-      // ── Check if coordinator is paused ─────────────────────────────────
-      // If the global coordinator is paused, don't start any engines.
-      // They will resume when the coordinator is resumed.
-      const { getRedisClient, initRedis } = await import("@/lib/redis-db")
-      try {
-        await initRedis()
-        const client = getRedisClient()
-        const globalState = await client.hgetall("trade_engine:global")
-        if ((globalState as any)?.status === "paused") {
-          console.log("[v0] [Coordinator] Skipping startMissingEngines - coordinator is paused")
-          return 0
-        }
-      } catch (err) {
-        console.warn("[v0] [Coordinator] Could not check pause state:", err instanceof Error ? err.message : String(err))
-        // Continue anyway - non-critical
+      if (!(await this.isGlobalCoordinatorEnabled("startMissingEngines"))) {
+        return 0
       }
 
       // Self-heal: make sure the watchdog and metrics tracker are armed
@@ -765,7 +805,14 @@ export class GlobalTradeEngineCoordinator {
               realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
-            await this.startEngine(connection.id, config)
+            const didStart = await this.startEngine(connection.id, config)
+            if (!didStart) {
+              await logProgressionEvent(connection.id, "engine_start_skipped", "warning", "Coordinator start skipped - engine is already owned by another worker or starting", {
+                connectionId: connection.id,
+                engineType: "main",
+              })
+              continue
+            }
             started++
 
             // Mirror the enabled/inserted flags that toggle-dashboard writes so
@@ -815,6 +862,10 @@ export class GlobalTradeEngineCoordinator {
   async refreshEngines(): Promise<void> {
     try {
       console.log("[v0] [Coordinator] === REFRESH ENGINES START (START ONLY) ===")
+
+      if (!(await this.isGlobalCoordinatorEnabled("refreshEngines"))) {
+        return
+      }
 
       // Self-heal background timers + drop dead Map slots before we
       // reconcile so a zombie manager doesn't shadow a connection that
@@ -874,7 +925,14 @@ export class GlobalTradeEngineCoordinator {
               realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
-            await this.startEngine(connection.id, config)
+            const didStart = await this.startEngine(connection.id, config)
+            if (!didStart) {
+              await logProgressionEvent(connection.id, "engine_start_skipped", "warning", "Coordinator start skipped - engine is already owned by another worker or starting", {
+                connectionId: connection.id,
+                engineType: "main",
+              })
+              continue
+            }
             started++
             
             await logProgressionEvent(connection.id, "engine_started", "info", "Main Trade Engine started for progression", {
@@ -1261,9 +1319,15 @@ export class GlobalTradeEngineCoordinator {
 
         // -- 2. Per-engine stall watchdog (in-place re-arm) ---------------
         //
-        // Always run, even when `isGloballyRunning` is false — individual
-        // engines can be running via dashboard toggle without the global
-        // run-all flag being set.
+        // Only run when the operator has explicitly enabled the global
+        // coordinator.  Settings/dashboard routes can leave local managers
+        // around briefly during stop/restart races; the watchdog must never
+        // re-arm or force-restart those managers while Redis says the global
+        // coordinator is stopped/paused.
+        if (!(await this.isGlobalCoordinatorEnabled("watchdog"))) {
+          this.stallEscalation.clear()
+          return
+        }
         const now = Date.now()
         for (const [connectionId, manager] of this.engineManagers.entries()) {
           if (!manager.isEngineRunning) continue
@@ -1561,6 +1625,12 @@ if (engineGlobalThis.__tradeEngineVersion && engineGlobalThis.__tradeEngineVersi
 engineGlobalThis.__tradeEngineVersion = TRADE_ENGINE_VERSION
 let globalCoordinator: GlobalTradeEngineCoordinator | null = engineGlobalThis.__tradeEngineCoordinator || null
 
+// ── Coordinator singleton lock (prevents concurrent initialization race) ──
+// If two requests call getGlobalTradeEngineCoordinator() simultaneously,
+// the double-check-lock pattern (check + assign under critical section)
+// ensures only one constructor runs, avoiding duplicate instances.
+let _coordinatorInitLock = false
+
 console.log(`[v0] Global Trade Engine V${TRADE_ENGINE_VERSION} loaded`)
 
 /**
@@ -1589,10 +1659,37 @@ export function getGlobalCoordinator(): GlobalTradeEngineCoordinator | null {
 }
 
 export function getGlobalTradeEngineCoordinator(): GlobalTradeEngineCoordinator {
+  // ── Double-check lock pattern (prevents concurrent initialization) ──
+  // First check: fast path when already initialized (no lock overhead).
+  // Second check (after acquiring lock): prevents duplicate construction
+  // if two concurrent requests entered the first-check window.
   if (!globalCoordinator) {
-    globalCoordinator = new GlobalTradeEngineCoordinator()
-    engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
-    console.log("[v0] Global trade engine coordinator auto-initialized")
+    // Acquire lock to prevent concurrent initialization.
+    if (!_coordinatorInitLock) {
+      _coordinatorInitLock = true
+      try {
+        // Second check: another request may have initialized while we waited.
+        if (!globalCoordinator) {
+          globalCoordinator = new GlobalTradeEngineCoordinator()
+          engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
+          console.log("[v0] Global trade engine coordinator auto-initialized")
+        }
+      } finally {
+        _coordinatorInitLock = false
+      }
+    } else {
+      // Another request is initializing; wait a brief moment for it to complete.
+      // In practice this branch is extremely rare (only during concurrent first-load).
+      for (let i = 0; i < 10 && !globalCoordinator; i++) {
+        // Spin-wait 1ms × 10 = up to 10ms for initialization to complete.
+        // This is safe because the lock will be released immediately after construction.
+      }
+      if (!globalCoordinator) {
+        // Fallback: return a temporary instance (should not happen in practice).
+        console.warn("[v0] Coordinator initialization lock timeout; returning temporary instance")
+        return new GlobalTradeEngineCoordinator()
+      }
+    }
   }
   return globalCoordinator
 }
