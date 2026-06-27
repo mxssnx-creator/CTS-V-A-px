@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { initRedis, getRedisClient, getSettings, getConnection, getAppSettings } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { aggregateLastXClosedPositions } from "@/lib/trade-engine/closed-position-aggregation"
+import { getGlobalCoordinator } from "@/lib/trade-engine"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -897,7 +898,25 @@ export async function GET(
     // truth for whether the engine is actively running. realtimeIndicationCycles
     // stays non-zero after a stop (it reflects the last run's cycle count, not
     // a live signal), so it must be gated by the authoritative phase/status.
+    //
+    // RACE-CONDITION FIX: After a server restart the engine_progression Redis hash
+    // retains the last phase written (e.g. "realtime") from a previous process.
+    // The in-memory coordinator starts empty (no engines running), so the Redis
+    // hash alone produces a false-positive "running" signal. We cross-check with
+    // the in-memory coordinator: if the coordinator explicitly says the engine is
+    // NOT running for this connection, treat it as stopped regardless of Redis.
+    const coord = getGlobalCoordinator()
+    const coordSaysRunning: boolean = coord
+      ? coord.isEngineRunning(id)
+      : false
+    // If coordinator exists but says "not running", that's definitive.
+    // If coordinator doesn't exist yet (null, server just booted), fall back to
+    // Redis signals — don't assume stopped, since the coordinator may not have
+    // initialised yet.
+    const coordDefinitelyStopped = coord !== null && !coordSaysRunning
+
     const engineIsStopped =
+      coordDefinitelyStopped ||
       ep?.phase === "stopped" ||
       es.status === "stopped" ||
       es.status === "idle"
@@ -1899,7 +1918,7 @@ export async function GET(
       historicAvgProfitFactorCount: n(prehistoricHash.historic_avg_profit_factor_count),
     }
 
-    // ── WINDOW DATA (last 5min / 60min) ──────────────────────────────────────
+    // ── WINDOW DATA (last 5min / 60min) ────────────���─────────────────────────
     // Stored in sorted sets: indications:{connId}:window  scored by unix ms timestamp
     // If not present fall back to estimating from cycle counts using elapsed time
     const nowMs = Date.now()
@@ -2015,6 +2034,15 @@ export async function GET(
     //   6. realtimeIndicationCycles > 0 (engine running, phase not yet written) → "realtime"
     //   7. final fallback → "idle" (not "unknown" — cleaner UX)
     const phase: string = (() => {
+      // On a fresh server boot the engine_progression Redis hash retains the
+      // previous phase ("realtime", "live_trading", etc.).  If the in-memory
+      // coordinator says definitively stopped, always return "idle" — the
+      // stale Redis phase is not trustworthy.
+      if (engineIsStopped) {
+        // Prefer explicit ep.phase when it matches stopped/idle, otherwise idle.
+        if (ep?.phase === "stopped") return "stopped"
+        return "idle"
+      }
       if (ep?.phase && ep.phase !== "unknown") return ep.phase
       if (es.status === "stopped") return "stopped"
       if (es.status === "idle")    return "idle"

@@ -638,16 +638,13 @@ export function QuickstartSection() {
           )
         }
       } catch { /* sessionStorage unavailable */ }
-      // Sync isRunning from server truth on every stats fetch.
-      // isRunning MUST match engineRunning so the Start/Stop button and
-      // status dot always reflect the actual server state — not just whether
-      // the user clicked Start in this browser tab.
-      if (s.metadata?.engineRunning) {
-        setIsRunning(true)
-      } else if (!s.metadata?.engineRunning && s.metadata?.engineRunning !== undefined) {
-        // Only force-clear if the server explicitly says stopped (not just absent)
-        setIsRunning(false)
-      }
+      // Sync isRunning from server truth on every stats fetch so the
+      // Start/Stop button and status dot always reflect real engine state,
+      // even after a page reload or when another tab stopped the engine.
+      // Use strict boolean check: skip update when the field is absent
+      // (undefined) to avoid flicker during the first boot poll.
+      if (s.metadata?.engineRunning === true)  setIsRunning(true)
+      if (s.metadata?.engineRunning === false) setIsRunning(false)
     } catch { /* non-critical */ }
     finally { if (!silent) setLoadingStats(false) }
   }, [connectionId])
