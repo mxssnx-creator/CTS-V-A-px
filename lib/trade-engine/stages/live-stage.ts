@@ -1304,7 +1304,7 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   const fillPrice = pos.averageExecutionPrice || pos.entryPrice
   if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
 
-  // ── Trailing stop: use the ratcheted absolute price directly ─�����──────────
+  // ── Trailing stop: use the ratcheted absolute price directly ─�����─────────���
   // When trailing is active syncLiveFromPseudo stamps pos.trailingStopPrice
   // with the latest ratcheted absolute stop level. Using that absolute price
   // directly avoids the percentage-anchored re-derivation below which would
@@ -2373,7 +2373,7 @@ export async function executeLivePosition(
     //
     // The previous guard `if (venueMax > livePosition.leverage)` caused
     // silent failures: when getMaxLeverageForExchange returned the
-    // SAFE_DEFAULT (10) — which is > any coordination signal (1–5x) —
+    // SAFE_DEFAULT (10) �� which is > any coordination signal (1–5x) —
     // the position was placed at 10x rather than 150x (BingX max).
     // Fix: always assign, no comparison.
     //
