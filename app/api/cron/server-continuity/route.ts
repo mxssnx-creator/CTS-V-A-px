@@ -81,17 +81,6 @@ export async function GET() {
         degraded: failedTasks.length > 0,
         tasks,
         warnings: failedTasks.map((task) => `${task.name}: ${task.error || "failed"}`),
-
-      return NextResponse.json({
-        success: tasks.every((task) => task.ok),
-        tasks,
-      // active. On Vercel/serverless the runner intentionally no-ops and this
-      // cron invocation itself is the durable heartbeat.
-      startServerContinuityRunner()
-      await initializeTradeEngineAutoStart()
-
-      return NextResponse.json({
-        success: true,
         durationMs: Date.now() - startedAt,
       })
     } finally {

@@ -1644,7 +1644,7 @@ export function ActiveConnectionCard({
                                 </span>
                                 <span className="text-muted-foreground">
                                   {isLive ? "Hold" : "DDT"} <span className="text-foreground font-medium">
-                                    {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "���"}
+                                    {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "—"}
                                   </span>
                                 </span>
                               </div>
