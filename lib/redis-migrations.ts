@@ -2750,6 +2750,35 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "48")
     },
   },
+  {
+    // Reduce bingx-x01 dev symbol set to 3 symbols so the engine can complete
+    // prehistoric + realtime within the 913 MB of available RAM on the 4 GB
+    // v0 sandbox VM (next-server itself occupies ~1870 MB RSS at idle).
+    // 3 symbols × MAIN_AXIS_SETS_CEILING(1500) = 4500 axis sets peak vs
+    // 20 symbols × 1500 = 30,000 — a 6.7× reduction in peak allocation.
+    // Trade history correctness (exit prices, liveOpen key-scan) is fully
+    // verifiable with 3 symbols; restore to 20 for production.
+    version: 50,
+    name: "050-dev-3-symbol-low-ram-mode",
+    up: async (client: any) => {
+      if (process.env.NODE_ENV !== "development") {
+        console.log("[v0] Migration 050: skipped (production — keeping 20 symbols)")
+        return
+      }
+      const DEV_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT"
+      const connId = "bingx-x01"
+      await client.hset(`connection:${connId}`, { force_symbols: DEV_SYMBOLS, symbol_count: "3" })
+      await client.hset(`settings:trade_engine_state:${connId}`, { force_symbols: DEV_SYMBOLS, active_symbols: DEV_SYMBOLS, symbol_count: "3" })
+      await client.hset(`settings:connection_settings:${connId}`, { force_symbols: DEV_SYMBOLS, active_symbols: DEV_SYMBOLS, symbol_count: "3" })
+      // Clear any prehistoric cache gate so the engine re-runs with the new symbol set
+      await client.del(`prehistoric_loaded:${connId}`).catch(() => 0)
+      await client.del(`prehistoric:progress:${connId}`).catch(() => 0)
+      console.log(`[v0] Migration 050: dev 3-symbol mode applied (${DEV_SYMBOLS})`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "49")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
