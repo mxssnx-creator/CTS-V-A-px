@@ -13,7 +13,7 @@
     "test": "node scripts/smoke-routes-test.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "start": "NODE_OPTIONS='--max-old-space-size=12288 --max-semi-space-size=128' next start -p 3002",
+    "start": "NODE_OPTIONS='--max-old-space-size=12288 --max-semi-space-size=128' next start -p ${PORT:-3002}",
     "vercel-build": "NODE_OPTIONS='--max-old-space-size=12288 --max-semi-space-size=128' next build",
     "vercel-build-setup": "bash scripts/vercel-build-setup.sh",
     "post-deploy-verify": "bash scripts/post-deploy-verify.sh",

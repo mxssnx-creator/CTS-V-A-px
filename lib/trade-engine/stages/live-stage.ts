@@ -46,6 +46,7 @@ const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
 
 
 
+
 function hasLiveTradeBlock(settings: Record<string, any>): boolean {
   return String(settings.live_trade_blocked_reason || "").trim().length > 0
 }
@@ -1359,6 +1360,8 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
       : 0
 
   return { desiredSl, desiredTp }
+}
+
 }
 
 }
