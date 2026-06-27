@@ -207,6 +207,7 @@ import {
   type LockHandle,
 } from "./progression-lock"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
+import { fetchTopSymbols } from "@/lib/top-symbols"
 
 /**
  * Per-symbol fan-out concurrency cap.
@@ -3660,6 +3661,43 @@ export class TradeEngineManager {
         if (useMainSymbols === true) {
           const mainSymbols = appSettings?.mainSymbols
           if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols.map(String).filter(Boolean)
+        }
+
+        // ── DEFAULT: dynamic top-N selection by 1h volatility ────────────────
+        // The system default (migration 055) is to trade the most volatile
+        // symbols. When no explicit operator force_symbols / self-written
+        // symbols / connSettings / mainSymbols exist, pick the top-N by true
+        // 1h ATR via fetchTopSymbols(...,"volatility_1h"). symbol_order gates
+        // this (set to "volatility_1h" by default); symbol_count controls N
+        // (6 in prod, 2 in dev). The engine persists the selection by writing
+        // `symbols`/`active_symbols` at start, so subsequent ticks reuse it
+        // (the self-written branch above) — no per-tick churn.
+        const symbolOrder = String(
+          (connState as any)?.symbol_order ?? (connSettings as any)?.symbol_order ?? "",
+        ).toLowerCase()
+        if (symbolOrder === "volatility" || symbolOrder === "volatility_1h") {
+          const exchange = String(
+            (connSettings as any)?.exchange ?? (connState as any)?.exchange ?? "bingx",
+          ).toLowerCase()
+          let count = Number(
+            (connState as any)?.symbol_count ?? (connSettings as any)?.symbol_count ?? 6,
+          )
+          if (!Number.isFinite(count) || count < 1) count = 6
+          try {
+            const top = await fetchTopSymbols(exchange, count, "volatility_1h")
+            const syms = (top.symbols ?? []).map((s) => String(s.symbol)).filter(Boolean)
+            if (syms.length > 0) {
+              console.log(
+                `[v0] [getSymbols] ${this.connectionId}: selected top-${syms.length} by 1h volatility on ${exchange}: ${syms.join(", ")}`,
+              )
+              return syms
+            }
+          } catch (volErr) {
+            console.error(
+              `[v0] [getSymbols] ${this.connectionId}: 1h-volatility selection failed, using fallback:`,
+              volErr instanceof Error ? volErr.message : String(volErr),
+            )
+          }
         }
 
         return ["DRIFTUSDT"]

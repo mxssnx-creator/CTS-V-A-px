@@ -2952,6 +2952,65 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "53")
     },
   },
+  {
+    // System-wide default change (operator request session 5):
+    //   • Volume factor → minimalist 0.1 (was 2.2). VolumeCalculator already
+    //     treats 0.1 as the canonical minimum when unset; this makes it the
+    //     EXPLICIT seeded default on the live connections too.
+    //   • Default symbol selection → top-6 by 1h volatility (PROD). symbol_order
+    //     is set to "volatility_1h" and getSymbols() now performs dynamic
+    //     top-N selection via fetchTopSymbols(...,"volatility_1h") whenever no
+    //     explicit operator force_symbols is present.
+    //   • DEV stays capped LOWER (2 symbols) for OOM survival on the 4.39 GB
+    //     no-swap VM — still uses volatility selection (top-2), just fewer of
+    //     them. Production uses the full 6.
+    //
+    // To activate dynamic volatility selection we must CLEAR the migration-seeded
+    // force_symbols / active_symbols / symbols overrides that 053 (dev 1-symbol)
+    // and earlier migrations wrote — otherwise getSymbols() short-circuits on
+    // those and the volatility branch never runs. We also clear the prehistoric
+    // gates so the engine re-selects + re-runs on next start.
+    version: 55,
+    name: "055-default-volume-0.1-and-6-symbols-by-volatility",
+    up: async (client: any) => {
+      const isDev = process.env.NODE_ENV !== "production"
+      const symbolCount = isDev ? "2" : "6"
+      const connIds = ["bingx-x01", "bybit-x03"]
+
+      for (const connId of connIds) {
+        const hashes = [
+          `connection:${connId}`,
+          `settings:trade_engine_state:${connId}`,
+          `settings:connection_settings:${connId}`,
+        ]
+        for (const h of hashes) {
+          // Set the new minimalist volume default + volatility ordering config.
+          await client.hset(h, {
+            live_volume_factor: "0.1",
+            volume_factor_live: "0.1",
+            symbol_count:       symbolCount,
+            symbol_order:       "volatility_1h",
+          }).catch(() => 0)
+          // Clear seeded symbol overrides so dynamic volatility selection runs.
+          await client.hdel(h, "force_symbols", "active_symbols", "symbols").catch(() => 0)
+        }
+        // Clear prehistoric cache gates so the engine re-selects + re-runs.
+        await client.del(`prehistoric_loaded:${connId}`).catch(() => 0)
+        await client.del(`prehistoric:progress:${connId}`).catch(() => 0)
+      }
+
+      // Also set the global VolumeCalculator fallback to the new default.
+      await client.hset("app_settings", { live_volume_factor: "0.1", volume_factor_live: "0.1" }).catch(() => 0)
+
+      console.log(
+        `[v0] Migration 055: defaults updated — volume_factor=0.1, symbol_count=${symbolCount} ` +
+          `(${isDev ? "DEV-capped" : "PROD"}), symbol_order=volatility_1h; cleared force/active symbol overrides`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "54")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -2994,6 +3053,12 @@ const BASE_TEST_SYMBOLS = [
 async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: number; credentialsInjected: number }> {
   let createdOrUpdated = 0
   let credentialsInjected = 0
+
+  // System default symbol count: 6 in production (top-6 by 1h volatility),
+  // capped to 2 in dev for OOM survival on the 4.39 GB no-swap VM. The actual
+  // symbols are chosen dynamically by getSymbols() via fetchTopSymbols(...,
+  // "volatility_1h"); this only controls how many are selected.
+  const DEFAULT_SYMBOL_COUNT = process.env.NODE_ENV !== "production" ? "2" : "6"
 
   // bybit-x03 is NO LONGER in this list: it is once again a canonical base
   // connection (see BASE_CONNECTION_CONFIG) and is always inited + visible
@@ -3093,7 +3158,6 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
 
     if (!hasExisting) {
       // First-time seed. Apply full canonical defaults.
-      const TEST_SYMBOLS_031 = BASE_TEST_SYMBOLS
       const seedData: Record<string, string> = {
         id: cfg.id,
         name: cfg.name,
@@ -3123,16 +3187,23 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
         created_at: now,
         updated_at: now,
       }
-      // For the primary autoActive BingX connection seed is_live_trade + symbols
-      // so live-trade testing works immediately after a dev restart without
-      // requiring the operator to re-configure via the UI.
+      // For the primary autoActive BingX connection seed is_live_trade + the
+      // volatility-selection config so live-trade testing works immediately
+      // after a dev restart without requiring the operator to re-configure.
+      //
+      // NOTE: we intentionally do NOT seed a static active_symbols list. The
+      // new system default (migration 055) is dynamic top-N selection by 1h
+      // volatility — getSymbols() performs that selection whenever no explicit
+      // force_symbols and no self-written symbols exist. Seeding a static list
+      // here would short-circuit that branch. symbol_count controls N
+      // (6 in prod, capped to 2 in dev for OOM survival).
       if (cfg.autoActive && cfg.exchange === "bingx") {
-        seedData["is_live_trade"]   = "1"
-        seedData["active_symbols"]  = JSON.stringify(TEST_SYMBOLS_031)
-        seedData["symbol_count"]    = String(TEST_SYMBOLS_031.length)
-        // Default order: by exchange 1h volatility (seeded list is fallback only)
-        seedData["symbol_order"]    = "volatility"
-        seedData["position_mode"]   = "hedge"
+        seedData["is_live_trade"]     = "1"
+        seedData["symbol_count"]      = DEFAULT_SYMBOL_COUNT
+        seedData["symbol_order"]      = "volatility_1h"
+        seedData["live_volume_factor"] = "0.1"
+        seedData["volume_factor_live"] = "0.1"
+        seedData["position_mode"]     = "hedge"
       }
       await client.hset(`connection:${cfg.id}`, seedData)
       await client.sadd("connections", cfg.id)
@@ -3155,26 +3226,21 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
         // connection:{id} hash. Write to both prefixed keys so the engine
         // resolves 5 symbols on the very first tick without waiting for the
         // PATCH route to push active_symbols into the engine-state key.
+        // Seed the volatility-selection config (NOT a static symbol list) to
+        // the setSettings-prefixed keys that getSymbols() reads. Leaving
+        // active_symbols empty lets getSymbols() do dynamic top-N selection.
         const engineStateKey = `settings:trade_engine_state:${cfg.id}`
-        const existEng = (await client.hgetall(engineStateKey).catch(() => null)) as Record<string,string> | null
-        const haveEng = existEng || {}
-        if (!haveEng["active_symbols"] || haveEng["active_symbols"] === "[]") {
-          await client.hset(engineStateKey, {
-            active_symbols: JSON.stringify(TEST_SYMBOLS_031),
-            symbol_count: String(TEST_SYMBOLS_031.length),
-            config_set_symbols_total: String(TEST_SYMBOLS_031.length),
-          }).catch(() => {})
-        }
-        // Also write to settings:connection:{id} — the secondary getSymbols lookup
+        await client.hset(engineStateKey, {
+          symbol_count:             DEFAULT_SYMBOL_COUNT,
+          symbol_order:             "volatility_1h",
+          config_set_symbols_total: DEFAULT_SYMBOL_COUNT,
+          live_volume_factor:       "0.1",
+        }).catch(() => {})
         const settConnKey = `settings:connection:${cfg.id}`
-        const existSettConn = (await client.hgetall(settConnKey).catch(() => null)) as Record<string,string> | null
-        const haveSettConn = existSettConn || {}
-        if (!haveSettConn["active_symbols"] || haveSettConn["active_symbols"] === "[]") {
-          await client.hset(settConnKey, {
-            active_symbols: JSON.stringify(TEST_SYMBOLS_031),
-            symbol_count: String(TEST_SYMBOLS_031.length),
-          }).catch(() => {})
-        }
+        await client.hset(settConnKey, {
+          symbol_count: DEFAULT_SYMBOL_COUNT,
+          symbol_order: "volatility_1h",
+        }).catch(() => {})
       }
 
       if (hasRealCredentials) credentialsInjected++
@@ -3188,15 +3254,18 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     {
       const liveFlag = String(existing["is_live_trade"] ?? "0")
       const hasLiveTrade = liveFlag === "1" || liveFlag === "true"
-      const symRaw = String(existing["active_symbols"] ?? "")
-      const hasSymbols = symRaw.length > 0 && symRaw !== "[]"
-      if (cfg.autoActive && cfg.exchange === "bingx" && (!hasLiveTrade || !hasSymbols)) {
-        const TEST_SYMBOLS_031 = BASE_TEST_SYMBOLS
+      // We no longer require a static active_symbols list — the default is
+      // dynamic top-N selection by 1h volatility (getSymbols). We only ensure
+      // is_live_trade + the selection config (symbol_count / symbol_order /
+      // volume) are present so the engine can place live orders and pick
+      // symbols on the first tick. We never seed a static symbol list here.
+      const hasOrder = String(existing["symbol_order"] ?? "").length > 0
+      if (cfg.autoActive && cfg.exchange === "bingx" && (!hasLiveTrade || !hasOrder)) {
         const patchData: Record<string,string> = {}
         if (!hasLiveTrade) patchData["is_live_trade"] = "1"
-        if (!hasSymbols)   patchData["active_symbols"] = JSON.stringify(TEST_SYMBOLS_031)
-        if (!hasSymbols)   patchData["symbol_count"]   = String(TEST_SYMBOLS_031.length)
-        if (!hasSymbols)   patchData["symbol_order"]   = "volatility"
+        if (!hasOrder)     patchData["symbol_order"]  = "volatility_1h"
+        if (!existing["symbol_count"]) patchData["symbol_count"] = DEFAULT_SYMBOL_COUNT
+        if (!existing["live_volume_factor"]) patchData["live_volume_factor"] = "0.1"
         if (!existing["position_mode"]) patchData["position_mode"] = "hedge"
         if (Object.keys(patchData).length > 0) {
           await client.hset(`connection:${cfg.id}`, patchData)
@@ -3211,20 +3280,18 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
           await client.hset(settKey2, settWrites2)
         }
 
-        // Also push to setSettings-prefixed keys so getSymbols() resolves
-        // the 15 test symbols on the very first engine tick.
-        if (!hasSymbols) {
-          const TEST_SYMBOLS_031 = BASE_TEST_SYMBOLS
-          await client.hset(`settings:trade_engine_state:${cfg.id}`, {
-            active_symbols: JSON.stringify(TEST_SYMBOLS_031),
-            symbol_count: String(TEST_SYMBOLS_031.length),
-            config_set_symbols_total: String(TEST_SYMBOLS_031.length),
-          }).catch(() => {})
-          await client.hset(`settings:connection:${cfg.id}`, {
-            active_symbols: JSON.stringify(TEST_SYMBOLS_031),
-            symbol_count: String(TEST_SYMBOLS_031.length),
-          }).catch(() => {})
-        }
+        // Push the selection config to the setSettings-prefixed keys that
+        // getSymbols() reads — without a static symbol list, so the dynamic
+        // volatility branch runs on the first engine tick.
+        await client.hset(`settings:trade_engine_state:${cfg.id}`, {
+          symbol_count:             DEFAULT_SYMBOL_COUNT,
+          symbol_order:             "volatility_1h",
+          config_set_symbols_total: DEFAULT_SYMBOL_COUNT,
+        }).catch(() => {})
+        await client.hset(`settings:connection:${cfg.id}`, {
+          symbol_count: DEFAULT_SYMBOL_COUNT,
+          symbol_order: "volatility_1h",
+        }).catch(() => {})
       }
     }
 
