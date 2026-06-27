@@ -42,6 +42,17 @@ export async function POST(_req: NextRequest) {
         await client.del(INIT_LOCK_KEY).catch(() => {})
       }
     }
+    const { seedProductionData } = await import("@/lib/production-seeder")
+    await seedProductionData({ seedSettings: true, seedConnections: true, seedMarketData: true, seedProgression: true })
+    // Start coordinator and server-side continuity directly. Avoid relative
+    // self-fetch here: Node's fetch cannot resolve `/api/...` without a base
+    // URL, and silently skipping this left production boot dependent on a
+    // browser page mount.
+    const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
+    await initializeTradeEngineAutoStart().catch(() => {})
+    const { startServerContinuityRunner } = await import("@/lib/server-continuity-runner")
+    startServerContinuityRunner()
+    return NextResponse.json({ success: true })
   } catch (err) {
     console.error("/api/system/initialize error:", err)
     return NextResponse.json({ success: false, error: String(err) }, { status: 500 })
