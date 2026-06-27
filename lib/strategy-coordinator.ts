@@ -1888,7 +1888,7 @@ export class StrategyCoordinator {
         )
       }
 
-      // ── ACTIVE-NOW snapshot per (symbol, stage) ─────────────────��─��─��─
+      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────���─────────��─��─��─
       // The cumulative `strategies_base_total` hincrby above answers
       // "how many Base Sets have been created EVER", but the dashboard
       // Overview asks "how many are alive RIGHT NOW for this symbol".
@@ -4131,7 +4131,6 @@ export class StrategyCoordinator {
               for (const s of qualifying) {
                 const isBlock = s.variant === "block"
                 const isDca   = s.variant === "dca"
-                const isNew   = !isBlock && !isDca // default / trailing
                 const isNew   = !isBlock && !isDca // default / trailing / pause
                 if (s.direction === "long") {
                   if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
