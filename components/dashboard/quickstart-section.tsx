@@ -565,8 +565,10 @@ export function QuickstartSection() {
         variantDca:            variant(s.strategyVariants?.dca),
         variantOverall:        variant(s.strategyVariants?.overall),
         mainCoord,
-        // Live exchange execution — from liveExecution block of the /stats endpoint
-        livePositionsOpen:     s.liveExecution?.positionsOpen    || 0,
+        // Live exchange execution — prefer openPositions.live.open (scan-based, authoritative)
+        // over liveExecution.positionsOpen (counter formula that can drift on restart).
+        livePositionsOpen:     Number(s.openPositions?.live?.open) ||
+                               s.liveExecution?.positionsOpen    || 0,
         livePositionsCreated:  s.liveExecution?.positionsCreated || 0,
         livePositionsClosed:   s.liveExecution?.positionsClosed  || 0,
         liveOrdersPlaced:      s.liveExecution?.ordersPlaced     || 0,
@@ -601,7 +603,14 @@ export function QuickstartSection() {
                                  || 0,
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
-        phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
+        // "unknown" = engine running but no phase written yet. Infer from cycles.
+        phase: (() => {
+          const p = s.metadata?.phase
+          if (p && p !== "unknown") return p
+          if (indCycles > 0) return "realtime"
+          if (s.metadata?.engineRunning) return "initializing"
+          return "—"
+        })(),
         engineRunning:         s.metadata?.engineRunning || indCycles > 0,
         // Real-stage rolling averages and stage cascade eval percentages.
         // Both arrive from the /stats endpoint already computed.

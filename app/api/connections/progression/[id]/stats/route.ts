@@ -2003,7 +2003,31 @@ export async function GET(
       }
     })()
 
-    const phase    = ep?.phase || "unknown"
+    // Phase derivation: prefer the explicit engine_progression field.
+    // When it's absent (fresh engine that hasn't written phase yet, or
+    // just-started before config-set-processor runs), fall back through
+    // observable signals so the UI never shows "unknown":
+    //   1. ep.phase — explicit from engine_progression Redis key
+    //   2. es.status=running + live cycles → "live_trading"
+    //   3. es.status=running + historic not done → "prehistoric_data"
+    //   4. es.status=running → "realtime"
+    //   5. es.status=stopped/idle → "stopped"/"idle"
+    //   6. realtimeIndicationCycles > 0 (engine running, phase not yet written) → "realtime"
+    //   7. final fallback → "idle" (not "unknown" — cleaner UX)
+    const phase: string = (() => {
+      if (ep?.phase && ep.phase !== "unknown") return ep.phase
+      if (es.status === "stopped") return "stopped"
+      if (es.status === "idle")    return "idle"
+      if (es.status === "running" || realtimeIsActive) {
+        if (historicIsComplete || es.prehistoric_data_loaded === "1" || es.prehistoric_data_loaded === true) {
+          return "live_trading"
+        }
+        if (historicSymbolsProcessed > 0) return "prehistoric_data"
+        return "realtime"
+      }
+      if (realtimeIndicationCycles > 0) return "realtime"
+      return "idle"
+    })()
     const progress = n(ep?.progress)
     const message  = ep?.detail || ep?.message || ""
     const lastUpdate = progHash.last_update || realtimeHash.last_cycle_at || new Date().toISOString()
@@ -2652,7 +2676,7 @@ export async function GET(
               realFallback: liveResolvedViaReal,
               unresolved:   liveUnresolvedCount,
             },
-            // ── Portfolio-wide exchange aggregates ──────────────
+            // ── Portfolio-wide exchange aggregates ─────────��────
             // Sum of `positions[]` — guarantees the Live strip
             // totals always equal what's visible in the rows.
             aggregate: {

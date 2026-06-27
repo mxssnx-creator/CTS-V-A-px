@@ -88,10 +88,11 @@ const PHASE_LABELS: Record<string, string> = {
   prehistoric_data: "Loading Historical Data",
   indications: "Processing Indications",
   strategies: "Calculating Strategies",
-  realtime: "Starting Real-time Processor",
+  realtime: "Real-time Processing",
   live_trading: "Live Trading Active",
   stopped: "Stopped",
   error: "Error",
+  unknown: "Starting Up",
 }
 
 const toBoolean = (value: unknown): boolean => value === true || value === "1" || value === "true"
@@ -410,8 +411,23 @@ export function ActiveConnectionCard({
             progress:  Number(meta.progress ?? data.progress ?? 0),
             message:   String(data.message  || meta.message  || ""),
             subPhase:  data.subPhase  != null ? String(data.subPhase)  : null,
-            startedAt: data.startedAt != null ? String(data.startedAt) : null,
-            updatedAt: data.updatedAt != null ? String(data.updatedAt) : null,
+            // startedAt/updatedAt may be epoch-ms numbers from metadata — convert to ISO string
+            startedAt: (() => {
+              const v = meta.startedAt ?? data.startedAt
+              if (v == null) return null
+              const n = Number(v)
+              return Number.isFinite(n) && n > 1_000_000_000_000
+                ? new Date(n).toISOString()
+                : String(v)
+            })(),
+            updatedAt: (() => {
+              const v = meta.lastUpdate ?? data.updatedAt
+              if (v == null) return null
+              const n = Number(v)
+              return Number.isFinite(n) && n > 1_000_000_000_000
+                ? new Date(n).toISOString()
+                : String(v)
+            })(),
             error:     data.error     != null && typeof data.error !== "object"
                          ? String(data.error)
                          : null,
@@ -512,7 +528,13 @@ export function ActiveConnectionCard({
     let timeoutId: ReturnType<typeof setTimeout>
     const scheduleNext = () => {
       const phase = phaseRef.current
-      const isActivePhase = phase && phase !== "idle" && phase !== "stopped" && phase !== "live_trading" && phase !== "disabled"
+      // Poll at 2 s during any actively-progressing or live phase.
+      // live_trading needs fast refresh for order/position updates.
+      // "unknown" means the engine just started — keep polling fast.
+      const isActivePhase = phase &&
+        phase !== "idle" &&
+        phase !== "stopped" &&
+        phase !== "disabled"
       const delay = isActivePhase ? 2000 : 5000
       timeoutId = setTimeout(async () => {
         await fetchProgression()
@@ -851,7 +873,10 @@ export function ActiveConnectionCard({
       ? prehistoricPercent
       : enginePhaseProgress
   const isRunning = phase === "live_trading"
-  const isStarting = phase !== "idle" && phase !== "stopped" && phase !== "live_trading" && phase !== "error" && progress < 100
+  // "unknown" = engine just started, no phase written yet → show amber "Starting..."
+  const isStarting = (
+    phase !== "idle" && phase !== "stopped" && phase !== "live_trading" && phase !== "error" && phase !== "disabled"
+  ) && (progress < 100 || phase === "unknown")
   const hasError = phase === "error"
 
   const cardBorderClass = isRunning
@@ -1194,8 +1219,9 @@ export function ActiveConnectionCard({
             </CardContent>
           )}
 
-          {/* Progress bar when engine has active progression data */}
-          {(connection.isActive || phase === "live_trading") && phase !== "idle" && phase !== "stopped" && phase !== "disabled" && (
+          {/* Progress bar when engine has active progression data.
+              "unknown" is omitted — it means no phase written yet, treat like idle. */}
+          {(connection.isActive || phase === "live_trading") && phase !== "idle" && phase !== "stopped" && phase !== "disabled" && phase !== "unknown" && (
             <CardContent className="pt-0 pb-3 px-4">
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
