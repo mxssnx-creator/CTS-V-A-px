@@ -3,7 +3,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import { updateConnection, initRedis, getConnection, getRedisClient, setSettings, getSettings, persistNow } from "@/lib/redis-db"
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
-import { getGlobalTradeEngineCoordinator, getTradeEngine } from "@/lib/trade-engine"
+import { getTradeEngine } from "@/lib/trade-engine"
 import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { toRedisFlag } from "@/lib/boolean-utils"
@@ -315,8 +315,7 @@ export async function PATCH(
           | Record<string, unknown>
           | undefined
         if (coord && typeof coord === "object") {
-          // Variant toggles:  variants.{trailing,block,dca}; pause is an axis, not a strategy variant.
-          // Variant toggles:  variants.{trailing,block,dca}
+          // Variant toggles: variants.{trailing,block,dca}; pause is an axis, not a strategy variant.
           //   → flat key variantTrailingEnabled, variantBlockEnabled, …
           const variantsObj = coord.variants as Record<string, unknown> | undefined
           if (variantsObj && typeof variantsObj === "object") {
@@ -372,6 +371,10 @@ export async function PATCH(
         const vfp = Number((merged as Record<string, unknown>).volume_factor_preset)
         if (Number.isFinite(vfp) && vfp > 0) {
           flatKnobs.volume_factor_preset = String(Math.max(0.1, Math.min(10, vfp)))
+        }
+        const vsr = Number((merged as Record<string, unknown>).volume_step_ratio ?? (merged as Record<string, unknown>).volumeStepRatio)
+        if (Number.isFinite(vsr) && vsr > 0) {
+          flatKnobs.volume_step_ratio = String(Math.max(0.2, Math.min(1.8, vsr)))
         }
         // control_orders flag — whether to place SL/TP orders
         const co = (merged as Record<string, unknown>).control_orders
@@ -449,6 +452,9 @@ export async function PATCH(
         }
         if (flatKnobs.volume_factor_preset !== undefined) {
           volumeConnectionPatch.preset_volume_factor = flatKnobs.volume_factor_preset
+        }
+        if (flatKnobs.volume_step_ratio !== undefined) {
+          volumeConnectionPatch.volume_step_ratio = flatKnobs.volume_step_ratio
         }
         if (flatKnobs.volume_factor !== undefined) {
           volumeConnectionPatch.volume_factor = flatKnobs.volume_factor
@@ -699,63 +705,25 @@ export async function PATCH(
       scalarChanged("is_testnet", (connection as Record<string, unknown>).is_testnet, (updated as Record<string, unknown>).is_testnet) ||
       scalarChanged("is_preset_trade", (connection as Record<string, unknown>).is_preset_trade, (updated as Record<string, unknown>).is_preset_trade) ||
       scalarChanged("connection_method", (connection as Record<string, unknown>).connection_method, (updated as Record<string, unknown>).connection_method)
-    let progressionChangedForActualOne = false
-    if (symbolsModeChanged) {
-      try {
-        const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
-        progressionChangedForActualOne = recoordination.changed
-
-        // If recoordination archived/recreated progression state, a running
-        // manager must not continue through the normal hot-reload path while
-        // still holding the previous epoch/ownership. Restarting rebinds it to
-        // the fresh progression lock before processors can write again.
-        if (recoordination.changed) {
-          const coordinator = getGlobalTradeEngineCoordinator()
-          if (coordinator.isEngineRunning(id)) {
-            console.log(
-              `[v0] [Settings PATCH] Progression re-coordinated for ${id} (${recoordination.reason ?? "changed"}); restarting running engine instead of hot reload.`,
-            )
-            await coordinator.restartEngine(id)
-    let progressionRestartHandled = false
     if (symbolsModeChanged) {
       try {
         const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
         if (recoordination.changed) {
-          progressionRestartHandled = true
-
-          // The progression epoch/lock changed, so this is no longer a safe
-          // in-place hot reload for a running manager. Publish a restart-class
-          // settings event and explicitly restart an active manager so it binds
-          // to the newly-created progression instead of continuing to write
-          // underneath an archived epoch.
+          // Progression state changed, but the running engine must stay live.
+          // Publish a reload-class event so the owning process invalidates symbol
+          // and strategy caches in place instead of stopping/restarting live trade.
           try {
             const { notifySettingsChanged } = await import("@/lib/settings-coordinator")
             await notifySettingsChanged(
               id,
-              ["progression_epoch", "connection_settings"],
+              ["connection_settings", "active_symbols", "force_symbols", "symbol_count", "symbol_order"],
               { ...connection, connection_settings: current },
               { ...connection, connection_settings: merged, updated_at: updated.updated_at },
             )
           } catch (notifyErr) {
             console.warn(
-              `[v0] [Settings PATCH] restart-class notify failed for ${id}:`,
+              `[v0] [Settings PATCH] reload notify failed for ${id}:`,
               notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
-            )
-          }
-
-          try {
-            const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
-            const coordinator = getGlobalTradeEngineCoordinator()
-            if (coordinator.isEngineRunning(id)) {
-              console.log(
-                `[v0] [Settings PATCH] Restarting ${id} after progression recoordination (${recoordination.reason || "changed"})`,
-              )
-              await coordinator.restartEngine(id)
-            }
-          } catch (restartErr) {
-            console.warn(
-              `[v0] [Settings PATCH] engine restart after progression recoordination failed for ${id}:`,
-              restartErr instanceof Error ? restartErr.message : String(restartErr),
             )
           }
         }
@@ -766,50 +734,11 @@ export async function PATCH(
         )
       }
 
-      // The durable settings-change envelope below now carries the concrete
-      // symbol/mode field names, so the engine-owning process classifies this
-      // as a serialized restart event. Do not also queue a separate route-local
-      // restart here: in production the route can run in a different worker than
-      // the engine, and the old double path raced hot-reload vs stop/start,
-      // producing duplicate progressions and stalled stats after settings saves.
-      // A symbol/mode change invalidates the currently running prehistoric
-      // gates. Recoordination clears Redis state; this background restart makes
-      // the active manager actually start processing the new symbols instead of
-      // waiting for a later watchdog tick. It is intentionally queued and
-      // cooldown-protected so the settings dialog response stays fast and a
-      // double-save cannot spawn duplicate restarts.
-      try {
-        const coordinator = getTradeEngine()
-        const client = getRedisClient()
-        const restartKey = `engine_restart_cooldown:${id}`
-        const lastRestartRaw = await client.get(restartKey).catch(() => null)
-        const lastRestartMs = Number(lastRestartRaw)
-        if (
-          coordinator &&
-          typeof (coordinator as any).isEngineRunning === "function" &&
-          (coordinator as any).isEngineRunning(id) &&
-          (!Number.isFinite(lastRestartMs) || Date.now() - lastRestartMs > 2_000)
-        ) {
-          await client.set(restartKey, String(Date.now()), { EX: 5 }).catch(() => null)
-          setImmediate(() => {
-            void (async () => {
-              try {
-                await (coordinator as any).restartEngine(id)
-              } catch (restartErr) {
-                console.warn(
-                  `[v0] [Settings PATCH] background restart failed for ${id}:`,
-                  restartErr instanceof Error ? restartErr.message : String(restartErr),
-                )
-              }
-            })()
-          })
-        }
-      } catch (restartScheduleErr) {
-        console.warn(
-          `[v0] [Settings PATCH] failed to schedule symbol/mode restart for ${id}:`,
-          restartScheduleErr instanceof Error ? restartScheduleErr.message : String(restartScheduleErr),
-        )
-      }
+      // The durable reload envelope below carries the concrete symbol/mode
+      // field names, so the engine-owning process hot-reloads in place. Do not
+      // queue a route-local restart: in production the API route can run in a
+      // different worker than the engine, and stop/start races make live trade
+      // unstable during normal settings saves.
     }
 
     // Full propagation. PATCH only ships a partial settings payload, so
@@ -817,18 +746,6 @@ export async function PATCH(
     // would report zero changes — pass an explicit override listing the
     // settings keys the caller touched, so the recoordinator knows
     // something inside `connection_settings` actually changed.
-    if (!progressionChangedForActualOne) {
-    if (!progressionRestartHandled) {
-      await recoordinateAfterSettingsChange(
-        id,
-        { ...connection, connection_settings: current },
-        { ...connection, connection_settings: merged, updated_at: updated.updated_at },
-        {
-          logTag: "PATCH /settings",
-          changedFieldsOverride: Object.keys(settings).length > 0 ? ["connection_settings"] : [],
-        },
-      )
-    }
     await recoordinateAfterSettingsChange(
       id,
       { ...connection, connection_settings: current },

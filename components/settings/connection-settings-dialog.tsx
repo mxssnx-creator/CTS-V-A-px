@@ -1,6 +1,6 @@
 "use client"
 
-import { MIN_VOLUME_FACTOR } from "@/lib/constants"
+import { DEFAULT_VOLUME_STEP_RATIO, MAX_VOLUME_STEP_RATIO, MIN_VOLUME_FACTOR, MIN_VOLUME_STEP_RATIO } from "@/lib/constants"
 import { useState, useEffect, useCallback, useMemo } from "react"
 import {
   Dialog,
@@ -123,10 +123,16 @@ function parseVolumeFactor(raw: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+function parseVolumeStepRatio(raw: unknown, fallback = DEFAULT_VOLUME_STEP_RATIO): number {
+  const parsed = parseVolumeFactor(raw, fallback)
+  return Math.max(MIN_VOLUME_STEP_RATIO, Math.min(MAX_VOLUME_STEP_RATIO, parsed))
+}
+
 interface OverviewSettings {
   volumeFactorBase:   number
   volumeFactorLive:   number
   volumeFactorPreset: number
+  volumeStepRatio: number
   marginMode:  "cross" | "isolated"
   volumeType:  "usdt" | "contract" | "spot"
   positionMode: "one_way" | "hedge"
@@ -176,7 +182,7 @@ export function ConnectionSettingsDialog({
   connectionName,
   exchange = "bingx",
 }: ConnectionSettingsDialogProps) {
-  const [tab, setTab] = useState<"overview" | "symbols" | "indications" | "strategies">("overview")
+  const [tab, setTab] = useState<"overview" | "live" | "symbols" | "indications" | "strategies">("overview")
 
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -187,6 +193,7 @@ export function ConnectionSettingsDialog({
     volumeFactorBase: MIN_VOLUME_FACTOR,
     volumeFactorLive: MIN_VOLUME_FACTOR,
     volumeFactorPreset: MIN_VOLUME_FACTOR,
+    volumeStepRatio: DEFAULT_VOLUME_STEP_RATIO,
     marginMode: "cross",
     volumeType: "usdt",
     positionMode: "one_way",
@@ -250,6 +257,7 @@ export function ConnectionSettingsDialog({
       const payload = {
         volume_factor_live:   overview.volumeFactorLive,
         volume_factor_preset: overview.volumeFactorPreset,
+        volume_step_ratio:   overview.volumeStepRatio,
         margin_mode:          overview.marginMode,
         volume_type:          overview.volumeType,
         position_mode:        overview.positionMode,
@@ -303,6 +311,7 @@ export function ConnectionSettingsDialog({
         volumeFactorBase:   parseVolumeFactor(p.volume_factor, prev.volumeFactorBase),
         volumeFactorLive:   parseVolumeFactor(p.volume_factor_live, prev.volumeFactorLive),
         volumeFactorPreset: parseVolumeFactor(p.volume_factor_preset, prev.volumeFactorPreset),
+        volumeStepRatio:   parseVolumeStepRatio(p.volume_step_ratio ?? p.volumeStepRatio, prev.volumeStepRatio),
         marginMode:        (p.margin_mode    as "cross" | "isolated") || prev.marginMode,
         volumeType:        (p.volume_type    as "usdt" | "contract" | "spot") || prev.volumeType,
         positionMode:      (p.position_mode  as "one_way" | "hedge") || prev.positionMode,
@@ -387,6 +396,7 @@ export function ConnectionSettingsDialog({
           // always reflected when the dialog opens.
           volumeFactorLive:   parseVolumeFactor(settings.volume_factor_live, parseVolumeFactor(conn.live_volume_factor, MIN_VOLUME_FACTOR)),
           volumeFactorPreset: parseVolumeFactor(settings.volume_factor_preset, parseVolumeFactor(conn.preset_volume_factor, MIN_VOLUME_FACTOR)),
+          volumeStepRatio:   parseVolumeStepRatio(settings.volume_step_ratio ?? conn.volume_step_ratio),
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
           positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
@@ -516,6 +526,7 @@ export function ConnectionSettingsDialog({
         // Overview
         volume_factor_live:   overview.volumeFactorLive,
         volume_factor_preset: overview.volumeFactorPreset,
+        volume_step_ratio:   overview.volumeStepRatio,
         margin_mode: overview.marginMode,
         volume_type: overview.volumeType,
         position_mode: overview.positionMode,
@@ -556,34 +567,23 @@ export function ConnectionSettingsDialog({
         variant_dca:      coordination.variants.dca      === true,
       }
 
-      const [settingsRes, indRes] = await Promise.all([
-        fetch(`/api/settings/connections/${connectionId}/settings`, {
-          method:  "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify(payload),
-        }),
-        fetch(`/api/settings/connections/${connectionId}/active-indications`, {
-          method:  "PUT",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify({ channels: { main: indMain, preset: indPreset } }),
-        }),
-        // Keep the connection hash (live_volume_factor / preset_volume_factor)
-        // in sync with the settings hash. The card's inline volume sliders and
-        // VolumeCalculator both read from the connection hash via getConnection().
-        // Without this extra write the two storage locations diverge as soon as
-        // the user saves from the dialog.
-        fetch(`/api/settings/connections/${connectionId}/volume`, {
-          method:  "POST",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify({
-            live_volume_factor:   overview.volumeFactorLive,
-            preset_volume_factor: overview.volumeFactorPreset,
-          }),
-        }).catch(() => { /* non-fatal — connection hash is a secondary write */ }),
-      ])
-
+      // Save in a deterministic order. The settings PATCH already mirrors
+      // volume factors into both the connection hash and `connection_settings`,
+      // so issuing a parallel `/volume` write here created a race between two
+      // change envelopes and occasionally hot-reloaded stale values.
+      const settingsRes = await fetch(`/api/settings/connections/${connectionId}/settings`, {
+        method:  "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(payload),
+      })
       if (!settingsRes.ok) throw new Error("Settings save failed")
-      if (!indRes.ok)      throw new Error("Indications save failed")
+
+      const indRes = await fetch(`/api/settings/connections/${connectionId}/active-indications`, {
+        method:  "PUT",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ channels: { main: indMain, preset: indPreset } }),
+      })
+      if (!indRes.ok) throw new Error("Indications save failed")
 
       // Re-read active_symbols from the updated settings response so the
       // toast can show what the engine will actually run next cycle.
@@ -606,7 +606,17 @@ export function ConnectionSettingsDialog({
       } catch { /* non-fatal — description falls back to connection name */ }
 
       toast.success("Settings saved", { description: resolvedDesc })
-      window.dispatchEvent(new CustomEvent("connection-settings-updated", { detail: { connectionId } }))
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", {
+        detail: {
+          connectionId,
+          settings: {
+            ...payload,
+            live_volume_factor: overview.volumeFactorLive,
+            preset_volume_factor: overview.volumeFactorPreset,
+            volume_step_ratio: overview.volumeStepRatio,
+          },
+        },
+      }))
       onOpenChange(false)
     } catch (err) {
       console.error("[v0] [Settings Dialog] save error:", err)
@@ -748,7 +758,7 @@ export function ConnectionSettingsDialog({
                 Update Settings — {connectionName}
               </DialogTitle>
               <DialogDescription className="text-xs">
-                Configure volumes, symbols, indications and strategies for this connection.
+                Configure live execution, volumes, symbols, indications and strategies for this connection.
               </DialogDescription>
             </div>
             <Badge variant="outline" className="text-[10px] uppercase">
@@ -759,9 +769,12 @@ export function ConnectionSettingsDialog({
 
         {/* Top Tabs */}
         <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="flex-1 flex flex-col overflow-hidden min-h-0">
-          <TabsList className="mx-5 mt-3 grid grid-cols-4 h-9 shrink-0 z-10">
+          <TabsList className="mx-5 mt-3 grid grid-cols-5 h-9 shrink-0 z-10">
             <TabsTrigger value="overview" className="text-xs gap-1.5">
               <Activity className="h-3.5 w-3.5" /> Overview
+            </TabsTrigger>
+            <TabsTrigger value="live" className="text-xs gap-1.5">
+              <Flame className="h-3.5 w-3.5" /> Live
             </TabsTrigger>
             <TabsTrigger value="symbols" className="text-xs gap-1.5">
               <Database className="h-3.5 w-3.5" /> Symbols
@@ -1003,6 +1016,10 @@ export function ConnectionSettingsDialog({
                     value={overview.volumeFactorPreset}
                     onChange={(v) => setOverview(p => ({ ...p, volumeFactorPreset: v }))}
                   />
+                  <VolumeStepSlider
+                    value={overview.volumeStepRatio}
+                    onChange={(v) => setOverview(p => ({ ...p, volumeStepRatio: v }))}
+                  />
 
                   <Separator className="my-4" />
                   <SectionHeading icon={ListFilter} title="Position Mode" subtitle="Margin and volume denomination applied to all orders." />
@@ -1107,6 +1124,197 @@ export function ConnectionSettingsDialog({
                       checked={overview.useSystemCloseOnly}
                       onCheckedChange={(checked) => setOverview(p => ({ ...p, useSystemCloseOnly: checked }))}
                     />
+                  </div>
+                </TabsContent>
+
+                {/* LIVE ─────────────────────────────────────────── */}
+                <TabsContent value="live" className="mt-0 space-y-5">
+                  <div className="relative overflow-hidden rounded-xl border border-emerald-500/30 bg-gradient-to-br from-emerald-500/10 via-background to-cyan-500/10 p-4">
+                    <div className="absolute right-0 top-0 h-24 w-24 rounded-full bg-emerald-500/10 blur-2xl" />
+                    <div className="relative flex items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/15">
+                            <Flame className="h-4 w-4 text-emerald-500" />
+                          </div>
+                          <div>
+                            <div className="text-sm font-semibold">Live Exchange Execution</div>
+                            <div className="text-[11px] text-muted-foreground">Venue sizing, leverage caps, order protection and live-stage limits.</div>
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5 pt-2">
+                          <Badge variant="outline" className="text-[10px] uppercase">{exchangeKey}</Badge>
+                          <Badge variant="secondary" className="text-[10px]">{overview.marginMode} margin</Badge>
+                          <Badge variant="secondary" className="text-[10px]">{overview.positionMode.replace("_", " ")}</Badge>
+                          <Badge variant="secondary" className="text-[10px]">{activeSymbols.length || symbolsCfg.symbolCount} symbols</Badge>
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-emerald-500/20 bg-background/70 px-3 py-2 text-right shadow-sm">
+                        <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Reload mode</div>
+                        <div className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">Hot reload, no restart</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded-xl border bg-card p-4 space-y-4">
+                      <SectionHeading icon={ArrowDownUp} title="Sizing & Balance Caps" subtitle="Live notional and balance-step recalculation controls." />
+                      <VolumeSlider
+                        label="Live Volume Factor"
+                        description="Multiplier used only for exchange live orders."
+                        value={overview.volumeFactorLive}
+                        onChange={(v) => setOverview(p => ({ ...p, volumeFactorLive: v }))}
+                      />
+                      <VolumeStepSlider
+                        value={overview.volumeStepRatio}
+                        onChange={(v) => setOverview(p => ({ ...p, volumeStepRatio: v }))}
+                      />
+                      <div className="space-y-1.5 rounded-lg border border-dashed p-3">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <Label className="text-xs">Live Symbol Cap</Label>
+                            <div className="text-[10px] text-muted-foreground">Maximum exchange symbols this connection can run after save.</div>
+                          </div>
+                          <span className="text-xs font-mono tabular-nums">{symbolsCfg.symbolCount}</span>
+                        </div>
+                        <Slider
+                          min={1} max={32} step={1}
+                          value={[symbolsCfg.symbolCount]}
+                          onValueChange={([v]) => setSymbolsCfg(p => ({ ...p, symbolCount: v }))}
+                          className="py-1"
+                        />
+                        <div className="flex justify-between text-[10px] text-muted-foreground"><span>1</span><span>32 max</span></div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border bg-card p-4 space-y-4">
+                      <SectionHeading icon={ListFilter} title="Exchange Mode" subtitle="Venue mode applied to live orders without restarting the engine." />
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="space-y-1.5">
+                          <Label className="text-xs">Margin Mode</Label>
+                          <Select value={overview.marginMode} onValueChange={(v) => setOverview(p => ({ ...p, marginMode: v as "cross" | "isolated" }))}>
+                            <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="cross">Cross Margin</SelectItem>
+                              <SelectItem value="isolated">Isolated Margin</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="space-y-1.5">
+                          <Label className="text-xs">Position Mode</Label>
+                          <Select value={overview.positionMode} onValueChange={(v) => setOverview(p => ({ ...p, positionMode: v as "one_way" | "hedge" }))}>
+                            <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="one_way">One-way</SelectItem>
+                              <SelectItem value="hedge">Hedge</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="space-y-1.5 col-span-2">
+                          <Label className="text-xs">Volume Type</Label>
+                          <Select value={overview.volumeType} onValueChange={(v) => setOverview(p => ({ ...p, volumeType: v as "usdt" | "contract" | "spot" }))}>
+                            <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="usdt">USDT-M Linear</SelectItem>
+                              <SelectItem value="contract">Coin-M Inverse</SelectItem>
+                              <SelectItem value="spot">Spot</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2 rounded-lg border border-primary/20 bg-primary/5 p-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <Label className="text-xs">Use Exchange Max Leverage</Label>
+                            <div className="text-[10px] text-muted-foreground">When enabled, live orders use the exchange max; otherwise the percentage cap below is applied.</div>
+                          </div>
+                          <Switch checked={overview.useMaximalLeverage} onCheckedChange={(v) => setOverview(p => ({ ...p, useMaximalLeverage: v }))} />
+                        </div>
+                        <div className={`space-y-1 ${overview.useMaximalLeverage ? "opacity-50" : ""}`}>
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Leverage Cap</Label>
+                            <span className="text-xs font-mono">{overview.useMaximalLeverage ? "MAX" : `${overview.leveragePercentage}%`}</span>
+                          </div>
+                          <Slider
+                            min={1} max={100} step={1}
+                            value={[overview.leveragePercentage]}
+                            onValueChange={([v]) => setOverview(p => ({ ...p, leveragePercentage: v }))}
+                            disabled={overview.useMaximalLeverage}
+                            className="py-1"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded-xl border bg-card p-4 space-y-4">
+                      <SectionHeading icon={Zap} title="Protection & Close Logic" subtitle="Choose exchange control orders or engine-side system close." />
+                      <div className={`rounded-lg border p-3 transition-colors ${overview.useSystemCloseOnly ? "border-amber-500/40 bg-amber-500/10" : "border-emerald-500/30 bg-emerald-500/10"}`}>
+                        <div className="flex items-start justify-between gap-4">
+                          <div className="space-y-1">
+                            <Label className="text-xs font-semibold">System Close Only</Label>
+                            <div className="text-[11px] leading-relaxed text-muted-foreground">
+                              {overview.useSystemCloseOnly
+                                ? "Exchange SL/TP control orders are not placed; reconcile/sync ticks close by market reduce-only when the band is crossed."
+                                : "Reduce-only SL/TP control orders are placed on the venue and verified by reconcile/sync ticks."}
+                            </div>
+                          </div>
+                          <Switch checked={overview.useSystemCloseOnly} onCheckedChange={(checked) => setOverview(p => ({ ...p, useSystemCloseOnly: checked }))} />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 text-[11px]">
+                        <div className="rounded-md border bg-muted/30 p-2"><div className="text-muted-foreground">Control orders</div><div className="font-semibold">{overview.useSystemCloseOnly ? "Disabled" : "Enabled"}</div></div>
+                        <div className="rounded-md border bg-muted/30 p-2"><div className="text-muted-foreground">Close verification</div><div className="font-semibold">Every sync tick</div></div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border bg-card p-4 space-y-4">
+                      <SectionHeading icon={TrendingUp} title="Real → Live Limits" subtitle="Exchange promotion gates used by the live pipeline." />
+                      <div className="space-y-3">
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Live Min Profit Factor</Label>
+                            <span className="text-xs font-mono">{stratMain.real.min_profit_factor.toFixed(1)}</span>
+                          </div>
+                          <Slider
+                            min={0.1} max={3} step={0.1}
+                            value={[stratMain.real.min_profit_factor]}
+                            onValueChange={([v]) => setStratMain(p => ({ ...p, real: { ...p.real, min_profit_factor: Number(v.toFixed(1)) } }))}
+                            className="py-1"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Max Drawdown Time</Label>
+                            <span className="text-xs font-mono">{stratMain.real.max_drawdown_time}m</span>
+                          </div>
+                          <Slider
+                            min={20} max={1440} step={20}
+                            value={[stratMain.real.max_drawdown_time]}
+                            onValueChange={([v]) => setStratMain(p => ({ ...p, real: { ...p.real, max_drawdown_time: v } }))}
+                            className="py-1"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Live Position Cap</Label>
+                            <span className="text-xs font-mono">{stratMain.real.max_positions}</span>
+                          </div>
+                          <Slider
+                            min={1} max={10000} step={100}
+                            value={[stratMain.real.max_positions]}
+                            onValueChange={([v]) => setStratMain(p => ({ ...p, real: { ...p.real, max_positions: v } }))}
+                            className="py-1"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-cyan-500/25 bg-cyan-500/5 p-3 text-[11px] leading-relaxed text-muted-foreground">
+                    <span className="font-medium text-foreground">Stable save behavior:</span> Live settings are written to the connection hash, mirrored into connection settings, then delivered as hot-reload events. Running live positions keep their engine process while sizing, symbols, leverage and protection options refresh for the next cycle.
                   </div>
                 </TabsContent>
 
@@ -1459,6 +1667,31 @@ function VolumeSlider({
       />
       <div className="flex justify-between text-[10px] text-muted-foreground">
         <span>0.1×</span><span>1.0×</span><span>5.0×</span>
+      </div>
+    </div>
+  )
+}
+
+function VolumeStepSlider({
+  value, onChange,
+}: { value: number; onChange: (v: number) => void }) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <div>
+          <Label className="text-xs">Volume Step Ratio</Label>
+          <div className="text-[10px] text-muted-foreground">Recalculate volume after balance crosses the next profit step; drawdowns reset immediately.</div>
+        </div>
+        <span className="text-xs font-mono tabular-nums w-16 text-right">{value.toFixed(1)}×</span>
+      </div>
+      <Slider
+        min={MIN_VOLUME_STEP_RATIO} max={MAX_VOLUME_STEP_RATIO} step={0.2}
+        value={[value]}
+        onValueChange={([v]) => onChange(v)}
+        className="py-1"
+      />
+      <div className="flex justify-between text-[10px] text-muted-foreground">
+        <span>0.2</span><span>0.6 default</span><span>1.8</span>
       </div>
     </div>
   )

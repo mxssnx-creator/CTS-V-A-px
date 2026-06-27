@@ -333,6 +333,7 @@ function createRealPosition(
     rewardTarget: rewardDistance,
     stopLoss,
     takeProfit,
+    netEffectivePF: rewardDistance / Math.max(stopDistance, Number.EPSILON),
     mainPositionCount: mainPos.basePositionCount,
     // Populated by caller (evaluateToRealPositions) — never 0 at rest.
     evaluationScore: ratios.evaluationScore,
@@ -350,7 +351,7 @@ function createRealPosition(
     // and size multiplier so the live executor applies correct position sizing.
     // 
     // Strategy types:
-    //   - "standard": Position-count based (axis sets, default/trailing/pause)
+    //   - "standard": Position-count based (axis sets, default/trailing)
     //     Qty applies continuousCount scaling in Live stage
     //   - "adjust": Adjustment strategies (Block/DCA)
     //     Qty applies baseMultiplier (volume-ratio scaled) directly

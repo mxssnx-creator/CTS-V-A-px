@@ -19,6 +19,24 @@ import { validateDatabase } from "@/lib/database-validator"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { consolidateDatabase } from "@/lib/database-consolidation"
 
+function getPositionConnectionId(pos: any): string {
+  return String(pos?.connectionId ?? pos?.connection_id ?? "").trim()
+}
+
+function hasSystemAndConnectionTracking(pos: any): boolean {
+  const connectionId = getPositionConnectionId(pos)
+  if (!connectionId) return false
+
+  const systemTrackingId = String(pos?.system_tracking_id ?? pos?.systemTrackingId ?? "").trim()
+  const connectionTrackingId = String(pos?.connection_tracking_id ?? pos?.connectionTrackingId ?? "").trim()
+
+  return (
+    systemTrackingId.startsWith(`sys-${connectionId}-`) &&
+    systemTrackingId.length > `sys-${connectionId}-`.length &&
+    connectionTrackingId === `conn-${connectionId}`
+  )
+}
+
 /**
  * Scan all live:position:* keys and close any that are still "open"
  * but have exceeded their max hold time. This catches positions that
@@ -54,6 +72,12 @@ async function reconcileStrandedPositions() {
         if (!raw) continue
         const pos = JSON.parse(raw as string)
         if (pos.status !== "open") continue
+        if (!hasSystemAndConnectionTracking(pos)) {
+          // Never mutate manually-created or foreign exchange positions during
+          // startup reconciliation. Only positions carrying both the system
+          // tracking id and the connection tracking id are owned by this app.
+          continue
+        }
         found++
 
         const age = now - (pos.openedAt || pos.createdAt || 0)

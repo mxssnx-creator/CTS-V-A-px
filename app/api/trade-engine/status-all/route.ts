@@ -22,6 +22,50 @@ function parseSymbols(value: unknown): string[] {
   return []
 }
 
+async function stripConsumedRuntimeFlags(
+  client: ReturnType<typeof getRedisClient>,
+  connectionId: string,
+  status: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const pending = (await client.hgetall(`settings:settings_change:${connectionId}`).catch(() => ({}))) as Record<string, string>
+  if (pending && typeof pending.connectionId === "string" && pending.connectionId.length > 0) return status
+
+  const cleaned = { ...status }
+  delete cleaned.restart_required
+  delete cleaned.restart_reason
+  delete cleaned.restart_requested_at
+  delete cleaned.reload_required
+  delete cleaned.reload_fields
+  delete cleaned.reload_requested_at
+
+  await Promise.all([
+    client
+      .hdel(
+        `settings:trade_engine_state:${connectionId}`,
+        "restart_required",
+        "restart_reason",
+        "restart_requested_at",
+        "reload_required",
+        "reload_fields",
+        "reload_requested_at",
+      )
+      .catch(() => 0),
+    client
+      .hdel(
+        `trade_engine_state:${connectionId}`,
+        "restart_required",
+        "restart_reason",
+        "restart_requested_at",
+        "reload_required",
+        "reload_fields",
+        "reload_requested_at",
+      )
+      .catch(() => 0),
+  ])
+
+  return cleaned
+}
+
 export const dynamic = "force-dynamic"
 export async function GET() {
   try {
@@ -74,11 +118,11 @@ export async function GET() {
           const configuredSymbols = parseSymbols(conn.active_symbols || conn.symbols)
           const statusSymbols = parseSymbols(status?.symbols || status?.active_symbols)
           const effectiveSymbols = configuredSymbols.length > 0 ? configuredSymbols : statusSymbols
-          const engineStatus = {
-            ...(status ?? {
+          const rawEngineStatus = {
+            ...((status ?? {
               status: globallyPaused ? "paused" : (isRunning ? "running" : "stopped"),
               source: "trade_engine:global",
-            }),
+            }) as Record<string, unknown>),
             ...(effectiveSymbols.length > 0
               ? {
                   symbols: effectiveSymbols,
@@ -87,6 +131,7 @@ export async function GET() {
                 }
               : {}),
           }
+          const engineStatus = await stripConsumedRuntimeFlags(client, conn.id, rawEngineStatus)
 
           return {
             connectionId: conn.id,

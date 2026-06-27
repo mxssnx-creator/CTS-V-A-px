@@ -18,9 +18,10 @@ export async function GET() {
       return NextResponse.json({
         ...report,
         status: "degraded",
+        alive: true,
         redis: "unhealthy",
-        message: "Redis connection is not healthy",
-      }, { status: 503 })
+        message: "Redis connection is not healthy; readiness is degraded but the web process is alive",
+      }, { status: 200 })
     }
 
     console.log("[HEALTH] Redis health check passed")
@@ -73,14 +74,19 @@ export async function GET() {
 
     console.log("[HEALTH] Full health check completed successfully")
     
-    const statusCode = report.status === 'healthy' ? 200 : report.status === 'degraded' ? 202 : 503
-    return NextResponse.json(response, { status: statusCode })
+    // Deployment platforms (Kilo/OpenNext, Docker, and Vercel previews) use
+    // this route as a process liveness probe. Do not fail the deployment
+    // because Redis/exchange readiness is temporarily degraded during cold
+    // start; strict dependency readiness is available at /api/health/readiness.
+    return NextResponse.json(response, { status: 200 })
   } catch (error) {
     console.error("[HEALTH] Health check failed:", error)
     return NextResponse.json({
-      status: "unhealthy",
+      status: "degraded",
+      alive: true,
       redis: "error",
       error: error instanceof Error ? error.message : "Unknown error",
-    }, { status: 503 })
+      message: "Health diagnostics failed, but the web process is alive",
+    }, { status: 200 })
   }
 }
