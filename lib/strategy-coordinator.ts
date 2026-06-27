@@ -5053,7 +5053,6 @@ export class StrategyCoordinator {
    */
   private variantFingerprint(
     baseSet: StrategySet,
-    variant: "default" | "trailing" | "block" | "dca",
     variant: "default" | "trailing" | "block" | "dca" | "pause",
     ctx: PositionContext,
   ): string {
