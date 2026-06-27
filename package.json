@@ -21,6 +21,8 @@
     "deploy:prod": "vercel --prod",
     "prebuild": "node scripts/verify-source-syntax.mjs && rm -rf .next",
     "prevercel-build": "node scripts/verify-source-syntax.mjs && rm -rf .next"
+    "prebuild": "rm -rf .next",
+    "prevercel-build": "rm -rf .next"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -99,5 +101,6 @@
   },
   "engines": {
     "node": ">=20 <23"
+    "node": "20.x"
   }
 }

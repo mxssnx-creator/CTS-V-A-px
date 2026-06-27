@@ -705,6 +705,7 @@ export async function PATCH(
       scalarChanged("is_testnet", (connection as Record<string, unknown>).is_testnet, (updated as Record<string, unknown>).is_testnet) ||
       scalarChanged("is_preset_trade", (connection as Record<string, unknown>).is_preset_trade, (updated as Record<string, unknown>).is_preset_trade) ||
       scalarChanged("connection_method", (connection as Record<string, unknown>).connection_method, (updated as Record<string, unknown>).connection_method)
+    let progressionRestartHandled = false
     if (symbolsModeChanged) {
       try {
         const recoordination = await ProgressionStateManager.recoordinateForActualOne(id)
