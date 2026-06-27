@@ -50,6 +50,7 @@ USER nextjs
 EXPOSE 3002
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT:-3002}/api/health/liveness" >/dev/null || exit 1
   CMD curl -fsS "http://127.0.0.1:${PORT:-3002}/api/health" >/dev/null || exit 1
 
 CMD ["sh", "-c", "npx next start -p ${PORT:-3002}"]

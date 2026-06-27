@@ -42,6 +42,7 @@
       "schedule": "* * * * *"
       "schedule": "* * * * *"
       "schedule": "* * * * *"
+      "schedule": "* * * * *"
     },
     {
       "path": "/api/cron/sync-live-positions",
