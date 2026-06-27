@@ -2879,6 +2879,79 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "52")
     },
   },
+  {
+    // Dual-connection always-inited bootstrap.
+    //
+    // bybit-x03 was previously in legacyIds (deleted every boot) and absent
+    // from BASE_CONNECTION_CONFIG, so it never appeared in the dashboard.
+    // Now it is a canonical base connection again (session 4) but existing
+    // Redis snapshots still have the stale/deleted hash. This migration:
+    //
+    //   1. Deletes the stale bybit-x03 hashes entirely so ensureBaseConnections
+    //      (which runs every boot AFTER migrations) re-seeds it from scratch
+    //      with the correct autoActive=true defaults (is_active_inserted=1,
+    //      is_dashboard_inserted=1, is_enabled_dashboard=0).
+    //
+    //   2. Ensures bingx-x01 is_active_inserted=1 / is_dashboard_inserted=1
+    //      so it appears in the Active panel (it was somehow stripped to
+    //      active_inserted=False in the prior snapshot).
+    //
+    //   3. Re-confirms is_live_trade=1 / live_trade_enabled=1 on bingx-x01
+    //      in case migration 042 LEGACY_DEFAULT_VALUES zeroed it and 051/052
+    //      didn't fully recover it due to ordering.
+    //
+    //   4. Removes bybit-x03 from the connections:tombstoned set (if present)
+    //      so ensureBaseConnections doesn't skip it.
+    version: 54,
+    name: "054-dual-connection-always-inited",
+    up: async (client: any) => {
+      // ── 1. Remove bybit-x03 from tombstone so ensureBaseConnections seeds it ──
+      await client.srem("connections:tombstoned", "bybit-x03").catch(() => 0)
+
+      // ── 2. Wipe stale bybit-x03 hashes so ensureBaseConnections does a clean
+      //       first-time seed. The operator-state-preservation contract in
+      //       ensureBaseConnections only applies to EXISTING rows; a fresh
+      //       seed applies the full canonical defaults including autoActive flags.
+      const bybitHashes = [
+        "connection:bybit-x03",
+        "settings:trade_engine_state:bybit-x03",
+        "settings:connection_settings:bybit-x03",
+      ]
+      for (const h of bybitHashes) {
+        await client.del(h).catch(() => 0)
+      }
+
+      // ── 3. Ensure bingx-x01 is active-inserted (visible in Active panel) ──
+      //       and has is_live_trade=1. Use conditional hset: only write flags
+      //       that are currently absent or wrong. This preserves any other
+      //       operator customisations on the hash.
+      const bingxConn = await client.hgetall("connection:bingx-x01").catch(() => ({})) as Record<string,string>
+      const bingxFixes: Record<string, string> = {}
+      if (!bingxConn?.is_active_inserted || bingxConn.is_active_inserted === "0") {
+        bingxFixes.is_active_inserted    = "1"
+      }
+      if (!bingxConn?.is_dashboard_inserted || bingxConn.is_dashboard_inserted === "0") {
+        bingxFixes.is_dashboard_inserted = "1"
+      }
+      if (!bingxConn?.is_inserted || bingxConn.is_inserted === "0") {
+        bingxFixes.is_inserted = "1"
+      }
+      if (!bingxConn?.is_live_trade || bingxConn.is_live_trade === "0" || bingxConn.is_live_trade === "false") {
+        bingxFixes.is_live_trade       = "1"
+        bingxFixes.live_trade_enabled  = "1"
+      }
+      if (Object.keys(bingxFixes).length > 0) {
+        await client.hset("connection:bingx-x01", bingxFixes).catch(() => 0)
+        await client.hset("settings:trade_engine_state:bingx-x01", bingxFixes).catch(() => 0)
+        await client.hset("settings:connection_settings:bingx-x01", bingxFixes).catch(() => 0)
+      }
+
+      console.log("[v0] Migration 054: dual-connection bootstrap — bybit-x03 wiped for fresh seed, bingx-x01 flags ensured")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "53")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
