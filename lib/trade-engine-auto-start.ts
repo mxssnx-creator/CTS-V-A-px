@@ -14,6 +14,7 @@ import { isConnectionEligibleForEngine, isTruthyFlag } from "./connection-state-
 
 let autoStartInitialized = false
 let autoStartTimer: NodeJS.Timeout | null = null
+let autoStartInitPromise: Promise<void> | null = null
 
 export function isAutoStartInitialized(): boolean {
   return autoStartInitialized
@@ -32,6 +33,17 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
     return
   }
 
+  if (autoStartInitPromise) {
+    return autoStartInitPromise
+  }
+
+  autoStartInitPromise = initializeTradeEngineAutoStartInternal().finally(() => {
+    autoStartInitPromise = null
+  })
+  return autoStartInitPromise
+}
+
+async function initializeTradeEngineAutoStartInternal(): Promise<void> {
   try {
     console.log("[v0] [Auto-Start] Starting trade engine auto-initialization (sync mode)...")
 
@@ -59,8 +71,13 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
     startConnectionMonitoring()
   } catch (error) {
     console.error("[v0] [Auto-Start] Initialization failed:", error)
-    autoStartInitialized = true
-    startConnectionMonitoring()
+    // Do not mark auto-start as initialized after a failed boot. In production
+    // cron/serverless mode there may be no durable in-process timer after this
+    // request returns; caching a failed init as "ready" makes every later
+    // continuity tick skip the real Redis/migration/engine initialization work.
+    // Keep the state retryable and surface the failure to the caller.
+    autoStartInitialized = false
+    throw error
   }
 }
 

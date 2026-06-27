@@ -412,7 +412,6 @@ export class InlineLocalRedis {
     // in dev — even if totalKeys is low — because the OOM-causing families
     // (strategies: lists, indication: strings, pseudo_position: hashes) can hold
     // 20+ MB each while only occupying a few hundred key slots.
-    try {
       try {
         if (process.env.NODE_ENV === "development") {
           let flushed = 0
@@ -722,20 +721,26 @@ export class InlineLocalRedis {
 
     // Caps indexed by bucket name (shared between hash and string passes)
     const CAPS: Record<string, number> = {
-      pseudo_position:     isDev ? 0 : 2000,
-      s_pseudo_position:   isDev ? 0 : 1500,  // settings:pseudo_position
-      strategies:          isDev ? 0 : 100,
-      s_strategies:        isDev ? 5 : 20,    // settings:strategies
+      // Dev used to evict several active calculation families down to zero.
+      // That protected the heap, but it also made the running engine lose the
+      // very data it needs for dashboard progress, strategy evaluation, and
+      // follow-up real/live decisions. Keep a bounded active window instead:
+      // small enough for the in-memory Redis emulator, large enough for the
+      // current quickstart fan-out to remain observable and evaluable.
+      pseudo_position:     isDev ? 500 : 2000,
+      s_pseudo_position:   isDev ? 500 : 1500,  // settings:pseudo_position
+      strategies:          isDev ? 250 : 100,
+      s_strategies:        isDev ? 100 : 20,    // settings:strategies
       config_set:          isDev ? 200 : 1500,
       strategy_positions:  isDev ? 100 : 1000,
       strategy_detail:     isDev ? 100 : 1000,
       real_stage:          isDev ? 100 : 1000,
-      indication:          isDev ? 0 : 500,
-      indications:         isDev ? 0 : 100,
+      indication:          isDev ? 500 : 500,
+      indications:         isDev ? 100 : 100,
       prehistoric:         20,
       live_history:        isDev ? 100 : 500,
       // string-only
-      indications_str:     isDev ? 0 : 50,
+      indications_str:     50,
       dedup:               isDev ? 500 : 3000,
       candle_cache:        20,
       candles:             20,
@@ -908,6 +913,14 @@ export class InlineLocalRedis {
     this.trackOperation()
     if (this.isExpired(key)) return null
     return this.data.strings.get(key) ?? null
+  }
+
+  async mget(...keys: string[]): Promise<Array<string | null>> {
+    this.trackOperation()
+    return keys.map((key) => {
+      if (this.isExpired(key)) return null
+      return this.data.strings.get(key) ?? null
+    })
   }
 
   /**
@@ -1758,8 +1771,6 @@ export async function initRedis(): Promise<void> {
       // responsive. The underlying migration may still resolve later, but
       // the server is unblocked. The migration runner also has its own
       // per-migration 30-second deadline for individual migrations.
-      const { runMigrations, resetMigrationRunState } = await import("@/lib/redis-migrations")
-      const MIGRATIONS_DEADLINE_MS = 90_000
       try {
         await Promise.race([
           runMigrations(),
@@ -1789,12 +1800,13 @@ export async function initRedis(): Promise<void> {
   try {
     await globalForRedis.__redis_init_promise
   } catch (error) {
-    // Boot must never crash the runtime. Log, reset retry state, and let the
-    // next caller re-attempt the full sequence (a transient migration failure
-    // should not permanently disable migrations for the whole process, which
-    // is exactly what the previous `migrationsRan = true`-on-failure did).
+    // Runtime must never continue on a partially migrated schema. Log, reset
+    // retry state, and propagate the failure so the current route/startup path
+    // does not serve stale or missing progression containers. The next caller
+    // gets a fresh attempt because the shared promise is cleared below.
     console.error("[v0] [Redis] initialization error (will retry on next call):", error)
     migrationsRan = false
+    throw error
   } finally {
     // Clear the shared promise unless we fully succeeded, so retries get a
     // fresh run. Once isConnected is true the top-of-function guard short-
@@ -2410,9 +2422,13 @@ export async function savePosition(position: any): Promise<void> {
 	      const trackingIds = new Set<string>()
 	      for (const candidate of [
 	        position.trackingId,
+	        position.system_tracking_id,
+	        position.connection_tracking_id,
 	        position.exchangeTrackingId,
 	        position.clientOrderId,
 	        exchangeData.trackingId,
+	        exchangeData.system_tracking_id,
+	        exchangeData.connection_tracking_id,
 	        exchangeData.exchangeTrackingId,
 	        exchangeData.clientOrderId,
 	      ]) {

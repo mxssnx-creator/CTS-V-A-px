@@ -1,3 +1,4 @@
+import { DEFAULT_VOLUME_STEP_RATIO } from "@/lib/constants"
 import { Settings } from "./types"
 import { toast } from "@/lib/simple-toast"
 
@@ -15,6 +16,7 @@ export const EXCHANGE_MAX_POSITIONS: Record<string, number> = {
 export const initialSettings: Settings = {
   // Overall / Main
   base_volume_factor: 1.0,
+  volume_step_ratio: DEFAULT_VOLUME_STEP_RATIO,
   // Default raised 50 → 300 so per-position USD shrinks by 6× and lots
   // more concurrent positions fit inside a tiny live balance. The
   // universal $5 minimum-notional floor in VolumeCalculator still

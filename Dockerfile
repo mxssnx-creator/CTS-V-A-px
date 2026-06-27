@@ -1,43 +1,55 @@
-FROM node:18-alpine
+FROM node:20-alpine AS builder
 
-# Install dependencies for native modules
+# Install dependencies required by native/optional packages during install/build.
 RUN apk add --no-cache curl libc6-compat python3 make g++
 
 WORKDIR /app
 
-# Copy package files
+# Copy dependency manifests first so Docker/Kilo layer caching remains effective.
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production && npm cache clean --force
+# Build requires devDependencies (TypeScript, Tailwind/PostCSS, ESLint/Next build tooling).
+RUN npm ci --legacy-peer-deps --no-audit --no-fund
 
-# Copy application code
 COPY . .
 
-# Build the application
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    NODE_OPTIONS="--max-old-space-size=4096 --max-semi-space-size=128"
+
 RUN npm run build
 
-# Create non-root user
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
+# Keep the final image lean after the production build is produced.
+RUN npm prune --omit=dev --legacy-peer-deps && npm cache clean --force
 
-# Set permissions
-RUN chown -R nextjs:nodejs /app
+FROM node:20-alpine AS runner
+
+RUN apk add --no-cache curl libc6-compat
+
+WORKDIR /app
+
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3002 \
+    NODE_OPTIONS="--max-old-space-size=4096 --max-semi-space-size=128"
+
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/next.config.mjs ./next.config.mjs
+COPY --from=builder /app/data ./data
+
+RUN mkdir -p data/redis && \
+    addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs && \
+    chown -R nextjs:nodejs /app
+
 USER nextjs
 
-# Expose port
-EXPOSE 3001
+EXPOSE 3002
 
-# Set environment
-ENV NODE_ENV=production
-ENV PORT=3001
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT:-3002}/api/health/liveness" >/dev/null || exit 1
 
-# Production coordination memory hint (completeStartup + auto-start self-heal for bingx-x01)
-ENV NODE_OPTIONS="--max-old-space-size=4096"
-
-# Health check (includes engine coordination status)
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:3001/api/health && curl -f http://localhost:3001/api/trade-engine/status || exit 1
-
-# Start the application
-CMD ["npm", "start"]
+CMD ["sh", "-c", "npx next start -p ${PORT:-3002}"]
