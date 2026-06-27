@@ -19,6 +19,8 @@
     "post-deploy-verify": "bash scripts/post-deploy-verify.sh",
     "deploy:local": "vercel",
     "deploy:prod": "vercel --prod",
+    "prebuild": "node scripts/verify-source-syntax.mjs && rm -rf .next",
+    "prevercel-build": "node scripts/verify-source-syntax.mjs && rm -rf .next"
     "prebuild": "rm -rf .next",
     "prevercel-build": "rm -rf .next"
   },

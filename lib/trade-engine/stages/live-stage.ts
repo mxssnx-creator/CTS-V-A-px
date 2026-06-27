@@ -44,6 +44,7 @@ const LOG_PREFIX = "[v0] [LivePositionStage]"
 const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
 
 
+
 function hasLiveTradeBlock(settings: Record<string, any>): boolean {
   return String(settings.live_trade_blocked_reason || "").trim().length > 0
 }
@@ -1357,6 +1358,15 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
       : 0
 
   return { desiredSl, desiredTp }
+}
+
+/**
+ * Has the desired protection price drifted enough from the currently
+ * placed one to warrant cancelling and re-placing? We use 0.25% as the
+ * tolerance — tighter than that and we'd thrash the exchange API on
+ * every tiny rounding diff. Looser and we'd leave stale levels in place
+ * after a real strategy adjustment.
+ */
 }
 
 /**
