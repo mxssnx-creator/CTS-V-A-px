@@ -1020,6 +1020,12 @@ return {
           client.del(`prehistoric:${connectionId}`).catch(() => {}),
           client.del(`prehistoric:${connectionId}:symbols`).catch(() => {}),
           client.del(`progression:${connectionId}:prehistoric_symbols_set`).catch(() => {}),
+          // Reset realtime telemetry for the new session. The stats route reads
+          // realtime cycle/indication counts from `realtime:{id}`; without this
+          // they carried over the PREVIOUS symbol selection's cumulative totals,
+          // making the dashboard show stale "running" cycle counts even though a
+          // fresh prehistoric pass had just started for the new symbol set.
+          client.del(`realtime:${connectionId}`).catch(() => {}),
         ])
 
         try {

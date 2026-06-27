@@ -149,7 +149,7 @@ export async function recoordinateAfterSettingsChange(
       // churn when the PATCH route also recoordinates.
       const result = await ProgressionStateManager.recoordinateForActualOne(id)
       console.log(
-        `[v0] [${opts.logTag}] Symbol set changed for ${id} → recoordinated progression (changed:${result?.changed ?? "?"}, symbols:${result?.symbolCount ?? "?"})`,
+        `[v0] [${opts.logTag}] Symbol set changed for ${id} → recoordinated progression (changed:${result?.changed ?? "?"}, reason:${result?.reason ?? "?"})`,
       )
     } catch (archiveErr) {
       console.warn(
