@@ -907,7 +907,7 @@ export async function GET(
     // NOT running for this connection, treat it as stopped regardless of Redis.
     const coord = getGlobalCoordinator()
     const coordSaysRunning: boolean = coord
-      ? coord.isEngineRunning(id)
+      ? coord.isEngineRunning(connectionId)
       : false
     // If coordinator exists but says "not running", that's definitive.
     // If coordinator doesn't exist yet (null, server just booted), fall back to
@@ -2553,7 +2553,7 @@ export async function GET(
       // pipeline (see lib/trade-engine/stages/live-stage.ts). Every stage of
       // the pipeline increments one of these so the UI can show a real-time
       // picture of exchange-level activity.
-      // ── OPEN POSITIONS & ACCUMULATED VOLUME ───────���─────────────────────
+      // ── OPEN POSITIONS & ACCUMULATED VOLUME ───────������────────────────────
       // Snapshot of every "currently holding exposure" layer of the
       // mirroring pipeline. CRITICAL semantics — pseudo/real/live are
       // NOT independent pools: they represent the SAME trading signal
