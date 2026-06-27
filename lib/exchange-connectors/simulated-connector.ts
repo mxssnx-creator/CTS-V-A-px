@@ -22,10 +22,20 @@ export class SimulatedConnector extends BaseExchangeConnector {
     return { success: true, balance: 1000, balances: [{ asset: "USDT", free: 1000, locked: 0, total: 1000 }] }
   }
 
-  async placeOrder(symbol: string, side: "buy" | "sell", quantity: number): Promise<{ success: boolean; orderId?: string; filledQty?: number; filledPrice?: number; error?: string }> {
+  async placeOrder(
+    symbol: string,
+    side: "buy" | "sell",
+    quantity: number,
+    price?: number,
+    orderType?: "limit" | "market",
+    options?: any,
+  ): Promise<{ success: boolean; orderId?: string; filledQty?: number; filledPrice?: number; error?: string }> {
     const orderId = `sim-${Date.now()}-${Math.floor(Math.random() * 100000)}`
-    // Simulate immediate full fill at a synthetic price
-    const filledPrice = 1.0
+    // Use the requested price so PF calculations are based on real entry prices.
+    // Add ±0.05% slippage to simulate realistic fills.
+    const basePrice = price && price > 0 ? price : 1.0
+    const slippagePct = side === "buy" ? 1.0005 : 0.9995
+    const filledPrice = Math.round(basePrice * slippagePct * 1e8) / 1e8
     return { success: true, orderId, filledQty: quantity, filledPrice }
   }
 
@@ -54,7 +64,9 @@ export class SimulatedConnector extends BaseExchangeConnector {
   }
 
   async getPosition(symbol: string): Promise<any> {
-    return { symbol, side: "long", contracts: 0, entryPrice: 0, currentPrice: 0, markPrice: 0, leverage: 1, marginType: "cross", unrealizedPnl: 0, realizedPnl: 0, liquidationPrice: 0, timestamp: Date.now() }
+    // Return null (no open position) rather than a zeroed stub so the live
+    // reconcile path correctly treats this symbol as having no exchange position.
+    return null
   }
 
   async getPositions(): Promise<any[]> {
@@ -98,7 +110,20 @@ export class SimulatedConnector extends BaseExchangeConnector {
   }
 
   async getTicker(symbol: string): Promise<{ bid: number; ask: number; last: number } | null> {
-    return { bid: 1, ask: 1.1, last: 1 }
+    // Return approximate realistic prices per symbol so PF/PnL simulations
+    // are in the right ballpark. These are rough constants — the live engine
+    // will use actual market candles for entry prices; this is only hit by
+    // the simulated exchange when a real API call would fail.
+    const APPROX: Record<string, number> = {
+      BTCUSDT: 65000, ETHUSDT: 3500, SOLUSDT: 150, BNBUSDT: 580,
+      XRPUSDT: 0.6, AVAXUSDT: 30, DOGEUSDT: 0.15, ADAUSDT: 0.45,
+      LINKUSDT: 14, DOTUSDT: 7, LTCUSDT: 85, UNIUSDT: 8, NEARUSDT: 5,
+      ATOMUSDT: 8, POLUSDT: 0.4, AAVEUSDT: 190, SUIUSDT: 2.5,
+      ARBUSDT: 0.9, APTUSDT: 8, OPUSDT: 1.5,
+    }
+    const last = APPROX[symbol.toUpperCase()] ?? 100
+    const spread = last * 0.0002
+    return { bid: last - spread, ask: last + spread, last }
   }
 
   async getOHLCV(symbol: string, timeframe: string = "1m", limit: number = 100): Promise<Array<{timestamp: number; open: number; high: number; low: number; close: number; volume: number}> | null> {
