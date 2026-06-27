@@ -3220,6 +3220,21 @@ export class TradeEngineManager {
             // pay the per-step allocation tax.
             const setsProcessor = new IndicationSetsProcessor(connId)
 
+            // Build a rolling window of up to 300 close prices from all
+            // candles up to (and including) resumeFrom so the first replay
+            // step already has a price history. IndicationSetsProcessor's
+            // normalizePriceHistory looks for marketData.prices or
+            // marketData.candles — passing prices[] is the fastest path.
+            const PRICE_WINDOW = 300
+            const priceWindowBase: number[] = candles
+              .filter((c: any) => {
+                const ts = Number(c?.timestamp ?? c?.t ?? 0)
+                return Number.isFinite(ts) && ts <= resumeFrom
+              })
+              .slice(-PRICE_WINDOW)
+              .map((c: any) => Number(c?.close ?? c?.price ?? c?.last ?? 0))
+              .filter((p: number) => p > 0)
+
             let indicationsTotal = 0
             let strategiesTotal = 0
             let lastReplayedTs = resumeFrom
@@ -3229,6 +3244,20 @@ export class TradeEngineManager {
               const asOfMs = Number(candle?.timestamp ?? candle?.t ?? 0)
               if (!Number.isFinite(asOfMs)) continue
 
+              // Append the current candle's close to the rolling window so
+              // each step sees an up-to-date price history.
+              const closePrice = Number(candle?.close ?? candle?.price ?? candle?.last ?? 0)
+              if (closePrice > 0) priceWindowBase.push(closePrice)
+              if (priceWindowBase.length > PRICE_WINDOW) priceWindowBase.shift()
+
+              // Attach the rolling price history to the candle object so
+              // processAllIndicationSets → normalizePriceHistory finds it.
+              const candleWithPrices = {
+                ...candle,
+                prices: [...priceWindowBase],
+                priceOrder: "oldest-first",
+              }
+
               // SAME pipeline the Realtime Progression uses — single
               // source of indication + strategy logic for both modes.
               const stepResult = await runIndStratCycle(connId, symbol, "historical", {
@@ -3236,7 +3265,7 @@ export class TradeEngineManager {
                 strategy: this.strategyProcessor,
                 realtime: this.realtimeProcessor,
                 asOfMs,
-                asOfCandle: candle,
+                asOfCandle: candleWithPrices,
                 setsProcessor,
               })
               indicationsTotal += stepResult.indicationCount
