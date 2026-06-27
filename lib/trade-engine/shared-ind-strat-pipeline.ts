@@ -138,25 +138,24 @@ async function executeReadyStrategiesAsLiveOrders(
 
     if (realSets.length === 0) return
 
-    const { getConnection, createExchangeConnector } = await __ensureLiveExecExports()
+    const { getConnection } = await __ensureLiveExecExports()
     const connection = await getConnection(connectionId).catch(() => null)
     if (!connection) {
       console.warn(`[v0] [Phase4] ${symbol}: connection ${connectionId} not found — skipping live orders`)
       return
     }
-    const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
-    const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
-    if (!apiKey || !apiSecret) {
-      console.warn(`[v0] [Phase4] ${symbol}: no credentials on connection ${connectionId} — skipping live orders`)
-      return
-    }
-    const exchangeConnector = await createExchangeConnector(connection.exchange, {
-      apiKey,
-      apiSecret,
-      apiType: connection.api_type,
-      contractType: connection.contract_type,
-      isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
-    }).catch(() => null)
+    // Resolve the exchange connector via the SAME factory path Phase 3
+    // (StrategyCoordinator.createLiveSets) uses. The factory returns a real
+    // connector when API credentials are present and a SimulatedConnector when
+    // they are absent (dev / sim connections). Previously this Phase 4 path
+    // bailed whenever credentials were missing, which silently disabled the
+    // entire realtime live-dispatch loop in dev (placed=0 forever) even though
+    // is_live_trade was enabled. Mirroring Phase 3's factory keeps both paths
+    // consistent: executeLivePosition still gates on the is_live_trade flag.
+    const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
+    const exchangeConnector = await exchangeConnectorFactory
+      .getOrCreateConnector(connectionId)
+      .catch(() => null)
     if (!exchangeConnector) {
       console.warn(`[v0] [Phase4] ${symbol}: failed to create exchange connector for ${connection.exchange} — skipping`)
       return
