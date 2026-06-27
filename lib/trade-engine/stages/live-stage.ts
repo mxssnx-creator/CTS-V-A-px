@@ -47,6 +47,7 @@ const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
 
 
 
+
 function hasLiveTradeBlock(settings: Record<string, any>): boolean {
   return String(settings.live_trade_blocked_reason || "").trim().length > 0
 }
@@ -140,6 +141,10 @@ interface LivePosition {
   takeProfitLastArmedAt?: number
   assignedStopLoss?: number
   assignedTakeProfit?: number
+  realStopLossPrice?: number
+  realTakeProfitPrice?: number
+  realProfitFactor?: number
+  realProfitFactorSource?: string
   protectionArmedQuantity?: number
   // ── Trailing stop state ────────────────────────────────────────────────
   // Written by syncLiveFromPseudo when the pseudo position's trailing machine
@@ -186,6 +191,12 @@ function makeSystemTrackingId(connectionId: string): string {
   return `sys-${connectionId}-${nanoid(10)}`
 }
 
+}
+
+function makeSystemTrackingId(connectionId: string): string {
+  return `sys-${connectionId}-${nanoid(10)}`
+}
+
 function isSystemTrackedLivePosition(position: Partial<LivePosition> | any, connectionId: string): boolean {
   const systemTrackingId = String(position?.system_tracking_id ?? position?.systemTrackingId ?? "").trim()
   const connectionTrackingId = String(position?.connection_tracking_id ?? position?.connectionTrackingId ?? "").trim()
@@ -218,6 +229,56 @@ function pushStep(position: LivePosition, step: string, ok: boolean, detail: str
   } catch {
     // non-critical
   }
+}
+
+
+function resolveProtectionPercent(
+  rawValue: unknown,
+  entryPrice: number,
+  direction: "long" | "short",
+  leg: "stopLoss" | "takeProfit",
+): { percent: number; absolutePrice?: number } {
+  const value = Number(rawValue)
+  if (!Number.isFinite(value) || value <= 0) return { percent: 0 }
+
+  const entry = Number(entryPrice)
+  if (Number.isFinite(entry) && entry > 0) {
+    const isAbsoluteStop =
+      leg === "stopLoss" &&
+      ((direction === "long" && value < entry) || (direction === "short" && value > entry))
+    const isAbsoluteTakeProfit =
+      leg === "takeProfit" &&
+      ((direction === "long" && value > entry) || (direction === "short" && value < entry))
+
+    if (isAbsoluteStop || isAbsoluteTakeProfit) {
+      return { percent: Math.abs(value - entry) / entry * 100, absolutePrice: value }
+    }
+  }
+
+  return { percent: value }
+}
+
+function resolvePositiveRealProfitFactor(realPosition: RealPosition): { value: number; source: string } | null {
+  const candidates: Array<[unknown, string]> = [
+    [realPosition.netEffectivePF, "realPosition.netEffectivePF"],
+    [realPosition.ratios?.profitabilityRatio, "realPosition.ratios.profitabilityRatio"],
+  ]
+
+  const riskAmount = Number(realPosition.riskAmount)
+  const rewardTarget = Number(realPosition.rewardTarget)
+  if (Number.isFinite(riskAmount) && riskAmount > 0 && Number.isFinite(rewardTarget) && rewardTarget > 0) {
+    candidates.push([rewardTarget / riskAmount, "realPosition.rewardTarget/riskAmount"])
+  }
+
+  const stopPct = resolveProtectionPercent(realPosition.stopLoss, realPosition.entryPrice, realPosition.direction, "stopLoss").percent
+  const takePct = resolveProtectionPercent(realPosition.takeProfit, realPosition.entryPrice, realPosition.direction, "takeProfit").percent
+  if (stopPct > 0 && takePct > 0) candidates.push([takePct / stopPct, "realPosition.takeProfit/stopLoss"])
+
+  for (const [raw, source] of candidates) {
+    const value = Number(raw)
+    if (Number.isFinite(value) && value > 0) return { value, source }
+  }
+  return null
 }
 
 function normalizeStopLossPercent(rawStopLoss: unknown): { value: number; adjusted: boolean; reason?: string } {
@@ -1366,6 +1427,8 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
 
 }
 
+}
+
 /**
  * Has the desired protection price drifted enough from the currently
  * placed one to warrant cancelling and re-placing? We use 0.25% as the
@@ -1914,6 +1977,19 @@ export async function executeLivePosition(
   await initRedis()
   const client = getRedisClient()
   const connectionTrackingId = makeConnectionTrackingId(connectionId)
+  const stopLossProtection = resolveProtectionPercent(
+    realPosition.stopLoss,
+    realPosition.entryPrice,
+    realPosition.direction,
+    "stopLoss",
+  )
+  const takeProfitProtection = resolveProtectionPercent(
+    realPosition.takeProfit,
+    realPosition.entryPrice,
+    realPosition.direction,
+    "takeProfit",
+  )
+  const positiveRealPf = resolvePositiveRealProfitFactor(realPosition)
 
   // ── Exchange circuit-breaker gate (per-symbol) ───────────────────────
   // BingX code 109400 — "API orders temporarily disabled due to market
@@ -1936,6 +2012,14 @@ export async function executeLivePosition(
       volumeUsd: 0,
       leverage: realPosition.leverage,
       marginType: "cross",
+      stopLoss: normalizeStopLossPercent(stopLossProtection.percent).value,
+      takeProfit: takeProfitProtection.percent,
+      assignedStopLoss: normalizeStopLossPercent(stopLossProtection.percent).value,
+      assignedTakeProfit: takeProfitProtection.percent,
+      realStopLossPrice: stopLossProtection.absolutePrice,
+      realTakeProfitPrice: takeProfitProtection.absolutePrice,
+      realProfitFactor: positiveRealPf?.value,
+      realProfitFactorSource: positiveRealPf?.source,
       stopLoss: realPosition.stopLoss,
       takeProfit: realPosition.takeProfit,
       assignedStopLoss: realPosition.stopLoss,
@@ -1993,6 +2077,16 @@ export async function executeLivePosition(
       volumeUsd: 0,
       leverage: realPosition.leverage,
       marginType: "cross",
+      stopLoss: normalizeStopLossPercent(stopLossProtection.percent).value,
+      takeProfit: takeProfitProtection.percent,
+      // Immutable snapshot of the originally-assigned values — survives
+      // any later override via `recalculateAndApplySLTP`. See type def.
+      assignedStopLoss: normalizeStopLossPercent(stopLossProtection.percent).value,
+      assignedTakeProfit: takeProfitProtection.percent,
+      realStopLossPrice: stopLossProtection.absolutePrice,
+      realTakeProfitPrice: takeProfitProtection.absolutePrice,
+      realProfitFactor: positiveRealPf?.value,
+      realProfitFactorSource: positiveRealPf?.source,
       stopLoss: normalizedSkippedSl,
       takeProfit: normalizedSkippedTp,
       // Immutable snapshot of the originally-assigned values — survives
@@ -2040,12 +2134,20 @@ export async function executeLivePosition(
     volumeUsd: 0,
     leverage: realPosition.leverage,
     marginType: "cross",
+    stopLoss: normalizeStopLossPercent(stopLossProtection.percent).value,
+    takeProfit: takeProfitProtection.percent,
+    realStopLossPrice: stopLossProtection.absolutePrice,
+    realTakeProfitPrice: takeProfitProtection.absolutePrice,
+    realProfitFactor: positiveRealPf?.value,
+    realProfitFactorSource: positiveRealPf?.source,
     stopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
     takeProfit: realPosition.takeProfit,
     // Immutable assignment snapshot — preserved across overrides so the
     // progression panel and post-trade stats can always recover what the
     // upstream Set originally specified. Mirrors `stopLoss`/`takeProfit`
     // at creation; never mutated thereafter.
+    assignedStopLoss: normalizeStopLossPercent(stopLossProtection.percent).value,
+    assignedTakeProfit: takeProfitProtection.percent,
     assignedStopLoss: realPosition.stopLoss,
     assignedTakeProfit: realPosition.takeProfit,
     status: "pending",
@@ -2069,7 +2171,7 @@ export async function executeLivePosition(
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
   }
 
-  const normalizedInitialSl = normalizeStopLossPercent(realPosition.stopLoss)
+  const normalizedInitialSl = normalizeStopLossPercent(livePosition.stopLoss)
   if (normalizedInitialSl.adjusted) {
     pushStep(livePosition, "protection_sl_normalized", true, normalizedInitialSl.reason!)
     logProgressionEvent(
@@ -2080,7 +2182,7 @@ export async function executeLivePosition(
       {
         symbol: realPosition.symbol,
         direction: realPosition.direction,
-        assignedStopLoss: realPosition.stopLoss,
+        assignedStopLoss: livePosition.assignedStopLoss,
         effectiveStopLoss: normalizedInitialSl.value,
         reason: normalizedInitialSl.reason,
       },
@@ -2123,6 +2225,21 @@ export async function executeLivePosition(
     // isBlockVariant and _lockDirSuffix are hoisted to function scope (before
     // the try block) so the catch handler can also release the correct key.
     const isBlockVariant = realPosition.setVariant === "block"
+
+    if (isLiveTradeEnabled && !positiveRealPf) {
+      livePosition.status = "rejected"
+      livePosition.statusReason =
+        "Rejected — Live trade requires a positive Real-stage profit factor before exchange order placement"
+      pushStep(livePosition, "preflight", false, livePosition.statusReason)
+      await logProgressionEvent(connectionId, "live_trading", "warning", livePosition.statusReason, {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+        realPositionId: realPosition.id,
+        netEffectivePF: realPosition.netEffectivePF,
+        profitabilityRatio: realPosition.ratios?.profitabilityRatio,
+      })
+      return livePosition
+    }
 
     pushStep(livePosition, "preflight", true, `live_trade=${isLiveTradeEnabled}`)
     await logProgressionEvent(

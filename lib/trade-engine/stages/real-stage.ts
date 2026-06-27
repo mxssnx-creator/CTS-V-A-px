@@ -333,6 +333,7 @@ function createRealPosition(
     rewardTarget: rewardDistance,
     stopLoss,
     takeProfit,
+    netEffectivePF: rewardDistance / Math.max(stopDistance, Number.EPSILON),
     mainPositionCount: mainPos.basePositionCount,
     // Populated by caller (evaluateToRealPositions) — never 0 at rest.
     evaluationScore: ratios.evaluationScore,
