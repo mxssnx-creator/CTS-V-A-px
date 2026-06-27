@@ -1584,59 +1584,20 @@ export async function GET(
       // (first 200 entries mirror the old lrange(0, 199) behaviour).
       // Keep PnL normalization in lock-step with evaluateClosedBatch():
       // realizedPnL → realized_pnl → pnl.
-      const sampledClosedEval = evaluateClosedBatch(sharedClosedParsed.slice(0, 200))
-      const countSampled = sampledClosedEval.count
-      const avgHoldMin  = countSampled > 0 ? (sampledClosedEval.sumHoldMs / countSampled) / 60_000 : 0
-      const avgPnl      = countSampled > 0 ? sampledClosedEval.sumPnl / countSampled : 0
-      const avgRoi      = countSampled > 0 ? sampledClosedEval.sumRoe / countSampled : 0
-      const profitFactor = sampledClosedEval.sumGrossLoss > 0
-        ? sampledClosedEval.sumGrossProfit / sampledClosedEval.sumGrossLoss
-        : sampledClosedEval.sumGrossProfit > 0 ? 999 : 0
-      const passRate   = livePlaced > 0 ? liveFilled / livePlaced : 0
-      const winRate    = liveClosed > 0 ? liveWins / liveClosed : 0
-      const avgPosSize = countSampled > 0
-        ? sampledClosedEval.sumVolumeUsd / countSampled
-        : liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
       const sampledClosed = sharedClosedParsed.slice(0, 200)
       const closedEval = evaluateClosedBatch(sampledClosed)
       const lastXClosed = aggregateLastXClosedPositions(sampledClosed, sampledClosed.length)
+      const countSampled = closedEval.count
       const sumPnl = closedEval.sumPnl
-      const avgHoldMin = closedEval.count > 0 ? (closedEval.sumHoldMs / closedEval.count) / 60_000 : 0
-      const avgPnl = closedEval.count > 0 ? sumPnl / closedEval.count : 0
-      const avgRoi = lastXClosed.avgSignedR
-      const profitFactor = lastXClosed.profitFactor
-      let sumPnl = 0
-      let sumGrossProfit = 0
-      let sumGrossLoss = 0
-      let sumHoldMs = 0
-      let sumRoi = 0
-      let countSampled = 0
-      for (const pos of sharedClosedParsed.slice(0, 200)) {
-        try {
-          const pnl = Number(pos.realizedPnL) || 0
-          sumPnl += pnl
-          if (pnl > 0) sumGrossProfit += pnl
-          if (pnl < 0) sumGrossLoss += Math.abs(pnl)
-          const created  = Number(pos.createdAt) || 0
-          const closedAt = Number(pos.closedAt) || Number(pos.updatedAt) || 0
-          if (created > 0 && closedAt > created) sumHoldMs += closedAt - created
-          const qty  = Number(pos.executedQuantity || pos.quantity) || 0
-          const avgP = Number(pos.averageExecutionPrice || pos.entryPrice) || 0
-          const notional = qty * avgP
-          if (notional > 0) sumRoi += pnl / notional
-          countSampled++
-        } catch { /* skip malformed */ }
-      }
-
-      const avgHoldMin  = countSampled > 0 ? (sumHoldMs / countSampled) / 60_000 : 0
+      const avgHoldMin  = countSampled > 0 ? (closedEval.sumHoldMs / countSampled) / 60_000 : 0
       const avgPnl      = countSampled > 0 ? sumPnl / countSampled : 0
-      const avgRoi      = countSampled > 0 ? sumRoi / countSampled : 0
-      const profitFactor = sumGrossLoss > 0
-        ? sumGrossProfit / sumGrossLoss
-        : sumGrossProfit > 0 ? 999 : 0
+      const avgRoi      = lastXClosed.avgSignedR
+      const profitFactor = lastXClosed.profitFactor
       const passRate   = livePlaced > 0 ? liveFilled / livePlaced : 0
-      const winRate    = liveClosed > 0 ? liveWins / liveClosed : 0
-      const avgPosSize = liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
+      const winRate    = lastXClosed.winRate
+      const avgPosSize = countSampled > 0
+        ? closedEval.sumVolumeUsd / countSampled
+        : liveCreated > 0 ? liveVolumeUsd / liveCreated : 0
       const perSymbolDispatchSelected = readFreshSymbolDispatchSummary("dispatch_selected")
       const perSymbolDispatchSuppressed = readFreshSymbolDispatchSummary("dispatch_suppressed")
       const dispatchSelected = perSymbolDispatchSelected.length > 0
@@ -1665,8 +1626,6 @@ export async function GET(
         passed:    liveFilled,
         failed:    Math.max(0, livePlaced - liveFilled),
         // Live-exclusive fields for richer UI display:
-        winRate:        Math.round(winRate * 1000) / 10,
-        totalPnl:       Math.round(sampledClosedEval.sumPnl * 100) / 100,
         winRate:        lastXClosed.winRate,
         totalPnl:       Math.round(sumPnl * 100) / 100,
         avgPnl:         Math.round(avgPnl * 100) / 100,
