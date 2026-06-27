@@ -406,7 +406,9 @@ export class InlineLocalRedis {
     // 4 GB VM: RSS at boot is ~2.3 GB (Next.js + InlineLocalRedis migrations).
     // Evict aggressively at 250 MB heap / 1400 MB RSS so the prehistoric
     // burst (which adds ~300-400 MB) never pushes RSS past the kernel OOM limit.
-    const HEAP_PRESSURE_MB = 250
+    // Trigger GC-assisted eviction at 650 MB heap (half of --max-old-space-size=1024).
+    // 250 MB was too aggressive — fired at idle and wasted CPU on every interval.
+    const HEAP_PRESSURE_MB = process.env.NODE_ENV === "development" ? 650 : 800
 
     // Run an immediate targeted flush SYNCHRONOUSLY before migrations at startup
     // to clear volatile key families that accumulate across hot-reload cycles
@@ -590,9 +592,12 @@ export class InlineLocalRedis {
         const mem = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
-        // RSS trigger: evict when process RSS exceeds 3 GB (leaves 3 GB+ for OS/other).
-        // heapUsed trigger: evict when V8 heap exceeds 800 MB.
-    const RSS_PRESSURE_MB      = 1_400 // 4GB VM: fire well before kernel OOM (~2.3 GB boot + ~400 MB engine)
+        // RSS trigger: disabled in dev because Next.js itself sits at ~1.9 GB RSS
+        // at idle (compiled routes + module cache), so the trigger fires constantly
+        // even when there's nothing to evict. Only heap + key-count triggers are
+        // actionable in the dev environment.
+        // In prod (real Redis, smaller binary) RSS trigger fires at 2.5 GB.
+        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? Infinity : 2_500
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         // Dev: lower threshold so eviction fires before indication_set keys accumulate.
