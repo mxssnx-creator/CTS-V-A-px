@@ -5,6 +5,7 @@
 export interface Settings {
   // Overall / Main
   base_volume_factor: number
+  volume_step_ratio: number
   positions_average: number
   max_leverage: number
   negativeChangePercent: number
