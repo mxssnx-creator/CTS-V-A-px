@@ -927,11 +927,6 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`✓ Order placed successfully: ${orderId}`)
 
       return { success: true, orderId: orderId ? String(orderId) : undefined, filledPrice: Number(orderInfo.avgPrice ?? orderInfo.price ?? orderInfo.filledPrice ?? 0) || undefined, avgPrice: Number(orderInfo.avgPrice ?? 0) || undefined, price: Number(orderInfo.price ?? 0) || undefined, filledQty: Number(orderInfo.executedQty ?? orderInfo.filledQty ?? orderInfo.cumQty ?? 0) || undefined, executedQty: Number(orderInfo.executedQty ?? 0) || undefined, status: orderInfo.status }
-	      const orderInfo = data.data?.order || data.data || {}
-	      const orderId = orderInfo.orderId || orderInfo.id || data.data?.orderId
-	      this.log(`✓ Order placed successfully: ${orderId}`)
-	
-	      return { success: true, orderId: orderId ? String(orderId) : undefined, clientOrderId: params.clientOrderId } as any
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to place order: ${errorMsg}`)
@@ -1125,10 +1120,6 @@ export class BingXConnector extends BaseExchangeConnector {
               this.log(`✓ ${orderType} placed on one-way retry: ${id}`)
               return { success: true, orderId: String(id), orderPrice: stopRounded, stopPrice: stopRounded }
             }
-	            if (id) {
-	              this.log(`✓ ${orderType} placed on one-way retry: ${id}`)
-	              return { success: true, orderId: String(id), clientOrderId: params.clientOrderId } as any
-	            }
             // Fall through to error handling if orderId was not found
           }
           throw new Error(`BingX stop order error (code=${retryData.code}): ${retryData.msg || "Unknown"}`)
@@ -1148,9 +1139,6 @@ export class BingXConnector extends BaseExchangeConnector {
       }
       this.log(`✓ ${orderType} placed: ${orderId} @ ${stopStr}`)
       return { success: true, orderId: String(orderId), orderPrice: stopRounded, stopPrice: stopRounded }
-	      }
-	      this.log(`✓ ${orderType} placed: ${orderId} @ ${stopStr}`)
-	      return { success: true, orderId: String(orderId), clientOrderId: params.clientOrderId } as any
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to place stop order: ${errorMsg}`)

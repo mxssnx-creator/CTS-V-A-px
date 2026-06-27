@@ -102,7 +102,7 @@ export async function recoordinateAfterSettingsChange(
     "symbol_count", "force_symbols", "symbols",
     // Strategy coordination — variants, block/dca, axis settings
     "coordination_settings", "variantTrailingEnabled", "variantBlockEnabled",
-    "variantDcaEnabled", "variantPauseEnabled",
+    "variantDcaEnabled",
     "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
     "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
     "blockVolumeRatio", "blockMaxStack",

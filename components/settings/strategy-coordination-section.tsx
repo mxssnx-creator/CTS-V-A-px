@@ -201,11 +201,11 @@ const AXES: Array<{
   },
   {
     key: "pause",
-    label: "Pause",
+    label: "Position-count Pause",
     range: "1–8",
     ceiling: 8,
     description:
-      "Last-N validation lookback for pausing further position-count calculations; not a general strategy variant.",
+      "Last-N count window used to pause/calibrate further position-count calculations. This stays under axis semantics and is not a dispatchable strategy variant.",
   },
 ]
 
@@ -459,7 +459,7 @@ export function StrategyCoordinationSection({
               </CardDescription>
             </div>
             <Badge variant="secondary" className="text-[10px]">
-              4 variants
+              3 variants
             </Badge>
           </div>
         </CardHeader>

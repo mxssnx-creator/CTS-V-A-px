@@ -46,6 +46,7 @@ import { ConnectionDetailedLogDialog } from "@/components/dashboard/connection-d
 import { EngineProcessingLogDialog }   from "@/components/dashboard/engine-processing-log-dialog"
 import { DetailedLoggingDialog }       from "@/components/dashboard/detailed-logging-dialog"
 import { VolumeConfigurationPanel } from "@/components/dashboard/volume-configuration-panel"
+import { DEFAULT_VOLUME_STEP_RATIO } from "@/lib/constants"
 import { OrderSettingsPanel } from "@/components/dashboard/order-settings-panel"
 import { MainTradeCard } from "@/components/dashboard/main-trade-card"
 import { PresetTradeCard } from "@/components/dashboard/preset-trade-card"
@@ -138,6 +139,7 @@ export function ActiveConnectionCard({
   const [presetModeLoading, setPresetModeLoading] = useState(false)
   const [liveVolumeFactor, setLiveVolumeFactor] = useState(1.0)
   const [presetVolumeFactor, setPresetVolumeFactor] = useState(1.0)
+  const [volumeStepRatio, setVolumeStepRatio] = useState(DEFAULT_VOLUME_STEP_RATIO)
   const [orderType, setOrderType] = useState<"market" | "limit">("market")
   const [volumeType, setVolumeType] = useState<"usdt" | "contract">("usdt")
   const [mainTradeStatus, setMainTradeStatus] = useState<"idle" | "active" | "paused" | "stopped">("idle")
@@ -279,6 +281,7 @@ export function ActiveConnectionCard({
       setPresetMode(toBoolean(details.is_preset_trade))
       setLiveVolumeFactor(Number(details.live_volume_factor) || 1.0)
       setPresetVolumeFactor(Number(details.preset_volume_factor) || 1.0)
+      setVolumeStepRatio(Number(details.volume_step_ratio) || DEFAULT_VOLUME_STEP_RATIO)
       setOrderType(details.order_type as "market" | "limit" || "market")
       setVolumeType(details.volume_type as "usdt" | "contract" || "usdt")
     }
@@ -337,11 +340,15 @@ export function ActiveConnectionCard({
   const handleLiveVolumeChange = useCallback(async (value: number) => {
     setLiveVolumeFactor(value)
     try {
-      await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
+      const res = await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ live_volume_factor: value }),
       })
+      if (!res.ok) throw new Error("Failed to save live volume factor")
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", {
+        detail: { connectionId: connection.connectionId, settings: { live_volume_factor: value, volume_factor_live: value } },
+      }))
     } catch (error) {
       console.error("[v0] Failed to save live volume factor:", error)
     }
@@ -350,13 +357,34 @@ export function ActiveConnectionCard({
   const handlePresetVolumeChange = useCallback(async (value: number) => {
     setPresetVolumeFactor(value)
     try {
-      await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
+      const res = await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ preset_volume_factor: value }),
       })
+      if (!res.ok) throw new Error("Failed to save preset volume factor")
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", {
+        detail: { connectionId: connection.connectionId, settings: { preset_volume_factor: value, volume_factor_preset: value } },
+      }))
     } catch (error) {
       console.error("[v0] Failed to save preset volume factor:", error)
+    }
+  }, [connection.connectionId])
+
+  const handleVolumeStepRatioChange = useCallback(async (value: number) => {
+    setVolumeStepRatio(value)
+    try {
+      const res = await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ volume_step_ratio: value }),
+      })
+      if (!res.ok) throw new Error("Failed to save volume step ratio")
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", {
+        detail: { connectionId: connection.connectionId, settings: { volume_step_ratio: value } },
+      }))
+    } catch (error) {
+      console.error("[v0] Failed to save volume step ratio:", error)
     }
   }, [connection.connectionId])
 
@@ -484,6 +512,13 @@ export function ActiveConnectionCard({
     const handleLiveTradeToggled = (event: Event) => {
       const customEvent = event as CustomEvent
       if (customEvent.detail?.connectionId === connection.connectionId) {
+        const updatedSettings = customEvent.detail?.settings || {}
+        const liveFactor = Number(updatedSettings.live_volume_factor ?? updatedSettings.volume_factor_live)
+        const presetFactor = Number(updatedSettings.preset_volume_factor ?? updatedSettings.volume_factor_preset)
+        const stepRatio = Number(updatedSettings.volume_step_ratio)
+        if (Number.isFinite(liveFactor) && liveFactor > 0) setLiveVolumeFactor(liveFactor)
+        if (Number.isFinite(presetFactor) && presetFactor > 0) setPresetVolumeFactor(presetFactor)
+        if (Number.isFinite(stepRatio) && stepRatio > 0) setVolumeStepRatio(stepRatio)
         fetchProgression()
       }
     }
@@ -2091,8 +2126,10 @@ export function ActiveConnectionCard({
               <VolumeConfigurationPanel
                 liveVolumeFactor={liveVolumeFactor}
                 presetVolumeFactor={presetVolumeFactor}
+                volumeStepRatio={volumeStepRatio}
                 onLiveVolumeChange={handleLiveVolumeChange}
                 onPresetVolumeChange={handlePresetVolumeChange}
+                onVolumeStepRatioChange={handleVolumeStepRatioChange}
                 orderType={orderType}
                 onOrderTypeChange={setOrderType}
                 volumeType={volumeType}

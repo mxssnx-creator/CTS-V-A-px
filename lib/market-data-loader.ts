@@ -153,56 +153,70 @@ async function fetchRealMarketData(
   }
 }
 
+const DEFAULT_ENGINE_MARKET_SYMBOLS = [
+  "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
+  "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+  "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+]
+
 // ── In-flight deduplication ─────────────────────────────────────────
 // `loadMarketDataForEngine` is called from four independent paths:
 // engine boot, heartbeat (30s), prehistoric cycle (adaptive), and the
 // fallback error handler. When two callers fire concurrently, they
 // would each fetch+parse+write the same symbol list independently,
 // doubling exchange API calls and Redis writes.
-let __loadFlight: Promise<number> | null = null
+const __loadFlights = new Map<string, Promise<number>>()
+let __lastDevCacheHitLogAt = 0
 
 /**
  * Load market data for all symbols into Redis
  * Fetches REAL data from exchanges, falls back to synthetic only on failure
  */
 export async function loadMarketDataForEngine(symbols: string[] = []): Promise<number> {
+  const requestedSymbols = symbols.length > 0 ? symbols : DEFAULT_ENGINE_MARKET_SYMBOLS
+  const uniqueSymbols = Array.from(new Set(requestedSymbols.map((s) => String(s || "").trim().toUpperCase()).filter(Boolean)))
+  const flightKey = uniqueSymbols.join("|")
+
   // Coalesce concurrent calls — the second caller joins the first
-  // promise and receives the same result, avoiding duplicate work.
-  if (__loadFlight) return __loadFlight
-  __loadFlight = (async () => {
-  // ── Dev-mode optimization: skip cold-boot loading if already cached ──
-  // In Next.js dev mode, module reloads and hot-reload cause repeated
-  // calls to loadMarketDataForEngine. Each call fetches 86k candles per
-  // symbol from exchange APIs, bloating heap and hammering rate limits.
-  // Check if data is already resident; reuse existing candles.
-  try {
-    await initRedis()
-    const client = getClient()
-    const isDev = process.env.NODE_ENV === "development"
-    
-    if (isDev) {
-      const checkKey = `market_data:BTCUSDT:1s`
-      const existing = await client.get(checkKey)
-      if (existing) {
-        console.log(`[v0] [MarketData] Dev-mode: data already cached, skipping reload`)
-        return 0 // Already loaded in this dev session
-      }
-    }
-  } catch (_) {
-    // Proceed normally if the check fails
-  }
-  
+  // promise for the exact same symbol set and receives the same result,
+  // avoiding duplicate work without making a 32-symbol quickstart wait on
+  // an unrelated 3-symbol heartbeat flight.
+  const existingFlight = __loadFlights.get(flightKey)
+  if (existingFlight) return existingFlight
+
+  const flight = (async () => {
   try {
     await initRedis()
     const client = getClient()
 
-    // Default symbols if none provided — matches the 15-symbol production set
-    // seeded by migration 031+032 (ordered by 1h volatility per standing directive).
-    const targetSymbols = symbols.length > 0 ? symbols : [
-      "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
-      "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
-      "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
-    ]
+    // Default symbols if none provided — matches the production set seeded by
+    // migrations (ordered by 1h volatility per standing directive).
+    let targetSymbols = uniqueSymbols
+
+    // ── Dev-mode cache short-circuit ──────────────────────────────────
+    // Next.js dev hot-reload can call this dozens of times per minute from
+    // engine boot, heartbeat, realtime, and prehistoric loops. The old guard
+    // checked only BTCUSDT, then logged on every call; that both hid missing
+    // non-BTC quickstart symbols and flooded stdout enough to slow the dev
+    // engine. Check the requested symbol set, only load missing symbols, and
+    // throttle the "already cached" log.
+    if (process.env.NODE_ENV === "development") {
+      const cacheKeys = targetSymbols.map((symbol) => `market_data:${symbol}:1s`)
+      const cachedValues = cacheKeys.length > 0
+        ? (await (client as any).mget(...cacheKeys)) as (string | null)[]
+        : []
+      const missingSymbols = targetSymbols.filter((_, index) => !cachedValues[index])
+      if (missingSymbols.length === 0) {
+        const now = Date.now()
+        if (now - __lastDevCacheHitLogAt > 30_000) {
+          __lastDevCacheHitLogAt = now
+          console.log(`[v0] [MarketData] Dev-mode: ${targetSymbols.length} requested symbols already cached; skipping reload`)
+        }
+        return 0
+      }
+      targetSymbols = missingSymbols
+      console.log(`[v0] [MarketData] Dev-mode: ${cachedValues.length - missingSymbols.length}/${cachedValues.length} requested symbols cached; loading ${missingSymbols.length} missing`)
+    }
 
     // Base prices for fallback synthetic data. Used when the live exchange
     // fetch fails (no API key / rate limit). Prices are approximate Jun-2026
@@ -348,8 +362,9 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
     return 0
   }
   })()
-  __loadFlight.finally(() => { __loadFlight = null })
-  return __loadFlight
+  __loadFlights.set(flightKey, flight)
+  flight.finally(() => { __loadFlights.delete(flightKey) })
+  return flight
 }
 
 /**
