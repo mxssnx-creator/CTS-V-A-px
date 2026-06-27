@@ -199,7 +199,7 @@ async function generateIndicationsForConnection(
       marketData = await fetchLivePriceFromExchange(symbol)
     }
 
-    // ── Synthetic fallback ──────────────────────────────────────────────
+    // ── Synthetic fallback ─────────────────────���────────────────────────
     // In connectivity-restricted environments (e.g. the sandbox) both the
     // cached lookup and the live exchange fetch return null, so this used to
     // `return result` with generated=0 — stalling the realtime cron and
@@ -510,12 +510,27 @@ export async function GET() {
     const connections = await getAllConnections()
 
     // Use active-inserted connections — same eligibility as the trade engine
-    const activeConnections = connections.filter(
+    let activeConnections = connections.filter(
       (c: any) =>
         isConnectionInActivePanel(c) ||
         isTruthyFlag(c.is_active_inserted) ||
         isTruthyFlag(c.is_assigned)
     )
+
+    // ── DEV ONE-CONNECTION CAP (mirror of the engine's one-engine guard) ──────
+    // This cron is the realtime driver. Both bingx-x01 and bybit-x03 are always
+    // inited + active-inserted, but on the low-RAM dev VM running the realtime
+    // pass (indication generation + RealtimeProcessor SL/TP sweep) for BOTH every
+    // few seconds doubles per-tick work and re-bloats indication_outcomes_pending.
+    // In DEV we process only the connection the operator explicitly enabled
+    // (is_enabled_dashboard="1"), defaulting to the primary bingx-x01, so bybit
+    // stays truly idle until enabled. Production processes every active connection.
+    if (process.env.NODE_ENV !== "production" && activeConnections.length > 1) {
+      const explicit = activeConnections.filter((c: any) => isTruthyFlag(c.is_enabled_dashboard))
+      const pool = explicit.length > 0 ? explicit : activeConnections
+      const primary = pool.find((c: any) => c.id === "bingx-x01") ?? pool[0]
+      if (primary) activeConnections = [primary]
+    }
 
     if (activeConnections.length === 0) {
       return NextResponse.json({
