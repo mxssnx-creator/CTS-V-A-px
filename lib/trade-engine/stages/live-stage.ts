@@ -1304,7 +1304,7 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   const fillPrice = pos.averageExecutionPrice || pos.entryPrice
   if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
 
-  // ── Trailing stop: use the ratcheted absolute price directly ────────────
+  // ── Trailing stop: use the ratcheted absolute price directly ─���──────────
   // When trailing is active syncLiveFromPseudo stamps pos.trailingStopPrice
   // with the latest ratcheted absolute stop level. Using that absolute price
   // directly avoids the percentage-anchored re-derivation below which would
@@ -1337,37 +1337,6 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
       : 0
 
   return { desiredSl, desiredTp }
-}
-
-}
-
-}
-
-/**
- * Has the desired protection price drifted enough from the currently
- * placed one to warrant cancelling and re-placing? We use 0.25% as the
- * tolerance — tighter than that and we'd thrash the exchange API on
- * every tiny rounding diff. Looser and we'd leave stale levels in place
- * after a real strategy adjustment.
- */
-}
-
-/**
- * Has the desired protection price drifted enough from the currently
- * placed one to warrant cancelling and re-placing? We use 0.25% as the
- * tolerance — tighter than that and we'd thrash the exchange API on
- * every tiny rounding diff. Looser and we'd leave stale levels in place
- * after a real strategy adjustment.
- */
-}
-
-/**
- * Has the desired protection price drifted enough from the currently
- * placed one to warrant cancelling and re-placing? We use 0.25% as the
- * tolerance — tighter than that and we'd thrash the exchange API on
- * every tiny rounding diff. Looser and we'd leave stale levels in place
- * after a real strategy adjustment.
- */
 }
 
 /**
@@ -2110,7 +2079,7 @@ export async function executeLivePosition(
       { liveTrade: isLiveTradeEnabled, realPositionId: realPosition.id }
     )
 
-    // ── Atomic dedup gate (P0-4 race fix) ──────────────────────────────
+    // ── Atomic dedup gate (P0-4 race fix) ──��───────────────────────────
     //
     // Spec: "Active Pseudo Position Limit for each direction Long, short
     // maximal 1." The previous implementation was a check-then-act
@@ -3696,7 +3665,7 @@ export async function closeLivePosition(
       )
     }
 
-    // ── Orphan-sweep safety net ────────────────────────────────────────
+    // ── Orphan-sweep safety net ───────────────────────────────────────��
     // After the recorded-id cancels, scan the venue for ANY reduce-only
     // order matching this symbol + close-side and cancel it. Catches:
     //   • by-id cancels that just failed transiently (we get a free retry)
@@ -5230,7 +5199,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       }
     }
 
-    // ── Exchange-orphan adoption ─────────────────────────────────────────
+    // ��─ Exchange-orphan adoption ─────────────────────────────────────────
     // `exchangePositionsForAdoption` was already fetched in the parallel
     // prefetch above — no second getPositions() call needed here.
     // Alias it so the adoption block's variable names are unchanged.
@@ -5380,7 +5349,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           }
         }
       }
-    // ── end orphan adoption ───────────────────────────────────────────
+    // ─�� end orphan adoption ───────────────────────────────────────────
 
     if (openPositions.length === 0) {
       // Nothing to sync after adoption — fire-and-forget the TTL expiry
