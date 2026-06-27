@@ -220,7 +220,22 @@ export function TradeHistoryTable({ trades, limit = 15, onRefresh }: TradeHistor
                       </Badge>
                     </div>
                     <div className="text-right font-mono text-muted-foreground">{trade.entryPrice > 0 ? `$${trade.entryPrice.toFixed(3)}` : "—"}</div>
-                    <div className="text-right font-mono text-muted-foreground">{trade.exitPrice > 0 ? `$${trade.exitPrice.toFixed(3)}` : "—"}</div>
+                    <div
+                      className="text-right font-mono text-muted-foreground"
+                      title={
+                        trade.exitPrice > 0 && trade.entryPrice > 0 &&
+                        Math.abs(trade.exitPrice - trade.entryPrice) / trade.entryPrice < 0.00001
+                          ? "Exit price reconstructed from P&L (no stored close price)"
+                          : undefined
+                      }
+                    >
+                      {trade.exitPrice > 0
+                        ? (trade.entryPrice > 0 &&
+                           Math.abs(trade.exitPrice - trade.entryPrice) / trade.entryPrice < 0.00001
+                            ? `~$${trade.exitPrice.toFixed(3)}`
+                            : `$${trade.exitPrice.toFixed(3)}`)
+                        : "—"}
+                    </div>
                     <div className={`text-right font-medium ${isWin ? "text-green-600" : "text-red-600"}`}>
                       {isWin ? "+" : ""}{trade.pnlLabel.substring(1)}
                     </div>
