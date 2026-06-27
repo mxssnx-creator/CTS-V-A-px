@@ -2897,6 +2897,13 @@ const BASE_CONNECTION_CONFIG: Array<{
   // fallback chain in `ensureBaseConnections` below — autoActive only
   // affects the initial-create defaults, never overwrites prior state.
   { id: "bingx-x01", name: "BingX Base", exchange: "bingx", credentialId: "bingx-x01", autoActive: true },
+  // Bybit is once again a canonical primary: always inited + inserted into the
+  // Active panel so it is visible from first boot. Its ENGINE does not run by
+  // default in dev (see the dev one-engine guard in
+  // TradeEngineCoordinator.startMissingEngines) — it stays engine-idle until the
+  // operator explicitly enables it, which prevents two concurrent prehistoric
+  // passes from OOM-killing the low-RAM dev VM. In production both engines run.
+  { id: "bybit-x03", name: "Bybit Base", exchange: "bybit", credentialId: "bybit-x03", autoActive: true },
   { id: "pionex-x01", name: "Pionex Base", exchange: "pionex", credentialId: "pionex-x01", autoActive: false },
   { id: "orangex-x01", name: "OrangeX Base", exchange: "orangex", credentialId: "orangex-x01", autoActive: false },
 ]
@@ -2915,10 +2922,11 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   let createdOrUpdated = 0
   let credentialsInjected = 0
 
-  // bybit-x03 is included here: it was previously a canonical base connection but is no
-  // longer auto-seeded. Any row in Redis left over from an older schema version must be
-  // cleaned up so it does not appear as a ghost connection in the dashboard.
-  const legacyIds = ["bybit-base", "bingx-base", "binance-base", "okx-base", "bybit-default-disabled", "bingx-default-disabled", "bybit-x03"]
+  // bybit-x03 is NO LONGER in this list: it is once again a canonical base
+  // connection (see BASE_CONNECTION_CONFIG) and is always inited + visible
+  // alongside bingx-x01. The remaining ids are genuinely obsolete schema rows
+  // that must be cleaned up so they don't appear as ghost connections.
+  const legacyIds = ["bybit-base", "bingx-base", "binance-base", "okx-base", "bybit-default-disabled", "bingx-default-disabled"]
   for (const legacyId of legacyIds) {
     const exists = await client.sismember("connections", legacyId)
     if (exists) {

@@ -895,7 +895,13 @@ export class IndicationSetsProcessor {
         openedAt: Date.now(),
       }
       await client.rpush(key, JSON.stringify(pending))
-      await client.ltrim(key, -1000, -1)
+      // Per-symbol pending-outcome list cap. In dev this was the single biggest
+      // in-memory Redis family (~150 KB/symbol × symbols = multiple MB restored
+      // into the InlineLocalRedis Map every boot). 1000 pending signals/symbol is
+      // far more than the low-RAM dev VM needs; 100 is plenty to evaluate forward
+      // outcomes. Production keeps the full 1000-entry window.
+      const pendingCap = this._isDev ? 100 : 1000
+      await client.ltrim(key, -pendingCap, -1)
       await client.expire(key, 86400)
     } catch { /* non-critical */ }
   }

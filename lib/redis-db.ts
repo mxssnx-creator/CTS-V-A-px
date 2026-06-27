@@ -434,7 +434,15 @@ export class InlineLocalRedis {
           //    (per-symbol per-stage). This hash is read by the stats API every
           //    second and must survive hot-reloads.
           for (const key of this.data.lists.keys()) {
-            if (key.startsWith("strategies:")) { this.data.lists.delete(key); flushed++ }
+            // `indication_outcomes_pending:*` is stored as a LIST (rpush/ltrim),
+            // not a string/hash, so the strings+hashes flush below never reached
+            // it — letting it accumulate (~150 KB/symbol, multiple MB) and
+            // persist across boots via the snapshot. Flush it here so dev starts
+            // each session clean; the runtime ltrim cap (100 in dev) keeps it
+            // bounded thereafter.
+            if (key.startsWith("strategies:") || key.startsWith("indication_outcomes_pending:")) {
+              this.data.lists.delete(key); flushed++
+            }
           }
           for (const key of this.data.hashes.keys()) {
             // Preserve strategies_active hash — it contains live coordinator counts
