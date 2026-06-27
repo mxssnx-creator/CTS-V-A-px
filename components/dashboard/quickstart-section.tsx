@@ -604,14 +604,23 @@ export function QuickstartSection() {
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
         // "unknown" = engine running but no phase written yet. Infer from cycles.
+        // Guard: only use indCycles as a phase/running signal when the server
+        // has NOT explicitly said the engine is stopped (engineRunning === false).
+        // stale Redis cycles from a previous run must not resurrect "Running".
         phase: (() => {
           const p = s.metadata?.phase
           if (p && p !== "unknown") return p
-          if (indCycles > 0) return "realtime"
+          // Only infer from cycles when engineRunning is not explicitly false.
+          if (s.metadata?.engineRunning !== false && indCycles > 0) return "realtime"
           if (s.metadata?.engineRunning) return "initializing"
           return "—"
         })(),
-        engineRunning:         s.metadata?.engineRunning || indCycles > 0,
+        engineRunning: s.metadata?.engineRunning === true
+          ? true
+          // Treat indCycles as a weak running signal only when the server has
+          // not explicitly said stopped. If engineRunning is explicitly false,
+          // stale Redis cycle counts must NOT show the engine as running.
+          : s.metadata?.engineRunning !== false && indCycles > 0,
         // Real-stage rolling averages and stage cascade eval percentages.
         // Both arrive from the /stats endpoint already computed.
         realAverages:     s.realAverages     ?? null,
