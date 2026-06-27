@@ -916,21 +916,29 @@ return {
           .filter(Boolean)
       }
 
-      // Best effort: ask engine for current symbols (or fall back to stored)
-      let currentSymbols: string[] = []
+      // Resolve the *operator-selected* symbol set.
+      //
       // NOTE: setSettings() stores under a `settings:` prefix, so the engine
-      // state hash lives at `settings:trade_engine_state:{id}`. The previous
-      // read used the unprefixed key and therefore never found the symbols,
-      // silently falling back to the connection's active_symbols every time.
+      // state hash lives at `settings:trade_engine_state:{id}`.
+      //
+      // CRITICAL ORDERING: the settings PATCH (and the Quickstart slot) write
+      // the user's selection to `force_symbols` / `symbol_count`. The engine
+      // only writes `symbols` / `active_symbols` LATER, during the prehistoric
+      // pass, and those reflect the PREVIOUS selection until the new run
+      // finishes. If we read `symbols` first (as the old code did) a symbol
+      // change is invisible here — liveSymbolCount stays at the old value, the
+      // mismatch check fails, and progress/stats never reset. So `force_symbols`
+      // (the explicit operator override) MUST take priority over the
+      // engine-populated `symbols` array.
       const state = (await client
         .hgetall(`settings:trade_engine_state:${connectionId}`)
         .catch(() => ({}))) as Record<string, string>
-      currentSymbols = parseSymbols(state.symbols)
-      if (currentSymbols.length === 0) {
-        // fallback to the connection's active_symbols
-        const cd = connData as Record<string, string>
-        currentSymbols = parseSymbols(cd.active_symbols)
-      }
+      const cd = connData as Record<string, string>
+      let currentSymbols: string[] = parseSymbols(state.force_symbols)
+      if (currentSymbols.length === 0) currentSymbols = parseSymbols(cd.force_symbols)
+      if (currentSymbols.length === 0) currentSymbols = parseSymbols(state.active_symbols)
+      if (currentSymbols.length === 0) currentSymbols = parseSymbols(state.symbols)
+      if (currentSymbols.length === 0) currentSymbols = parseSymbols(cd.active_symbols)
 
       const liveSymbolCount = currentSymbols.length
       const liveSymbolsHash = currentSymbols.slice().sort().join("|")
@@ -1049,6 +1057,25 @@ return {
           engine_type: engineType || "main",
           prehistoric_phase_active: "false",
         }).catch(() => {})
+
+        // Reset the stale `config_set_*` snapshot held in the engine-state hash.
+        // The stats route uses these as a TERTIARY source inside its
+        // Math.max/pick fallbacks (config_set_symbols_total /
+        // _symbols_processed / _candles_processed / _indication_results). They
+        // survive the prehistoric:{id} reset above, so without this the
+        // dashboard kept showing the PREVIOUS selection's totals (e.g. "20/20,
+        // 5000 candles") after the operator switched to fewer symbols. We seed
+        // the total with the new live count and zero the progress counters; the
+        // engine repopulates all four on its next prehistoric pass
+        // (engine-manager writes them at start and after processing).
+        await client
+          .hset(`settings:trade_engine_state:${connectionId}`, {
+            config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
+            config_set_symbols_processed: "0",
+            config_set_candles_processed: "0",
+            config_set_indication_results: "0",
+          })
+          .catch(() => {})
 
         return { changed: true, reason, newEpoch }
       }
