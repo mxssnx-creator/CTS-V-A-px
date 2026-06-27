@@ -2711,6 +2711,45 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "47")
     },
   },
+  {
+    // Strip progression:, settings:trade_engine_state:, settings:connection_settings:,
+    // settings:eval_knobs:, and market_data: hashes from template-only connections.
+    // These 9 connections (bybit-x03, binance-x01, okx-x01, ...) are shown in the
+    // connection picker UI but never run the engine — they accumulate ~2 MB of
+    // unnecessary migration-seeded hashes that inflate the InlineLocalRedis in-process
+    // store and push boot RSS past the kernel OOM limit on the 4 GB v0 sandbox VM.
+    // The connection: hash is PRESERVED so the UI still lists them as options.
+    version: 49,
+    name: "049-strip-template-connection-overhead",
+    up: async (client: any) => {
+      const ACTIVE_CONN = "bingx-x01"
+      const templateIds = [
+        "bybit-x03", "binance-x01", "okx-x01", "gateio-x01", "kucoin-x01",
+        "mexc-x01", "bitget-x01", "pionex-x01", "orangex-x01", "huobi-x01",
+      ]
+      const prefixes = [
+        "progression",
+        "settings:trade_engine_state",
+        "settings:connection_settings",
+        "settings:eval_knobs",
+        "prehistoric_loaded",
+        "prehistoric:progress",
+      ]
+      let deleted = 0
+      for (const id of templateIds) {
+        if (id === ACTIVE_CONN) continue
+        for (const prefix of prefixes) {
+          const key = `${prefix}:${id}`
+          const r = await client.del(key).catch(() => 0)
+          if (Number(r) > 0) deleted++
+        }
+      }
+      console.log(`[v0] Migration 049: stripped ${deleted} overhead keys from ${templateIds.length} template connections`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "48")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
